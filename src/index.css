@@ -1,0 +1,153 @@
+@import "tailwindcss";
+
+@layer utilities {
+  /* Deep Space Titanium Obsidian Background with Cosmic Aurora Dust */
+  .bg-titanium-obsidian {
+    background-color: #030712;
+    background-image: 
+      radial-gradient(circle at 20% 15%, rgba(16, 185, 129, 0.09) 0%, transparent 50%),
+      radial-gradient(circle at 80% 85%, rgba(99, 102, 241, 0.08) 0%, transparent 50%),
+      radial-gradient(circle at 50% 50%, rgba(20, 184, 166, 0.06) 0%, transparent 60%),
+      radial-gradient(1px 1px at 30px 40px, rgba(255, 255, 255, 0.6), rgba(0,0,0,0)),
+      radial-gradient(1.2px 1.2px at 120px 80px, rgba(52, 211, 153, 0.7), rgba(0,0,0,0)),
+      radial-gradient(1px 1px at 220px 180px, rgba(148, 163, 184, 0.6), rgba(0,0,0,0));
+    background-size: 100% 100%, 100% 100%, 100% 100%, 250px 250px, 300px 300px, 350px 350px;
+    background-attachment: fixed;
+  }
+
+  /* GPU Hardware Acceleration for Ultra-Smooth 60fps Scrolling */
+  .gpu-accelerated {
+    transform: translateZ(0);
+    will-change: transform;
+    backface-visibility: hidden;
+  }
+
+  /* Radiant Aurora Emerald Glow Effects */
+  .glow-aurora-sm {
+    box-shadow: 0 0 12px rgba(16, 185, 129, 0.25);
+  }
+
+  .glow-aurora-md {
+    box-shadow: 0 0 25px rgba(16, 185, 129, 0.35);
+  }
+
+  .glow-platinum-sm {
+    box-shadow: 0 0 15px rgba(226, 232, 240, 0.2);
+  }
+
+  /* Moving Futuristic HUD Scanline Overlay for UI Cards */
+  .hud-scanline {
+    position: relative;
+    overflow: hidden;
+  }
+  
+  .hud-scanline::before {
+    content: " ";
+    display: block;
+    position: absolute;
+    top: 0; left: 0; bottom: 0; right: 0;
+    background: linear-gradient(
+      rgba(16, 185, 129, 0) 50%, 
+      rgba(16, 185, 129, 0.04) 50%
+    );
+    background-size: 100% 4px;
+    z-index: 2;
+    pointer-events: none;
+    opacity: 0.6;
+  }
+
+  /* Moving HUD Laser Sweep Beam */
+  .hud-laser-sweep {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hud-laser-sweep::after {
+    content: "";
+    position: absolute;
+    top: -100%;
+    left: 0;
+    right: 0;
+    height: 100%;
+    background: linear-gradient(
+      180deg,
+      transparent 0%,
+      rgba(16, 185, 129, 0.04) 60%,
+      rgba(16, 185, 129, 0.15) 100%
+    );
+    animation: hudSweep 7s linear infinite;
+    pointer-events: none;
+    z-index: 3;
+  }
+}
+
+/* Global Hardware Smooth Scrolling Optimization */
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  overflow-y: scroll;
+  contain: layout style;
+}
+
+@keyframes hudSweep {
+  0% {
+    top: -100%;
+  }
+  100% {
+    top: 200%;
+  }
+}
+
+/* Futuristic HUD Corner Edges in Aurora Emerald & Platinum */
+.hud-corner {
+  position: relative;
+}
+
+.hud-corner::before,
+.hud-corner::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.hud-corner::before {
+  top: 0;
+  right: 0;
+  border-top: 2px solid rgba(16, 185, 129, 0.9);
+  border-right: 2px solid rgba(16, 185, 129, 0.9);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+}
+
+.hud-corner::after {
+  bottom: 0;
+  left: 0;
+  border-bottom: 2px solid rgba(148, 163, 184, 0.8);
+  border-left: 2px solid rgba(148, 163, 184, 0.8);
+  box-shadow: 0 0 8px rgba(148, 163, 184, 0.5);
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #030712;
+}
+::-webkit-scrollbar-thumb {
+  background: #064e3b;
+  border-radius: 4px;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #10b981;
+}
+
+
+

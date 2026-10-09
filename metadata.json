@@ -1,0 +1,6 @@
+{
+  "name": "Quantum Trade AI - ترمینال معامله و تحلیل بیت‌کوین",
+  "description": "سامانه هوشمند تحلیل چند تایم‌فریمی MTF، امتیازدهی همگرایی تکنیکال و شبیه‌ساز معاملات پیشرفته کریپتو",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

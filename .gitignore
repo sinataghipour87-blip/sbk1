@@ -1,0 +1,10 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+node_modules
+dist/
+bun.lock
+*.log
+
