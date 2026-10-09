@@ -1174,6 +1174,45 @@ export class HunterExecutionEngine {
       }
     } catch {}
   }
+
+  // سناریو ۹: پیگیری شناسه‌های یکتا و جلوگیری از ارسال تکراری (Idempotency Key Cache)
+  private submittedDecisionIds = new Set<string>();
+
+  public registerDecisionSubmission(decisionId: string): boolean {
+    if (this.submittedDecisionIds.has(decisionId)) {
+      return false; // تکراری
+    }
+    this.submittedDecisionIds.add(decisionId);
+    if (this.submittedDecisionIds.size > 2000) {
+      const first = Array.from(this.submittedDecisionIds)[0];
+      this.submittedDecisionIds.delete(first);
+    }
+    return true;
+  }
+
+  // سناریو ۱۲: پردازش رد سفارش از صرافی و جلوگیری از ثبت موفقیت کاذب
+  public handleExchangeOrderRejection(orderId: string, reasonFa: string) {
+    return {
+      orderId,
+      status: 'REJECTED' as const,
+      isFalseSuccessPrevented: true,
+      messageFa: `🛑 سفارش ${orderId} توسط صرافی رد شد: ${reasonFa}`,
+      timestamp: Date.now(),
+    };
+  }
+
+  // سناریو ۱۵: بررسی آستانه لغزش و تغییر ناگهانی قیمت
+  public validatePriceSlippageThreshold(expectedPrice: number, livePrice: number, maxTolerancePct = 0.005) {
+    const driftPct = Math.abs(livePrice - expectedPrice) / expectedPrice;
+    const isSlippageAcceptable = driftPct <= maxTolerancePct;
+    return {
+      expectedPrice,
+      livePrice,
+      driftPct: Number((driftPct * 100).toFixed(3)),
+      isSlippageAcceptable,
+      verdictFa: isSlippageAcceptable ? 'قیمت در محدوده مجاز قرار دارد.' : 'پرش ناگهانی قیمت بالاتر از حد مجاز؛ ابطال سفارش.',
+    };
+  }
 }
 
 export const hunterExecutionEngine = HunterExecutionEngine.getInstance();

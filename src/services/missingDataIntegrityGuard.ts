@@ -159,10 +159,20 @@ export class MissingDataIntegrityGuardService {
     const validCount = features.filter(f => f.status === 'VALID').length;
     const overallFeedHealthPct = Math.round((validCount / features.length) * 100);
 
-    const isTradePermitted = missingCriticals.length === 0 && analysis.dataStatus !== 'DATA_UNAVAILABLE';
+    const isSynthetic = analysis.dataStatus === 'SIMULATED' ||
+      (analysis as any)?.__isSynthetic === true ||
+      (analysis as any)?.__isSyntheticUnsafeForLive__ === true ||
+      (analysis as any)?.__isLiveSafe === false;
+
+    const isTradePermitted = missingCriticals.length === 0 &&
+      analysis.dataStatus !== 'DATA_UNAVAILABLE' &&
+      analysis.dataStatus !== 'UNAVAILABLE' &&
+      !isSynthetic;
     let blockReasonFa: string | undefined;
 
-    if (!isTradePermitted) {
+    if (isSynthetic) {
+      blockReasonFa = '🛑 توقف معاملات زنده: داده‌های دریافتی از نوع شبیه‌سازی‌شده (SIMULATED) یا آزمایشی هستند. داده‌های مصنوعی فقط در محیط آزمایشگاهی مجازند و هرگز نباید وارد هسته معاملات زنده شوند.';
+    } else if (!isTradePermitted) {
       const missingNames = missingCriticals.map(m => m.nameFa).join('، ');
       blockReasonFa = `🛑 توقف معاملات به دلیل تغذیه ناقص داده‌ها: شاخص‌های حیاتی [${missingNames || 'داده نامعتبر'}] در وضعیت UNKNOWN هستند. جایگزینی داده‌های مفقود با صفر اکیداً ممنوع است.`;
     }

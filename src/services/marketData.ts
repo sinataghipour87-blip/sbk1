@@ -10,6 +10,7 @@ import {
   CanonicalMarketSnapshot, 
   CanonicalExchangeFeed 
 } from '../types/trading';
+import { dataProvenanceLayerService } from './dataProvenanceLayer';
 
 // Helper for fetching JSON with timeout and measured latency
 async function safeFetchJson<T>(url: string, timeoutMs = 6000): Promise<{ data: T; latencyMs: number }> {
@@ -27,8 +28,16 @@ async function safeFetchJson<T>(url: string, timeoutMs = 6000): Promise<{ data: 
   }
 }
 
+export interface BybitCandlesResult {
+  candles: Candle[];
+  latencyMs: number;
+  sourceStartTimeMs: number;
+  sourceCloseTimeMs: number;
+  receivedTimestampMs: number;
+}
+
 // 1. Fetch candles from Bybit Linear Futures Market (Item 31)
-export async function fetchBybit(interval = '15', limit = 150): Promise<{ candles: Candle[]; latencyMs: number }> {
+export async function fetchBybit(interval = '15', limit = 150): Promise<BybitCandlesResult> {
   const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=${interval}&limit=${limit}`;
   interface BybitResp {
     result?: {
@@ -36,6 +45,7 @@ export async function fetchBybit(interval = '15', limit = 150): Promise<{ candle
     };
   }
   const { data, latencyMs } = await safeFetchJson<BybitResp>(url);
+  const receivedTimestampMs = Date.now();
   if (!data?.result?.list || data.result.list.length < 20) {
     throw new Error('Invalid Bybit Futures data');
   }
@@ -51,7 +61,19 @@ export async function fetchBybit(interval = '15', limit = 150): Promise<{ candle
   if (!candles.every(isValidMarketCandle)) {
     throw new Error('Bybit returned invalid futures candles');
   }
-  return { candles, latencyMs };
+
+  const lastRaw = reversed[reversed.length - 1];
+  const sourceStartTimeMs = parseInt(lastRaw[0], 10);
+  const intervalMinutes = parseInt(interval, 10) || 15;
+  const sourceCloseTimeMs = sourceStartTimeMs + (intervalMinutes * 60 * 1000);
+
+  return {
+    candles,
+    latencyMs,
+    sourceStartTimeMs,
+    sourceCloseTimeMs,
+    receivedTimestampMs,
+  };
 }
 
 function isValidMarketCandle(candle: Candle): boolean {
@@ -113,12 +135,43 @@ export async function fetchFuturesPrices(forceRefresh = false): Promise<FuturesP
         source: 'Bybit Linear Futures Ticker (BTCUSDT)',
         status: 'LIVE'
       };
+      dataProvenanceLayerService.registerAndAuditFeedProvenance({
+        feedKey: 'TICKER_FUTURES',
+        source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+        exchange: 'BYBIT',
+        symbol: 'BTCUSDT',
+        marketType: 'LINEAR_PERPETUAL',
+        timeframe: 'TICK',
+        sourceTimestampMs: result.timestampUtc,
+        receivedTimestampMs: Date.now(),
+        networkLatencyMs: latencyMs,
+        rawPriceValues: {
+          lastPrice,
+          markPrice,
+          indexPrice,
+        },
+      });
       setCache(cacheKey, result);
       return result;
     }
   } catch {
     // ignore
   }
+
+  dataProvenanceLayerService.registerAndAuditFeedProvenance({
+    feedKey: 'TICKER_FUTURES',
+    source: 'DATA_UNAVAILABLE',
+    exchange: 'BYBIT',
+    symbol: 'BTCUSDT',
+    marketType: 'LINEAR_PERPETUAL',
+    timeframe: 'TICK',
+    customStatus: 'UNAVAILABLE',
+    rawPriceValues: {
+      lastPrice: null,
+      markPrice: null,
+      indexPrice: null,
+    },
+  });
 
   return {
     lastPrice: 0,
@@ -133,8 +186,16 @@ export async function fetchFuturesPrices(forceRefresh = false): Promise<FuturesP
   };
 }
 
+export interface KucoinCandlesResult {
+  candles: Candle[];
+  latencyMs: number;
+  sourceStartTimeMs: number;
+  sourceCloseTimeMs: number;
+  receivedTimestampMs: number;
+}
+
 // 2. Fetch candles from KuCoin Linear Futures (Secondary Fallback) (Item 31)
-export async function fetchKucoin(type = '15min'): Promise<{ candles: Candle[]; latencyMs: number }> {
+export async function fetchKucoin(type = '15min'): Promise<KucoinCandlesResult> {
   // KuCoin Futures kline query for XBTUSDTM
   const granularityMap: Record<string, number> = { '1min': 1, '5min': 5, '15min': 15, '1hour': 60, '4hour': 240 };
   const gran = granularityMap[type] || 15;
@@ -144,6 +205,7 @@ export async function fetchKucoin(type = '15min'): Promise<{ candles: Candle[]; 
   }
   try {
     const { data, latencyMs } = await safeFetchJson<KucoinFuturesResp>(url);
+    const receivedTimestampMs = Date.now();
     if (data?.data && data.data.length >= 20) {
       // KuCoin Futures returns: [time, open, high, low, close, volume]
       const reversed = [...data.data].reverse();
@@ -157,7 +219,20 @@ export async function fetchKucoin(type = '15min'): Promise<{ candles: Candle[]; 
       if (!candles.every(isValidMarketCandle)) {
         throw new Error('KuCoin returned invalid futures candles');
       }
-      return { candles, latencyMs };
+
+      const lastRaw = reversed[reversed.length - 1];
+      // KuCoin time is in seconds or milliseconds
+      const rawTime = lastRaw[0];
+      const sourceStartTimeMs = rawTime < 1e11 ? rawTime * 1000 : rawTime;
+      const sourceCloseTimeMs = sourceStartTimeMs + (gran * 60 * 1000);
+
+      return {
+        candles,
+        latencyMs,
+        sourceStartTimeMs,
+        sourceCloseTimeMs,
+        receivedTimestampMs,
+      };
     }
   } catch {
     // Fallback if KuCoin futures API endpoint fails
@@ -299,6 +374,10 @@ export interface FetchCandlesResult {
   source: string;
   status: 'LIVE' | 'STALE' | 'DATA_UNAVAILABLE' | 'SIMULATED';
   timestamp?: number;
+  candleStartTimeMs?: number;    // True exchange origin time of latest candle
+  candleCloseTimeMs?: number;    // Scheduled close timestamp of latest candle
+  receivedTimestampMs?: number;  // API response reception time at client
+  lastUpdateTimestampMs?: number;// Last modification timestamp
   ageMs?: number;
   latencyMs?: number;
 }
@@ -333,17 +412,34 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
 
   // Attempt Primary Futures Feed: Bybit Linear Futures (BTCUSDT)
   try {
-    const { candles: rawCandles, latencyMs } = await fetchBybit('15', 150);
+    const bybitRes = await fetchBybit('15', 150);
+    const rawCandles = bybitRes.candles;
     if (rawCandles.length >= 50) {
       isCurrentMarketDataLive = true;
+      dataProvenanceLayerService.registerAndAuditFeedProvenance({
+        feedKey: 'CANDLES_PRIMARY',
+        source: 'Bybit Linear Futures BTCUSDT (Primary)',
+        exchange: 'BYBIT',
+        symbol: 'BTCUSDT',
+        marketType: 'LINEAR_PERPETUAL',
+        timeframe: '15m',
+        sourceTimestampMs: bybitRes.sourceStartTimeMs,
+        receivedTimestampMs: bybitRes.receivedTimestampMs,
+        networkLatencyMs: bybitRes.latencyMs,
+        candles: rawCandles,
+      });
       const result: FetchCandlesResult = {
         candles: rawCandles, // Raw candles preserved for exact liquidity sweeps & wicks
         rawCandles,
         source: 'Bybit Linear Futures BTCUSDT (Primary)',
         status: 'LIVE',
-        timestamp: now,
-        ageMs: 0,
-        latencyMs
+        timestamp: bybitRes.sourceStartTimeMs,
+        candleStartTimeMs: bybitRes.sourceStartTimeMs,
+        candleCloseTimeMs: bybitRes.sourceCloseTimeMs,
+        receivedTimestampMs: bybitRes.receivedTimestampMs,
+        lastUpdateTimestampMs: now,
+        ageMs: Math.max(0, now - bybitRes.sourceStartTimeMs),
+        latencyMs: bybitRes.latencyMs,
       };
       setCache(cacheKey, result);
       lastKnownLiveCandles = result;
@@ -355,17 +451,40 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
 
   // Attempt Secondary Futures Feed: KuCoin Linear Futures (XBTUSDTM) - Same Contract Type ONLY
   try {
-    const { candles: rawCandles, latencyMs } = await fetchKucoin('15min');
+    const kucoinRes = await fetchKucoin('15min');
+    const rawCandles = kucoinRes.candles;
     if (rawCandles.length >= 50) {
       isCurrentMarketDataLive = true;
+      const compatCheck = dataProvenanceLayerService.verifyFallbackCompatibility(
+        { exchange: 'BYBIT', symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' },
+        { exchange: 'KUCOIN', symbol: 'XBTUSDTM', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' }
+      );
+      if (compatCheck.isCompatible) {
+        dataProvenanceLayerService.registerAndAuditFeedProvenance({
+          feedKey: 'CANDLES_FALLBACK',
+          source: 'KuCoin Linear Futures XBTUSDTM (Secondary Futures Fallback)',
+          exchange: 'KUCOIN',
+          symbol: 'BTCUSDT',
+          marketType: 'LINEAR_PERPETUAL',
+          timeframe: '15m',
+          sourceTimestampMs: kucoinRes.sourceStartTimeMs,
+          receivedTimestampMs: kucoinRes.receivedTimestampMs,
+          networkLatencyMs: kucoinRes.latencyMs,
+          candles: rawCandles,
+        });
+      }
       const result: FetchCandlesResult = {
         candles: rawCandles,
         rawCandles,
         source: 'KuCoin Linear Futures XBTUSDTM (Secondary Futures Fallback)',
         status: 'LIVE',
-        timestamp: now,
-        ageMs: 0,
-        latencyMs
+        timestamp: kucoinRes.sourceStartTimeMs,
+        candleStartTimeMs: kucoinRes.sourceStartTimeMs,
+        candleCloseTimeMs: kucoinRes.sourceCloseTimeMs,
+        receivedTimestampMs: kucoinRes.receivedTimestampMs,
+        lastUpdateTimestampMs: now,
+        ageMs: Math.max(0, now - kucoinRes.sourceStartTimeMs),
+        latencyMs: kucoinRes.latencyMs,
       };
       setCache(cacheKey, result);
       lastKnownLiveCandles = result;
@@ -391,6 +510,16 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
   // If real futures feeds are unavailable, NEVER use Spot data or fake synthetic candles.
   // Strictly report DATA_UNAVAILABLE for prediction core!
   isCurrentMarketDataLive = false;
+  dataProvenanceLayerService.registerAndAuditFeedProvenance({
+    feedKey: 'CANDLES_PRIMARY',
+    source: 'DATA_UNAVAILABLE (Bybit/KuCoin Linear Futures Unreachable)',
+    exchange: 'BYBIT',
+    symbol: 'BTCUSDT',
+    marketType: 'LINEAR_PERPETUAL',
+    timeframe: '15m',
+    customStatus: 'UNAVAILABLE',
+    candles: [],
+  });
   const unavailableResult: FetchCandlesResult = {
     candles: [],
     rawCandles: [],

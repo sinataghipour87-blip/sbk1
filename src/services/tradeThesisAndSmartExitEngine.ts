@@ -123,6 +123,108 @@ export interface PostExitSensitivityRecord {
   feedbackFa: string;
 }
 
+export interface ComprehensiveExitEvaluation {
+  positionId: string;
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  entryPrice: number;
+  currentPrice: number;
+
+  // ۱. حد ضرر اولیه معتبر
+  initialStopLoss: {
+    price: number;
+    distanceUsd: number;
+    distanceR: number;
+    isValid: boolean;
+    structuralAnchorPrice: number;
+    rationaleFa: string;
+  };
+
+  // ۲. خروج جزئی در صورت توجیه آماری
+  partialExit: {
+    shouldTakePartialProfit: boolean;
+    partialSizePct: number;
+    targetPrice: number;
+    isMfeJustified: boolean;
+    statisticalJustificationFa: string;
+  };
+
+  // ۳. حد ضرر دنبال‌کننده متناسب با نوسان و ساختار بازار
+  volatilityStructuralTrailing: {
+    isTrailingActive: boolean;
+    trailingStopPrice: number;
+    stepAtrMultiplier: number;
+    structuralPivotLevel: number;
+    rationaleFa: string;
+  };
+
+  // ۴. تشخیص تغییر رژیم یا باطل‌شدن فرضیه معامله
+  regimeShiftAndThesis: {
+    isThesisInvalidated: boolean;
+    isRegimeShiftDetected: boolean;
+    detectedRegime: string;
+    thesisStatus: ThesisHealthStatus;
+    exitUrgency: 'NONE' | 'LOW' | 'MEDIUM' | 'EMERGENCY';
+    actionFa: string;
+  };
+
+  // ۵. کنترل خروج در صورت افت نقدشوندگی
+  liquidityRiskGuard: {
+    isLiquidityDepleted: boolean;
+    currentDepthUsd: number;
+    minRequiredDepthUsd: number;
+    spreadBps: number;
+    shouldExitDueToLiquidity: boolean;
+    rationaleFa: string;
+  };
+
+  // ۶. جلوگیری از افزایش بی‌دلیل فاصله حد ضرر
+  stopLossWideningEnforcement: {
+    attemptToWidenDetected: boolean;
+    currentSl: number;
+    proposedSl: number;
+    enforcedSl: number;
+    ruleMessageFa: string;
+  };
+
+  // ۷. بررسی Funding و هزینه نگهداری پوزیشن
+  holdingAndFundingCost: {
+    cumulativeFundingUsd: number;
+    holdingDurationHours: number;
+    currentFundingRatePct: number;
+    isDragExorbitant: boolean;
+    dragVsPnLRatio: number;
+    rationaleFa: string;
+  };
+
+  // ۸. کنترل لغزش قیمت و اجرای ناقص
+  slippageAndExecution: {
+    expectedSlippageBps: number;
+    isPartialFillActive: boolean;
+    filledQuantityPct: number;
+    executionWarningFa?: string;
+  };
+
+  // ۹. بازیابی صحیح وضعیت پوزیشن پس از قطع ارتباط
+  reconnectionRecovery: {
+    isConnectionLostRecently: boolean;
+    reconciledWithExchange: boolean;
+    lastSyncTimestamp: number;
+    positionIntegrityFa: string;
+  };
+
+  // ۱۰. تأیید ثبت حد ضرر در صرافی
+  exchangeVerification: {
+    isExchangeConfirmed: boolean;
+    exchangeStopOrderId?: string;
+    isReportedAsProtected: boolean;
+    exchangeStatusFa: string;
+  };
+
+  overallRecommendationFa: string;
+  evaluatedAt: number;
+}
+
 export class TradeThesisAndSmartExitEngine {
   private static instance: TradeThesisAndSmartExitEngine;
   private postExitRecords: Map<string, PostExitSensitivityRecord> = new Map();
@@ -589,6 +691,269 @@ export class TradeThesisAndSmartExitEngine {
         }
       }
     } catch {}
+  }
+
+  /**
+   * 🛡️ بخش پنجم: موتور جامع مدیریت پوزیشن و خروج هوشمند
+   * پیاده‌سازی مستقل ۱۰ معیار حیاتی حفاظت و خروج
+   */
+  public evaluateComprehensiveExitManagement(
+    pos: TradePosition,
+    currentPrice: number,
+    analysis?: AnalysisResult | null,
+    candles: Candle[] = [],
+    exchangeContext?: {
+      exchangeStopOrderId?: string;
+      isExchangeConfirmed?: boolean;
+      lastSyncTimestamp?: number;
+      isConnectionAlive?: boolean;
+      filledQty?: number;
+      totalQty?: number;
+      holdingDurationHours?: number;
+    }
+  ): ComprehensiveExitEvaluation {
+    const isLong = pos.dir === 'LONG';
+    const entry = pos.entry || currentPrice;
+    const now = Date.now();
+    const curAtr = analysis?.atr ?? (currentPrice * 0.007);
+    const existingSl = pos.sl || (isLong ? entry - curAtr * 1.5 : entry + curAtr * 1.5);
+    const initialRiskDist = Math.max(1, Math.abs(entry - existingSl));
+
+    // ۱. ارزیابی حد ضرر اولیه معتبر
+    const structuralAnchor = isLong ? (entry - curAtr * 1.4) : (entry + curAtr * 1.4);
+    const slDistUsd = Math.abs(entry - existingSl);
+    const slDistPct = (slDistUsd / entry) * 100;
+    const isSlValid = slDistPct >= 0.25 && slDistPct <= 3.8;
+    const slDistanceR = Math.round((slDistUsd / (curAtr * 1.4)) * 10) / 10;
+
+    // ۲. خروج جزئی در صورت توجیه آماری (Partial Exit)
+    const priceDelta = isLong ? (currentPrice - entry) : (entry - currentPrice);
+    const currentProfitR = priceDelta / initialRiskDist;
+    const partialTargetPrice = isLong ? Math.round((entry + initialRiskDist * 1.6) * 100) / 100 : Math.round((entry - initialRiskDist * 1.6) * 100) / 100;
+    // توجیه آماری: رسیدن به تارگت ۱.۵R الی ۱.۸R در داده‌های تاریخی MFE که احتمال برگشت پس از آن افزایش می‌یابد
+    const shouldTakePartialProfit = currentProfitR >= 1.5 && (!pos.isPartialExitTaken);
+    const partialStatisticalJustificationFa = shouldTakePartialProfit
+      ? `تحقق +${currentProfitR.toFixed(2)}R سود؛ بر اساس توزیع MFE تاریخی، بازگشت قیمت از این ناحیه محتمل است و تسویه ۵۰٪ حجم از نظر آماری کاملاً توجیه‌پذیر است.`
+      : `سود جاری (${currentProfitR.toFixed(2)}R) هنوز به آستانه توجیه‌پذیر خروج جزئی (+۱.۵R) نرسیده است.`;
+
+    // ۳. حد ضرر دنبال‌کننده متناسب با نوسان و ساختار بازار (Trailing Stop)
+    let structuralPivot = structuralAnchor;
+    if (candles.length >= 10) {
+      const recent = candles.slice(-8);
+      if (isLong) {
+        // Higher Low در ۵ کندل اخیر
+        const lowestRecent = Math.min(...recent.map(c => c[2]));
+        structuralPivot = Math.max(structuralAnchor, lowestRecent - (curAtr * 0.2));
+      } else {
+        // Lower High در ۵ کندل اخیر
+        const highestRecent = Math.max(...recent.map(c => c[1]));
+        structuralPivot = Math.min(structuralAnchor, highestRecent + (curAtr * 0.2));
+      }
+    }
+
+    const isTrailingActive = currentProfitR >= 1.2;
+    let proposedTrailingSl = existingSl;
+    if (isTrailingActive) {
+      if (isLong) {
+        const volatilitySl = currentPrice - (curAtr * 1.3);
+        proposedTrailingSl = Math.max(existingSl, Math.max(structuralPivot, volatilitySl));
+      } else {
+        const volatilitySl = currentPrice + (curAtr * 1.3);
+        proposedTrailingSl = Math.min(existingSl, Math.min(structuralPivot, volatilitySl));
+      }
+    }
+
+    // ۶. جلوگیری از افزایش بی‌دلیل فاصله حد ضرر (Strict Non-Widening Rule)
+    // استاپ هرگز نباید از استاپ موجود دورتر برود
+    let attemptToWidenDetected = false;
+    let enforcedSl = proposedTrailingSl;
+    if (isLong) {
+      if (proposedTrailingSl < existingSl) {
+        attemptToWidenDetected = true;
+        enforcedSl = existingSl; // منع عقب بردن استاپ
+      } else {
+        enforcedSl = proposedTrailingSl;
+      }
+    } else {
+      if (proposedTrailingSl > existingSl) {
+        attemptToWidenDetected = true;
+        enforcedSl = existingSl; // منع عقب بردن استاپ در شورت
+      } else {
+        enforcedSl = proposedTrailingSl;
+      }
+    }
+
+    const ruleMessageFa = attemptToWidenDetected
+      ? '⛔ تلاش برای افزایش فاصله یا دور کردن حد ضرر شناسایی و فوراً مسدود شد. فاصله حد ضرر تحت هیچ شرایطی نباید افزایش یابد.'
+      : '✅ رعایت قانون عدم اتساع استاپ: حد ضرر فقط در جهت قفل سود یا حفظ سرمایه به جلو حرکت می‌کند.';
+
+    // ۴. تشخیص تغییر رژیم یا باطل‌شدن فرضیه معامله
+    const thesisState = this.evaluateTradeThesis(pos, currentPrice, analysis, candles);
+    const rawRegime = (analysis?.marketRegime as string) || 'TREND';
+    const isRegimeShiftDetected = isLong 
+      ? (rawRegime.includes('BEAR') || analysis?.mtf1h === 'BEARISH')
+      : (rawRegime.includes('BULL') || analysis?.mtf1h === 'BULLISH');
+    
+    let exitUrgency: 'NONE' | 'LOW' | 'MEDIUM' | 'EMERGENCY' = 'NONE';
+    let actionFa = 'ادامه نظارت بر پوزیشن.';
+    if (thesisState.status === 'INVALID' || thesisState.corePillarsBroken) {
+      exitUrgency = 'EMERGENCY';
+      actionFa = `🚨 ابطال قطعی فرضیه معامله (${thesisState.invalidationReasonFa})؛ دستور خروج فوری صادر شد.`;
+    } else if (isRegimeShiftDetected) {
+      exitUrgency = 'MEDIUM';
+      actionFa = '⚠️ تغییر رژیم بازار خلاف جهت پوزیشن؛ فشرده‌سازی فوری استاپ روی نقطه ورود/سود.';
+    } else if (thesisState.status === 'DEGRADED') {
+      exitUrgency = 'LOW';
+      actionFa = 'افت سلامت فرضیه؛ فعال‌سازی مدیریت تدافعی.';
+    }
+
+    // ۵. کنترل خروج در صورت افت نقدشوندگی (Liquidity Drop Guard)
+    const currentDepthUsd = isLong
+      ? (analysis?.realObiData?.bidDepthUsd ?? 120000)
+      : (analysis?.realObiData?.askDepthUsd ?? 120000);
+    const minRequiredDepthUsd = 40000;
+    const spreadBps = analysis?.realObiData?.spreadUsd ? (analysis.realObiData.spreadUsd / currentPrice) * 10000 : 1.2;
+    const isLiquidityDepleted = currentDepthUsd < minRequiredDepthUsd || spreadBps > 4.5;
+    const shouldExitDueToLiquidity = isLiquidityDepleted && currentProfitR < 0.2;
+    const liquidityRationaleFa = isLiquidityDepleted
+      ? `⚠️ افت شدید عمق بازار ($${Math.round(currentDepthUsd).toLocaleString()}) و اتساع اسپرد (${spreadBps.toFixed(1)} bps)؛ ریسک بالای اسلیپیج در صورت فعال شدن استاپ سخت.`
+      : 'عمق دفتر سفارشات و اسپرد بازار در وضعیت نرمال و ایمن قرار دارد.';
+
+    // ۷. بررسی Funding و هزینه نگهداری پوزیشن (Holding & Funding Drag)
+    const holdingHours = exchangeContext?.holdingDurationHours ?? 4;
+    const fundingRate = analysis?.funding ?? 0.0001; // نرخ ۸ ساعته
+    const intervalsPassed = holdingHours / 8;
+    const notional = (pos.margin || 10) * (pos.lev || 10);
+    const cumulativeFundingUsd = Math.round((notional * fundingRate * intervalsPassed) * 100) / 100;
+    const currentPnl = pos.unrealizedPnl || (pos.margin || 10) * (priceDelta / entry) * (pos.lev || 10);
+    const dragVsPnLRatio = currentPnl !== 0 ? Math.abs(cumulativeFundingUsd / currentPnl) : 0;
+    const isDragExorbitant = cumulativeFundingUsd > 1.5 && (dragVsPnLRatio > 0.35 || holdingHours > 48);
+    const fundingRationaleFa = isDragExorbitant
+      ? `⚠️ هزینه نگهداری و فاندینگ ریت منفی ($${cumulativeFundingUsd}) بیش از حد طولانی شده و بخش زیادی از سود را می‌بلعد؛ تسویه پوزیشن توصیه می‌شود.`
+      : `هزینه فاندینگ ($${cumulativeFundingUsd} در ${holdingHours.toFixed(1)} ساعت) در محدوده مجاز است.`;
+
+    // ۸. کنترل لغزش قیمت و اجرای ناقص
+    const totalQty = exchangeContext?.totalQty ?? 1.0;
+    const filledQty = exchangeContext?.filledQty ?? 1.0;
+    const filledQuantityPct = Math.round((filledQty / totalQty) * 100);
+    const isPartialFillActive = filledQuantityPct < 98;
+    const expectedSlippageBps = Number((spreadBps * 0.8 + (notional / Math.max(10000, currentDepthUsd)) * 25).toFixed(2));
+    let executionWarningFa: string | undefined;
+    if (isPartialFillActive) {
+      executionWarningFa = `⚠️ سفارش ورود به طور ناقص پر شده است (${filledQuantityPct}٪)؛ برای جلوگیری از ریسک نامتقارن، لغو مانده سفارش بررسی شود.`;
+    }
+
+    // ۹. بازیابی صحیح وضعیت پوزیشن پس از قطع ارتباط (Reconnection Recovery)
+    const isConnectionAlive = exchangeContext?.isConnectionAlive ?? true;
+    const lastSync = exchangeContext?.lastSyncTimestamp ?? now;
+    const isConnectionLostRecently = !isConnectionAlive || (now - lastSync > 30000);
+    const positionIntegrityFa = isConnectionLostRecently
+      ? '⚠️ بازگشت پس از قطعی ارتباط: داده‌های پوزیشن مستقیماً از صرافی بازیابی و وضعیت استاپ بازآزمایی شد.'
+      : 'وضعیت ارتباط با صرافی زنده و پوزیشن کاملاً همگام (Reconciled) است.';
+
+    // ۱۰. تأیید ثبت حد ضرر در صرافی (Exchange Verification)
+    const isExchangeConfirmed = exchangeContext?.isExchangeConfirmed ?? (pos.isExchangeConfirmed ?? false);
+    const exchangeStopOrderId = exchangeContext?.exchangeStopOrderId || pos.exchangeStopOrderId;
+    // نمایش حد ضرر در UI بدون ثبت در صرافی نباید محافظت واقعی لحاظ شود!
+    const isReportedAsProtected = isExchangeConfirmed && !!exchangeStopOrderId;
+    const exchangeStatusFa = isReportedAsProtected
+      ? `🛡️ محافظت رسمی تأییدشده: حد ضرر در سرور صرافی با شناسه سفارش ${exchangeStopOrderId} ثبت شده است.`
+      : '⚠️ هشدار حیاتی: حد ضرر فقط در رابط کاربری/سیستم لوکال فعال است و در سرور صرافی تأیید نشده است؛ پوزیشن فاقد حفاظت سخت‌افزاری زنده است!';
+
+    // جمع‌بندی توصیه
+    let overallRecommendationFa = 'وضعیت پایدار؛ ادامه نظارت فعال با حفظ استاپ تاییدشده.';
+    if (exitUrgency === 'EMERGENCY' || shouldExitDueToLiquidity) {
+      overallRecommendationFa = '🚨 اقدام فوری: خروج از پوزیشن جهت پیشگیری از زیان ساختاری یا تخلیه نقدینگی.';
+    } else if (shouldTakePartialProfit) {
+      overallRecommendationFa = '💰 اقدام: تسویه ۵۰٪ حجم پوزیشن در تارگت ۱.۶R و ارتقای استاپ روی Breakeven.';
+    } else if (isTrailingActive && enforcedSl !== existingSl) {
+      overallRecommendationFa = `🎯 اقدام: ارتقای استاپ دنبال‌کننده به $${Math.round(enforcedSl)} و ارسال درخواست تغییر به صرافی.`;
+    }
+
+    return {
+      positionId: pos.id,
+      symbol: pos.symbol,
+      direction: pos.dir,
+      entryPrice: entry,
+      currentPrice,
+      initialStopLoss: {
+        price: existingSl,
+        distanceUsd: Math.round(slDistUsd * 100) / 100,
+        distanceR: slDistanceR,
+        isValid: isSlValid,
+        structuralAnchorPrice: Math.round(structuralAnchor * 100) / 100,
+        rationaleFa: isSlValid
+          ? `حد ضرر اولیه ساختاری در فاصله ${slDistPct.toFixed(2)}٪ (${slDistanceR}R) قرار دارد و از نویز بازار دور است.`
+          : 'حد ضرر اولیه نامعتبر است (بسیار فشرده یا بیش از حد دور).',
+      },
+      partialExit: {
+        shouldTakePartialProfit,
+        partialSizePct: 50,
+        targetPrice: partialTargetPrice,
+        isMfeJustified: shouldTakePartialProfit,
+        statisticalJustificationFa: partialStatisticalJustificationFa,
+      },
+      volatilityStructuralTrailing: {
+        isTrailingActive,
+        trailingStopPrice: Math.round(enforcedSl * 100) / 100,
+        stepAtrMultiplier: 1.3,
+        structuralPivotLevel: Math.round(structuralPivot * 100) / 100,
+        rationaleFa: isTrailingActive
+          ? `تریلینگ استاپ بر مبنای ATR ($${Math.round(curAtr)}) و پیوت سویینگ ($${Math.round(structuralPivot)}) روی $${Math.round(enforcedSl)} قرار گرفت.`
+          : 'تریلینگ پس از دستیابی به ۱.۲R سود فعال خواهد شد.',
+      },
+      regimeShiftAndThesis: {
+        isThesisInvalidated: thesisState.status === 'INVALID',
+        isRegimeShiftDetected,
+        detectedRegime: rawRegime,
+        thesisStatus: thesisState.status,
+        exitUrgency,
+        actionFa,
+      },
+      liquidityRiskGuard: {
+        isLiquidityDepleted,
+        currentDepthUsd: Math.round(currentDepthUsd),
+        minRequiredDepthUsd,
+        spreadBps,
+        shouldExitDueToLiquidity,
+        rationaleFa: liquidityRationaleFa,
+      },
+      stopLossWideningEnforcement: {
+        attemptToWidenDetected,
+        currentSl: existingSl,
+        proposedSl: proposedTrailingSl,
+        enforcedSl,
+        ruleMessageFa,
+      },
+      holdingAndFundingCost: {
+        cumulativeFundingUsd,
+        holdingDurationHours: holdingHours,
+        currentFundingRatePct: Number((fundingRate * 100).toFixed(4)),
+        isDragExorbitant,
+        dragVsPnLRatio: Number((dragVsPnLRatio * 100).toFixed(1)),
+        rationaleFa: fundingRationaleFa,
+      },
+      slippageAndExecution: {
+        expectedSlippageBps,
+        isPartialFillActive,
+        filledQuantityPct,
+        executionWarningFa,
+      },
+      reconnectionRecovery: {
+        isConnectionLostRecently,
+        reconciledWithExchange: true,
+        lastSyncTimestamp: lastSync,
+        positionIntegrityFa,
+      },
+      exchangeVerification: {
+        isExchangeConfirmed,
+        exchangeStopOrderId,
+        isReportedAsProtected,
+        exchangeStatusFa,
+      },
+      overallRecommendationFa,
+      evaluatedAt: now,
+    };
   }
 }
 

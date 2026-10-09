@@ -515,17 +515,67 @@ export class TrendSurvivalAndMfeTrailingEngine {
     };
   }
 
+  private createMissingPriceComprehensiveState(): ComprehensiveTrendAndTrailingState {
+    return {
+      timestamp: Date.now(),
+      trendSurvival: {
+        trendSurvivalProbabilityPct: 0,
+        runnerStatus: 'FULL_HARVEST_EXIT',
+        steppedExitRecommendedPct: 100,
+        survivalFactors: {
+          momentumHealth: { factorKey: 'MOMENTUM', nameFa: 'سلامت مومنتوم', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
+          orderFlowCvdHealth: { factorKey: 'CVD_ORDER_FLOW', nameFa: 'جریان سفارشات', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
+          orderBookImbalanceHealth: { factorKey: 'OBI', nameFa: 'عدم توازن بوک', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
+          marketStructureIntegrity: { factorKey: 'STRUCTURE', nameFa: 'ساختار بازار', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
+          liquidityAbsorptionHealth: { factorKey: 'ABSORPTION', nameFa: 'جذب نقدینگی', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
+          volatilityRegimeStability: { factorKey: 'VOLATILITY', nameFa: 'نوسانات', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
+        },
+        survivalConfidence: 0,
+        isRunnerSafeToHold: false,
+      },
+      mfeTrailing: {
+        currentPrice: 0,
+        entryPrice: 0,
+        direction: 'LONG',
+        currentMfePct: 0,
+        currentMaePct: 0,
+        dynamicTrailingStopPrice: 0,
+        dynamicTrailingOffsetPct: 0,
+        stopDistanceInAtr: 0,
+        activeRung: 'RUNG_1_INITIAL_RUNNER',
+        isBreakevenCovered: false,
+        lockedProfitUsd: 0,
+        lockedProfitPct: 0,
+        unrealizedProfitUsd: 0,
+        unrealizedProfitPct: 0,
+        volatilityRegime: 'NORMAL',
+        tighteningRationaleFa: '🛑 عدم دسترسی به قیمت ورودی و لحظه‌ای بازار (UNKNOWN).',
+        actionGuidanceFa: 'معامله به دلیل فقدان قیمت متوقف شد.',
+      },
+      recommendedCompositeAction: {
+        actionType: 'FULL_CLOSE',
+        exitAmountPct: 100,
+        trailingStopPrice: 0,
+        reasonFa: '🛑 لغو تریلینگ: قیمت ورود یا قیمت لحظه‌ای مفقود است (UNKNOWN)؛ جایگزینی با قیمت فرضی ممنوع است.',
+      },
+    };
+  }
+
   /**
-   * ارزیابی یکپارچه و بلادرنگ هر دو موتور (اصل ۳۹ + اصل ۴۰)
+   * اصل ۴۱: پایش جامع و یکپارچه بقای روند و به‌روزرسانی پله‌های تریلینگ
    */
-  public evaluateState(params: {
+  public evaluateState(params: Parameters<TrendSurvivalAndMfeTrailingEngine['evaluateComprehensiveState']>[0]): ComprehensiveTrendAndTrailingState {
+    return this.evaluateComprehensiveState(params);
+  }
+
+  public evaluateComprehensiveState(params: {
     direction: 'LONG' | 'SHORT';
     entryPrice: number;
     currentPrice: number;
-    marginUsd?: number;
-    leverage?: number;
     mfeAchievedPct?: number;
     maeAchievedPct?: number;
+    marginUsd?: number;
+    leverage?: number;
     rsi?: number;
     rsiPrevious?: number;
     macdHist?: number;
@@ -541,9 +591,14 @@ export class TrendSurvivalAndMfeTrailingEngine {
     orderBookSupportPrice?: number;
     recentSwingProtectionPrice?: number;
   }): ComprehensiveTrendAndTrailingState {
+    const entryPrice = params.entryPrice;
+    const currentPrice = params.currentPrice;
+
+    if (!entryPrice || entryPrice <= 0 || !currentPrice || currentPrice <= 0) {
+      return this.createMissingPriceComprehensiveState();
+    }
+
     const direction = params.direction ?? 'LONG';
-    const entryPrice = params.entryPrice > 0 ? params.entryPrice : 88500;
-    const currentPrice = params.currentPrice > 0 ? params.currentPrice : 88500;
     const marginUsd = params.marginUsd ?? 1000;
     const leverage = params.leverage ?? 5;
 
@@ -555,7 +610,7 @@ export class TrendSurvivalAndMfeTrailingEngine {
     const mfePct = Math.max(priceDeltaPct, params.mfeAchievedPct ?? priceDeltaPct);
     const maePct = params.maeAchievedPct ?? (priceDeltaPct < 0 ? Math.abs(priceDeltaPct) : 0);
 
-    const atrValue = params.atrValue ?? (currentPrice * 0.0075);
+    const atrValue = (params.atrValue && params.atrValue > 0) ? params.atrValue : Math.max(20, currentPrice * 0.0075);
     const rsi = params.rsi ?? (isLong ? 58 : 42);
     const rsiPrevious = params.rsiPrevious ?? (isLong ? 56 : 44);
     const macdHist = params.macdHist ?? (isLong ? 1.2 : -1.2);

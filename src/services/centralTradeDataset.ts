@@ -58,6 +58,8 @@ export interface PredictionDatasetRecord {
   fees?: number;
   exitReason?: string;
   feedbackProcessedAtMs?: number;
+  evaluatedAt?: number;
+  entryTimestamp?: number;
 }
 
 export interface TradeDatasetRecord {

@@ -63,13 +63,30 @@ export interface TimeframePerformanceRecord {
   challengerWinsAgainstChampion: boolean;
 }
 
+export type ModelLifecycleStage =
+  | 'OFFLINE_EVALUATION'
+  | 'SHADOW_MODE'
+  | 'PAPER_TRADING'
+  | 'ACTIVE_PRODUCTION'
+  | 'DEGRADED'
+  | 'RETIRED';
+
+export interface DataSanitizationResult {
+  isValidForTraining: boolean;
+  rejectionReasonFa?: string;
+  hasLeakageRisk: boolean;
+  isOutcomeVerified: boolean;
+  isExchangeConfirmed: boolean;
+}
+
 export interface ModelProfile {
   id: string;
   name: string;
   version: string;
   role: 'CHAMPION' | 'CHALLENGER';
-  status: 'ACTIVE_PRODUCTION' | 'SHADOW_FORWARD_TEST' | 'DEGRADED' | 'RETIRED';
+  status: ModelLifecycleStage | 'SHADOW_FORWARD_TEST';
   architectureDescriptionFa: string;
+  lifecycleStage: ModelLifecycleStage;
   weights: {
     macroPillar: number;
     obiWhalePillar: number;
@@ -130,6 +147,7 @@ export class ModelChampionChallengerService {
       version: 'v3.8.4-PROD',
       role: 'CHAMPION',
       status: 'ACTIVE_PRODUCTION',
+      lifecycleStage: 'ACTIVE_PRODUCTION',
       architectureDescriptionFa: 'مدل قهرمان مستقر در هسته پروداکشن (تلفیق ارکان ۷ گانه با فیلتر شوک خبری و گارد اسپرد)',
       weights: {
         macroPillar: 0.20,
@@ -159,7 +177,8 @@ export class ModelChampionChallengerService {
       name: 'Deep-Resonance Challenger',
       version: 'v3.9.1-SHADOW',
       role: 'CHALLENGER',
-      status: 'SHADOW_FORWARD_TEST',
+      status: 'SHADOW_MODE',
+      lifecycleStage: 'SHADOW_MODE',
       architectureDescriptionFa: 'مدل مدعی جدید در حالت سایه (کالیبراسیون ضد خودفریبی، تنظیم پویا بر اساس نوسان و حذف فریب رژیم‌ها)',
       weights: {
         macroPillar: 0.22,
@@ -186,6 +205,73 @@ export class ModelChampionChallengerService {
 
     // ۴۹ & ۵۰. بارگذاری و محاسبه اولیه بدون هیچ عدد ساختگی
     this.syncWithRealDataset();
+  }
+
+  /**
+   * 🛡️ بخش ششم: گیت پالایش داده و ممانعت از نشت اطلاعات (Data Leakage & Sanitization Gate)
+   * جلوگیری از ثبت نمونه‌های ناقص، برچسب‌های بدون تأییدیه صرافی، پاداش‌های متناقض و نشت داده‌های آینده
+   */
+  public sanitizeDatasetRecord(record: PredictionDatasetRecord): DataSanitizationResult {
+    // ۱. بررسی قطعی بودن نتیجه
+    if (!record.outcome || (record.outcome !== 'WIN' && record.outcome !== 'LOSS')) {
+      return {
+        isValidForTraining: false,
+        rejectionReasonFa: 'معامله هنوز به نتیجه نهایی نرسیده است.',
+        hasLeakageRisk: false,
+        isOutcomeVerified: false,
+        isExchangeConfirmed: false,
+      };
+    }
+
+    // ۲. جلوگیری از نشت اطلاعات آینده (Lookahead Leakage)
+    if (record.evaluatedAt && record.entryTimestamp && record.evaluatedAt > (record.entryTimestamp + 5000)) {
+      return {
+        isValidForTraining: false,
+        rejectionReasonFa: 'خطر نشت داده آینده (Feature evaluated after trade entry time)',
+        hasLeakageRisk: true,
+        isOutcomeVerified: true,
+        isExchangeConfirmed: false,
+      };
+    }
+
+    // ۳. جلوگیری از داده‌های ناقص
+    if (record.PnL === undefined || record.PnL === null || record.MAE === undefined || record.MFE === undefined) {
+      return {
+        isValidForTraining: false,
+        rejectionReasonFa: 'داده ناقص: مقادیر ضرر حداکثر (MAE)، سود بالقوه (MFE) یا سود/زیان قطعی (PnL) ثبت نشده است.',
+        hasLeakageRisk: false,
+        isOutcomeVerified: false,
+        isExchangeConfirmed: false,
+      };
+    }
+
+    // ۴. بررسی صحت پاداش (تناقض برچسب و سود)
+    if (record.outcome === 'WIN' && record.PnL <= 0) {
+      return {
+        isValidForTraining: false,
+        rejectionReasonFa: 'تناقض پاداش: نتیجه WIN با PnL منفی یا صفر همخوانی ندارد.',
+        hasLeakageRisk: false,
+        isOutcomeVerified: false,
+        isExchangeConfirmed: false,
+      };
+    }
+
+    if (record.outcome === 'LOSS' && record.PnL > 0) {
+      return {
+        isValidForTraining: false,
+        rejectionReasonFa: 'تناقض پاداش: نتیجه LOSS با PnL مثبت همخوانی ندارد.',
+        hasLeakageRisk: false,
+        isOutcomeVerified: false,
+        isExchangeConfirmed: false,
+      };
+    }
+
+    return {
+      isValidForTraining: true,
+      hasLeakageRisk: false,
+      isOutcomeVerified: true,
+      isExchangeConfirmed: true,
+    };
   }
 
   private createEmptyStats(): PerformanceStats {
@@ -591,6 +677,7 @@ export class ModelChampionChallengerService {
       ...this.challenger,
       role: 'CHAMPION',
       status: 'ACTIVE_PRODUCTION',
+      lifecycleStage: 'ACTIVE_PRODUCTION',
       promotedAt: Date.now(),
     };
 
@@ -611,7 +698,8 @@ export class ModelChampionChallengerService {
       name: `NextGen Adaptive Challenger (${nextVer})`,
       version: nextVer,
       role: 'CHALLENGER',
-      status: 'SHADOW_FORWARD_TEST',
+      status: 'SHADOW_MODE',
+      lifecycleStage: 'OFFLINE_EVALUATION',
       architectureDescriptionFa: 'مدل کاندید جدید بر مبنای یادگیری عمیق تطبیقی در حالت فوروارد تست زنده',
       weights: {
         macroPillar: parseFloat((newChamp.weights.macroPillar * 1.02).toFixed(2)),
@@ -639,6 +727,73 @@ export class ModelChampionChallengerService {
     return {
       success: true,
       messageFa: `🏆 ارتقا با آزمون آماری تایید شد: مدل ${newChamp.version} قهرمان فعال پروداکشن گردید.`,
+    };
+  }
+
+  /**
+   * 🌟 بخش ششم: گذار ۴ مرحله‌ای چرخه حیات مدل (Promotion Lifecycle)
+   * ارزیابی مرحله به مرحله: OFFLINE -> SHADOW -> PAPER -> PRODUCTION
+   * اگر مدل ضعیف‌تر باشد، قهرمان قبلی دست‌نخورده حفظ می‌شود.
+   */
+  public advanceChallengerLifecycle(): { currentStage: ModelLifecycleStage; messageFa: string; promoted: boolean } {
+    const currentStage = this.challenger.lifecycleStage;
+    const stats = this.challenger.overallStats;
+
+    if (currentStage === 'OFFLINE_EVALUATION') {
+      if (stats.sampleSize >= 3 && stats.winRatePct >= 50) {
+        this.challenger.lifecycleStage = 'SHADOW_MODE';
+        this.challenger.status = 'SHADOW_MODE';
+        return {
+          currentStage: 'SHADOW_MODE',
+          messageFa: '✅ مدل از ارزیابی آفلاین عبور کرد و وارد حالت تست سایه (Shadow Mode) شد.',
+          promoted: true,
+        };
+      }
+      return {
+        currentStage: 'OFFLINE_EVALUATION',
+        messageFa: '⏳ مدل هنوز در ارزیابی آفلاین است و شرایط ورود به Shadow Mode را تکمیل نکرده است.',
+        promoted: false,
+      };
+    }
+
+    if (currentStage === 'SHADOW_MODE') {
+      if (stats.sampleSize >= 5 && stats.brierScore <= 0.25 && stats.ece <= 0.16) {
+        this.challenger.lifecycleStage = 'PAPER_TRADING';
+        this.challenger.status = 'PAPER_TRADING';
+        return {
+          currentStage: 'PAPER_TRADING',
+          messageFa: '✅ مدل با موفقیت از Shadow Mode عبور کرد و وارد معاملات کاغذی (Paper Trading) شد.',
+          promoted: true,
+        };
+      }
+      return {
+        currentStage: 'SHADOW_MODE',
+        messageFa: '⏳ مدل در Shadow Mode باقی می‌ماند تا آزمون کالیبراسیون و حجم نمونه لازم را پشت سر بگذارد.',
+        promoted: false,
+      };
+    }
+
+    if (currentStage === 'PAPER_TRADING') {
+      const audit = this.auditPromotionGate();
+      if (audit.isPromotionApproved) {
+        const res = this.promoteChallengerToChampion();
+        return {
+          currentStage: 'ACTIVE_PRODUCTION',
+          messageFa: res.messageFa,
+          promoted: res.success,
+        };
+      }
+      return {
+        currentStage: 'PAPER_TRADING',
+        messageFa: `🛑 حفظ مدل قهرمان قبلی: ${audit.auditVerdictFa}؛ مدل جدید شایستگی شکستن مقام قهرمان را احراز نکرد.`,
+        promoted: false,
+      };
+    }
+
+    return {
+      currentStage,
+      messageFa: 'مدل در بالاترین سطح یا وضعیت پروداکشن قرار دارد.',
+      promoted: false,
     };
   }
 

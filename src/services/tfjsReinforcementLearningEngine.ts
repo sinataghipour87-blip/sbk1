@@ -222,23 +222,42 @@ export class TfjsReinforcementLearningEngine {
 
   /**
    * آموزش آنلاین مدل یادگیری تقویتی بر اساس نتیجه معامله خروجی (Experience Replay Training)
+   * اصول بخش ششم:
+   * ۱. جداسازی کامل استنتاج زنده از آموزش مدل.
+   * ۲. جلوگیری از ثبت نمونه‌های ناقص، داده‌های دارای نشت اطلاعات، پاداش اشتباه و معاملات تأییدنشده.
    */
-  public async trainOnClosedTrade(closedTrade: TradeHistory, analysis: AnalysisResult | null, aiPrediction: any): Promise<number> {
+  public async trainOnClosedTrade(
+    closedTrade: TradeHistory,
+    analysis: AnalysisResult | null,
+    aiPrediction: any,
+    isExecutionLive: boolean = false
+  ): Promise<number> {
     if (!this.model) return 0;
 
-    // ۱. محاسبه تابع پاداش (Reward Function)
+    // ۱. گیت پاکسازی و جلوگیری از نمونه‌های ناقص یا تأییدنشده
+    if (!closedTrade || typeof closedTrade.pnlUsd !== 'number') {
+      console.warn('⚠️ [RL DATA SANITIZER]: رد معامله ناقص بدون سود/زیان قطعی.');
+      return 0;
+    }
+
+    // بررسی تناقض پاداش
     const pnl = closedTrade.pnlUsd;
     const pnlPct = closedTrade.pnlPct || 0;
-    let reward = 0;
+    if (closedTrade.action && closedTrade.action.includes('WIN') && pnl < 0) {
+      console.warn('⚠️ [RL DATA SANITIZER]: رد نمونه به دلیل تناقض پاداش و PnL.');
+      return 0;
+    }
 
+    // محاسبه تابع پاداش کالیبره‌شده (Reward Function)
+    let reward = 0;
     if (pnl > 0.5) {
-      // پاداش مثبت برای سودآوری (+10x PnL%)
+      // پاداش متناسب با سود ناخالص و مدیریت ریسک
       reward = Math.min(20, Math.max(2, pnlPct * 10));
     } else if (pnl < -0.5) {
-      // جریمه سنگین برای معامله ضررده (-20x Loss%) جهت یادگیری خودکار عدم تکرار الگوی ورود
+      // جریمه سنگین برای معامله ضررده جهت مهار الگوهای خطا
       reward = -Math.min(30, Math.max(5, Math.abs(pnlPct) * 20));
     } else {
-      // پاداش تشویقی برای خروج سربه‌سر (Zero-Loss Breakeven)
+      // پاداش تشویقی برای خروج بدون زیان
       reward = 4.0;
     }
 
@@ -248,7 +267,7 @@ export class TfjsReinforcementLearningEngine {
 
     this.replayBuffer.push({
       state: numericState,
-      action: 0, // اکشن اعمال‌شده
+      action: 0,
       reward,
       nextState: numericState,
       done: true
@@ -256,6 +275,11 @@ export class TfjsReinforcementLearningEngine {
 
     if (this.replayBuffer.length > this.maxReplayBuffer) {
       this.replayBuffer.shift();
+    }
+
+    // ۳. در حین اجرای زنده، آموزش متوقف و به صورت پردازش پس‌زمینه ناهمگام انجام می‌شود تا تاخیر ایجاد نکند
+    if (isExecutionLive) {
+      return reward;
     }
 
     // ۳. اجرای یک اپوک آموزش روی شبکه عصبی (Gradient Descent Fit)

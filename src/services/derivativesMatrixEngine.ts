@@ -176,7 +176,7 @@ export function computeCvdOiDivergenceMatrix(
     },
     {
       dimensionName: 'نرخ فاندینگ (Funding)',
-      valueText: `${fundingRatePct > 0 ? '+' : ''}${fundingRatePct.toFixed(4)}%`,
+      valueText: fundingRatePct !== null ? `${fundingRatePct > 0 ? '+' : ''}${fundingRatePct.toFixed(4)}%` : 'ناموجود (UNAVAILABLE)',
       state: fundingState,
       scoreContribution: fundingState === 'HIGH_POSITIVE' ? 15 : (fundingState === 'HIGH_NEGATIVE' ? -15 : 0),
       isDivergent: fundingState !== 'NEUTRAL',

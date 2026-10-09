@@ -68,6 +68,25 @@ export class SbFiveModelsEngine {
     return SbFiveModelsEngine.instance;
   }
 
+  private createMissingPriceUnknownPentagon(): SbPentagonOutput {
+    return {
+      iteration: this.learningIteration,
+      timestamp: Date.now(),
+      models: [
+        { id: 'SB1', name: 'SB1 Macro Trend', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
+        { id: 'SB2', name: 'SB2 OrderBook Depth', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
+        { id: 'SB3', name: 'SB3 Profit Maximizer', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
+        { id: 'SB4', name: 'SB4 Crisis Escaper', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
+        { id: 'SB5', name: 'SB5 Super Orchestrator', weight: 0.2, bias: 'NO_TRADE', confidenceScore: 0, reasoningFa: '🛑 عدم دسترسی به قیمت واقعی بازار؛ صدور وضعیت NO_TRADE.' },
+      ],
+      masterDecision: 'NO_TRADE',
+      masterConfidencePct: 0,
+      executionPermitted: false,
+      masterVerdictFa: '🛑 لغو تصمیم‌گیری مدل‌های پنج‌گانه: قیمت معتبر بازار در دسترس نیست (UNKNOWN)؛ جایگزینی با قیمت فرضی اکیداً ممنوع است.',
+      consensusStrengthPct: 0,
+    };
+  }
+
   /**
    * اجرای هماهنگ ۵ مدل هوش مصنوعی با ورودی داده‌های بازار واقعی
    */
@@ -79,7 +98,11 @@ export class SbFiveModelsEngine {
     tradeHistory: TradeHistory[] = []
   ): SbPentagonOutput {
     this.learningIteration += 1;
-    const price = currentPrice || analysis?.price || 88500;
+    const rawPrice = currentPrice > 0 ? currentPrice : (analysis?.price && analysis.price > 0 ? analysis.price : null);
+    if (!rawPrice) {
+      return this.createMissingPriceUnknownPentagon();
+    }
+    const price = rawPrice;
     const obi = analysis?.obi ?? 0;
     const rsi = analysis?.rsi ?? 50;
     const adx = analysis?.adx ?? 25;
@@ -361,7 +384,7 @@ export function analyzeMultiTimeframeSbObiCorrelation(
 ): MultiTimeframeSbObiCorrelationResult {
   const isLong = targetDir === 'LONG';
   const targetSign = isLong ? 1 : -1;
-  const p = currentPrice || analysis?.price || 88500;
+  const p = currentPrice > 0 ? currentPrice : (analysis?.price && analysis.price > 0 ? analysis.price : 0);
   const obi = analysis?.obi ?? 0;
 
   // ۱. ارزیابی خروجی مدل‌های پنج‌گانه هوش مصنوعی SB1 تا SB5

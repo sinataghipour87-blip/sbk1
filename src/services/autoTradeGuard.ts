@@ -12,6 +12,8 @@ interface ExchangeSecurityStatus {
   clockSynchronized: boolean;
   clockDriftMs: number;
   exchangePositions: any[];
+  walletBalanceUsdt: number | null;
+  availableBalanceUsdt: number | null;
   requestFailure: 'http' | 'network' | null;
 }
 
@@ -40,6 +42,8 @@ function getCachedExchangeSecurityStatus(): Promise<ExchangeSecurityStatus> {
           clockSynchronized: false,
           clockDriftMs: 0,
           exchangePositions: [],
+          walletBalanceUsdt: null,
+          availableBalanceUsdt: null,
           requestFailure: 'http',
         };
       }
@@ -55,6 +59,8 @@ function getCachedExchangeSecurityStatus(): Promise<ExchangeSecurityStatus> {
         clockSynchronized: clockDriftMs < 1500,
         clockDriftMs,
         exchangePositions: data.activePositions || [],
+        walletBalanceUsdt: typeof data.walletBalanceUsdt === 'number' ? data.walletBalanceUsdt : null,
+        availableBalanceUsdt: typeof data.availableBalanceUsdt === 'number' ? data.availableBalanceUsdt : null,
         requestFailure: null,
       };
     } catch {
@@ -64,6 +70,8 @@ function getCachedExchangeSecurityStatus(): Promise<ExchangeSecurityStatus> {
         clockSynchronized: false,
         clockDriftMs: 0,
         exchangePositions: [],
+        walletBalanceUsdt: null,
+        availableBalanceUsdt: null,
         requestFailure: 'network',
       };
     }
@@ -164,6 +172,11 @@ export async function verifyAutoTradePrerequisites(
     if (!clockSynchronized) {
       detailsFa.push(`❌ انحراف ساعت محلی با صرافی بیش از حد مجاز است (${exchangeStatus.clockDriftMs}ms).`);
     }
+
+    const hasRealEquity = typeof exchangeStatus.walletBalanceUsdt === 'number' && exchangeStatus.walletBalanceUsdt > 0;
+    if (!hasRealEquity) {
+      detailsFa.push('❌ مارجین و اکوئیتی واقعی صرافی (Real Equity) در دسترس نیست یا صفر است؛ معامله زنده مسدود شد.');
+    }
   }
 
   // 3: Market Data LIVE Check
@@ -223,7 +236,8 @@ export async function verifyAutoTradePrerequisites(
   // 7: Emergency Stop Breaker Available
   const emergencyStopAvailable = typeof window !== 'undefined';
 
-  const liveExecutionChecksPassed = exchangeConnected && apiPermissionValid && clockSynchronized;
+  const realEquityAvailable = typeof exchangeStatus.walletBalanceUsdt === 'number' && exchangeStatus.walletBalanceUsdt > 0;
+  const liveExecutionChecksPassed = exchangeConnected && apiPermissionValid && clockSynchronized && (executionMode !== 'LIVE' || realEquityAvailable);
   const isEligible =
     liveExecutionChecksPassed &&
     marketDataLive &&
@@ -245,6 +259,8 @@ export async function verifyAutoTradePrerequisites(
     clockSynchronized,
     positionStateSynchronized,
     emergencyStopAvailable,
+    realEquityAvailable,
+    walletBalanceUsdt: exchangeStatus.walletBalanceUsdt,
     detailsFa,
     checkedAt: now,
   };
@@ -629,3 +645,62 @@ export function simulateLiveOrderRealisticFill(params: {
     marketDepthUsd: depth,
   });
 }
+
+/**
+ * =============================================================================
+ * 🧭 Section 7: Auto-Trade Comprehensive Decision Trace Engine
+ * =============================================================================
+ * Records exact decision path, stopping stage, and detailed rejection reasons
+ * for every single scan cycle without removing any safety gates!
+ */
+export interface DecisionTraceStep {
+  stepId: string;
+  stepNameFa: string;
+  status: 'PASSED' | 'BLOCKED' | 'SKIPPED';
+  detailFa: string;
+  timestampMs: number;
+}
+
+export interface ComprehensiveDecisionTrace {
+  traceId: string;
+  evaluatedAtMs: number;
+  evaluatedAtIso: string;
+  evaluatedDirection: 'LONG' | 'SHORT' | 'NEUTRAL';
+  autoTradeEnabled: boolean;
+  executionMode: ExecutionMode;
+  finalVerdict: 'EXECUTION_TRIGGERED' | 'ORDER_BLOCKED' | 'WAIT_CONDITION';
+  primaryBlockReasonFa?: string;
+  stoppingStage: string;
+  steps: DecisionTraceStep[];
+}
+
+export class AutoTradeDecisionTracerService {
+  private static instance: AutoTradeDecisionTracerService;
+  private latestTrace: ComprehensiveDecisionTrace | null = null;
+  private traceHistory: ComprehensiveDecisionTrace[] = [];
+
+  public static getInstance(): AutoTradeDecisionTracerService {
+    if (!AutoTradeDecisionTracerService.instance) {
+      AutoTradeDecisionTracerService.instance = new AutoTradeDecisionTracerService();
+    }
+    return AutoTradeDecisionTracerService.instance;
+  }
+
+  public recordDecisionTrace(trace: ComprehensiveDecisionTrace): void {
+    this.latestTrace = Object.freeze(trace);
+    this.traceHistory.push(this.latestTrace);
+    if (this.traceHistory.length > 50) {
+      this.traceHistory.shift();
+    }
+  }
+
+  public getLatestTrace(): ComprehensiveDecisionTrace | null {
+    return this.latestTrace;
+  }
+
+  public getRecentTraces(): ComprehensiveDecisionTrace[] {
+    return [...this.traceHistory];
+  }
+}
+
+export const autoTradeDecisionTracer = AutoTradeDecisionTracerService.getInstance();

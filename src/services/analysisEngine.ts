@@ -720,18 +720,72 @@ export function analyzePro(
     ? Math.round(((calibratedWinProb * Math.max(1.2, riskRewardRatio)) - ((1 - calibratedWinProb) * 1.0) - 0.06) * 100) / 100
     : 0;
 
-  let slDistPct = (Math.abs(price - sl) / price) * 100.0;
-  if (slDistPct < 0.4) slDistPct = 0.5;
+  // =========================================================================
+  // Section 5: Institutional Risk-Based Position Sizing, Margin & Leverage
+  // Replaces fixed 15% allocation with rigorous risk budgeting (No heuristics)
+  // =========================================================================
+  const realEquity = (typeof balance === 'number' && Number.isFinite(balance) && balance > 0) ? balance : 0;
+  const executableEntryPrice = optimalEntryZone.optimal > 0 ? optimalEntryZone.optimal : price;
+  const structuralSlDistUsd = Math.max(10, Math.abs(executableEntryPrice - sl));
+  let slDistPct = (structuralSlDistUsd / executableEntryPrice) * 100.0;
+  if (slDistPct < 0.4) slDistPct = 0.4;
 
-  // Smart Adaptive Leverage: scales dynamically with SL distance
-  const calcLev = Math.floor(10.0 / Math.max(0.5, slDistPct));
-  const leverage = Math.max(5, Math.min(25, calcLev));
+  // 1. Dollar Risk Budget dynamically adjusted by Data Quality, Volatility & Model Calibration
+  const requestedRiskPct = Math.max(0.5, Math.min(2.5, riskPct));
+  const dataQualityFactor = dataQualityReport ? Math.max(0.5, Math.min(1.0, (dataQualityReport.overallScore ?? 80) / 100)) : 0.85;
+  const targetVolPct = 1.4;
+  const volRiskFactor = Math.max(0.6, Math.min(1.25, targetVolPct / Math.max(0.5, volatilityPct)));
+  const baseDollarRiskBudget = realEquity * (requestedRiskPct / 100.0);
+  const dollarRiskBudget = Math.round(baseDollarRiskBudget * dataQualityFactor * volRiskFactor * 100) / 100;
 
-  // Margin allocation (12-18% of balance per trade)
-  const marginNeeded = Math.round(balance * 0.15 * 100) / 100;
-  const posUsd = marginNeeded * leverage;
-  const riskUsd = posUsd * (slDistPct / 100.0);
-  const qtyBtc = posUsd / price;
+  // 2. Expected Execution Costs: Fees (0.11%), Slippage (0.04%), Spread (0.03%), Funding (0.01%) = 0.19%
+  const roundTripFrictionPct = 0.0019;
+  const totalUnitRiskFraction = (structuralSlDistUsd / executableEntryPrice) + roundTripFrictionPct;
+
+  // 3. Position Notional proportional strictly to Risk Budget (NOT arbitrary leverage)
+  let posUsd = Math.round((dollarRiskBudget / Math.max(0.005, totalUnitRiskFraction)) * 100) / 100;
+  let qtyBtc = Math.round((posUsd / executableEntryPrice) * 1000) / 1000;
+  let isRiskBudgetBreachedByMinLot = false;
+  if (qtyBtc < 0.001 && realEquity > 10) {
+    qtyBtc = 0.001; // Exchange minimum contract size
+    const recalculatedRiskUsd = qtyBtc * executableEntryPrice * totalUnitRiskFraction;
+    // Strict audit: If min exchange lot breaches allowable risk budget by > 10%, trade MUST be rejected
+    if (recalculatedRiskUsd > dollarRiskBudget * 1.10) {
+      isRiskBudgetBreachedByMinLot = true;
+    }
+  }
+  posUsd = Math.round(qtyBtc * executableEntryPrice * 100) / 100;
+
+  // 4. Permissible Leverage: Strictly constrained by Liquidation Distance buffer including MMR, Fees & Mark Price
+  // Bybit/Binance BTC Linear Maintenance Margin Rate: 0.5% + Liquidation Clearance Fee Buffer 0.08%
+  const mmrPct = 0.50;
+  const feeBufferPct = 0.08;
+  const totalLiqBufferPct = mmrPct + feeBufferPct;
+  const markPriceDivergencePct = (Math.abs(markPrice - executableEntryPrice) / executableEntryPrice) * 100.0;
+  
+  // Safe distance to liquidation must strictly exceed SL distance by 35% margin + MMR + mark basis
+  const requiredLiqDistancePct = (slDistPct * 1.35) + totalLiqBufferPct + markPriceDivergencePct;
+  const maxSafeLeverageByLiq = Math.floor(100.0 / Math.max(1.0, requiredLiqDistancePct));
+  
+  // Leverage can safely be 1x (never blindly forced to 2x without verified liquidation buffer!)
+  let leverage = Math.max(1, Math.min(25, maxSafeLeverageByLiq));
+  const estimatedLiqDistancePct = (100.0 / leverage) - totalLiqBufferPct;
+  let isLiquidationUnsafe = estimatedLiqDistancePct < (slDistPct * 1.20);
+  if (isLiquidationUnsafe && leverage > 1) {
+    leverage = 1;
+    const unleveragedLiqDist = 100.0 - totalLiqBufferPct;
+    isLiquidationUnsafe = unleveragedLiqDist < slDistPct;
+  }
+
+  // 5. Margin Required and Free Margin Verification
+  let marginNeeded = Math.round((posUsd / leverage) * 100) / 100;
+  if (marginNeeded > realEquity * 0.85 && realEquity > 0) {
+    // Scale position down if margin exceeds 85% of available free equity
+    posUsd = Math.round(realEquity * 0.85 * leverage * 100) / 100;
+    qtyBtc = Math.round((posUsd / executableEntryPrice) * 1000) / 1000;
+    marginNeeded = Math.round((posUsd / leverage) * 100) / 100;
+  }
+  const riskUsd = Math.round((posUsd * totalUnitRiskFraction) * 100) / 100;
 
   const vol = currAtr * 0.35;
   const mom = closes.length > 1 ? (closes[closes.length - 1] - closes[closes.length - 2]) * 0.25 : 0;
@@ -824,6 +878,19 @@ export function analyzePro(
     entryTiming = 'NO_TRADE';
     signalOk = false;
     tradeThesis = 'صبر کنید (WAIT): روند بازار مشخص است اما ست‌آپ ساختاری معتبر شکل نگرفته است (Trend ≠ Setup).';
+  }
+  // ۳.۵) پایش سخت‌گیرانه سقف بودجه ریسک بر اثر حداقل حجم و حاشیه امن لیکوییدیشن
+  else if (isRiskBudgetBreachedByMinLot) {
+    entryTiming = 'NO_TRADE';
+    signalOk = false;
+    lifecycleState = 'CANCELLED';
+    tradeThesis = `🛑 لغو معامله: حداقل لات سایز مجاز صرافی (0.001 BTC) ریسک این معامله را از سقف بودجه ریسک (${dollarRiskBudget} USD) فراتر می‌برد. حساب برای این فاصله استاپ نیاز به بالانس بیشتری دارد.`;
+  }
+  else if (isLiquidationUnsafe) {
+    entryTiming = 'NO_TRADE';
+    signalOk = false;
+    lifecycleState = 'CANCELLED';
+    tradeThesis = `🛑 لغو معامله: فاصله قیمت تا قیمت لیکوییدیشن حتی با اهرم ۱x برای تامین حاشیه امن استاپ‌لاس، مارجین نگهداری (0.5%) و کارمزدها ناکافی است.`;
   }
   // ۴) بررسی کیفیت داده و امید ریاضی مثبت خالص (Issue 25: Expected Value)
   else if (isDataQualityBroken || isRangeBound || netExpectedValue <= 0 || riskRewardRatio < 1.30 || setupExpectancyR < 0.15) {

@@ -362,6 +362,11 @@ export interface TradePosition {
   isBreakevenArmed?: boolean;
   isInMarketNoiseZone?: boolean;
   estimatedLossSavingsUsd?: number;
+  symbol?: string;
+  isPartialExitTaken?: boolean;
+  isExchangeConfirmed?: boolean;
+  exchangeStopOrderId?: string;
+  unrealizedPnl?: number;
   // Real-time tracking of Excursions & Immutable Contract
   maeUsd?: number; // Maximum Adverse Excursion in USD
   maePct?: number; // Maximum Adverse Excursion in %
@@ -380,6 +385,10 @@ export interface TradePosition {
   auditTrail?: TradeAuditTrail;
 
   // --- Real-World Execution & Safeguard Fields (Issues 26-30) ---
+  fillSource?: 'EXCHANGE' | 'SIMULATION' | 'PENDING';
+  isSimulatedFill?: boolean;
+  simulatedFillPrice?: number;
+  actualQtyBtc?: number;
   uniqueClientOrderId?: string;
   signalId?: string;
   decisionId?: string;
@@ -421,6 +430,8 @@ export interface AutoTradePrerequisitesCheck {
   clockSynchronized: boolean;
   positionStateSynchronized: boolean;
   emergencyStopAvailable: boolean;
+  realEquityAvailable?: boolean;
+  walletBalanceUsdt?: number | null;
   detailsFa: string[];
   checkedAt: number;
 }
@@ -432,6 +443,7 @@ export interface TradeHistory extends TradePosition {
   closeReason?: string;
   exitPrice?: number;
   durationSeconds?: number;
+  action?: string;
 }
 
 export interface TradeContract {

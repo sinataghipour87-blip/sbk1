@@ -14,14 +14,45 @@ import { BybitCredentials } from './hunterExecutionEngine';
 import { centralPriceSourcePolicy } from './priceSourcePolicy';
 
 export type InstitutionalOrderLifecycleState =
-  | 'CREATED'
+  | 'DECISION_APPROVED'
   | 'SUBMITTED'
   | 'ACKNOWLEDGED'
   | 'PARTIALLY_FILLED'
   | 'FILLED'
-  | 'PROTECTED'
   | 'REJECTED'
-  | 'CANCELLED';
+  | 'CANCELLED'
+  | 'UNKNOWN_IN_FLIGHT'
+  | 'POSITION_RECONCILED'
+  | 'CREATED'
+  | 'PROTECTED';
+
+export type ProtectiveVerificationStatus = 'EXCHANGE_CONFIRMED' | 'SIMULATED' | 'UNKNOWN' | 'DESYNC_DETECTED';
+
+export interface RealOrderExecutionRecord {
+  clientOrderId: string;
+  exchangeOrderId: string | null;
+  decisionId: string;
+  symbol: string;
+  side: 'Buy' | 'Sell';
+  direction: 'LONG' | 'SHORT';
+  requestedQty: number;
+  filledQty: number;
+  fillSource: 'EXCHANGE' | 'SIMULATION' | 'PENDING';
+  averageFillPrice: number | null; // ONLY set for real Exchange Fill
+  simulatedFillPrice: number | null; // Set for simulation/paper fill
+  estimatedFillPrice: number | null; // Pre-flight estimation
+  actualFeeUsd: number;
+  actualSlippageUsd: number;
+  actualSlippageBps: number;
+  submittedAtMs: number;
+  acknowledgedAtMs: number | null;
+  filledAtMs: number | null;
+  state: InstitutionalOrderLifecycleState;
+  rejectionReasonFa: string | null;
+  protectiveVerification: ProtectiveOrderVerification | null;
+  isSimulated: boolean;
+  reconciliationStatus?: 'SYNCED' | 'DISCREPANCY_DETECTED' | 'HALTED';
+}
 
 export interface DetailedExecutionAccounting {
   expectedPrice: number;
@@ -48,6 +79,7 @@ export interface PartialFillState {
 }
 
 export interface ProtectiveOrderVerification {
+  verificationStatus: ProtectiveVerificationStatus;
   isSlVerifiedOnExchange: boolean;
   isTpVerifiedOnExchange: boolean;
   slTriggerPrice: number;
@@ -179,42 +211,70 @@ export class OrderExecutionLifecycleService {
   /**
    * 47. Verifies protective orders (SL/TP) on exchange and activates emergency protection if missing
    */
+  /**
+   * 47. Verifies protective orders (SL/TP) on exchange and activates emergency protection if missing
+   * Strictly separates UNKNOWN, SIMULATED, and EXCHANGE_CONFIRMED states.
+   */
   public verifyProtectiveOrders(
     positionSide: 'LONG' | 'SHORT',
     filledQtyBtc: number,
     slPrice: number,
     tpPrice: number,
-    exchangeStopOrders?: { slRegistered: boolean; tpRegistered: boolean; registeredQty: number; triggerType?: string }
+    exchangeStopOrders?: { slRegistered: boolean; tpRegistered: boolean; registeredQty: number; triggerType?: string },
+    isSimulation = false
   ): ProtectiveOrderVerification {
-    // If no exchange connection active (simulation/paper mode), verify logically
-    if (!exchangeStopOrders) {
+    // 1. Explicit Simulation / Paper Mode: SL/TP is managed virtually, NEVER reported as verified on exchange
+    if (isSimulation) {
       return {
-        isSlVerifiedOnExchange: true,
-        isTpVerifiedOnExchange: true,
+        verificationStatus: 'SIMULATED',
+        isSlVerifiedOnExchange: false,
+        isTpVerifiedOnExchange: false,
         slTriggerPrice: slPrice,
         tpTriggerPrice: tpPrice,
         slTriggerType: 'MARK_PRICE',
         tpTriggerType: 'LAST_PRICE',
         verifiedQuantityBtc: filledQtyBtc,
-        isProtectionFullySynchronized: true,
+        isProtectionFullySynchronized: false,
         emergencyProtectionActive: false,
-        statusFa: '✅ اردرهای محافظتی SL/TP با استاندارد Mark Price در هدر ثبت و تطبیق داده شدند.',
+        statusFa: '🧪 وضعیت شبیه‌سازی (SIMULATED): اردرهای SL/TP در حافظه موتور محلی فعالند و روی سرور صرافی واقعی ثبت نشده‌اند.',
       };
     }
 
+    // 2. Missing Exchange Confirmation in Live Trading: must yield UNKNOWN and trigger Emergency Protection
+    if (!exchangeStopOrders) {
+      return {
+        verificationStatus: 'UNKNOWN',
+        isSlVerifiedOnExchange: false,
+        isTpVerifiedOnExchange: false,
+        slTriggerPrice: slPrice,
+        tpTriggerPrice: tpPrice,
+        slTriggerType: 'MARK_PRICE',
+        tpTriggerType: 'LAST_PRICE',
+        verifiedQuantityBtc: 0,
+        isProtectionFullySynchronized: false,
+        emergencyProtectionActive: true, // Crucial: Missing exchange info must immediately flag emergency protection!
+        statusFa: '⚠️ وضعیت نامعلوم (UNKNOWN): اطلاعات اردرهای محافظتی صرافی در دسترس نیست؛ به دلیل ریسک سرمایه پروتکل Emergency Protection فعال است.',
+      };
+    }
+
+    // 3. Real Exchange Confirmation Provided
     const isSlVerified = exchangeStopOrders.slRegistered && exchangeStopOrders.registeredQty >= filledQtyBtc;
     const isTpVerified = exchangeStopOrders.tpRegistered;
     const isProtectionFullySynchronized = isSlVerified && isTpVerified;
     const emergencyProtectionActive = !isSlVerified; // SL is non-negotiable
 
-    let statusFa = '✅ اردرهای محافظتی با موفقیت روی سرور صرافی تایید شدند.';
+    let statusFa = '✅ اردرهای محافظتی با موفقیت روی سرور صرافی تایید شدند (EXCHANGE_CONFIRMED).';
+    let verificationStatus: ProtectiveVerificationStatus = 'EXCHANGE_CONFIRMED';
+
     if (!isSlVerified) {
+      verificationStatus = 'DESYNC_DETECTED';
       statusFa = '🚨 هشدار بحرانی: استاپ‌لاس روی صرافی ثبت نشده است! پروتکل Emergency Protection جهت بستن اضطراری فعال شد.';
     } else if (!isTpVerified) {
       statusFa = '⚠️ حد سود هنوز در هدر صرافی ثبت نشده است. ثبت مجدد در دست اجراست.';
     }
 
     return {
+      verificationStatus,
       isSlVerifiedOnExchange: isSlVerified,
       isTpVerifiedOnExchange: isTpVerified,
       slTriggerPrice: slPrice,
@@ -304,6 +364,179 @@ export class OrderExecutionLifecycleService {
       isHalted: this.isSystemTradingHalted,
       reasonFa: this.haltReasonFa,
     };
+  }
+
+  // Registry for tracking real order executions and preventing duplicate submissions
+  private orderExecutionRegistry: Map<string, RealOrderExecutionRecord> = new Map();
+
+  /**
+   * Section 6: Records an order lifecycle transition with full accounting
+   */
+  public registerOrderSubmission(params: {
+    clientOrderId: string;
+    decisionId: string;
+    symbol: string;
+    side: 'Buy' | 'Sell';
+    direction: 'LONG' | 'SHORT';
+    requestedQty: number;
+    expectedPrice: number;
+    isSimulated?: boolean;
+  }): RealOrderExecutionRecord {
+    const existing = this.orderExecutionRegistry.get(params.clientOrderId);
+    if (existing) {
+      return existing; // Idempotent: return existing without duplication
+    }
+
+    const record: RealOrderExecutionRecord = {
+      clientOrderId: params.clientOrderId,
+      exchangeOrderId: null,
+      decisionId: params.decisionId,
+      symbol: params.symbol,
+      side: params.side,
+      direction: params.direction,
+      requestedQty: params.requestedQty,
+      filledQty: 0,
+      fillSource: 'PENDING',
+      averageFillPrice: null,
+      simulatedFillPrice: null,
+      estimatedFillPrice: params.expectedPrice,
+      actualFeeUsd: 0,
+      actualSlippageUsd: 0,
+      actualSlippageBps: 0,
+      submittedAtMs: Date.now(),
+      acknowledgedAtMs: null,
+      filledAtMs: null,
+      state: 'SUBMITTED',
+      rejectionReasonFa: null,
+      protectiveVerification: null,
+      isSimulated: Boolean(params.isSimulated),
+      reconciliationStatus: 'SYNCED',
+    };
+
+    this.orderExecutionRegistry.set(params.clientOrderId, record);
+    return record;
+  }
+
+  /**
+   * Section 6: Updates order status on Exchange Acknowledgment
+   */
+  public acknowledgeOrder(clientOrderId: string, exchangeOrderId: string): RealOrderExecutionRecord | null {
+    const record = this.orderExecutionRegistry.get(clientOrderId);
+    if (!record) return null;
+
+    record.exchangeOrderId = exchangeOrderId;
+    record.acknowledgedAtMs = Date.now();
+    record.state = 'ACKNOWLEDGED';
+    return record;
+  }
+
+  /**
+   * Section 6: Real Exchange Fill Execution (Never mixed with simulation)
+   */
+  public recordOrderFill(params: {
+    clientOrderId: string;
+    filledQty: number;
+    averageFillPrice: number;
+    actualFeeUsd: number;
+    actualSlippageUsd: number;
+    actualSlippageBps: number;
+    isFullFill: boolean;
+  }): RealOrderExecutionRecord | null {
+    const record = this.orderExecutionRegistry.get(params.clientOrderId);
+    if (!record) return null;
+
+    record.filledQty = params.filledQty;
+    record.fillSource = 'EXCHANGE';
+    record.averageFillPrice = params.averageFillPrice;
+    record.actualFeeUsd = params.actualFeeUsd;
+    record.actualSlippageUsd = params.actualSlippageUsd;
+    record.actualSlippageBps = params.actualSlippageBps;
+    record.filledAtMs = Date.now();
+    record.state = params.isFullFill ? 'FILLED' : 'PARTIALLY_FILLED';
+    return record;
+  }
+
+  /**
+   * Section 6: Dedicated Simulation / Paper Fill Route (Maintains explicit simulation tag)
+   */
+  public recordSimulatedFill(params: {
+    clientOrderId: string;
+    filledQty: number;
+    simulatedFillPrice: number;
+    estimatedFeeUsd: number;
+    estimatedSlippageUsd: number;
+    estimatedSlippageBps: number;
+    isFullFill: boolean;
+  }): RealOrderExecutionRecord | null {
+    const record = this.orderExecutionRegistry.get(params.clientOrderId);
+    if (!record) return null;
+
+    record.isSimulated = true;
+    record.filledQty = params.filledQty;
+    record.fillSource = 'SIMULATION';
+    record.simulatedFillPrice = params.simulatedFillPrice;
+    record.averageFillPrice = null; // Strictly null for simulation
+    record.actualFeeUsd = params.estimatedFeeUsd;
+    record.actualSlippageUsd = params.estimatedSlippageUsd;
+    record.actualSlippageBps = params.estimatedSlippageBps;
+    record.filledAtMs = Date.now();
+    record.state = params.isFullFill ? 'FILLED' : 'PARTIALLY_FILLED';
+    return record;
+  }
+
+  /**
+   * Section 6: Handles Network Disconnection In-Flight
+   * Marks state as UNKNOWN_IN_FLIGHT to prevent blind retries before exchange reconciliation
+   */
+  public markOrderInFlightDisconnection(clientOrderId: string): RealOrderExecutionRecord | null {
+    const record = this.orderExecutionRegistry.get(clientOrderId);
+    if (!record) return null;
+
+    record.state = 'UNKNOWN_IN_FLIGHT';
+    record.rejectionReasonFa = '⚠️ قطع شبکه در حین ارسال؛ وضعیت سفارش در صرافی در حال استعلام است و از ارسال مجدد کورکورانه جلوگیری شد.';
+    return record;
+  }
+
+  /**
+   * Section 6: Reconciles In-Flight Order with Exchange before any retry
+   */
+  public reconcileInFlightOrder(
+    clientOrderId: string,
+    exchangeOrderResult?: {
+      existsOnExchange: boolean;
+      exchangeOrderId?: string;
+      orderStatus?: string;
+      cumExecQty?: number;
+      avgPrice?: number;
+    }
+  ): RealOrderExecutionRecord | null {
+    const record = this.orderExecutionRegistry.get(clientOrderId);
+    if (!record) return null;
+
+    if (!exchangeOrderResult || !exchangeOrderResult.existsOnExchange) {
+      // Order never reached exchange matcher
+      record.state = 'REJECTED';
+      record.rejectionReasonFa = 'سفارش در صرافی ثبت نشده و پس از خطای شبکه با موفقیت لغو/رد شد.';
+    } else {
+      // Order did reach exchange! Adopt its real exchange state
+      record.exchangeOrderId = exchangeOrderResult.exchangeOrderId || record.exchangeOrderId;
+      const isFilled = exchangeOrderResult.orderStatus === 'Filled';
+      const isPartial = exchangeOrderResult.orderStatus === 'PartiallyFilled';
+      record.state = isFilled ? 'FILLED' : (isPartial ? 'PARTIALLY_FILLED' : 'ACKNOWLEDGED');
+      if (exchangeOrderResult.cumExecQty) record.filledQty = exchangeOrderResult.cumExecQty;
+      if (exchangeOrderResult.avgPrice) record.averageFillPrice = exchangeOrderResult.avgPrice;
+      record.reconciliationStatus = 'SYNCED';
+    }
+
+    return record;
+  }
+
+  public getOrderRecord(clientOrderId: string): RealOrderExecutionRecord | undefined {
+    return this.orderExecutionRegistry.get(clientOrderId);
+  }
+
+  public getAllOrderRecords(): RealOrderExecutionRecord[] {
+    return Array.from(this.orderExecutionRegistry.values());
   }
 }
 

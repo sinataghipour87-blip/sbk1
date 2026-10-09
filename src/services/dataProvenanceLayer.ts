@@ -82,6 +82,82 @@ export interface NoTradeDecisionReason {
   isCapitalPreserving: true;
 }
 
+export type MarketType = 'LINEAR_PERPETUAL' | 'INVERSE_PERPETUAL' | 'SPOT' | 'OPTIONS' | 'INDEX';
+export type FeedOperationalStatus = 'LIVE' | 'STALE' | 'UNAVAILABLE' | 'SIMULATED';
+export type DataIntegrityCategory = 'VALID_LIVE' | 'NO_DATA' | 'INVALID_DATA' | 'SIMULATED_DATA' | 'STALE_DATA';
+
+/**
+ * 🏛️ Strict Contract Specification for Cross-Exchange Mapping
+ */
+export interface CanonicalContractSpec {
+  canonicalBase: 'BTC' | 'ETH' | 'SOL';
+  canonicalQuote: 'USDT' | 'USD';
+  marketType: MarketType;
+  settlementCoin: string;
+  contractMultiplier: number;
+  volumeUnit: 'BTC' | 'CONTRACT' | 'USDT';
+}
+
+export interface OhlcvConsistencyAudit {
+  isConsistent: boolean;
+  dataCategory: DataIntegrityCategory;
+  candlesEvaluated: number;
+  invalidCandleIndex?: number;
+  violations: string[];
+}
+
+/**
+ * 🏛️ Five Distinct Price Types in Data Truth Layer (Never Confused)
+ */
+export interface DataTruthPriceMatrix {
+  lastPrice: number | null;          // Real Last Traded Price from Matching Engine
+  markPrice: number | null;          // Fair Mark Price for Risk & Liquidations
+  indexPrice: number | null;         // Spot Underlying Index Benchmark
+  exchangeFillPrice: number | null;  // Actual executed fill reported by Exchange
+  simulatedFillPrice: number | null; // Paper / Simulation / Estimated Fill
+  isSimulated: boolean;
+  sourceExchange: string;
+  priceTruthVersion: string;
+}
+
+export interface MandatoryFeedProvenanceRecord {
+  feedKey: string;
+  source: string; // e.g. Bybit Linear Futures, KuCoin Linear Futures
+  exchange: string;
+  symbol: string;
+  marketType: MarketType;
+  timeframe: string; // e.g. '15m', '1m', 'TICK'
+  sourceTimestampMs: number;
+  receivedTimestampMs: number;
+  networkLatencyMs: number;
+  dataAgeMs: number;
+  status: FeedOperationalStatus;
+  dataCategory: DataIntegrityCategory;
+  numericalValidity: boolean;
+  ohlcvConsistency: OhlcvConsistencyAudit;
+  dataVersionId: string;
+  validationReasonFa: string;
+  isTradePermitted: boolean;
+  isSynthetic: boolean;
+  priceContext?: DataTruthPriceMatrix;
+}
+
+export interface CentralMandatoryDataIntegrityReport {
+  timestampMs: number;
+  versionId: string;
+  feeds: Record<string, MandatoryFeedProvenanceRecord>;
+  overallStatus: 'LIVE' | 'STALE' | 'BLOCKED_CORRUPT' | 'BLOCKED_SYNTHETIC' | 'DATA_UNAVAILABLE';
+  isLiveTradePermitted: boolean;
+  blockReasonsFa: string[];
+  pricing: {
+    lastPrice: number | null;
+    markPrice: number | null;
+    indexPrice: number | null;
+    priceDivergenceValid: boolean;
+    pricingDiagnosticFa: string;
+  };
+}
+
 export class DataProvenanceLayerService {
   private static instance: DataProvenanceLayerService;
 
@@ -522,6 +598,456 @@ export class DataProvenanceLayerService {
       remedyFa: base.remedyFa,
       isCapitalPreserving: true,
     };
+  }
+
+  // Registry for tracking the latest audit of every active data feed (Section 2)
+  private feedProvenanceRegistry: Map<string, MandatoryFeedProvenanceRecord> = new Map();
+
+  /**
+   * Section 2: Strict numerical validity & OHLCV consistency verification.
+   * Checks:
+   * - Finite numbers for Open, High, Low, Close, Volume
+   * - Open, High, Low, Close > 0 and Volume >= 0
+   * - High >= Low
+   * - High >= Math.max(Open, Close)
+   * - Low <= Math.min(Open, Close)
+   */
+  /**
+   * 🏛️ Explicit Canonical Contract Specifications Registry
+   */
+  private static readonly CONTRACT_SPECS: Record<string, CanonicalContractSpec> = {
+    'BYBIT:BTCUSDT': {
+      canonicalBase: 'BTC',
+      canonicalQuote: 'USDT',
+      marketType: 'LINEAR_PERPETUAL',
+      settlementCoin: 'USDT',
+      contractMultiplier: 1.0,
+      volumeUnit: 'BTC',
+    },
+    'KUCOIN:XBTUSDTM': {
+      canonicalBase: 'BTC',
+      canonicalQuote: 'USDT',
+      marketType: 'LINEAR_PERPETUAL',
+      settlementCoin: 'USDT',
+      contractMultiplier: 1.0,
+      volumeUnit: 'CONTRACT',
+    },
+    'BINANCE:BTCUSDT': {
+      canonicalBase: 'BTC',
+      canonicalQuote: 'USDT',
+      marketType: 'LINEAR_PERPETUAL',
+      settlementCoin: 'USDT',
+      contractMultiplier: 1.0,
+      volumeUnit: 'BTC',
+    },
+  };
+
+  /**
+   * Section 2: Real OHLCV Candlestick Logical Integrity Audit
+   * Strictly separates NO_DATA, INVALID_DATA, SIMULATED_DATA, and VALID_LIVE
+   */
+  public auditOhlcvConsistency(candles: any[] | undefined | null): OhlcvConsistencyAudit {
+    if (!candles || !Array.isArray(candles) || candles.length === 0) {
+      return {
+        isConsistent: false,
+        dataCategory: 'NO_DATA',
+        candlesEvaluated: 0,
+        violations: ['🛑 نبود داده (NO_DATA): آرایه کندل‌های بازار مفقود یا خالی است؛ تایید ضمنی فید بدون کندل ممنوع است.'],
+      };
+    }
+
+    const isSimulated = Boolean(
+      (candles as any)?.__isSynthetic ||
+      (candles as any)?.__isSyntheticUnsafeForLive__ ||
+      (candles as any)?.__isSimulated
+    );
+
+    const violations: string[] = [];
+    let invalidIndex: number | undefined;
+
+    for (let i = 0; i < candles.length; i++) {
+      const c = candles[i];
+      if (!Array.isArray(c) || c.length < 5) {
+        violations.push(`کاندل در شاخص [${i}] دارای فرمت نامعتبر یا طول کمتر از ۵ مؤلفه است.`);
+        invalidIndex = i;
+        break;
+      }
+
+      // Check format: [open, high, low, close, volume] or [timestamp, open, high, low, close, volume]
+      let open: number, high: number, low: number, close: number, volume: number;
+      if (c.length >= 6) {
+        [, open, high, low, close, volume] = c;
+      } else {
+        [open, high, low, close, volume] = c;
+      }
+
+      if (!Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close) || !Number.isFinite(volume)) {
+        violations.push(`کاندل [${i}] حاوی مقادیر غیرعددی (NaN یا Infinity) است.`);
+        invalidIndex = i;
+        break;
+      }
+
+      if (open <= 0 || high <= 0 || low <= 0 || close <= 0 || volume < 0) {
+        violations.push(`کاندل [${i}] دارای قیمت نامثبت یا حجم منفی است (O:${open}, H:${high}, L:${low}, C:${close}, V:${volume}).`);
+        invalidIndex = i;
+        break;
+      }
+
+      if (high < low) {
+        violations.push(`تناقض سقف و کف: در کاندل [${i}] مقدار High (${high}) کمتر از Low (${low}) است.`);
+        invalidIndex = i;
+        break;
+      }
+
+      if (high < Math.max(open, close)) {
+        violations.push(`تناقض سقف با بدنه: در کاندل [${i}] مقدار High (${high}) کمتر از Max(Open, Close) است.`);
+        invalidIndex = i;
+        break;
+      }
+
+      if (low > Math.min(open, close)) {
+        violations.push(`تناقض کف با بدنه: در کاندل [${i}] مقدار Low (${low}) بیشتر از Min(Open, Close) است.`);
+        invalidIndex = i;
+        break;
+      }
+    }
+
+    if (violations.length > 0) {
+      return {
+        isConsistent: false,
+        dataCategory: 'INVALID_DATA',
+        candlesEvaluated: candles.length,
+        invalidCandleIndex: invalidIndex,
+        violations,
+      };
+    }
+
+    if (isSimulated) {
+      return {
+        isConsistent: true,
+        dataCategory: 'SIMULATED_DATA',
+        candlesEvaluated: candles.length,
+        violations: ['⚠️ داده‌های کندل از نوع شبیه‌سازی‌شده/مصنوعی هستند.'],
+      };
+    }
+
+    return {
+      isConsistent: true,
+      dataCategory: 'VALID_LIVE',
+      candlesEvaluated: candles.length,
+      invalidCandleIndex: undefined,
+      violations: [],
+    };
+  }
+
+  /**
+   * Section 2: Validates Fallback Source Compatibility using explicit Contract Specification
+   * Supports multi-exchange symbol mapping (e.g. KuCoin XBTUSDTM -> Bybit BTCUSDT) via rigorous contract validation.
+   */
+  public verifyFallbackCompatibility(
+    primary: { exchange: string; symbol: string; marketType: MarketType; timeframe: string },
+    fallback: { exchange: string; symbol: string; marketType: MarketType; timeframe: string }
+  ): { isCompatible: boolean; rejectionReasonFa?: string; primarySpec?: CanonicalContractSpec; fallbackSpec?: CanonicalContractSpec } {
+    const primaryKey = `${primary.exchange.toUpperCase()}:${primary.symbol.toUpperCase()}`;
+    const fallbackKey = `${fallback.exchange.toUpperCase()}:${fallback.symbol.toUpperCase()}`;
+
+    const primarySpec = DataProvenanceLayerService.CONTRACT_SPECS[primaryKey] || {
+      canonicalBase: primary.symbol.replace(/USDT|USD/i, '') as any,
+      canonicalQuote: (primary.symbol.endsWith('USD') ? 'USD' : 'USDT') as any,
+      marketType: primary.marketType,
+      settlementCoin: 'USDT',
+      contractMultiplier: 1.0,
+      volumeUnit: 'BTC',
+    };
+
+    const fallbackSpec = DataProvenanceLayerService.CONTRACT_SPECS[fallbackKey] || {
+      canonicalBase: fallback.symbol.replace(/XBT|BTC/i, 'BTC').replace(/USDTM|USDT|USD/i, '') as any,
+      canonicalQuote: (fallback.symbol.includes('USD') ? 'USDT' : 'USDT') as any,
+      marketType: fallback.marketType,
+      settlementCoin: 'USDT',
+      contractMultiplier: 1.0,
+      volumeUnit: 'CONTRACT',
+    };
+
+    if (primarySpec.canonicalBase !== fallbackSpec.canonicalBase) {
+      return {
+        isCompatible: false,
+        rejectionReasonFa: `🛑 دارایی پایه منبع جایگزین (${fallbackSpec.canonicalBase}) با دارایی پایه اصلی (${primarySpec.canonicalBase}) تطابق ندارد.`,
+      };
+    }
+
+    if (primary.marketType !== fallback.marketType || primarySpec.marketType !== fallbackSpec.marketType) {
+      return {
+        isCompatible: false,
+        rejectionReasonFa: `🛑 نوع بازار منبع جایگزین (${fallback.marketType}) با نوع بازار منبع اصلی (${primary.marketType}) یکسان نیست. جایگزینی Spot با Futures یا بالعکس اکیداً ممنوع است.`,
+      };
+    }
+
+    if (primarySpec.settlementCoin !== fallbackSpec.settlementCoin) {
+      return {
+        isCompatible: false,
+        rejectionReasonFa: `🛑 ارز تسویه منبع جایگزین (${fallbackSpec.settlementCoin}) با منبع اصلی (${primarySpec.settlementCoin}) مغایرت دارد.`,
+      };
+    }
+
+    if (primary.timeframe !== fallback.timeframe) {
+      return {
+        isCompatible: false,
+        rejectionReasonFa: `🛑 تایم‌فریم منبع جایگزین (${fallback.timeframe}) با نیاز موتور (${primary.timeframe}) مغایرت دارد.`,
+      };
+    }
+
+    return { isCompatible: true, primarySpec, fallbackSpec };
+  }
+
+  /**
+   * Section 2: Mandatory Feed Registration & Real-Time Audit
+   */
+  public registerAndAuditFeedProvenance(params: {
+    feedKey: string;
+    source: string;
+    exchange: string;
+    symbol: string;
+    marketType: MarketType;
+    timeframe: string;
+    sourceTimestampMs?: number;
+    receivedTimestampMs?: number;
+    networkLatencyMs?: number;
+    candles?: any[];
+    rawPriceValues?: {
+      lastPrice?: number | null;
+      markPrice?: number | null;
+      indexPrice?: number | null;
+      exchangeFillPrice?: number | null;
+      simulatedFillPrice?: number | null;
+    };
+    isSimulatedSandboxOnly?: boolean;
+    customStatus?: FeedOperationalStatus;
+  }): MandatoryFeedProvenanceRecord {
+    const now = Date.now();
+    const sourceTimestampMs = params.sourceTimestampMs || now;
+    const receivedTimestampMs = params.receivedTimestampMs || now;
+    const networkLatencyMs = params.networkLatencyMs ?? Math.max(0, receivedTimestampMs - sourceTimestampMs);
+    const dataAgeMs = Math.max(0, now - sourceTimestampMs);
+
+    // Check synthetic / sandbox contamination
+    const isSyntheticExplicit = Boolean(
+      params.isSimulatedSandboxOnly ||
+      (params.candles as any)?.__isSyntheticUnsafeForLive__ ||
+      (params.candles as any)?.__isSynthetic ||
+      (params.candles as any)?.__isLiveSafe === false
+    );
+
+    // Audit OHLCV consistency: if feedKey expects candles, missing candles must be detected as NO_DATA!
+    const isCandleFeed = params.feedKey.includes('CANDLES') || params.candles !== undefined;
+    let ohlcvAudit: OhlcvConsistencyAudit;
+    if (isCandleFeed) {
+      ohlcvAudit = this.auditOhlcvConsistency(params.candles);
+    } else {
+      ohlcvAudit = {
+        isConsistent: true,
+        dataCategory: isSyntheticExplicit ? 'SIMULATED_DATA' : 'VALID_LIVE',
+        candlesEvaluated: 0,
+        violations: [],
+      };
+    }
+
+    // Numerical validity check
+    let numericalValidity = ohlcvAudit.isConsistent;
+    if (params.rawPriceValues) {
+      const { lastPrice, markPrice, indexPrice } = params.rawPriceValues;
+      if (lastPrice !== undefined && lastPrice !== null && (!Number.isFinite(lastPrice) || lastPrice <= 0)) numericalValidity = false;
+      if (markPrice !== undefined && markPrice !== null && (!Number.isFinite(markPrice) || markPrice <= 0)) numericalValidity = false;
+      if (indexPrice !== undefined && indexPrice !== null && (!Number.isFinite(indexPrice) || indexPrice <= 0)) numericalValidity = false;
+    }
+
+    // Determine status & data category
+    let status: FeedOperationalStatus = params.customStatus || 'LIVE';
+    let dataCategory: DataIntegrityCategory = ohlcvAudit.dataCategory;
+
+    if (isSyntheticExplicit) {
+      status = 'SIMULATED';
+      dataCategory = 'SIMULATED_DATA';
+    } else if (ohlcvAudit.dataCategory === 'NO_DATA' || (isCandleFeed && (!params.candles || params.candles.length === 0))) {
+      status = 'UNAVAILABLE';
+      dataCategory = 'NO_DATA';
+      numericalValidity = false;
+    } else if (!numericalValidity || ohlcvAudit.dataCategory === 'INVALID_DATA') {
+      status = 'UNAVAILABLE';
+      dataCategory = 'INVALID_DATA';
+    } else if (dataAgeMs > 15000) {
+      status = 'STALE';
+      dataCategory = 'STALE_DATA';
+    }
+
+    let isTradePermitted = false;
+    let validationReasonFa = '';
+
+    if (isSyntheticExplicit || dataCategory === 'SIMULATED_DATA') {
+      isTradePermitted = false;
+      validationReasonFa = '🛑 داده‌های شبیه‌سازی‌شده/مصنوعی صرفاً در محیط آزمایشی مجاز هستند و ورود آن‌ها به هسته معاملات مسدود است.';
+    } else if (dataCategory === 'NO_DATA') {
+      isTradePermitted = false;
+      validationReasonFa = '🛑 عدم وجود داده (NO_DATA): آرایه کندل یا داده قیمت در دسترس نیست.';
+    } else if (status === 'UNAVAILABLE' || !numericalValidity || dataCategory === 'INVALID_DATA') {
+      isTradePermitted = false;
+      validationReasonFa = `🛑 داده‌های فید نامعتبر یا دارای تناقض عددی هستند: ${ohlcvAudit.violations.join('؛ ') || 'عدم اعتبار پارامترهای قیمتی'}`;
+    } else if (status === 'STALE' || dataCategory === 'STALE_DATA') {
+      isTradePermitted = false;
+      validationReasonFa = `🛑 سن داده (${(dataAgeMs / 1000).toFixed(1)} ثانیه) فراتر از آستانه مجاز (۱۵ ثانیه) است؛ فید به وضعیت STALE تغییر یافت.`;
+    } else {
+      isTradePermitted = true;
+      validationReasonFa = `✅ فید زنده تایید شد: تاخیر شبکه ${networkLatencyMs}ms، سن داده ${dataAgeMs}ms، تمام اصول صحت سنجیده شدند.`;
+    }
+
+    const versionId = `DATA_VER_${params.feedKey}_${sourceTimestampMs}_${Math.random().toString(36).substring(2, 6)}`;
+
+    const priceMatrix: DataTruthPriceMatrix | undefined = params.rawPriceValues ? {
+      lastPrice: params.rawPriceValues.lastPrice ?? null,
+      markPrice: params.rawPriceValues.markPrice ?? null,
+      indexPrice: params.rawPriceValues.indexPrice ?? null,
+      exchangeFillPrice: params.rawPriceValues.exchangeFillPrice ?? null,
+      simulatedFillPrice: params.rawPriceValues.simulatedFillPrice ?? null,
+      isSimulated: isSyntheticExplicit || Boolean(params.rawPriceValues.simulatedFillPrice && !params.rawPriceValues.exchangeFillPrice),
+      sourceExchange: params.exchange,
+      priceTruthVersion: versionId,
+    } : undefined;
+
+    const record: MandatoryFeedProvenanceRecord = {
+      feedKey: params.feedKey,
+      source: params.source,
+      exchange: params.exchange,
+      symbol: params.symbol,
+      marketType: params.marketType,
+      timeframe: params.timeframe,
+      sourceTimestampMs,
+      receivedTimestampMs,
+      networkLatencyMs,
+      dataAgeMs,
+      status,
+      dataCategory,
+      numericalValidity,
+      ohlcvConsistency: ohlcvAudit,
+      dataVersionId: versionId,
+      validationReasonFa,
+      isTradePermitted,
+      isSynthetic: isSyntheticExplicit,
+      priceContext: priceMatrix,
+    };
+
+    this.feedProvenanceRegistry.set(params.feedKey, Object.freeze(record));
+    return record;
+  }
+
+  /**
+   * Section 2: Central Mandatory System-Wide Data Integrity Audit
+   */
+  public auditCentralSystemDataIntegrity(params: {
+    lastPrice: number | null;
+    markPrice: number | null;
+    indexPrice: number | null;
+    candles?: any[];
+    feedStatus?: string;
+  }): CentralMandatoryDataIntegrityReport {
+    const now = Date.now();
+    const versionId = `INTEGRITY_AUDIT_${now}_${Math.random().toString(36).substring(2, 7)}`;
+    const blockReasonsFa: string[] = [];
+
+    // 1. Audit Price Metrics (Never confuse Last, Mark, Index, or substitute missing with 0 or random)
+    const hasValidLast = params.lastPrice !== null && Number.isFinite(params.lastPrice) && params.lastPrice > 0;
+    const hasValidMark = params.markPrice !== null && Number.isFinite(params.markPrice) && params.markPrice > 0;
+    const hasValidIndex = params.indexPrice !== null && Number.isFinite(params.indexPrice) && params.indexPrice > 0;
+
+    let priceDivergenceValid = true;
+    let pricingDiagnosticFa = 'قیمت‌های سه‌گانه (Last, Mark, Index) مجزا و معتبر هستند.';
+
+    if (!hasValidLast) {
+      blockReasonsFa.push('🛑 قیمت لحظه‌ای معاملات واقعی (Last Price) مفقود یا نامعتبر است؛ جایگزینی با صفر یا مقدار تصادفی مجاز نیست.');
+    }
+    if (!hasValidMark) {
+      blockReasonsFa.push('🛑 قیمت مارک (Mark Price) برای ارزیابی ریسک و استاپ‌لاس در دسترس نیست.');
+    }
+    if (!hasValidIndex) {
+      blockReasonsFa.push('🛑 قیمت شاخص نقدی (Index Price) برای مبنای اوراق مشتقه در دسترس نیست.');
+    }
+
+    if (hasValidLast && hasValidMark) {
+      const divergencePct = (Math.abs(params.markPrice! - params.lastPrice!) / params.markPrice!) * 100;
+      if (divergencePct > 0.5) {
+        priceDivergenceValid = false;
+        blockReasonsFa.push(`🛑 واگرایی قیمت Mark و Last (${divergencePct.toFixed(2)}٪) فراتر از سقف مجاز ۰.۵٪ است.`);
+      }
+    }
+
+    // 2. Audit Candles Feed
+    const candleRecord = this.registerAndAuditFeedProvenance({
+      feedKey: 'CANDLES_PRIMARY',
+      source: 'Bybit Linear Futures (BTCUSDT)',
+      exchange: 'BYBIT',
+      symbol: 'BTCUSDT',
+      marketType: 'LINEAR_PERPETUAL',
+      timeframe: '15m',
+      candles: params.candles,
+      rawPriceValues: {
+        lastPrice: params.lastPrice,
+        markPrice: params.markPrice,
+        indexPrice: params.indexPrice,
+      },
+      customStatus: params.feedStatus === 'SIMULATED' ? 'SIMULATED' : undefined,
+    });
+
+    if (!candleRecord.isTradePermitted) {
+      blockReasonsFa.push(candleRecord.validationReasonFa);
+    }
+
+    // Determine overall status
+    let overallStatus: CentralMandatoryDataIntegrityReport['overallStatus'] = 'LIVE';
+    if (candleRecord.isSynthetic || params.feedStatus === 'SIMULATED') {
+      overallStatus = 'BLOCKED_SYNTHETIC';
+    } else if (candleRecord.status === 'UNAVAILABLE' || !hasValidLast || !hasValidMark) {
+      overallStatus = 'DATA_UNAVAILABLE';
+    } else if (!candleRecord.numericalValidity || !priceDivergenceValid) {
+      overallStatus = 'BLOCKED_CORRUPT';
+    } else if (candleRecord.status === 'STALE') {
+      overallStatus = 'STALE';
+    }
+
+    const isLiveTradePermitted = overallStatus === 'LIVE' && blockReasonsFa.length === 0;
+
+    const feedsObj: Record<string, MandatoryFeedProvenanceRecord> = {};
+    this.feedProvenanceRegistry.forEach((v, k) => {
+      feedsObj[k] = v;
+    });
+
+    const report: CentralMandatoryDataIntegrityReport = {
+      timestampMs: now,
+      versionId,
+      feeds: feedsObj,
+      overallStatus,
+      isLiveTradePermitted,
+      blockReasonsFa,
+      pricing: {
+        lastPrice: hasValidLast ? params.lastPrice : null,
+        markPrice: hasValidMark ? params.markPrice : null,
+        indexPrice: hasValidIndex ? params.indexPrice : null,
+        priceDivergenceValid,
+        pricingDiagnosticFa,
+      },
+    };
+
+    return Object.freeze(report);
+  }
+
+  public getFeedAudit(feedKey: string): MandatoryFeedProvenanceRecord | undefined {
+    return this.feedProvenanceRegistry.get(feedKey);
+  }
+
+  public getAllFeedAudits(): Record<string, MandatoryFeedProvenanceRecord> {
+    const res: Record<string, MandatoryFeedProvenanceRecord> = {};
+    this.feedProvenanceRegistry.forEach((v, k) => {
+      res[k] = v;
+    });
+    return res;
   }
 }
 

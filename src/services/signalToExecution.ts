@@ -791,29 +791,6 @@ export function buildExecutionPosition(
     return null;
   }
   const targetSide = direction === 'LONG' ? 'Buy' : 'Sell';
-  const estimatedQty = 0.015;
-  const fillAccounting = orderExecutionLifecycleService.calculateExchangeFillAccounting(
-    expectedAnalysisPrice,
-    estimatedQty,
-    targetSide,
-    analysis.volatilityPct || 1.0,
-    analysis.canonicalSnapshot?.basisSpreadBps || (analysis as any).spreadBps || 1.8
-  );
-
-  const entryPrice = fillAccounting.averageFillPrice;
-  const now = new Date();
-  const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
-
-  // Execute Dynamic Logic-Targeting based on Multi-Timeframe ATR + Key S/R levels
-  const logicTargets = calculateLogicTargets(entryPrice, direction, analysis);
-
-
-  // -------------------------------------------------------------
-  // RULE 3 & 4: absolute leverage ceiling and auto-reduction parameters
-  // -------------------------------------------------------------
-  const MAX_LEVERAGE_CEILING = 5; // Absolute leverage ceiling (Rule 3)
-  const garchRegime = aiPrediction?.garch?.regime || 'NORMAL';
-  const isHighVol = (analysis.volatilityPct && analysis.volatilityPct > 1.5) || garchRegime === 'HIGH';
 
   // -------------------------------------------------------------
   // RULE 6: Post-Loss Entry Size Scaling (Anti-Martingale)
@@ -830,17 +807,60 @@ export function buildExecutionPosition(
   const lossSizeScale = Math.pow(0.75, consecutiveLosses);
 
   // -------------------------------------------------------------
-  // RULE 1: Leverage is derived from Risk budget and Stop Loss distance
+  // RULE 1: True Risk Budget & Preliminary Stop Distance
   // -------------------------------------------------------------
   const targetRiskPct = 1.5; // Standard 1.5% fixed risk of account balance (Rule 1)
   const riskUsd = (balance || 1000) * (targetRiskPct / 100) * lossSizeScale;
 
+  // Execute Dynamic Logic-Targeting based on Multi-Timeframe ATR + Key S/R levels
+  const preliminaryTargets = calculateLogicTargets(expectedAnalysisPrice, direction, analysis);
+  const rawSlPrice = preliminaryTargets.sl;
+  const rawSlDistancePct = Math.abs(expectedAnalysisPrice - rawSlPrice) / expectedAnalysisPrice;
+  const safeSlDistancePct = Math.max(0.0035, rawSlDistancePct); // safe minimum stop distance (0.35%)
+
+  // Sizing directly derived from risk budget and structural stop distance (No static 0.015 BTC dummy)
+  let rawNotionalUsd = riskUsd / safeSlDistancePct;
+  let dynamicCalculatedQtyBtc = Math.round((rawNotionalUsd / expectedAnalysisPrice) * 1000) / 1000;
+  if (dynamicCalculatedQtyBtc < 0.001) {
+    dynamicCalculatedQtyBtc = 0.001; // Exchange minimum linear contract
+  }
+
+  // Double check if minimum contract lot breaches strict risk budget limit (+10% leeway max)
+  const lotRiskUsd = dynamicCalculatedQtyBtc * expectedAnalysisPrice * safeSlDistancePct;
+  if (lotRiskUsd > riskUsd * 1.15 && balance < 250) {
+    isRejected = true;
+    rejectionReason = `حداقل لات سایز صرافی (0.001 BTC معادل $${(dynamicCalculatedQtyBtc * expectedAnalysisPrice).toFixed(1)}) ریسک معامله ($${lotRiskUsd.toFixed(2)}) را به فراتر از بودجه ریسک مجاز ($${riskUsd.toFixed(2)}) می‌رساند.`;
+  }
+
+  // ۴۳ & ۴۴. قیمت اجرای واقعی صرافی یا شبیه‌سازی مبتنی بر اسلیپیج و کارمزد دقیق متناسب با حجم واقعی
+  const fillAccounting = orderExecutionLifecycleService.calculateExchangeFillAccounting(
+    expectedAnalysisPrice,
+    dynamicCalculatedQtyBtc,
+    targetSide,
+    analysis.volatilityPct || 1.0,
+    analysis.canonicalSnapshot?.basisSpreadBps || (analysis as any).spreadBps || 1.8
+  );
+
+  const entryPrice = fillAccounting.averageFillPrice;
+  const now = new Date();
+  const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+
+  // Execute final Dynamic Logic-Targeting from actual fill price
+  const logicTargets = calculateLogicTargets(entryPrice, direction, analysis);
+
+  // -------------------------------------------------------------
+  // RULE 3 & 4: absolute leverage ceiling and auto-reduction parameters
+  // -------------------------------------------------------------
+  const MAX_LEVERAGE_CEILING = 5; // Absolute leverage ceiling (Rule 3)
+  const garchRegime = aiPrediction?.garch?.regime || 'NORMAL';
+  const isHighVol = (analysis.volatilityPct && analysis.volatilityPct > 1.5) || garchRegime === 'HIGH';
+
   const slPrice = logicTargets.sl;
   const slDistancePct = Math.abs(entryPrice - slPrice) / entryPrice;
-  const safeSlDistancePct = Math.max(0.0035, slDistancePct); // safe minimum stop distance (0.35%)
+  const finalSlDistancePct = Math.max(0.0035, slDistancePct);
 
   // Position Size (Notional USD Size) derived directly from risk budget and SL distance
-  let notionalUsd = riskUsd / safeSlDistancePct;
+  let notionalUsd = riskUsd / finalSlDistancePct;
 
   // Derive required leverage based on allocating ~10% of balance as margin
   const baseMargin = (balance || 1000) * 0.10 * lossSizeScale;
@@ -927,7 +947,13 @@ export function buildExecutionPosition(
   console.log(logMessage);
 
   // Emergency hard stop loss distance for Smart Recovery (2.8x ATR)
-  const baseAtr = Math.max(0.5, analysis.atr || (entryPrice * 0.006));
+  const rawAtr = analysis.atr;
+  const isAtrValid = typeof rawAtr === 'number' && Number.isFinite(rawAtr) && rawAtr > 0;
+  if (!isAtrValid) {
+    isRejected = true;
+    rejectionReason = '🛑 شاخص نوسان ATR مفقود یا نامعتبر است (UNKNOWN)؛ ورود و تعیین استاپ اضطراری با داده‌های فرضی مجاز نیست.';
+  }
+  const baseAtr = isAtrValid ? rawAtr : Math.max(0.5, entryPrice * 0.006);
   const emergencyHardSl = Math.round((direction === 'LONG' ? entryPrice - (2.8 * baseAtr) : entryPrice + (2.8 * baseAtr)) * 100) / 100;
 
   // 💰 محاسبه مهندسی و پیش‌بینی سود خالص معامله با تضمین پوشش کامل کارمزد صرافی
@@ -1030,7 +1056,11 @@ export function buildExecutionPosition(
     slippageUsd: fillAccounting.actualSlippageUsd || 0.05,
     expectedPrice: expectedAnalysisPrice,
     submittedPrice: expectedAnalysisPrice,
-    averageFillPrice: entryPrice,
+    averageFillPrice: undefined, // Must NOT record estimated price as actual exchange fill
+    simulatedFillPrice: entryPrice, // Explicitly tagged as simulated fill price
+    fillSource: 'SIMULATION',
+    isSimulatedFill: true,
+    actualQtyBtc: dynamicCalculatedQtyBtc,
     actualSlippageBps: fillAccounting.actualSlippageBps || 0.5,
     actualRiskUsd: riskUsd,
     protectiveOrderVerified: !isRejected,
