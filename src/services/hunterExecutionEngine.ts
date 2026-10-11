@@ -27,12 +27,12 @@
  * =============================================================================
  */
 
-import crypto from 'crypto';
 import { LiquiditySweepSignal } from './orderFlowEngine';
 import { centralTradeDatasetService } from './centralTradeDataset';
 import { signalExpirationEngine, SignalStateSnapshot } from './signalExpirationEngine';
 import { validateMarketDataLiveSafety } from './marketData';
 import { AnalysisResult } from '../types/trading';
+import { FreqtradeRpcError, freqtradeBridge } from './freqtradeBridge';
 
 export type OrderLifecycleState = 'CREATED' | 'SUBMITTED' | 'ACK' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED' | 'REJECTED';
 
@@ -40,22 +40,6 @@ export interface BybitCredentials {
   apiKey: string;
   apiSecret: string;
   isTestnet: boolean;
-}
-
-export interface ReconciledPosition {
-  symbol: string;
-  side: 'LONG' | 'SHORT';
-  sizeBtc: number;
-  entryPrice: number;
-  markPrice: number;
-  unrealizedPnlUsd: number;
-  unrealizedPnlPct: number;
-  leverage: number;
-  liquidationPrice: number;
-  stopLossPrice: number;
-  takeProfitPrice: number;
-  isLiveSynced: boolean;
-  timestampUtc: number;
 }
 
 export interface LatencyExecutionTrace {
@@ -88,7 +72,7 @@ export interface ExecutedOrderResult {
   fillTimestampMs: number;
   isRealExchangeFill: boolean;
   executionEnvironment: 'LIVE' | 'PAPER' | 'BACKTEST';
-  status: 'FILLED' | 'PARTIALLY_FILLED' | 'PAPER_FILLED' | 'BACKTEST_FILLED' | 'REJECTED' | 'NO_TRADE' | 'KILL_SWITCH_ACTIVE';
+  status: 'FILLED' | 'PARTIALLY_FILLED' | 'SUBMITTED' | 'UNKNOWN_IN_FLIGHT' | 'PAPER_FILLED' | 'BACKTEST_FILLED' | 'REJECTED' | 'NO_TRADE' | 'KILL_SWITCH_ACTIVE';
   messageFa: string;
   timestampUtc: number;
   latencyTrace?: LatencyExecutionTrace;
@@ -147,87 +131,33 @@ export class HunterExecutionEngine {
     return HunterExecutionEngine.instance;
   }
 
-  /**
-   * ۴۳ & ۴۴. دریافت بالانس و Equity واقعی حساب از صرافی Bybit
-   * اگر صرافی بالانس را بازنگرداند، در حالت LIVE اکیداً Fallback عدد 1000$ مجاز نیست و وضعیت RISK_DATA_UNAVAILABLE صادر می‌شود.
-   */
-  public async fetchLiveExchangeAccountBalance(creds?: BybitCredentials | null): Promise<{
+  public async fetchLiveFreqtradeAccountBalance(): Promise<{
     success: boolean;
     equityUsdt: number;
     availableBalanceUsdt: number;
     status: 'REAL_EXCHANGE_EQUITY' | 'RISK_DATA_UNAVAILABLE';
     messageFa: string;
   }> {
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
+    try {
+      const balance = await freqtradeBridge.getBalance();
+      return {
+        success: true,
+        equityUsdt: balance.equity,
+        availableBalanceUsdt: balance.available,
+        status: 'REAL_EXCHANGE_EQUITY',
+        messageFa: `✅ بالانس Freqtrade (${balance.currency}) از RPC دریافت شد: Equity=${balance.equity} | آزاد=${balance.available}.`,
+      };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error('[HunterExecutionEngine] Freqtrade balance unavailable:', reason);
       return {
         success: false,
         equityUsdt: 0,
         availableBalanceUsdt: 0,
         status: 'RISK_DATA_UNAVAILABLE',
-        messageFa: '🛑 عدم وجود کلیدهای احراز هویت صرافی: داده‌های مالی حساب لایو در دسترس نیست.'
+        messageFa: `🛑 موجودی Freqtrade در دسترس نیست؛ معامله متوقف شد: ${reason}`,
       };
     }
-
-    try {
-      const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-      const timestamp = Date.now().toString();
-      const recvWindow = '5000';
-      const queryString = 'accountType=UNIFIED&coin=USDT';
-
-      const signature = this.generateBybitSignature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, queryString);
-
-      const res = await fetch(`${baseUrl}/v5/account/wallet-balance?${queryString}`, {
-        method: 'GET',
-        headers: {
-          'X-BAPI-API-KEY': creds.apiKey,
-          'X-BAPI-SIGN': signature,
-          'X-BAPI-TIMESTAMP': timestamp,
-          'X-BAPI-RECV-WINDOW': recvWindow,
-        },
-      });
-
-      const resJson = await res.json();
-      if (res.ok && resJson.retCode === 0 && resJson.result?.list?.length > 0) {
-        const account = resJson.result.list[0];
-        const totalEquity = parseFloat(account.totalEquity || account.totalWalletBalance || '0');
-        const availableBal = parseFloat(account.totalAvailableBalance || account.totalMarginBalance || '0');
-
-        if (totalEquity > 0) {
-          return {
-            success: true,
-            equityUsdt: Number(totalEquity.toFixed(2)),
-            availableBalanceUsdt: Number(availableBal.toFixed(2)),
-            status: 'REAL_EXCHANGE_EQUITY',
-            messageFa: `✅ دریافت واقعی بالانس صرافی: Equity=$${totalEquity.toFixed(2)} | آزاد=$${availableBal.toFixed(2)}.`
-          };
-        }
-      }
-    } catch (err) {
-      console.error('Error fetching live wallet balance:', err);
-    }
-
-    // ۴۴. هیچ Fallback مالی (مانند فرض عدد 1000$) در لایو مجاز نیست
-    return {
-      success: false,
-      equityUsdt: 0,
-      availableBalanceUsdt: 0,
-      status: 'RISK_DATA_UNAVAILABLE',
-      messageFa: '🛑 [RISK_DATA_UNAVAILABLE]: عدم موفقیت در دریافت بالانس حساب لایو از صرافی؛ معامله به دلایل امنیتی متوقف گردید.'
-    };
-  }
-
-  /**
-   * Generates Bybit V5 HMAC-SHA256 Signature
-   */
-  public generateBybitSignature(
-    apiKey: string,
-    apiSecret: string,
-    timestamp: string,
-    recvWindow: string,
-    payloadOrQueryString: string
-  ): string {
-    const rawStr = timestamp + apiKey + recvWindow + payloadOrQueryString;
-    return crypto.createHmac('sha256', apiSecret).update(rawStr).digest('hex');
   }
 
   /**
@@ -250,263 +180,28 @@ export class HunterExecutionEngine {
   }
 
   /**
-   * Triggers the Hard Kill-Switch: Cancels orders, closes positions, freezes trading for 24 hours
+   * Blocks new SBK1 execution requests. Existing trades remain owned by Freqtrade.
    */
-  public async triggerHardKillSwitch(reason: string, creds?: BybitCredentials | null): Promise<void> {
-    const now = Date.now();
+  public async triggerHardKillSwitch(reason: string): Promise<void> {
     this.isKillSwitchActive = true;
     this.killSwitchReason = reason;
-    this.killSwitchFrozenUntilUtc = now + 24 * 60 * 60 * 1000; // 24 hours freeze
-
-    console.error(`🚨 [HARD KILL-SWITCH TRIGGERED]: ${reason}. Freezing trading for 24 hours.`);
-
-    if (creds && creds.apiKey && creds.apiSecret) {
-      try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = Date.now().toString();
-        const recvWindow = '5000';
-
-        // 1. Cancel all open orders
-        const cancelPayload = JSON.stringify({ category: 'linear', symbol: 'BTCUSDT' });
-        const cancelSig = this.generateBybitSignature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, cancelPayload);
-        await fetch(`${baseUrl}/v5/order/cancel-all`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-BAPI-API-KEY': creds.apiKey,
-            'X-BAPI-SIGN': cancelSig,
-            'X-BAPI-TIMESTAMP': timestamp,
-            'X-BAPI-RECV-WINDOW': recvWindow,
-          },
-          body: cancelPayload,
-        });
-
-        // 2. Fetch open positions and market close them
-        const positions = await this.reconcileBybitPositions(creds);
-        for (const pos of positions) {
-          if (pos.sizeBtc > 0) {
-            const closeSide = pos.side === 'LONG' ? 'Sell' : 'Buy';
-            const closePayload = JSON.stringify({
-              category: 'linear',
-              symbol: 'BTCUSDT',
-              side: closeSide,
-              orderType: 'Market',
-              qty: pos.sizeBtc.toString(),
-              reduceOnly: true,
-            });
-            const closeSig = this.generateBybitSignature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, closePayload);
-            await fetch(`${baseUrl}/v5/order/create`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': closeSig,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-              },
-              body: closePayload,
-            });
-          }
-        }
-      } catch (err) {
-        console.error('Error executing kill switch cancellation on Bybit:', err);
-      }
-    }
+    this.killSwitchFrozenUntilUtc = Date.now() + 24 * 60 * 60 * 1000;
+    console.error(`🚨 [HARD KILL-SWITCH TRIGGERED]: ${reason}. New SBK1 execution requests are blocked for 24 hours; open trades remain under Freqtrade management.`);
   }
 
-  /**
-   * Reconciles open positions directly with Bybit V5 `/v5/position/list`
-   */
-  public async reconcileBybitPositions(creds?: BybitCredentials | null): Promise<ReconciledPosition[]> {
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-      return [];
-    }
-
-    try {
-      const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-      const timestamp = Date.now().toString();
-      const recvWindow = '5000';
-      const queryString = 'category=linear&symbol=BTCUSDT';
-
-      const signature = this.generateBybitSignature(
-        creds.apiKey,
-        creds.apiSecret,
-        timestamp,
-        recvWindow,
-        queryString
-      );
-
-      const res = await fetch(`${baseUrl}/v5/position/list?${queryString}`, {
-        method: 'GET',
-        headers: {
-          'X-BAPI-API-KEY': creds.apiKey,
-          'X-BAPI-SIGN': signature,
-          'X-BAPI-TIMESTAMP': timestamp,
-          'X-BAPI-RECV-WINDOW': recvWindow,
-        },
-      });
-
-      const resJson = await res.json();
-      if (res.ok && resJson.retCode === 0 && resJson.result?.list) {
-        this.consecutiveApiErrors = 0;
-
-        const rawList = resJson.result.list;
-        return rawList
-          .filter((p: any) => parseFloat(p.size || '0') > 0)
-          .map((p: any) => {
-            const sizeBtc = parseFloat(p.size);
-            const entryPrice = parseFloat(p.avgPrice || p.entryPrice || '0');
-            const markPrice = parseFloat(p.markPrice || '0');
-            const unrealizedPnlUsd = parseFloat(p.unrealisedPnl || '0');
-            const leverage = parseFloat(p.leverage || '10');
-            const side: 'LONG' | 'SHORT' = p.side === 'Buy' ? 'LONG' : 'SHORT';
-            const liquidationPrice = parseFloat(p.liqPrice || '0');
-            const stopLossPrice = parseFloat(p.stopLoss || '0');
-            const takeProfitPrice = parseFloat(p.takeProfit || '0');
-
-            const initialMargin = (sizeBtc * entryPrice) / leverage;
-            const unrealizedPnlPct = initialMargin > 0 ? (unrealizedPnlUsd / initialMargin) * 100 : 0;
-
-            return {
-              symbol: 'BTCUSDT',
-              side,
-              sizeBtc,
-              entryPrice,
-              markPrice,
-              unrealizedPnlUsd: parseFloat(unrealizedPnlUsd.toFixed(2)),
-              unrealizedPnlPct: parseFloat(unrealizedPnlPct.toFixed(2)),
-              leverage,
-              liquidationPrice,
-              stopLossPrice,
-              takeProfitPrice,
-              isLiveSynced: true,
-              timestampUtc: Date.now(),
-            };
-          });
-      } else {
-        this.handleApiError(`Bybit position fetch returned code ${resJson.retCode}: ${resJson.retMsg}`, creds);
-        return [];
-      }
-    } catch (err: any) {
-      this.handleApiError(`Position fetch network error: ${err.message}`, creds);
-      return [];
-    }
-  }
-
-  private handleApiError(msg: string, creds?: BybitCredentials | null) {
+  private handleApiError(msg: string) {
     this.consecutiveApiErrors++;
     console.warn(`⚠️ [API Error ${this.consecutiveApiErrors}/3]: ${msg}`);
     if (this.consecutiveApiErrors >= 3) {
-      this.triggerHardKillSwitch(`بیش از ۳ خطای متوالی در ارتباط با API صرافی Bybit (${msg})`, creds);
+      void this.triggerHardKillSwitch(`بیش از ۳ خطای متوالی در ارتباط با Freqtrade (${msg})`);
     }
   }
 
-  /**
-   * ۳۵. استعلام قطعی وضعیت واقعی پر شدن سفارش از صرافی Bybit (Real Execution Query)
-   * اندپوینت‌های رسمی: `/v5/execution/list` و `/v5/order/realtime`
-   */
-  public async queryActualExchangeExecution(
-    orderId: string,
-    clientOrderId: string,
-    creds?: BybitCredentials | null
-  ): Promise<{
-    orderStatus: 'Filled' | 'PartiallyFilled' | 'New' | 'Cancelled' | 'Rejected' | 'Untriggered';
-    avgPrice: number;
-    cumExecQty: number;
-    cumExecFee: number;
-    execTime: number;
-    isVerifiedFromExchange: boolean;
-  }> {
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-      // در حالت شبیه‌ساز یا عدم وجود کلید صرافی
-      return {
-        orderStatus: 'Filled',
-        avgPrice: 0,
-        cumExecQty: 0,
-        cumExecFee: 0,
-        execTime: Date.now(),
-        isVerifiedFromExchange: false
-      };
-    }
-
-    try {
-      const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-      const timestamp = Date.now().toString();
-      const recvWindow = '5000';
-      const queryString = `category=linear&orderId=${orderId}&orderLinkId=${clientOrderId}`;
-
-      const signature = this.generateBybitSignature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, queryString);
-
-      // ۱. استعلام از order/realtime
-      const orderRes = await fetch(`${baseUrl}/v5/order/realtime?${queryString}`, {
-        method: 'GET',
-        headers: {
-          'X-BAPI-API-KEY': creds.apiKey,
-          'X-BAPI-SIGN': signature,
-          'X-BAPI-TIMESTAMP': timestamp,
-          'X-BAPI-RECV-WINDOW': recvWindow,
-        },
-      });
-
-      const orderJson = await orderRes.json();
-      if (orderRes.ok && orderJson.retCode === 0 && orderJson.result?.list?.length > 0) {
-        const orderData = orderJson.result.list[0];
-        const status = orderData.orderStatus as 'Filled' | 'PartiallyFilled' | 'New' | 'Cancelled' | 'Rejected';
-        const avgPrice = parseFloat(orderData.avgPrice || '0');
-        const cumExecQty = parseFloat(orderData.cumExecQty || '0');
-        const cumExecFee = parseFloat(orderData.cumExecFee || '0');
-        const execTime = parseInt(orderData.updatedTime || timestamp, 10);
-
-        return {
-          orderStatus: status,
-          avgPrice,
-          cumExecQty,
-          cumExecFee,
-          execTime,
-          isVerifiedFromExchange: true
-        };
-      }
-
-      // ۲. در صورت نیاز به جزئیات ریز معاملات، استعلام از /v5/execution/list
-      const execSig = this.generateBybitSignature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, `category=linear&orderId=${orderId}`);
-      const execRes = await fetch(`${baseUrl}/v5/execution/list?category=linear&orderId=${orderId}`, {
-        method: 'GET',
-        headers: {
-          'X-BAPI-API-KEY': creds.apiKey,
-          'X-BAPI-SIGN': execSig,
-          'X-BAPI-TIMESTAMP': timestamp,
-          'X-BAPI-RECV-WINDOW': recvWindow,
-        },
-      });
-      const execJson = await execRes.json();
-      if (execRes.ok && execJson.retCode === 0 && execJson.result?.list?.length > 0) {
-        const execList = execJson.result.list;
-        const totalQty = execList.reduce((sum: number, e: any) => sum + parseFloat(e.execQty || '0'), 0);
-        const totalValue = execList.reduce((sum: number, e: any) => sum + parseFloat(e.execValue || '0'), 0);
-        const totalFee = execList.reduce((sum: number, e: any) => sum + parseFloat(e.execFee || '0'), 0);
-        const avgPrice = totalQty > 0 ? totalValue / totalQty : 0;
-
-        return {
-          orderStatus: 'Filled',
-          avgPrice: parseFloat(avgPrice.toFixed(2)),
-          cumExecQty: totalQty,
-          cumExecFee: parseFloat(totalFee.toFixed(4)),
-          execTime: parseInt(execList[0].execTime || timestamp, 10),
-          isVerifiedFromExchange: true
-        };
-      }
-    } catch (err) {
-      console.warn('⚠️ Exception querying actual Bybit order execution state:', err);
-    }
-
-    return {
-      orderStatus: 'Filled',
-      avgPrice: 0,
-      cumExecQty: 0,
-      cumExecFee: 0,
-      execTime: Date.now(),
-      isVerifiedFromExchange: false
-    };
+  private haltAfterFreqtradeFailure(reason: string): void {
+    this.isKillSwitchActive = true;
+    this.killSwitchReason = `Freqtrade RPC failure: ${reason}`;
+    this.killSwitchFrozenUntilUtc = Date.now() + 24 * 60 * 60 * 1000;
+    console.error(`[HunterExecutionEngine] LIVE execution halted after Freqtrade RPC failure: ${reason}`);
   }
 
   /**
@@ -677,14 +372,14 @@ export class HunterExecutionEngine {
    */
   public async executeHunterOrder(
     signal: LiquiditySweepSignal,
-    creds?: BybitCredentials | null,
-    accountBalanceUsdt?: number,
+    _creds?: BybitCredentials | null,
+    _accountBalanceUsdt?: number,
     leverage = 10,
     signalCreatedTimestampMs?: number,
     freshMarketSnapshot?: AnalysisResult | null
   ): Promise<ExecutedOrderResult & { lifecycleStages?: OrderLifecycleState[] }> {
     const now = Date.now();
-    const environment: 'LIVE' | 'PAPER' | 'BACKTEST' = (creds && creds.apiKey) ? 'LIVE' : 'PAPER';
+    const environment: 'LIVE' | 'PAPER' | 'BACKTEST' = 'LIVE';
     const clientOrderId = `HNT_${signal.direction}_${now}_${Math.random().toString(36).substring(2, 6)}`;
     const lifecycleStages: OrderLifecycleState[] = ['CREATED'];
 
@@ -698,35 +393,77 @@ export class HunterExecutionEngine {
       predictionLatencyMs: 45,
       decisionLatencyMs: 18,
       orderSentLatencyMs: orderSentDelay,
-      exchangeAckLatencyMs: creds && creds.apiKey ? 75 : 12,
-      fillLatencyMs: creds && creds.apiKey ? 60 : 8,
-      totalChainLatencyMs: orderSentDelay + (creds && creds.apiKey ? 135 : 20),
+      exchangeAckLatencyMs: 75,
+      fillLatencyMs: 60,
+      totalChainLatencyMs: orderSentDelay + 135,
       isStaleSignalRejected: false,
       maxAllowableLatencyMs: 500,
     };
 
-    // بررسی حیاتی موجودی واقعی حساب: هیچ عدد پیش‌فرضی مجاز نیست
-    if (accountBalanceUsdt === undefined || accountBalanceUsdt === null || !Number.isFinite(accountBalanceUsdt) || accountBalanceUsdt <= 0) {
+    const failClosed = (
+      status: ExecutedOrderResult['status'],
+      messageFa: string,
+      orderId?: string,
+    ): ExecutedOrderResult & { lifecycleStages?: OrderLifecycleState[] } => ({
+      success: false,
+      orderId,
+      clientOrderId,
+      symbol: signal.symbol,
+      side: signal.direction === 'LONG' ? 'Buy' : 'Sell',
+      executedQty: 0,
+      expectedPrice: signal.entryPrice,
+      submittedPrice: signal.entryPrice,
+      actualAverageFillPrice: 0,
+      actualFeeUsd: 0,
+      actualSlippageUsd: 0,
+      actualSlippageBps: 0,
+      fillTimestampMs: 0,
+      isRealExchangeFill: false,
+      executionEnvironment: 'LIVE',
+      status,
+      messageFa,
+      timestampUtc: Date.now(),
+      latencyTrace,
+      lifecycleStages,
+    });
+
+    const balanceResult = await this.fetchLiveFreqtradeAccountBalance();
+    if (!balanceResult.success || balanceResult.availableBalanceUsdt <= 0) {
+      this.haltAfterFreqtradeFailure(balanceResult.messageFa);
+      return failClosed('REJECTED', balanceResult.messageFa);
+    }
+    const accountBalanceUsdt = balanceResult.availableBalanceUsdt;
+
+    try {
+      const botState = await freqtradeBridge.getStatus();
+      if (
+        !botState.ping ||
+        botState.status !== 'running' ||
+        botState.dryRun ||
+        !botState.forceEntryEnabled
+      ) {
+        return failClosed(
+          'REJECTED',
+          `🛑 اجرای live مجاز نیست؛ وضعیت Freqtrade: ${botState.status}، dry-run: ${botState.dryRun}، force_entry_enable: ${botState.forceEntryEnabled}.`,
+        );
+      }
+      const pair = freqtradeBridge.getConfiguredPair();
+      const whitelist = await freqtradeBridge.getWhitelist();
+      if (!whitelist.includes(pair)) {
+        return failClosed(
+          'REJECTED',
+          `🛑 نماد Freqtrade (${pair}) در whitelist فعال بات نیست؛ سفارشی ارسال نشد.`,
+        );
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.haltAfterFreqtradeFailure(reason);
+      return failClosed('REJECTED', `🛑 پیش‌بررسی Freqtrade ناموفق بود؛ سفارشی ارسال نشد: ${reason}`);
+    }
+
+    if (!Number.isFinite(accountBalanceUsdt) || accountBalanceUsdt <= 0) {
       return {
-        success: false,
-        clientOrderId,
-        symbol: 'BTCUSDT',
-        side: signal.direction === 'LONG' ? 'Buy' : 'Sell',
-        executedQty: 0,
-        expectedPrice: signal.entryPrice,
-        submittedPrice: signal.entryPrice,
-        actualAverageFillPrice: signal.entryPrice,
-        actualFeeUsd: 0,
-        actualSlippageUsd: 0,
-        actualSlippageBps: 0,
-        fillTimestampMs: now,
-        isRealExchangeFill: false,
-        executionEnvironment: environment,
-        status: 'NO_TRADE',
-        messageFa: '🛑 موجودی واقعی حساب صرافی در دسترس نیست یا صفر است (DATA_UNAVAILABLE / ZERO_BALANCE)؛ ارسال سفارش متوقف شد.',
-        timestampUtc: now,
-        latencyTrace,
-        lifecycleStages,
+        ...failClosed('REJECTED', '🛑 موجودی Freqtrade نامعتبر یا صفر است؛ سفارش ارسال نشد.'),
       };
     }
 
@@ -753,7 +490,7 @@ export class HunterExecutionEngine {
         (freshMarketSnapshot as any).candles || (freshMarketSnapshot as any).rawCandles || [],
         (freshMarketSnapshot as any).feedStatus
       );
-      if (!dataSafety.isLiveSafe && creds?.apiKey) {
+      if (!dataSafety.isLiveSafe) {
         return {
           success: false,
           clientOrderId,
@@ -925,7 +662,7 @@ export class HunterExecutionEngine {
         isRealExchangeFill: false,
         executionEnvironment: environment,
         status: 'NO_TRADE',
-        messageFa: `🛑 حجم محاسبه‌شده (${steppedQtyBtc} BTC) کمتر از حداقل مجاز صرافی Bybit (0.001 BTC / 5 USDT) است.`,
+        messageFa: `🛑 حجم محاسبه‌شده (${steppedQtyBtc} BTC) کمتر از حداقل مجاز اجرای سفارش است.`,
         timestampUtc: now,
         latencyTrace,
         lifecycleStages,
@@ -948,204 +685,126 @@ export class HunterExecutionEngine {
       nominalPrice: signal.entryPrice
     });
 
-    if (creds && creds.apiKey && creds.apiSecret) {
-      try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = Date.now().toString();
-        const recvWindow = '5000';
-
-        const payloadObj: Record<string, any> = {
-          category: 'linear',
-          symbol: 'BTCUSDT',
-          side,
-          orderType: 'Market',
-          qty: qtyBtc.toFixed(3),
-          tpslMode: 'Full',
-          orderLinkId: clientOrderId,
-        };
-
-        if (signal.takeProfitTarget1 && signal.takeProfitTarget1 > 0) {
-          payloadObj.takeProfit = signal.takeProfitTarget1.toString();
-          payloadObj.tpTriggerBy = 'LastPrice';
-        }
-
-        if (signal.invalidationStopLoss && signal.invalidationStopLoss > 0) {
-          payloadObj.stopLoss = signal.invalidationStopLoss.toString();
-          payloadObj.slTriggerBy = 'MarkPrice';
-        }
-
-        const jsonPayload = JSON.stringify(payloadObj);
-        const signature = this.generateBybitSignature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, jsonPayload);
-
-        const res = await fetch(`${baseUrl}/v5/order/create`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-BAPI-API-KEY': creds.apiKey,
-            'X-BAPI-SIGN': signature,
-            'X-BAPI-TIMESTAMP': timestamp,
-            'X-BAPI-RECV-WINDOW': recvWindow,
-          },
-          body: jsonPayload,
-        });
-
-        const resJson = await res.json();
-        if (res.ok && resJson.retCode === 0) {
-          this.consecutiveApiErrors = 0;
-          
-          // گام ۲: دریافت ACK از صرافی
-          lifecycleStages.push('ACK');
-          const exchangeOrderId = resJson.result?.orderId || `BYBIT_${now}`;
-
-          // ۳۵. استعلام Actual Fill واقعی از اندپوینت رسمی Bybit
-          const actualFillData = await this.queryActualExchangeExecution(exchangeOrderId, clientOrderId, creds);
-          
-          let finalActualFillPrice = actualFillData.avgPrice > 0 ? actualFillData.avgPrice : (
-            side === 'Buy' ? signal.entryPrice + expectedSlippageCalc.actualSlippageUsd : signal.entryPrice - expectedSlippageCalc.actualSlippageUsd
-          );
-          const finalExecutedQty = actualFillData.cumExecQty > 0 ? actualFillData.cumExecQty : qtyBtc;
-          const finalActualFee = actualFillData.cumExecFee > 0 ? actualFillData.cumExecFee : parseFloat((finalActualFillPrice * finalExecutedQty * 0.00055).toFixed(4));
-          const actualSlippageUsd = Math.abs(finalActualFillPrice - signal.entryPrice);
-          const actualSlippageBps = Number(((actualSlippageUsd / signal.entryPrice) * 10000).toFixed(2));
-
-          // تغییر وضعیت Lifecycle بر اساس گزارش رسمی صرافی
-          if (actualFillData.orderStatus === 'PartiallyFilled') {
-            lifecycleStages.push('PARTIALLY_FILLED');
-          } else {
-            lifecycleStages.push('FILLED');
-          }
-
-          // ۳۷. آموزش آنلاین مدل Slippage با Actual Fill
-          this.recordActualSlippageForLearning({
-            expectedSlippageUsd: expectedSlippageCalc.expectedSlippageUsd,
-            actualSlippageUsd,
-            orderSizeBtc: finalExecutedQty,
-            orderBookDepthUsd: freshMarketSnapshot?.realObiData?.bidDepthUsd || 1250000,
-            spreadBps: 1.4,
-            volatilityPct: freshMarketSnapshot?.volatilityPct || 1.2
-          });
-
-          // ۳۶. ثبت در Central Trade Dataset با داده‌های کاملاً واقعی
-          try {
-            centralTradeDatasetService.recordPrediction({
-              price: signal.entryPrice,
-              atr: signal.invalidationStopLoss ? Math.abs(signal.entryPrice - signal.invalidationStopLoss) / 1.5 : 100,
-              setupContext: { setupType: signal.setupType },
-              marketRegime: freshMarketSnapshot?.marketRegime || 'TREND',
-              timeframe: '15m',
-            }, signal.direction, undefined, 'EXECUTED_FILLED');
-          } catch {}
-
-          return {
-            success: true,
-            orderId: exchangeOrderId,
-            clientOrderId,
-            symbol: 'BTCUSDT',
-            side,
-            executedQty: finalExecutedQty,
-            expectedPrice: signal.entryPrice,
-            submittedPrice,
-            actualAverageFillPrice: parseFloat(finalActualFillPrice.toFixed(2)),
-            actualFeeUsd: finalActualFee,
-            actualSlippageUsd: parseFloat(actualSlippageUsd.toFixed(2)),
-            actualSlippageBps,
-            fillTimestampMs: actualFillData.execTime || now,
-            isRealExchangeFill: actualFillData.isVerifiedFromExchange,
-            executionEnvironment: 'LIVE',
-            status: actualFillData.orderStatus === 'PartiallyFilled' ? 'PARTIALLY_FILLED' : 'FILLED',
-            messageFa: `✅ اجرای تاییدشده صرافی: ${actualFillData.isVerifiedFromExchange ? 'داده زنده Bybit' : 'تطبیق اجرایی'} • قیمت فیل واقعی: $${finalActualFillPrice.toFixed(2)} (اسلیپیج: $${actualSlippageUsd.toFixed(2)} / ${actualSlippageBps} bps | کارمزد: $${finalActualFee.toFixed(4)}).`,
-            timestampUtc: now,
-            latencyTrace,
-            lifecycleStages,
-          };
-        } else {
-          this.handleApiError(`Order create failed: ${resJson.retMsg}`, creds);
-          return {
-            success: false,
-            clientOrderId,
-            symbol: 'BTCUSDT',
-            side,
-            executedQty: 0,
-            expectedPrice: signal.entryPrice,
-            submittedPrice,
-            actualAverageFillPrice: signal.entryPrice,
-            actualFeeUsd: 0,
-            actualSlippageUsd: 0,
-            actualSlippageBps: 0,
-            fillTimestampMs: now,
-            isRealExchangeFill: false,
-            executionEnvironment: 'LIVE',
-            status: 'REJECTED',
-            messageFa: `🛑 رد سفارش Bybit: ${resJson.retMsg}`,
-            timestampUtc: now,
-            lifecycleStages,
-          };
-        }
-      } catch (err: any) {
-        this.handleApiError(`Order execution network exception: ${err.message}`, creds);
-        return {
-          success: false,
-          clientOrderId,
-          symbol: 'BTCUSDT',
-          side,
-          executedQty: 0,
-          expectedPrice: signal.entryPrice,
-          submittedPrice,
-          actualAverageFillPrice: signal.entryPrice,
-          actualFeeUsd: 0,
-          actualSlippageUsd: 0,
-          actualSlippageBps: 0,
-          fillTimestampMs: now,
-          isRealExchangeFill: false,
-          executionEnvironment: 'LIVE',
-          status: 'REJECTED',
-          messageFa: `🛑 خطای شبکه صرافی: ${err.message}`,
-          timestampUtc: now,
-          lifecycleStages,
-        };
-      }
+    let entryAcknowledgement: Awaited<ReturnType<typeof freqtradeBridge.forceEntry>>;
+    try {
+      entryAcknowledgement = await freqtradeBridge.forceEntry({
+        pair: freqtradeBridge.getConfiguredPair(),
+        side: signal.direction === 'LONG' ? 'long' : 'short',
+        orderType: 'market',
+        stakeAmount: Number(((qtyBtc * signal.entryPrice) / enforcedLeverage).toFixed(8)),
+        leverage: enforcedLeverage,
+        entryTag: clientOrderId,
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const wasDefinitelyRejected =
+        error instanceof FreqtradeRpcError &&
+        error.statusCode !== undefined &&
+        error.statusCode >= 400 &&
+        error.statusCode < 500;
+      if (!wasDefinitelyRejected) this.handleApiError(`Freqtrade entry outcome is unknown: ${reason}`);
+      if (!wasDefinitelyRejected) this.haltAfterFreqtradeFailure(reason);
+      return failClosed(
+        wasDefinitelyRejected ? 'REJECTED' : 'UNKNOWN_IN_FLIGHT',
+        `🛑 ${wasDefinitelyRejected ? 'Freqtrade سفارش را رد کرد' : 'وضعیت ارسال به Freqtrade نامعلوم است'}؛ هیچ Fill فرضی ثبت نشد: ${reason}`,
+      );
     }
 
-    // حالت Paper Trading / شبیه‌ساز واقعی
-    const simulatedFillPrice = side === 'Buy'
-      ? signal.entryPrice + expectedSlippageCalc.actualSlippageUsd
-      : signal.entryPrice - expectedSlippageCalc.actualSlippageUsd;
-    const simulatedFee = parseFloat((simulatedFillPrice * qtyBtc * 0.00055).toFixed(4));
-    const simulatedSlippageUsd = parseFloat((expectedSlippageCalc.actualSlippageUsd * qtyBtc).toFixed(2));
-
+    const tradeId = entryAcknowledgement.trade_id;
     lifecycleStages.push('ACK');
-    lifecycleStages.push('FILLED');
+    let trade;
+    try {
+      trade = await freqtradeBridge.getTrade(tradeId);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.handleApiError(`Freqtrade acknowledged trade ${tradeId} but status reconciliation failed: ${reason}`);
+      this.haltAfterFreqtradeFailure(reason);
+      lifecycleStages.push('SUBMITTED');
+      return failClosed(
+        'UNKNOWN_IN_FLIGHT',
+        `⚠️ درخواست ورود توسط Freqtrade پذیرفته شد اما وضعیت سفارش قابل استعلام نیست؛ از ارسال مجدد خودداری کنید: ${reason}`,
+        String(tradeId),
+      );
+    }
 
-    this.recordActualSlippageForLearning({
-      expectedSlippageUsd: expectedSlippageCalc.expectedSlippageUsd,
-      actualSlippageUsd: expectedSlippageCalc.actualSlippageUsd,
-      orderSizeBtc: qtyBtc,
-      orderBookDepthUsd: 1250000,
-      spreadBps: 1.4,
-      volatilityPct: 1.2
-    });
+    const entrySide = trade.is_short ? 'sell' : 'buy';
+    const entryOrders = trade.orders.filter((order) => order.ft_order_side.toLowerCase() === entrySide);
+    const filledOrders = entryOrders.filter((order) => Number.isFinite(order.filled) && (order.filled ?? 0) > 0);
+    const finalExecutedQty = filledOrders.reduce((total, order) => total + (order.filled ?? 0), 0);
+    const finalActualFillPrice = finalExecutedQty > 0 ? trade.open_rate : 0;
+    const actualFee = Number.isFinite(trade.fee_open_cost) ? trade.fee_open_cost ?? 0 : 0;
+    const fillTimestamp = filledOrders.reduce(
+      (latest, order) => Math.max(latest, order.order_filled_timestamp ?? 0),
+      0,
+    );
+    const hasPendingEntry = entryOrders.some((order) => order.is_open);
+    const isRejected = finalExecutedQty === 0 &&
+      entryOrders.length > 0 &&
+      entryOrders.every((order) => ['canceled', 'cancelled', 'rejected', 'expired'].includes(order.status.toLowerCase()));
 
-    return {
-      success: true,
-      orderId: `SIM_${now}`,
-      clientOrderId,
-      symbol: 'BTCUSDT',
-      side,
-      executedQty: qtyBtc,
-      expectedPrice: signal.entryPrice,
-      submittedPrice,
-      actualAverageFillPrice: parseFloat(simulatedFillPrice.toFixed(2)),
-      actualFeeUsd: simulatedFee,
-      actualSlippageUsd: simulatedSlippageUsd,
-      actualSlippageBps: expectedSlippageCalc.actualSlippageBps,
-      fillTimestampMs: now,
-      isRealExchangeFill: false,
-      executionEnvironment: 'PAPER',
-      status: 'PAPER_FILLED',
-      messageFa: `✅ اجرای شبیه‌ساز واقع‌گرایانه: قیمت فیل $${simulatedFillPrice.toFixed(2)} (اسلیپیج محاسباتی: $${simulatedSlippageUsd.toFixed(2)} | کارمزد: $${simulatedFee.toFixed(4)}).`,
-      timestampUtc: now,
-      lifecycleStages,
-    };
+    if (finalExecutedQty > 0 && finalActualFillPrice > 0) {
+      const isPartialFill = hasPendingEntry;
+      lifecycleStages.push(isPartialFill ? 'PARTIALLY_FILLED' : 'FILLED');
+      const actualSlippageUsd = Math.abs(finalActualFillPrice - signal.entryPrice);
+      const actualSlippageBps = signal.entryPrice > 0
+        ? Number(((actualSlippageUsd / signal.entryPrice) * 10000).toFixed(2))
+        : 0;
+
+      this.consecutiveApiErrors = 0;
+      this.recordActualSlippageForLearning({
+        expectedSlippageUsd: expectedSlippageCalc.expectedSlippageUsd,
+        actualSlippageUsd,
+        orderSizeBtc: finalExecutedQty,
+        orderBookDepthUsd: freshMarketSnapshot?.realObiData?.bidDepthUsd || 1250000,
+        spreadBps: 1.4,
+        volatilityPct: freshMarketSnapshot?.volatilityPct || 1.2,
+      });
+      try {
+        centralTradeDatasetService.recordPrediction({
+          price: signal.entryPrice,
+          atr: signal.invalidationStopLoss ? Math.abs(signal.entryPrice - signal.invalidationStopLoss) / 1.5 : 100,
+          setupContext: { setupType: signal.setupType },
+          marketRegime: freshMarketSnapshot?.marketRegime || 'TREND',
+          timeframe: '15m',
+        }, signal.direction, undefined, 'EXECUTED_FILLED');
+      } catch (error) {
+        console.error('[HunterExecutionEngine] Could not record confirmed Freqtrade fill:', error);
+      }
+
+      return {
+        success: true,
+        orderId: String(tradeId),
+        clientOrderId,
+        symbol: trade.pair,
+        side,
+        executedQty: finalExecutedQty,
+        expectedPrice: signal.entryPrice,
+        submittedPrice,
+        actualAverageFillPrice: Number(finalActualFillPrice.toFixed(8)),
+        actualFeeUsd: actualFee,
+        actualSlippageUsd: Number((actualSlippageUsd * finalExecutedQty).toFixed(8)),
+        actualSlippageBps,
+        fillTimestampMs: fillTimestamp,
+        isRealExchangeFill: true,
+        executionEnvironment: 'LIVE',
+        status: isPartialFill ? 'PARTIALLY_FILLED' : 'FILLED',
+        messageFa: `✅ وضعیت و Fill واقعی از Freqtrade تأیید شد؛ حجم پرشده ${finalExecutedQty}، میانگین قیمت ${finalActualFillPrice}.`,
+        timestampUtc: Date.now(),
+        latencyTrace,
+        lifecycleStages,
+      };
+    }
+
+    if (isRejected) {
+      return failClosed('REJECTED', '🛑 سفارش ورود Freqtrade بدون Fill رد یا لغو شد.', String(tradeId));
+    }
+
+    lifecycleStages.push('SUBMITTED');
+    return failClosed(
+      'SUBMITTED',
+      '⏳ Freqtrade سفارش را پذیرفته اما هنوز Fill تأیید نشده است؛ وضعیت فرضی ثبت نشد.',
+      String(tradeId),
+    );
   }
 
   public getSlippageLearningHistory(): SlippageLearningSample[] {

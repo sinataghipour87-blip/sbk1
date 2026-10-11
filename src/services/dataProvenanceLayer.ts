@@ -12,8 +12,6 @@
  * - Item 59: "No Trade" as an Explicit High-Value Decision
  */
 
-import { centralTradeDatasetService } from './centralTradeDataset';
-
 export type FeatureStatus = 'VALID' | 'STALE' | 'UNKNOWN';
 
 export interface FeatureProvenance {
@@ -23,9 +21,9 @@ export interface FeatureProvenance {
   value: any;
   exchange: string;
   endpoint: string;
-  timestampMs: number;
-  ageMs: number;
-  latencyMs: number;
+  timestampMs: number | null;
+  ageMs: number | null;
+  latencyMs: number | null;
   quality: 'HIGH' | 'DEGRADED' | 'UNRELIABLE' | 'UNKNOWN';
   transformation: string;
   isCritical: boolean;
@@ -63,14 +61,15 @@ export interface EmpiricalPatternMetric {
 }
 
 export interface AntiChasingMfeAssessment {
+  status: 'AVAILABLE' | 'UNAVAILABLE';
   setupType: string;
-  historicalMfeMedianPct: number;
-  historicalMfeP75Pct: number;
-  realizedMfePct: number;
-  realizedMfeRatio: number; // realized / median MFE
+  historicalMfeMedianPct: number | null;
+  historicalMfeP75Pct: number | null;
+  realizedMfePct: number | null;
+  realizedMfeRatio: number | null;
   maxEntryThresholdRatio: number; // e.g. 0.65
-  isChasingDetected: boolean;
-  isEdgeExhausted: boolean;
+  isChasingDetected: boolean | null;
+  isEdgeExhausted: boolean | null;
   reasonFa: string;
 }
 
@@ -127,10 +126,10 @@ export interface MandatoryFeedProvenanceRecord {
   symbol: string;
   marketType: MarketType;
   timeframe: string; // e.g. '15m', '1m', 'TICK'
-  sourceTimestampMs: number;
-  receivedTimestampMs: number;
-  networkLatencyMs: number;
-  dataAgeMs: number;
+  sourceTimestampMs: number | null;
+  receivedTimestampMs: number | null;
+  networkLatencyMs: number | null;
+  dataAgeMs: number | null;
   status: FeedOperationalStatus;
   dataCategory: DataIntegrityCategory;
   numericalValidity: boolean;
@@ -161,99 +160,7 @@ export interface CentralMandatoryDataIntegrityReport {
 export class DataProvenanceLayerService {
   private static instance: DataProvenanceLayerService;
 
-  // Real Empirical Pattern Library backed by dataset metrics (Item 56)
-  private patternLibrary: Record<string, EmpiricalPatternMetric> = {
-    WYCKOFF_SPRING: {
-      patternId: 'WYCKOFF_SPRING',
-      nameFa: 'انباشت وایکوف و جاروی نقدینگی کف (Wyckoff Spring)',
-      archetypeType: 'WYCKOFF_SPRING',
-      sampleCount: 1420,
-      winRate: 0.684,
-      medianReturnPct: 2.35,
-      maePct: 0.48,
-      mfePct: 3.10,
-      durationMinutes: 24,
-      regime: 'ACCUMULATION_RANGE',
-      oosPerformance: {
-        sampleCount: 380,
-        winRate: 0.665,
-        profitFactor: 2.14,
-        maxDrawdownPct: 1.8,
-      },
-    },
-    UPTHRUST_BLOWOFF: {
-      patternId: 'UPTHRUST_BLOWOFF',
-      nameFa: 'توزیع سقف و تله هیجانی (Wyckoff Upthrust)',
-      archetypeType: 'UPTHRUST_BLOWOFF',
-      sampleCount: 1180,
-      winRate: 0.652,
-      medianReturnPct: -2.20,
-      maePct: 0.52,
-      mfePct: 2.95,
-      durationMinutes: 22,
-      regime: 'DISTRIBUTION_TOP',
-      oosPerformance: {
-        sampleCount: 290,
-        winRate: 0.638,
-        profitFactor: 1.95,
-        maxDrawdownPct: 2.1,
-      },
-    },
-    V_SHAPE_SWEEP: {
-      patternId: 'V_SHAPE_SWEEP',
-      nameFa: 'شکار نقدینگی سریع و جهش V شکل (V-Shape Sweep)',
-      archetypeType: 'V_SHAPE_SWEEP',
-      sampleCount: 1890,
-      winRate: 0.712,
-      medianReturnPct: 2.80,
-      maePct: 0.42,
-      mfePct: 3.45,
-      durationMinutes: 18,
-      regime: 'VOLATILITY_SWEEP',
-      oosPerformance: {
-        sampleCount: 450,
-        winRate: 0.695,
-        profitFactor: 2.38,
-        maxDrawdownPct: 1.4,
-      },
-    },
-    DOUBLE_BOTTOM: {
-      patternId: 'DOUBLE_BOTTOM',
-      nameFa: 'کف دوقلوی ساختاری و جذب سفارشات (Double Bottom)',
-      archetypeType: 'DOUBLE_BOTTOM',
-      sampleCount: 960,
-      winRate: 0.628,
-      medianReturnPct: 1.90,
-      maePct: 0.61,
-      mfePct: 2.40,
-      durationMinutes: 32,
-      regime: 'TREND_REVERSAL',
-      oosPerformance: {
-        sampleCount: 210,
-        winRate: 0.610,
-        profitFactor: 1.78,
-        maxDrawdownPct: 2.4,
-      },
-    },
-    MOMENTUM_FLAG: {
-      patternId: 'MOMENTUM_FLAG',
-      nameFa: 'پرچم تثبیت مومنتوم (Momentum Flag Continuation)',
-      archetypeType: 'MOMENTUM_FLAG',
-      sampleCount: 2150,
-      winRate: 0.645,
-      medianReturnPct: 2.10,
-      maePct: 0.55,
-      mfePct: 2.75,
-      durationMinutes: 28,
-      regime: 'TREND_CONTINUATION',
-      oosPerformance: {
-        sampleCount: 520,
-        winRate: 0.632,
-        profitFactor: 1.88,
-        maxDrawdownPct: 2.0,
-      },
-    },
-  };
+  private patternLibrary: Record<string, EmpiricalPatternMetric> = {};
 
   public static getInstance(): DataProvenanceLayerService {
     if (!DataProvenanceLayerService.instance) {
@@ -267,16 +174,26 @@ export class DataProvenanceLayerService {
    */
   public extractFeatureProvenance(analysis: any, currentPrice: number): Record<string, FeatureProvenance> {
     const now = Date.now();
-    const exchange = 'BYBIT';
-
-    // Helper to evaluate feature status
-    const evalStatus = (val: any, isCritical: boolean, StaleMaxAgeMs = 15000): { status: FeatureStatus; ageMs: number; quality: FeatureProvenance['quality'] } => {
-      if (val === undefined || val === null || (typeof val === 'number' && isNaN(val))) {
-        return { status: 'UNKNOWN', ageMs: 999999, quality: 'UNKNOWN' };
+    const evalStatus = (
+      value: unknown,
+      maxAgeMs: number,
+      eventTimestampMs?: number,
+      receivedTimestampMs?: number,
+      feedStatus?: string,
+    ): { status: FeatureStatus; ageMs: number | null; quality: FeatureProvenance['quality'] } => {
+      if (value === undefined || value === null || (typeof value === 'number' && !Number.isFinite(value))) {
+        return { status: 'UNKNOWN', ageMs: null, quality: 'UNKNOWN' };
       }
-      const snapshotTs = analysis?.canonicalSnapshot?.timestampUtc || analysis?.evaluatedAt || now;
-      const ageMs = Math.max(0, now - snapshotTs);
-      if (ageMs > StaleMaxAgeMs) {
+      if (
+        !Number.isFinite(eventTimestampMs) ||
+        !Number.isFinite(receivedTimestampMs) ||
+        eventTimestampMs! > receivedTimestampMs! ||
+        receivedTimestampMs! > now + 1000
+      ) {
+        return { status: 'UNKNOWN', ageMs: null, quality: 'UNKNOWN' };
+      }
+      const ageMs = now - eventTimestampMs!;
+      if (feedStatus !== 'LIVE' && feedStatus !== 'VERIFIED_REALTIME' || ageMs < 0 || ageMs > maxAgeMs) {
         return { status: 'STALE', ageMs, quality: 'DEGRADED' };
       }
       return { status: 'VALID', ageMs, quality: 'HIGH' };
@@ -285,18 +202,25 @@ export class DataProvenanceLayerService {
     const features: Record<string, FeatureProvenance> = {};
 
     // 1. Ticker / Last Price
-    const priceVal = typeof currentPrice === 'number' && currentPrice > 1000 ? currentPrice : null;
-    const priceEval = evalStatus(priceVal, true, 5000);
+    const priceFeed = analysis?.futuresPrices;
+    const priceVal = typeof currentPrice === 'number' && Number.isFinite(currentPrice) && currentPrice > 0 ? currentPrice : null;
+    const priceEval = evalStatus(
+      priceVal,
+      5000,
+      priceFeed?.timestampUtc,
+      priceFeed?.receivedTimestampMs,
+      priceFeed?.status,
+    );
     features['TICKER_PRICE'] = {
       key: 'TICKER_PRICE',
       nameFa: 'قیمت لایو تیکر (Last Price)',
       status: priceEval.status,
       value: priceVal !== null ? priceVal : 'UNKNOWN',
-      exchange,
-      endpoint: '/v5/market/tickers',
-      timestampMs: now - priceEval.ageMs,
+      exchange: priceFeed?.source || 'UNKNOWN',
+      endpoint: priceFeed ? '/v5/market/tickers' : 'UNKNOWN',
+      timestampMs: Number.isFinite(priceFeed?.timestampUtc) ? priceFeed.timestampUtc : null,
       ageMs: priceEval.ageMs,
-      latencyMs: 18,
+      latencyMs: Number.isFinite(priceFeed?.latencyMs) ? priceFeed.latencyMs : null,
       quality: priceEval.quality,
       transformation: 'RAW_REALTIME_STREAM',
       isCritical: true,
@@ -304,19 +228,28 @@ export class DataProvenanceLayerService {
     };
 
     // 2. Order Book Imbalance (OBI) - Item 51: Explicitly distinguish OBI=0 from missing OBI
-    const rawObi = analysis?.obi;
+    const orderBookFeed = analysis?.realObiData;
+    const rawObi = orderBookFeed?.obi;
     const isObiAvailable = rawObi !== undefined && rawObi !== null && typeof rawObi === 'number' && !isNaN(rawObi);
-    const obiEval = evalStatus(isObiAvailable ? rawObi : null, true, 8000);
+    const obiEval = evalStatus(
+      isObiAvailable ? rawObi : null,
+      8000,
+      orderBookFeed?.timestamp,
+      typeof orderBookFeed?.timestamp === 'number' && typeof orderBookFeed?.ageMs === 'number'
+        ? orderBookFeed.timestamp + orderBookFeed.ageMs
+        : undefined,
+      orderBookFeed?.status,
+    );
     features['ORDER_BOOK_OBI'] = {
       key: 'ORDER_BOOK_OBI',
       nameFa: 'عدم توازن دفتر سفارشات (OBI)',
       status: isObiAvailable ? obiEval.status : 'UNKNOWN',
       value: isObiAvailable ? rawObi : 'UNKNOWN',
-      exchange,
-      endpoint: '/v5/market/orderbook',
-      timestampMs: now - obiEval.ageMs,
+      exchange: orderBookFeed?.source || 'UNKNOWN',
+      endpoint: orderBookFeed ? '/v5/market/orderbook' : 'UNKNOWN',
+      timestampMs: Number.isFinite(orderBookFeed?.timestamp) ? orderBookFeed.timestamp : null,
       ageMs: obiEval.ageMs,
-      latencyMs: 25,
+      latencyMs: Number.isFinite(orderBookFeed?.latencyMs) ? orderBookFeed.latencyMs : null,
       quality: isObiAvailable ? obiEval.quality : 'UNKNOWN',
       transformation: 'L2_DEPTH_IMBALANCE_RATIO',
       isCritical: true,
@@ -326,19 +259,28 @@ export class DataProvenanceLayerService {
     };
 
     // 3. Funding Rate & Open Interest (OI) - Item 52
-    const rawFunding = analysis?.fundingRate ?? analysis?.funding;
-    const isFundingAvailable = rawFunding !== undefined && rawFunding !== null && typeof rawFunding === 'number' && !isNaN(rawFunding);
-    const fundingEval = evalStatus(isFundingAvailable ? rawFunding : null, true, 30000);
+    const derivativesFeed = analysis?.derivativesData;
+    const rawFunding = derivativesFeed?.funding;
+    const isFundingAvailable = typeof rawFunding === 'number' && Number.isFinite(rawFunding);
+    const fundingEval = evalStatus(
+      isFundingAvailable ? rawFunding : null,
+      30000,
+      derivativesFeed?.timestampUtc,
+      typeof derivativesFeed?.timestampUtc === 'number' && typeof derivativesFeed?.ageMs === 'number'
+        ? derivativesFeed.timestampUtc + derivativesFeed.ageMs
+        : undefined,
+      derivativesFeed?.status,
+    );
     features['DERIVATIVES_FUNDING'] = {
       key: 'DERIVATIVES_FUNDING',
       nameFa: 'نرخ تامین مالی مشتقه (Funding Rate)',
       status: isFundingAvailable ? fundingEval.status : 'UNKNOWN',
       value: isFundingAvailable ? rawFunding : 'UNKNOWN',
-      exchange,
-      endpoint: '/v5/market/funding/history',
-      timestampMs: now - fundingEval.ageMs,
+      exchange: derivativesFeed?.source || 'UNKNOWN',
+      endpoint: derivativesFeed?.source || 'UNKNOWN',
+      timestampMs: Number.isFinite(derivativesFeed?.timestampUtc) ? derivativesFeed.timestampUtc : null,
       ageMs: fundingEval.ageMs,
-      latencyMs: 42,
+      latencyMs: Number.isFinite(derivativesFeed?.latencyMs) ? derivativesFeed.latencyMs : null,
       quality: isFundingAvailable ? fundingEval.quality : 'UNKNOWN',
       transformation: 'DERIVATIVES_8H_RATE',
       isCritical: true,
@@ -346,21 +288,48 @@ export class DataProvenanceLayerService {
         ? `فاندینگ ریت ${(rawFunding * 100).toFixed(4)}٪ است.`
         : '⚠️ فاندینگ ریت قطعی است؛ صفر به عنوان داده واقعی وارد پیش‌بینی نمی‌شود (UNKNOWN).',
     };
+    const rawOpenInterest = derivativesFeed?.oi;
+    const hasOpenInterest = typeof rawOpenInterest === 'number' && Number.isFinite(rawOpenInterest) && rawOpenInterest > 0;
+    const openInterestEval = evalStatus(
+      hasOpenInterest ? rawOpenInterest : null,
+      30000,
+      derivativesFeed?.timestampUtc,
+      typeof derivativesFeed?.timestampUtc === 'number' && typeof derivativesFeed?.ageMs === 'number'
+        ? derivativesFeed.timestampUtc + derivativesFeed.ageMs
+        : undefined,
+      derivativesFeed?.status,
+    );
+    features['DERIVATIVES_OPEN_INTEREST'] = {
+      key: 'DERIVATIVES_OPEN_INTEREST',
+      nameFa: 'بهره باز مشتقه (Open Interest)',
+      status: openInterestEval.status,
+      value: hasOpenInterest ? rawOpenInterest : 'UNKNOWN',
+      exchange: derivativesFeed?.source || 'UNKNOWN',
+      endpoint: derivativesFeed?.source || 'UNKNOWN',
+      timestampMs: Number.isFinite(derivativesFeed?.timestampUtc) ? derivativesFeed.timestampUtc : null,
+      ageMs: openInterestEval.ageMs,
+      latencyMs: Number.isFinite(derivativesFeed?.latencyMs) ? derivativesFeed.latencyMs : null,
+      quality: openInterestEval.quality,
+      transformation: 'RAW_OPEN_INTEREST',
+      isCritical: true,
+      diagnosticFa: hasOpenInterest ? 'داده Open Interest دارای منبع و زمان دریافت معتبر است.' : 'Open Interest معتبر و دارای provenance در دسترس نیست.',
+    };
 
     // 4. Volatility / ATR
     const rawAtr = analysis?.atr;
-    const isAtrValid = typeof rawAtr === 'number' && rawAtr > 0 && !isNaN(rawAtr);
-    const atrEval = evalStatus(isAtrValid ? rawAtr : null, true, 15000);
+    const isAtrValid = typeof rawAtr === 'number' && rawAtr > 0 && Number.isFinite(rawAtr);
+    const candleFeed = analysis?.candleProvenance;
+    const atrEval = evalStatus(isAtrValid ? rawAtr : null, 15000, candleFeed?.eventTimestampMs, candleFeed?.receivedTimestampMs, candleFeed?.status);
     features['VOLATILITY_ATR'] = {
       key: 'VOLATILITY_ATR',
       nameFa: 'شاخص نوسانات (ATR)',
       status: isAtrValid ? atrEval.status : 'UNKNOWN',
       value: isAtrValid ? rawAtr : 'UNKNOWN',
-      exchange,
-      endpoint: '/v5/market/kline',
-      timestampMs: now - atrEval.ageMs,
+      exchange: candleFeed?.source || 'UNKNOWN',
+      endpoint: candleFeed?.source || 'UNKNOWN',
+      timestampMs: Number.isFinite(candleFeed?.eventTimestampMs) ? candleFeed.eventTimestampMs : null,
       ageMs: atrEval.ageMs,
-      latencyMs: 12,
+      latencyMs: Number.isFinite(candleFeed?.latencyMs) ? candleFeed.latencyMs : null,
       quality: isAtrValid ? atrEval.quality : 'UNKNOWN',
       transformation: '14_PERIOD_ATR_SMA',
       isCritical: true,
@@ -369,19 +338,32 @@ export class DataProvenanceLayerService {
 
     // 5. Calibrated Win Probability
     const rawProb = analysis?.calibratedWinProbability;
-    const isProbValid = typeof rawProb === 'number' && !isNaN(rawProb);
+    const calibration = analysis?.calibratedMetadata;
+    const isProbValid = typeof rawProb === 'number' &&
+      Number.isFinite(rawProb) &&
+      rawProb >= 0 &&
+      rawProb <= 1 &&
+      calibration?.isCalibrationVerified === true &&
+      Number.isFinite(calibration?.validatedAtMs);
+    const probabilityEval = evalStatus(
+      isProbValid ? rawProb : null,
+      300000,
+      calibration?.validatedAtMs,
+      calibration?.validatedAtMs,
+      isProbValid ? 'LIVE' : undefined,
+    );
     features['CALIBRATED_PROBABILITY'] = {
       key: 'CALIBRATED_PROBABILITY',
       nameFa: 'احتمال کالیبره‌شده آماری',
-      status: isProbValid ? 'VALID' : 'UNKNOWN',
+      status: probabilityEval.status,
       value: isProbValid ? rawProb : 'UNKNOWN',
-      exchange: 'INTERNAL_CALIBRATOR',
-      endpoint: 'OOS_ISOTONIC_MODEL',
-      timestampMs: now,
-      ageMs: 0,
-      latencyMs: 5,
-      quality: isProbValid ? 'HIGH' : 'UNKNOWN',
-      transformation: 'OOS_PLATT_SCALING',
+      exchange: calibration?.modelId || 'UNKNOWN',
+      endpoint: calibration?.validationDatasetId || 'UNKNOWN',
+      timestampMs: Number.isFinite(calibration?.validatedAtMs) ? calibration.validatedAtMs : null,
+      ageMs: probabilityEval.ageMs,
+      latencyMs: null,
+      quality: probabilityEval.quality,
+      transformation: calibration?.method || 'UNKNOWN',
       isCritical: true,
       diagnosticFa: isProbValid ? `احتمال کالیبره‌شده ${(rawProb * 100).toFixed(1)}٪ است.` : 'احتمال کالیبره‌شده مفقود است (UNKNOWN).',
     };
@@ -412,8 +394,8 @@ export class DataProvenanceLayerService {
       const names = missingCriticals.map((m) => m.nameFa).join('، ');
       provenanceSummaryFa = `🛑 مسدودسازی پیش‌بینی: ویژگی‌های حیاتی [${names}] در وضعیت UNKNOWN هستند.`;
     } else if (staleCriticals.length > 0) {
-      overallIntegrityStatus = 'DEGRADED_STALE';
-      provenanceSummaryFa = '⚠️ برخی ویژگی‌ها منقضی (STALE) هستند اما به علت حاشیه ایمنی پردازش شدند.';
+      overallIntegrityStatus = 'BLOCKED_MISSING_CRITICAL';
+      provenanceSummaryFa = '🛑 داده حیاتی منقضی است و برای تصمیم معاملاتی قابل استفاده نیست.';
     }
 
     const snapshotDraft: ImmutableFeatureSnapshot = {
@@ -448,10 +430,25 @@ export class DataProvenanceLayerService {
       ? 'UPTHRUST_BLOWOFF'
       : 'MOMENTUM_FLAG';
 
-    const patternMetric = this.patternLibrary[patternKey] || this.patternLibrary['MOMENTUM_FLAG'];
+    const patternMetric = this.patternLibrary[patternKey];
 
     // Calculate how much move has already been realized relative to entry candidate
     const realizedMovePct = Math.abs(price - entryPriceCandidate) / Math.max(1, entryPriceCandidate) * 100;
+    if (!patternMetric || candles.length === 0) {
+      return {
+        status: 'UNAVAILABLE',
+        setupType,
+        historicalMfeMedianPct: null,
+        historicalMfeP75Pct: null,
+        realizedMfePct: Number.isFinite(realizedMovePct) ? Number(realizedMovePct.toFixed(2)) : null,
+        realizedMfeRatio: null,
+        maxEntryThresholdRatio: 0.65,
+        isChasingDetected: null,
+        isEdgeExhausted: null,
+        reasonFa: 'داده تاریخی معتبر و out-of-sample برای این الگو موجود نیست؛ anti-chasing تجربی نامشخص است.',
+      };
+    }
+
     const historicalMfeMedianPct = patternMetric.mfePct;
     const historicalMfeP75Pct = patternMetric.mfePct * 1.35;
 
@@ -467,6 +464,7 @@ export class DataProvenanceLayerService {
     }
 
     return {
+      status: 'AVAILABLE',
       setupType,
       historicalMfeMedianPct,
       historicalMfeP75Pct,
@@ -484,51 +482,8 @@ export class DataProvenanceLayerService {
    * ۴۵ & ۴۶. قرنطینه داده‌های مرجع استاتیک و اجبار به محاسبه واقعی از روی دیتاست زنده در حالت LIVE
    */
   public getEmpiricalPatternLibrary(isLiveMode: boolean = false): Record<string, EmpiricalPatternMetric> {
-    if (!isLiveMode) {
-      return this.patternLibrary;
-    }
-
-    // در حالت LIVE: محاسبه زنده و تجربی تمام الگوها از روی Central Dataset
-    const realDataset = centralTradeDatasetService.getAllPredictions();
-    const cleanRecords = realDataset.filter(p => p.outcome !== undefined && p.entryPrice && p.entryPrice > 0);
-
-    if (cleanRecords.length >= 3) {
-      const wins = cleanRecords.filter(p => p.outcome === 'WIN').length;
-      const winRate = wins / cleanRecords.length;
-      const maes = cleanRecords.map(p => (p.MAE || 0) / (p.entryPrice || 1) * 100);
-      const mfes = cleanRecords.map(p => (p.MFE || 0) / (p.entryPrice || 1) * 100);
-      const avgMae = maes.reduce((a, b) => a + b, 0) / maes.length;
-      const avgMfe = mfes.reduce((a, b) => a + b, 0) / mfes.length;
-
-      const livePattern: EmpiricalPatternMetric = {
-        patternId: 'LIVE_EMPIRICAL_PATTERN',
-        nameFa: 'الگوی پویای کالیبره‌شده از معاملات زنده',
-        archetypeType: 'V_SHAPE_SWEEP',
-        sampleCount: cleanRecords.length,
-        winRate: Number(winRate.toFixed(3)),
-        medianReturnPct: Number(avgMfe.toFixed(2)),
-        maePct: Number(avgMae.toFixed(2)),
-        mfePct: Number(avgMfe.toFixed(2)),
-        durationMinutes: 20,
-        regime: 'LIVE_EMPIRICAL_DATASET',
-        oosPerformance: {
-          sampleCount: Math.round(cleanRecords.length * 0.3),
-          winRate: Number(winRate.toFixed(3)),
-          profitFactor: 2.15,
-          maxDrawdownPct: 1.5,
-        },
-      };
-
-      return {
-        WYCKOFF_SPRING: { ...livePattern, patternId: 'WYCKOFF_SPRING', nameFa: 'انباشت وایکوف (داده تجربی زنده)' },
-        UPTHRUST_BLOWOFF: { ...livePattern, patternId: 'UPTHRUST_BLOWOFF', nameFa: 'توزیع سقف (داده تجربی زنده)' },
-        V_SHAPE_SWEEP: { ...livePattern, patternId: 'V_SHAPE_SWEEP', nameFa: 'شکار نقدینگی V-Shape (داده تجربی زنده)' },
-        DOUBLE_BOTTOM: { ...livePattern, patternId: 'DOUBLE_BOTTOM', nameFa: 'کف دوقلو (داده تجربی زنده)' },
-        MOMENTUM_FLAG: { ...livePattern, patternId: 'MOMENTUM_FLAG', nameFa: 'پرچم مومنتوم (داده تجربی زنده)' },
-      };
-    }
-
-    // اگر در لایو هنوز داده زنده کافی نباشد، هیچ الگوی مصنوعی برنمی‌گرداند
+    void isLiveMode;
+    // The available dataset has no per-pattern, leakage-safe out-of-sample split.
     return {};
   }
 
@@ -825,10 +780,27 @@ export class DataProvenanceLayerService {
     customStatus?: FeedOperationalStatus;
   }): MandatoryFeedProvenanceRecord {
     const now = Date.now();
-    const sourceTimestampMs = params.sourceTimestampMs || now;
-    const receivedTimestampMs = params.receivedTimestampMs || now;
-    const networkLatencyMs = params.networkLatencyMs ?? Math.max(0, receivedTimestampMs - sourceTimestampMs);
-    const dataAgeMs = Math.max(0, now - sourceTimestampMs);
+    const sourceTimestampMs = Number.isFinite(params.sourceTimestampMs) ? params.sourceTimestampMs! : null;
+    const receivedTimestampMs = Number.isFinite(params.receivedTimestampMs) ? params.receivedTimestampMs! : null;
+    const networkLatencyMs = Number.isFinite(params.networkLatencyMs) && params.networkLatencyMs! >= 0
+      ? params.networkLatencyMs!
+      : null;
+    const dataAgeMs = sourceTimestampMs === null ? null : now - sourceTimestampMs;
+    const timeframeMatch = /^(\d+)(m|h|d)$/.exec(params.timeframe);
+    const timeframeAgeLimitMs = params.timeframe === 'TICK'
+      ? 3000
+      : timeframeMatch
+        ? Number(timeframeMatch[1]) * (timeframeMatch[2] === 'm' ? 60_000 : timeframeMatch[2] === 'h' ? 3_600_000 : 86_400_000) * 2 + 1500
+        : 15000;
+    const provenanceTimeValid =
+      sourceTimestampMs !== null &&
+      receivedTimestampMs !== null &&
+      networkLatencyMs !== null &&
+      sourceTimestampMs > 0 &&
+      receivedTimestampMs >= sourceTimestampMs &&
+      receivedTimestampMs <= now + 1000 &&
+      dataAgeMs !== null &&
+      dataAgeMs >= 0;
 
     // Check synthetic / sandbox contamination
     const isSyntheticExplicit = Boolean(
@@ -875,7 +847,11 @@ export class DataProvenanceLayerService {
     } else if (!numericalValidity || ohlcvAudit.dataCategory === 'INVALID_DATA') {
       status = 'UNAVAILABLE';
       dataCategory = 'INVALID_DATA';
-    } else if (dataAgeMs > 15000) {
+    } else if (!provenanceTimeValid) {
+      status = 'UNAVAILABLE';
+      dataCategory = 'INVALID_DATA';
+      numericalValidity = false;
+    } else if (dataAgeMs! > timeframeAgeLimitMs) {
       status = 'STALE';
       dataCategory = 'STALE_DATA';
     }
@@ -892,9 +868,12 @@ export class DataProvenanceLayerService {
     } else if (status === 'UNAVAILABLE' || !numericalValidity || dataCategory === 'INVALID_DATA') {
       isTradePermitted = false;
       validationReasonFa = `🛑 داده‌های فید نامعتبر یا دارای تناقض عددی هستند: ${ohlcvAudit.violations.join('؛ ') || 'عدم اعتبار پارامترهای قیمتی'}`;
+    } else if (!provenanceTimeValid) {
+      isTradePermitted = false;
+      validationReasonFa = '🛑 زمان رویداد، زمان دریافت یا latency اندازه‌گیری‌شده فید موجود یا معتبر نیست.';
     } else if (status === 'STALE' || dataCategory === 'STALE_DATA') {
       isTradePermitted = false;
-      validationReasonFa = `🛑 سن داده (${(dataAgeMs / 1000).toFixed(1)} ثانیه) فراتر از آستانه مجاز (۱۵ ثانیه) است؛ فید به وضعیت STALE تغییر یافت.`;
+      validationReasonFa = `🛑 سن داده (${(dataAgeMs! / 1000).toFixed(1)} ثانیه) از حد مجاز این تایم‌فریم فراتر است؛ فید STALE است.`;
     } else {
       isTradePermitted = true;
       validationReasonFa = `✅ فید زنده تایید شد: تاخیر شبکه ${networkLatencyMs}ms، سن داده ${dataAgeMs}ms، تمام اصول صحت سنجیده شدند.`;
@@ -946,6 +925,9 @@ export class DataProvenanceLayerService {
     lastPrice: number | null;
     markPrice: number | null;
     indexPrice: number | null;
+    sourceTimestampMs?: number;
+    receivedTimestampMs?: number;
+    networkLatencyMs?: number;
     candles?: any[];
     feedStatus?: string;
   }): CentralMandatoryDataIntegrityReport {
@@ -987,6 +969,9 @@ export class DataProvenanceLayerService {
       symbol: 'BTCUSDT',
       marketType: 'LINEAR_PERPETUAL',
       timeframe: '15m',
+      sourceTimestampMs: params.sourceTimestampMs,
+      receivedTimestampMs: params.receivedTimestampMs,
+      networkLatencyMs: params.networkLatencyMs,
       candles: params.candles,
       rawPriceValues: {
         lastPrice: params.lastPrice,

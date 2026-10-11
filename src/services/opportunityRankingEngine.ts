@@ -190,14 +190,12 @@ export class OpportunityRankingEngine {
 
   private createMissingPriceDualResult(): DualDirectionEvaluationResult {
     return {
-      longOpportunity: null,
-      shortOpportunity: null,
-      comparison: {
-        scoreSpread: 0,
-        dominance: 'EQUAL',
-        verdictFa: '🛑 لغو ارزیابی دوطرفه: قیمت واقعی بازار مفقود است (UNKNOWN)؛ جایگزینی با قیمت فرضی مجاز نیست.',
-        executionAction: 'HOLD_BOTH',
-      },
+      longCandidate: null,
+      shortCandidate: null,
+      selectedOpportunity: null,
+      evaluationMode: 'HEAD_TO_HEAD_INDEPENDENT',
+      arbitrationVerdictFa: '🛑 لغو ارزیابی دوطرفه: قیمت واقعی بازار مفقود است (UNKNOWN)؛ جایگزینی با قیمت فرضی مجاز نیست.',
+      rankedOpportunities: [],
     };
   }
 
@@ -205,12 +203,12 @@ export class OpportunityRankingEngine {
     return {
       detectedMarketRegime: 'UNKNOWN',
       regimeRationaleFa: '🛑 عدم دسترسی به قیمت لحظه‌ای بازار؛ تعیین رژیم مسدود شد.',
+      isMarketSafeForTrading: false,
       dataQualityScore: 0,
-      isTradeAllowed: false,
-      evaluatedOpportunities: [],
-      selectedOpportunity: null,
-      overallDecision: 'NO_TRADE',
-      decisionRationaleFa: '🛑 قیمت بازار مفقود است (UNKNOWN)؛ معامله بر اساس مقادیر فرضی اکیداً ممنوع است.',
+      allOpportunities: [],
+      approvedRankedOpportunities: [],
+      topSelectedOpportunity: null,
+      arbitrationVerdictFa: '🛑 قیمت بازار مفقود است (UNKNOWN)؛ معامله بر اساس مقادیر فرضی اکیداً ممنوع است.',
     };
   }
 

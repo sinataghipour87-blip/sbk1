@@ -68,7 +68,7 @@ export interface Brain4PatternDivergence {
   patternMatchPct: number;
   matchedPatternName: string;
   reversal30mProbabilityPct: number | null;
-  expectedMove30mPct: number;
+  expectedMove30mPct: number | null;
   calibratedProbabilityPct: number | null;
   rationaleFa: string;
 }
@@ -488,7 +488,7 @@ export function runUnifiedMultiBrainEnsemble(
     reversal30mProbabilityPct: reversalAnalysis.reversalProbability,
     expectedMove30mPct: reversalAnalysis.expectedMovePct30m,
     calibratedProbabilityPct: reversalAnalysis.reversalProbability !== null ? Math.round(reversalAnalysis.reversalProbability) : null,
-    rationaleFa: `محاسبه احتمال برگشت با الگوی تاریخی "${reversalAnalysis.primaryMatchedPattern.nameFa}" با درصد شباهت ${reversalAnalysis.primaryMatchedPattern.similarityPct}٪.`
+    rationaleFa: `امتیاز شباهت هیوریستیک ${reversalAnalysis.primaryMatchedPattern.similarityPct}٪ است؛ احتمال و بازده کالیبره‌شده موجود نیست و خروجی غیرقابل معامله است.`
   };
 
   // ۵. مغز ۵: کنترل‌کننده ریسک پویای پوزیشن (Risk Controller - Item 5)

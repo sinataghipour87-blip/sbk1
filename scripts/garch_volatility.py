@@ -1,104 +1,123 @@
-import sys
 import json
 import math
+import sys
+
+
+def unavailable_result(reason):
+    return {
+        "status": "DATA_UNAVAILABLE",
+        "tradeEligible": False,
+        "modelType": "fixed_parameter_garch_approximation",
+        "reason": reason,
+        "regime": None,
+        "conditionalVolatilityPctPerCandle": None,
+        "historicalMeanVolatilityPctPerCandle": None,
+        "volatilityRatio": None,
+        "expansionProbability": None,
+        "targetMultiplier": None,
+        "series": [],
+    }
+
+
+def parse_candle(candle):
+    if isinstance(candle, dict):
+        values = [candle.get(key) for key in ("open", "high", "low", "close", "volume")]
+    elif isinstance(candle, (list, tuple)) and len(candle) >= 5:
+        values = candle[:5]
+    else:
+        return None
+
+    try:
+        opening, high, low, close, volume = (float(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+
+    if not all(math.isfinite(value) for value in (opening, high, low, close, volume)):
+        return None
+    if min(opening, high, low, close) <= 0 or volume < 0:
+        return None
+    if high < max(opening, close) or low > min(opening, close) or high < low:
+        return None
+    return opening, high, low, close, volume
+
 
 def calculate_garch_regime(data):
-    candles = data.get('candles', [])
-    if len(candles) < 20:
-        return {
-            "regime": "NORMAL",
-            "volatilityForecast": 1.5,
-            "expansionProbability": 50.0,
-            "targetMultiplier": 1.0,
-            "description": "داده‌های کندلی در حال پردازش اولیه هستند."
-        }
+    candles = data.get("candles")
+    if not isinstance(candles, list) or len(candles) < 20:
+        return unavailable_result("At least 20 valid market candles are required.")
 
-    closes = [float(c[3]) for c in candles]
-    highs = [float(c[1]) for c in candles]
-    lows = [float(c[2]) for c in candles]
-    
-    # Calculate Log Returns
-    returns = []
-    for i in range(1, len(closes)):
-        if closes[i-1] > 0:
-            returns.append(math.log(closes[i] / closes[i-1]))
-    
-    # Estimate GARCH(1,1) Parameters (omega, alpha, beta)
-    # sigma_t^2 = omega + alpha * epsilon_{t-1}^2 + beta * sigma_{t-1}^2
+    parsed_candles = [parse_candle(candle) for candle in candles]
+    if any(candle is None for candle in parsed_candles):
+        return unavailable_result("Market candles contain missing or invalid OHLCV values.")
+
+    closes = [candle[3] for candle in parsed_candles]
+    returns = [math.log(current / previous) for previous, current in zip(closes, closes[1:])]
+    if not returns or not all(math.isfinite(value) for value in returns):
+        return unavailable_result("Market candles do not produce finite returns.")
+
     omega = 0.000005
     alpha = 0.12
     beta = 0.85
-    
-    variance = sum([r**2 for r in returns]) / max(1, len(returns))
+    variance = sum(value * value for value in returns) / len(returns)
     variances = [variance]
-    
-    for r in returns:
-        var_t = omega + (alpha * (r**2)) + (beta * variances[-1])
-        variances.append(var_t)
-        
-    latest_vol_pct = math.sqrt(variances[-1]) * 100.0 * math.sqrt(24) # Annualized/Intraday scaling
-    avg_vol_pct = math.sqrt(sum(variances) / len(variances)) * 100.0 * math.sqrt(24)
-    
-    vol_ratio = latest_vol_pct / max(0.01, avg_vol_pct)
-    
-    if vol_ratio > 1.4:
-        regime = "HIGH_VOLATILITY_EXPANSION"
-        expansion_prob = 85.0
-        target_multiplier = 1.35
-        desc = "رژیم انبساط شدید نوسان (Volatility Breakout): پتانسیل پرتاب سریع قیمت به سمت تارگت‌های ۲ و ۳."
-    elif vol_ratio < 0.7:
-        regime = "VOLATILITY_SQUEEZE"
-        expansion_prob = 78.0
-        target_multiplier = 0.90
-        desc = "رژیم فشردگی باندها (Squeeze Accumulation): آمادگی انفجار قریب‌الوقوع در جهت روند اصلی."
+    for value in returns:
+        variance = omega + alpha * value * value + beta * variance
+        if not math.isfinite(variance) or variance <= 0:
+            return unavailable_result("Volatility recursion produced an invalid variance.")
+        variances.append(variance)
+
+    current_volatility_pct = math.sqrt(variances[-1]) * 100
+    mean_volatility_pct = math.sqrt(sum(variances) / len(variances)) * 100
+    if not all(math.isfinite(value) for value in (current_volatility_pct, mean_volatility_pct)) or mean_volatility_pct <= 0:
+        return unavailable_result("Volatility estimate is unavailable.")
+
+    volatility_ratio = current_volatility_pct / mean_volatility_pct
+    if volatility_ratio > 1.4:
+        regime = "HIGH_VOLATILITY"
+    elif volatility_ratio < 0.7:
+        regime = "LOW_VOLATILITY"
     else:
-        regime = "BALANCED_REGIME"
-        expansion_prob = 50.0
-        target_multiplier = 1.10
-        desc = "رژیم تعادل حرکتی نوسان: حرکت نرم قیمت مطابق با کانال فیبوناچی استاندارد."
+        regime = "BALANCED_VOLATILITY"
 
-    # Calculate localized historical series for line-chart comparison (last 25 points)
-    history_points = []
-    num_pts = min(25, len(variances))
-    
-    # Calculate localized True Range for each candle
-    atr_values = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        atr_pct = (tr / max(1.0, closes[i-1])) * 100.0
-        atr_values.append(atr_pct)
-
-    recent_vars = variances[-num_pts:]
-    recent_atr = atr_values[-num_pts:] if len(atr_values) >= num_pts else ([1.2] * num_pts)
-    
-    for i in range(len(recent_vars)):
-        garch_vol = math.sqrt(recent_vars[i]) * 100.0 * math.sqrt(24)
-        atr_val = recent_atr[i] if i < len(recent_atr) else recent_atr[-1]
-        history_points.append({
-            "step": i + 1,
-            "garch": round(garch_vol, 2),
-            "atr": round(atr_val, 2)
-        })
+    series = [
+        {
+            "step": index + 1,
+            "conditionalVolatilityPctPerCandle": round(math.sqrt(value) * 100, 4),
+        }
+        for index, value in enumerate(variances[-25:])
+    ]
 
     return {
+        "status": "ANALYSIS_ONLY",
+        "tradeEligible": False,
+        "modelType": "fixed_parameter_garch_approximation",
+        "parameterStatus": "FIXED_NOT_FITTED_OR_VALIDATED",
+        "volatilityUnit": "PERCENT_PER_CANDLE",
+        "omega": omega,
+        "alpha": alpha,
+        "beta": beta,
         "regime": regime,
-        "currentVol": round(latest_vol_pct, 2),
-        "meanVol": round(avg_vol_pct, 2),
-        "volRatio": round(vol_ratio, 2),
-        "expansionProbability": expansion_prob,
-        "targetMultiplier": target_multiplier,
-        "description": desc,
-        "series": history_points
+        "conditionalVolatilityPctPerCandle": round(current_volatility_pct, 4),
+        "historicalMeanVolatilityPctPerCandle": round(mean_volatility_pct, 4),
+        "volatilityRatio": round(volatility_ratio, 4),
+        "expansionProbability": None,
+        "targetMultiplier": None,
+        "forecastHorizonCandles": 1,
+        "series": series,
     }
+
 
 def main():
     try:
-        input_data = json.load(sys.stdin)
-        result = calculate_garch_regime(input_data)
-        print(json.dumps(result))
-    except Exception as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            raise ValueError("Input must be a JSON object.")
+        result = calculate_garch_regime(data)
+        print(json.dumps(result, allow_nan=False))
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        print(json.dumps(unavailable_result(str(error)), allow_nan=False))
+
 
 if __name__ == "__main__":
     main()

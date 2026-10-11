@@ -671,8 +671,12 @@ export interface HistoricalPatternMatch {
   similarityPct: number;
   samplePeriod: string;
   historicalOutcome: 'REVERSED_UP' | 'REVERSED_DOWN' | 'CONTINUED_BULL' | 'CONTINUED_BEAR';
-  avgReturnPct30m: number;
+  avgReturnPct30m: number | null;
   winRatePct: number | null; // Strictly empirical from verified dataset or null
+  sampleCount: number | null;
+  maePct: number | null;
+  mfePct: number | null;
+  durationMinutes: number | null;
   isEmpiricallyCalibrated: boolean;
 }
 
@@ -685,30 +689,33 @@ export interface ReversalPillarIndicator {
 }
 
 export interface Pattern30mReversalAnalysis {
+  analysisStatus: 'ANALYSIS_ONLY' | 'DATA_UNAVAILABLE';
+  tradeEligible: false;
+  scoreType: 'HEURISTIC_PATTERN_SIMILARITY_NOT_CONFIDENCE';
   reversalProbability: number | null; // null if not empirical OOS calibrated
   reversalSignalStrength: number; // 0 - 100 heuristic indicator strength
   continuationProbability: number | null;
   continuationSignalStrength: number; // 0 - 100 heuristic continuation strength
   predictedTrend30m: 'BULLISH_REVERSAL' | 'BEARISH_REVERSAL' | 'BULLISH_CONTINUATION' | 'BEARISH_CONTINUATION' | 'NEUTRAL_CHOP';
-  expectedPrice30m: number;
-  expectedMovePct30m: number;
+  expectedPrice30m: number | null;
+  expectedMovePct30m: number | null;
   confidenceScore: number;
-  timeToReversalEstimatedMinutes: number;
+  timeToReversalEstimatedMinutes: number | null;
   primaryMatchedPattern: HistoricalPatternMatch;
   topHistoricalMatches: HistoricalPatternMatch[];
   confluenceIndicators: ReversalPillarIndicator[];
   sniperActionRecommendation: {
-    action: 'PREPARE_REVERSAL_SNIPE' | 'RIDE_CONTINUATION_MOMENTUM' | 'LOCK_BREAKEVEN_AND_HOLD' | 'HIGH_VOLATILITY_SCALP';
+    action: 'NO_TRADE_UNCALIBRATED';
     optimalEntryPrice: number;
     recommendedSniperSl: number;
     quickBreakevenTarget: number;
-    tp30mTarget: number;
+    tp30mTarget: number | null;
     maxRiskPct: number;
-    projectedRiskReward: number;
+    projectedRiskReward: number | null;
     guidanceFa: string;
   };
   tradeFrequencyProtection: {
-    status: 'ACTIVE_HIGH_FREQUENCY';
+    status: 'NO_EMPIRICAL_EDGE';
     noteFa: string;
   };
 }
@@ -754,40 +761,47 @@ export function predict30mTrendReversalPatternLayer(
   } else {
     // Fail-Closed: اگر سابقه کندل‌های زنده کافی نیست، هیچ داده جعلی ساخته نمی‌شود
     return {
+      analysisStatus: 'DATA_UNAVAILABLE',
+      tradeEligible: false,
+      scoreType: 'HEURISTIC_PATTERN_SIMILARITY_NOT_CONFIDENCE',
       reversalProbability: null,
       reversalSignalStrength: 0,
       continuationProbability: null,
       continuationSignalStrength: 0,
       predictedTrend30m: 'NEUTRAL_CHOP',
-      expectedPrice30m: p,
-      expectedMovePct30m: 0,
+      expectedPrice30m: null,
+      expectedMovePct30m: null,
       confidenceScore: 0,
-      timeToReversalEstimatedMinutes: 0,
+      timeToReversalEstimatedMinutes: null,
       primaryMatchedPattern: {
         patternId: 'NO_DATA',
         nameFa: 'داده ناکافی',
         similarityPct: 0,
         samplePeriod: 'RECENT',
         historicalOutcome: 'CONTINUED_BULL',
-        avgReturnPct30m: 0,
+        avgReturnPct30m: null,
         winRatePct: null,
+        sampleCount: null,
+        maePct: null,
+        mfePct: null,
+        durationMinutes: null,
         isEmpiricallyCalibrated: false
       },
       topHistoricalMatches: [],
       confluenceIndicators: [],
       sniperActionRecommendation: {
-        action: 'HIGH_VOLATILITY_SCALP',
+        action: 'NO_TRADE_UNCALIBRATED',
         optimalEntryPrice: p,
         recommendedSniperSl: p * 0.99,
         quickBreakevenTarget: p * 1.005,
-        tp30mTarget: p * 1.015,
+        tp30mTarget: null,
         maxRiskPct: 1,
-        projectedRiskReward: 1.5,
-        guidanceFa: 'داده‌های زنده ناکافی است.'
+        projectedRiskReward: null,
+        guidanceFa: 'داده کندلی کافی نیست؛ پیش‌بینی و سفارش معاملاتی صادر نمی‌شود.'
       },
       tradeFrequencyProtection: {
-        status: 'ACTIVE_HIGH_FREQUENCY',
-        noteFa: 'داده‌های زنده در دسترس نیست.'
+        status: 'NO_EMPIRICAL_EDGE',
+        noteFa: 'داده کندلی کافی نیست.'
       }
     };
   }
@@ -810,8 +824,6 @@ export function predict30mTrendReversalPatternLayer(
     period: string;
     targetTrend: 'REVERSED_UP' | 'REVERSED_DOWN' | 'CONTINUED_BULL' | 'CONTINUED_BEAR';
     archetypeVector: number[];
-    historicalReturnPct: number;
-    baseMinutesToReversal: number;
   }> = [
     {
       id: 'wyckoff_spring',
@@ -819,55 +831,43 @@ export function predict30mTrendReversalPatternLayer(
       period: 'مارکت واقعی بیت‌کوین - کف‌های واگرا Q4',
       targetTrend: 'REVERSED_UP',
       archetypeVector: [-0.4, -0.8, -1.2, -1.8, -2.2, -0.6, 0.5, 1.2, 1.8, 1.5, 1.2],
-      historicalReturnPct: 2.15,
-      baseMinutesToReversal: 16
     },
     {
       id: 'blowoff_upthrust',
       nameFa: 'تله سقف هیجانی و فرسایش حجم (Wyckoff Upthrust / Blow-off Top)',
-      period: 'مارکت واقعی بیت‌کوین - سقف‌های اشباع خرید',
+      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
       targetTrend: 'REVERSED_DOWN',
       archetypeVector: [0.3, 0.7, 1.1, 1.9, 2.3, 0.4, -0.7, -1.3, -1.7, -1.4, -1.1],
-      historicalReturnPct: -2.30,
-      baseMinutesToReversal: 18
     },
     {
       id: 'v_shape_liquidity_sweep',
       nameFa: 'سقوط استاپ‌هانتر و جهش V شکل شارپ (V-Shape Liquidity Absorption)',
-      period: 'شکار نقدینگی استاپ معامله‌گران خرد',
+      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
       targetTrend: 'REVERSED_UP',
       archetypeVector: [-0.2, -0.5, -1.5, -2.6, 0.8, 1.9, 2.1, 1.6, 1.3, 0.9, 0.6],
-      historicalReturnPct: 2.60,
-      baseMinutesToReversal: 14
     },
     {
       id: 'double_bottom_divergence',
       nameFa: 'کف دوقلوی ساختاری همراه با واگرایی پنهان مومنتوم و جذب اردربوک',
-      period: 'تثبیت محدوده تقاضا نهنگ‌ها',
+      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
       targetTrend: 'REVERSED_UP',
       archetypeVector: [-1.2, -0.4, 0.6, 0.2, -1.1, 0.4, 1.1, 1.4, 1.2, 1.0, 0.8],
-      historicalReturnPct: 1.85,
-      baseMinutesToReversal: 22
     },
     {
       id: 'rounding_distribution_top',
       nameFa: 'چرخش فرسایشی توزیع سقف همراه با دیوارهای سنگین فروش نهنگ',
-      period: 'خروج تدریجی پول هوشمند در فاز رنج',
+      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
       targetTrend: 'REVERSED_DOWN',
       archetypeVector: [1.2, 1.1, 0.7, 0.3, -0.2, -0.6, -1.1, -1.5, -1.3, -1.0, -0.8],
-      historicalReturnPct: -1.75,
-      baseMinutesToReversal: 20
     },
     {
       id: 'persistent_momentum_flag',
       nameFa: 'پرچم ادامه‌دهنده پرقدرت مومنتوم (Bull/Bear Momentum Highway)',
-      period: 'امواج تثبیت روند بدون فرسایش',
+      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
       targetTrend: isBullish ? 'CONTINUED_BULL' : 'CONTINUED_BEAR',
       archetypeVector: isBullish
         ? [0.5, 0.8, 0.3, 0.4, 0.9, 1.2, 0.6, 0.8, 1.4, 1.1, 0.9]
         : [-0.5, -0.8, -0.3, -0.4, -0.9, -1.2, -0.6, -0.8, -1.4, -1.1, -0.9],
-      historicalReturnPct: isBullish ? 2.45 : -2.45,
-      baseMinutesToReversal: 30
     }
   ];
 
@@ -892,22 +892,19 @@ export function predict30mTrendReversalPatternLayer(
     const similarityPct = Math.min(98.0, Math.max(0.0, Math.round(((cosineSim + 1) / 2 * 100) * 10) / 10));
 
     // دریافت آمارهای واقعی و مستند از لایه منشا داده‌ها (بند ۵۶)
-    const empiricalLib = dataProvenanceLayerService.getEmpiricalPatternLibrary();
-    const metric = empiricalLib[arch.id.toUpperCase()] || empiricalLib['MOMENTUM_FLAG'];
-
     return {
       patternId: arch.id,
-      nameFa: `${arch.nameFa} (تعداد نمونه: ${metric?.sampleCount || 1000} | MAE: ${metric?.maePct}% | MFE: ${metric?.mfePct}%)`,
+      nameFa: `${arch.nameFa} (شباهت هیوریستیک؛ آمار تجربی ناموجود)`,
       similarityPct, // Similarity is strictly a feature, NOT a probability (Item 57)
       samplePeriod: arch.period,
       historicalOutcome: arch.targetTrend,
-      avgReturnPct30m: arch.historicalReturnPct,
-      winRatePct: metric ? Math.round(metric.winRate * 100) : null,
-      sampleCount: metric?.sampleCount,
-      maePct: metric?.maePct,
-      mfePct: metric?.mfePct,
-      durationMinutes: metric?.durationMinutes,
-      isEmpiricallyCalibrated: true
+      avgReturnPct30m: null,
+      winRatePct: null,
+      sampleCount: null,
+      maePct: null,
+      mfePct: null,
+      durationMinutes: null,
+      isEmpiricallyCalibrated: false
     };
   });
 
@@ -1013,30 +1010,22 @@ export function predict30mTrendReversalPatternLayer(
 
   // تعیین وضعیت جهت‌گیری پیش‌بینی ۳۰ دقیقه آینده بر اساس قدرت برداری سیگنال
   let predictedTrend30m: Pattern30mReversalAnalysis['predictedTrend30m'];
-  let expectedMovePct30m = 0;
-  let timeToReversalEstimatedMinutes = 20;
+  const expectedMovePct30m = null;
+  const timeToReversalEstimatedMinutes = null;
 
   if (reversalSignalStrength >= 65) {
     if (isBullish) {
       predictedTrend30m = 'BEARISH_REVERSAL';
-      expectedMovePct30m = -Math.abs(primaryMatchedPattern.avgReturnPct30m || 1.6);
-      timeToReversalEstimatedMinutes = 16;
     } else {
       predictedTrend30m = 'BULLISH_REVERSAL';
-      expectedMovePct30m = Math.abs(primaryMatchedPattern.avgReturnPct30m || 1.8);
-      timeToReversalEstimatedMinutes = 15;
     }
   } else if (continuationSignalStrength >= 60) {
     predictedTrend30m = isBullish ? 'BULLISH_CONTINUATION' : 'BEARISH_CONTINUATION';
-    expectedMovePct30m = isBullish ? 2.1 : -2.1;
-    timeToReversalEstimatedMinutes = 30;
   } else {
     predictedTrend30m = 'NEUTRAL_CHOP';
-    expectedMovePct30m = 0.4;
-    timeToReversalEstimatedMinutes = 25;
   }
 
-  const expectedPrice30m = Math.round((p * (1 + expectedMovePct30m / 100)) * 100) / 100;
+  const expectedPrice30m = null;
   const confidenceScore = Math.round(primaryMatchedPattern.similarityPct);
 
   // 6. معماری تضمین سود حداکثر، ریسک صفر یا حداقل، و حفظ فرکانس معاملات
@@ -1068,28 +1057,10 @@ export function predict30mTrendReversalPatternLayer(
     : Math.round((optimalEntryPrice - beOffset) * 100) / 100;
 
   // تارگت سود ۳۰ دقیقه آینده
-  const tp30mTarget = expectedPrice30m;
-  const projectedGain = Math.abs(tp30mTarget - optimalEntryPrice);
-  const projectedRiskReward = Math.round((projectedGain / Math.max(1, slDist)) * 10) / 10;
-
-  let actionType: Pattern30mReversalAnalysis['sniperActionRecommendation']['action'];
-  let guidanceFa = '';
-
-  if (reversalSignalStrength >= 70 && projectedRiskReward >= 1.4) {
-    actionType = 'PREPARE_REVERSAL_SNIPE';
-    guidanceFa = `🎯 موقعیت شکار چرخش زودهنگام ۳۰ دقیقه‌ای: الگوی تاریخی "${primaryMatchedPattern.nameFa}" با شباهت ${primaryMatchedPattern.similarityPct}٪ تایید شد. لیمیت در زون ساختاری ${optimalEntryPrice.toLocaleString()}$ با استاپ لاس ابطال (${recommendedSniperSl.toLocaleString()}$) و تارگت R:R معتبر ${projectedRiskReward}R.`;
-  } else if (continuationSignalStrength >= 65 && projectedRiskReward >= 1.4) {
-    actionType = 'RIDE_CONTINUATION_MOMENTUM';
-    guidanceFa = `🚀 موج پرقدرت ادامه‌دهنده: حفظ یا ورود در جهت موج با تارگت ساختاری ${tp30mTarget.toLocaleString()}$ و استاپ محافظت‌شده $${recommendedSniperSl.toLocaleString()}.`;
-  } else if (reversalSignalStrength >= 55) {
-    actionType = 'LOCK_BREAKEVEN_AND_HOLD';
-    guidanceFa = `🛡️ افزایش احتمال فرسایش روند (قدرت چرخش ${reversalSignalStrength}/100): به سرعت استاپ معاملات فعال را به نقطه ورود (Breakeven) منتقل کنید تا سرمایه بیمه گردد.`;
-  } else {
-    actionType = 'HIGH_VOLATILITY_SCALP';
-    guidanceFa = `⚡ نوسان دوطرفه خرد: انتظار برای خروج از رنج یا اسکالپ کنترل‌شده با بودجه سخت ریسک.`;
-  }
-
   return {
+    analysisStatus: 'ANALYSIS_ONLY',
+    tradeEligible: false,
+    scoreType: 'HEURISTIC_PATTERN_SIMILARITY_NOT_CONFIDENCE',
     reversalProbability,
     reversalSignalStrength,
     continuationProbability,
@@ -1103,18 +1074,18 @@ export function predict30mTrendReversalPatternLayer(
     topHistoricalMatches,
     confluenceIndicators,
     sniperActionRecommendation: {
-      action: actionType,
+      action: 'NO_TRADE_UNCALIBRATED',
       optimalEntryPrice,
       recommendedSniperSl,
       quickBreakevenTarget,
-      tp30mTarget,
+      tp30mTarget: null,
       maxRiskPct,
-      projectedRiskReward: Math.max(1.4, projectedRiskReward),
-      guidanceFa,
+      projectedRiskReward: null,
+      guidanceFa: 'شباهت الگو فقط یک امتیاز هیوریستیک است؛ داده OOS کالیبره‌شده و برآورد بازده معتبر موجود نیست، بنابراین NO TRADE.',
     },
     tradeFrequencyProtection: {
-      status: 'ACTIVE_HIGH_FREQUENCY',
-      noteFa: '🛡️ اولویت کیفیت سیگنال و انضباط معاملاتی: تایید نهایی معامله صرفاً منوط به عبور از فیلترهای اعتبارسنجی آماری، امید ریاضی مثبت و نسبت سود به ضرر ساختاری است.'
+      status: 'NO_EMPIRICAL_EDGE',
+      noteFa: 'داده معتبر out-of-sample برای نرخ برد و بازده این الگو موجود نیست؛ این تحلیل سفارش صادر نمی‌کند.'
     }
   };
 }

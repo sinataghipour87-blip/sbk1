@@ -233,7 +233,8 @@ export interface FuturesPrices {
   lastPrice: number;    // Used for Entry Execution & Slippage
   markPrice: number;    // Used for Stop Loss & Liquidation Engine
   indexPrice: number;   // Spot Underlying Index Benchmark
-  timestampUtc: number;
+  timestampUtc: number; // Exchange event timestamp
+  receivedTimestampMs: number;
   isoTimeUtc: string;
   ageMs: number;
   latencyMs: number;
@@ -374,6 +375,8 @@ export interface TradePosition {
   mfePct?: number; // Maximum Favorable Excursion in %
   realizedFeesUsd?: number;
   slippageUsd?: number;
+  estimatedSlippageUsd?: number;
+  estimatedSlippageBps?: number;
   expectedPrice?: number;
   submittedPrice?: number;
   averageFillPrice?: number;
@@ -1807,5 +1810,3 @@ export interface HunterMemoryInsights {
   strategicImprovementSummaryFa: string;
   memories: HunterEpisodicMemoryRecord[];
 }
-
-
