@@ -57,6 +57,21 @@ def is_dry_run_fixture_runtime(config: dict[str, Any], runmode: str) -> bool:
     return config.get("dry_run") is True and runmode == "dry_run"
 
 
+def orphaned_submitted_signal_ids(
+    records: list[Any],
+    open_trade_signal_ids: set[str],
+) -> list[str]:
+    orphaned_ids = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("status") != "ORDER_SUBMITTED":
+            continue
+        signal = record.get("signal")
+        signal_id = signal.get("signalId") if isinstance(signal, dict) else None
+        if isinstance(signal_id, str) and signal_id not in open_trade_signal_ids:
+            orphaned_ids.append(signal_id)
+    return orphaned_ids
+
+
 def is_valid_sbk_signal(
     signal: Any,
     *,

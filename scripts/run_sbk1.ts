@@ -183,6 +183,17 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   };
 }
 
+export function isValidSbk1HealthResponse(body: unknown): boolean {
+  return (
+    typeof body === 'object' &&
+    body !== null &&
+    'status' in body &&
+    body.status === 'ok' &&
+    'service' in body &&
+    body.service === 'sbk1'
+  );
+}
+
 function normalizeApiBaseUrl(url: URL): string {
   const basePath = url.pathname.replace(/\/+$/, '');
   url.pathname = basePath.endsWith('/api/v1') ? basePath : `${basePath}/api/v1`;
@@ -469,12 +480,7 @@ async function checkSbk1Ready(): Promise<void> {
   } catch {
     throw new Error('Health endpoint returned invalid JSON.');
   }
-  if (
-    typeof body !== 'object' ||
-    body === null ||
-    !('status' in body) ||
-    body.status !== 'ok'
-  ) {
+  if (!isValidSbk1HealthResponse(body)) {
     throw new Error('Health endpoint returned an invalid response.');
   }
 }

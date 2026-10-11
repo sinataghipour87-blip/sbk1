@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
-import { validateRuntimeSettings } from './run_sbk1';
+import { isValidSbk1HealthResponse, validateRuntimeSettings } from './run_sbk1';
+
+assert.equal(isValidSbk1HealthResponse({ status: 'ok', service: 'sbk1' }), true);
+assert.equal(isValidSbk1HealthResponse({ status: 'ok', service: 'other' }), false);
+assert.equal(isValidSbk1HealthResponse({ status: 'ok' }), false);
+assert.equal(isValidSbk1HealthResponse('<html>stale SPA fallback</html>'), false);
 
 const apiPassword = 'freqtrade-api-password-for-runtime-test';
 const environment = {
@@ -70,6 +75,14 @@ assert.throws(
     ...config,
     api_server: { ...config.api_server, username: 'different-user' },
   }, environment),
+  /configured credentials/,
+);
+assert.throws(
+  () => validateRuntimeSettings(config, {
+    ...environment,
+    FREQTRADE__API_SERVER__USERNAME: 'different-user',
+    FREQTRADE__API_SERVER__PASSWORD: apiPassword,
+  }),
   /configured credentials/,
 );
 assert.throws(

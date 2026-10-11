@@ -1,7 +1,46 @@
-import {StrictMode} from 'react';
+import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
+
+class RootErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[UI] Application render failed:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main dir="rtl" role="alert" className="min-h-screen bg-slate-950 p-6 text-slate-100">
+          <section className="mx-auto mt-16 max-w-2xl rounded-2xl border border-rose-800/60 bg-slate-900 p-6">
+            <h1 className="text-xl font-bold text-rose-300">بخشی از رابط کاربری اجرا نشد</h1>
+            <p className="mt-3 text-sm text-slate-300">
+              صفحه را دوباره بارگذاری کنید. اگر خطا تکرار شد، پیام زیر را برای بررسی نگه دارید.
+            </p>
+            <pre dir="ltr" className="mt-4 overflow-auto whitespace-pre-wrap rounded-lg bg-black/40 p-3 text-xs text-rose-200">
+              {this.state.error.message}
+            </pre>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="mt-5 rounded-lg bg-rose-700 px-4 py-2 text-sm font-bold hover:bg-rose-600"
+            >
+              بارگذاری دوباره
+            </button>
+          </section>
+        </main>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 if (typeof window !== 'undefined') {
   // Global fetch interceptor to automatically inject x-admin-token for secure server routes
@@ -75,6 +114,8 @@ if (typeof window !== 'undefined') {
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <RootErrorBoundary>
+      <App />
+    </RootErrorBoundary>
   </StrictMode>,
 );

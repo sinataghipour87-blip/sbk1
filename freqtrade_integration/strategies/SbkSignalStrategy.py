@@ -7,10 +7,12 @@ from typing import Any
 import requests
 from pandas import DataFrame
 
+from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
 from sbk_signal_contract import (
     is_dry_run_fixture_runtime,
     is_valid_sbk_signal,
+    orphaned_submitted_signal_ids,
     validate_bridge_url,
 )
 
@@ -79,6 +81,30 @@ class SbkSignalStrategy(IStrategy):
                 return
             logger.debug("SBK1 bridge returned %d signal record(s).", len(records))
 
+            submitted_signal_records = [
+                record for record in records
+                if isinstance(record, dict) and record.get("status") == "ORDER_SUBMITTED"
+            ]
+            orphaned_signal_ids: set[str] = set()
+            if submitted_signal_records:
+                open_trade_signal_ids = {
+                    trade.enter_tag
+                    for trade in Trade.get_open_trades()
+                    if isinstance(trade.enter_tag, str)
+                }
+                orphaned_signal_ids = set(
+                    orphaned_submitted_signal_ids(
+                        submitted_signal_records,
+                        open_trade_signal_ids,
+                    )
+                )
+                for signal_id in orphaned_signal_ids:
+                    self._post_status(
+                        signal_id,
+                        "CANCELLED",
+                        "Freqtrade no longer reports an open trade for this submitted signal; the unfilled entry was cancelled or removed.",
+                    )
+
             now_ms = int(current_time.timestamp() * 1000)
             configured_exchange = str(self.config.get("exchange", {}).get("name", "")).lower()
             configured_market = str(self.config.get("trading_mode", "spot")).lower()
@@ -88,6 +114,8 @@ class SbkSignalStrategy(IStrategy):
                 signal = record.get("signal") if isinstance(record, dict) else None
                 status = record.get("status") if isinstance(record, dict) else None
                 if status not in ("ACCEPTED", "STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED", "FILLED"):
+                    continue
+                if isinstance(signal, dict) and signal.get("signalId") in orphaned_signal_ids:
                     continue
                 if not self._is_valid_signal(
                     signal,

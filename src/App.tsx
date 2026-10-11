@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import React, { lazy, Suspense, useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { QuantumChart } from './components/QuantumChart';
 import { ChartTopBar } from './components/ChartTopBar';
 import { TickerBar } from './components/TickerBar';
@@ -41,7 +41,6 @@ import { MacroContextBrainWidget } from './components/MacroContextBrainWidget';
 import { WhaleSignalStatisticalProofWidget } from './components/WhaleSignalStatisticalProofWidget';
 import { WhaleOnChainRadarWidget } from './components/WhaleOnChainRadarWidget';
 import { GarchRealtimeRiskWidget } from './components/GarchRealtimeRiskWidget';
-import { TfjsReinforcementLearningWidget } from './components/TfjsReinforcementLearningWidget';
 import { CrossExchangeCorrelationWidget } from './components/CrossExchangeCorrelationWidget';
 import { CvdOiMatrixWidget } from './components/CvdOiMatrixWidget';
 import { LiquidationCascadeWidget } from './components/LiquidationCascadeWidget';
@@ -96,12 +95,17 @@ import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTarget
 import { verifyAutoTradePrerequisites, reconcileOrderWithExchange } from './services/autoTradeGuard';
 import { getExecutionMode } from './services/executionMode';
 import type { FreqtradeTrade } from './services/freqtradeBridge';
-import { TfjsReinforcementLearningEngine } from './services/tfjsReinforcementLearningEngine';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
 import { tradeThesisAndSmartExitEngine } from './services/tradeThesisAndSmartExitEngine';
 import { signalExpirationEngine, SignalStateSnapshot } from './services/signalExpirationEngine';
 import { hunterExecutionEngine } from './services/hunterExecutionEngine';
 import { AlertCircle, Settings, CheckCircle2, Cpu, Shield, Activity, BarChart2, Layers, Compass, Menu, Crosshair } from 'lucide-react';
+
+const TfjsReinforcementLearningWidget = lazy(() =>
+  import('./components/TfjsReinforcementLearningWidget').then(({ TfjsReinforcementLearningWidget }) => ({
+    default: TfjsReinforcementLearningWidget,
+  }))
+);
 
 export interface DerivFeeData {
   fundingRate?: number;
@@ -389,12 +393,15 @@ export default function App() {
     }
 
     // ۲. آموزش بلادرنگ شبکه عصبی یادگیری تقویتی TensorFlow.js با تابع پاداش و جریمه
-    try {
-      const rlEngine = TfjsReinforcementLearningEngine.getInstance();
-      rlEngine.trainOnClosedTrade(historyEntry, activeAnalysis, activePrediction).catch(() => {});
-    } catch {
-      // ایمن‌سازی اجرای پس‌زمینه
-    }
+    void import('./services/tfjsReinforcementLearningEngine')
+      .then(({ TfjsReinforcementLearningEngine }) =>
+        TfjsReinforcementLearningEngine.getInstance().trainOnClosedTrade(
+          historyEntry,
+          activeAnalysis,
+          activePrediction
+        )
+      )
+      .catch((error) => console.error('[RL] Could not train on the closed trade:', error));
 
     // ۳. به‌روزرسانی آنلاین حلقه فیدبک اوزان استراتژی‌های پیش‌بینی
     try {
@@ -1272,9 +1279,11 @@ export default function App() {
     // 🎓 آموزش اولیه و تسلیح شبکه عصبی TensorFlow.js بر روی سوابق معاملات واقعی
     const hist = getTradeHistory();
     if (hist && hist.length > 0) {
-      try {
-        TfjsReinforcementLearningEngine.getInstance().trainOnHistoricalTradesBatch(hist);
-      } catch {}
+      void import('./services/tfjsReinforcementLearningEngine')
+        .then(({ TfjsReinforcementLearningEngine }) =>
+          TfjsReinforcementLearningEngine.getInstance().trainOnHistoricalTradesBatch(hist)
+        )
+        .catch((error) => console.error('[RL] Could not train on historical trades:', error));
     }
 
     requestNotificationPermission();
@@ -3235,11 +3244,19 @@ export default function App() {
                     currentPrice={liveEffectivePrice}
                     recentHistory={getTradeHistory()}
                   />
-                  <TfjsReinforcementLearningWidget
-                    analysis={analysis}
-                    aiPrediction={aiPrediction}
-                    historyList={getTradeHistory()}
-                  />
+                  <Suspense
+                    fallback={
+                      <div role="status" className="rounded-xl border border-cyan-800/50 bg-slate-950/80 p-4 text-sm text-cyan-200">
+                        در حال بارگذاری موتور یادگیری تقویتی...
+                      </div>
+                    }
+                  >
+                    <TfjsReinforcementLearningWidget
+                      analysis={analysis}
+                      aiPrediction={aiPrediction}
+                      historyList={getTradeHistory()}
+                    />
+                  </Suspense>
                   <RealtimeSynchronizerWidget
                     analysis={analysis}
                     aiPrediction={aiPrediction}
