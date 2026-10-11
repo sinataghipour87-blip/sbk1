@@ -1,18 +1,21 @@
 {
-  "name": "react-example",
+  "name": "sbk1",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "start": "tsx server.ts",
+    "start": "tsx scripts/run_sbk1.ts",
+    "sbk1": "tsx scripts/run_sbk1.ts",
+    "sbk1:check": "tsx scripts/run_sbk1.ts --check",
+    "sbk1:status": "tsx scripts/run_sbk1.ts --status",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "verify:freqtrade": "tsx scripts/verify_freqtrade_rpc_connection.ts",
     "verify:freqtrade:dry-run": "tsx scripts/verify_freqtrade_dry_run.ts",
-    "test": "tsx scripts/verify_fail_closed_system.ts && tsx scripts/verify_freqtrade_signal_adapter.ts && tsx scripts/verify_freqtrade_dry_run_fixture.ts && tsx scripts/verify_freqtrade_rpc_contract.ts && python3 -m unittest scripts.test_market_models",
+    "test": "tsx scripts/verify_fail_closed_system.ts && tsx scripts/verify_freqtrade_signal_adapter.ts && tsx scripts/verify_freqtrade_dry_run_fixture.ts && tsx scripts/verify_freqtrade_rpc_contract.ts && tsx scripts/verify_sbk1_runtime.ts && python3 -m unittest scripts.test_market_models",
     "verify:freqtrade:contract": "tsx scripts/verify_freqtrade_rpc_contract.ts"
   },
   "dependencies": {

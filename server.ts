@@ -70,6 +70,7 @@ let serverWalletBalance = 0;
 let userLeverage: number | null = null;
 
 const app = express();
+let shutdownRequested = false;
 
 // Trust reverse proxy headers (Cloud Run, load balancers)
 app.set('trust proxy', 1);
@@ -116,6 +117,10 @@ app.use((req, res, next) => {
         return origin ? res.sendStatus(204) : res.sendStatus(403);
     }
     next();
+});
+
+app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok', service: 'sbk1' });
 });
 
 // Configure Rate Limiter for API paths
@@ -641,7 +646,7 @@ interface CachedOrderExecution {
 const orderIdempotencyCache = new Map<string, CachedOrderExecution>();
 
 // Periodically clean up idempotency cache older than 10 minutes
-setInterval(() => {
+const idempotencyCleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [key, val] of orderIdempotencyCache.entries()) {
         if (now - val.timestamp > 10 * 60 * 1000) {
@@ -3331,9 +3336,11 @@ async function setupSymbolPositionParameters(creds: any, symbol: string, leverag
 
 // Bybit WebSocket Price Connection Client (Item 1)
 let wsClient: WebSocket | null = null;
+let wsReconnectTimer: NodeJS.Timeout | null = null;
 let lastBtcPrice = 0;
 
 function connectBybitWs() {
+    if (shutdownRequested) return;
     const creds = loadServerCredentials();
     const isTestnet = creds ? creds.isTestnet : true;
     const wsUrl = isTestnet 
@@ -3372,8 +3379,9 @@ function connectBybitWs() {
     });
 
     wsClient.on('close', () => {
+        if (shutdownRequested) return;
         logTradingEvent('WS_CLOSE', 'WebSocket connection closed. Retrying in 5 seconds.');
-        setTimeout(connectBybitWs, 5000);
+        wsReconnectTimer = setTimeout(connectBybitWs, 5000);
     });
 
     wsClient.on('error', (err) => {
@@ -3850,18 +3858,66 @@ app.post('/api/live/toggle-auto-trade', (req, res) => {
 });
 
 // Vite middleware
+let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
+let httpServer: ReturnType<typeof app.listen> | null = null;
+
 async function startServer() {
-  const vite = await createViteServer({
+  viteServer = await createViteServer({
     server: { middlewareMode: true },
     appType: 'spa'
   });
+  if (shutdownRequested) {
+    await viteServer.close();
+    return;
+  }
 
-  app.use(vite.middlewares);
+  app.use(viteServer.middlewares);
 
   // Start market data only. Trade lifecycle and position reconciliation belong to Freqtrade.
   await startServerSideMarketFeed();
+  if (shutdownRequested) {
+    wsClient?.close();
+    await viteServer.close();
+    return;
+  }
 
-  app.listen(3000, '0.0.0.0', () => console.log('Server running on port 3000'));
+  httpServer = app.listen(3000, '0.0.0.0', () => console.log('Server running on port 3000'));
 }
+
+async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
+  if (shutdownRequested) return;
+  shutdownRequested = true;
+  console.log(`[SBK1] Received ${signal}; shutting down server and market feed.`);
+  clearInterval(idempotencyCleanupTimer);
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+  wsClient?.close();
+
+  const forceCloseTimer = setTimeout(() => {
+    httpServer?.closeAllConnections();
+    process.exit(1);
+  }, 10_000);
+  forceCloseTimer.unref();
+
+  try {
+    await Promise.all([
+      new Promise<void>((resolve, reject) => {
+        if (!httpServer?.listening) {
+          resolve();
+          return;
+        }
+        httpServer.close((error) => error ? reject(error) : resolve());
+      }),
+      viteServer?.close(),
+    ]);
+  } catch (error) {
+    console.error('[SBK1] Graceful shutdown failed:', error);
+    process.exitCode = 1;
+  } finally {
+    clearTimeout(forceCloseTimer);
+  }
+}
+
+process.once('SIGINT', () => void shutdownServer('SIGINT'));
+process.once('SIGTERM', () => void shutdownServer('SIGTERM'));
 
 startServer();
