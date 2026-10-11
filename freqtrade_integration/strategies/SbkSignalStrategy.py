@@ -12,7 +12,7 @@ from freqtrade.strategy import IStrategy, stoploss_from_absolute
 from sbk_signal_contract import (
     is_dry_run_fixture_runtime,
     is_valid_sbk_signal,
-    orphaned_submitted_signal_ids,
+    unresolved_inflight_signal_ids,
     validate_bridge_url,
 )
 
@@ -81,29 +81,60 @@ class SbkSignalStrategy(IStrategy):
                 return
             logger.debug("SBK1 bridge returned %d signal record(s).", len(records))
 
-            submitted_signal_records = [
+            inflight_signal_records = [
                 record for record in records
-                if isinstance(record, dict) and record.get("status") == "ORDER_SUBMITTED"
+                if isinstance(record, dict)
+                and record.get("status") in ("STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED")
             ]
-            orphaned_signal_ids: set[str] = set()
-            if submitted_signal_records:
-                open_trade_signal_ids = {
-                    trade.enter_tag
-                    for trade in Trade.get_open_trades()
+            unresolved_signal_ids: set[str] = set()
+            trades_by_signal_id: dict[str, Any] = {}
+            if inflight_signal_records:
+                trades_by_signal_id = {
+                    trade.enter_tag: trade
+                    for trade in Trade.get_trades_proxy()
                     if isinstance(trade.enter_tag, str)
                 }
-                orphaned_signal_ids = set(
-                    orphaned_submitted_signal_ids(
-                        submitted_signal_records,
-                        open_trade_signal_ids,
+                unresolved_signal_ids = set(
+                    unresolved_inflight_signal_ids(
+                        inflight_signal_records,
+                        set(trades_by_signal_id),
                     )
                 )
-                for signal_id in orphaned_signal_ids:
+                for signal_id in unresolved_signal_ids:
                     self._post_status(
                         signal_id,
-                        "CANCELLED",
-                        "Freqtrade no longer reports an open trade for this submitted signal; the unfilled entry was cancelled or removed.",
+                        "UNKNOWN_IN_FLIGHT",
+                        "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
                     )
+                for record in inflight_signal_records:
+                    signal = record.get("signal")
+                    signal_id = signal.get("signalId") if isinstance(signal, dict) else None
+                    trade = trades_by_signal_id.get(signal_id)
+                    if not isinstance(signal_id, str) or not trade:
+                        continue
+                    open_entry_orders = [
+                        order for order in trade.open_orders
+                        if order.ft_order_side == trade.entry_side
+                    ]
+                    has_filled_entry = bool(trade.select_filled_orders(trade.entry_side))
+                    partial_open_fill = any(float(order.safe_filled or 0) > 0 for order in open_entry_orders)
+                    if open_entry_orders:
+                        reconciled_status = "PARTIALLY_FILLED" if partial_open_fill else "ORDER_SUBMITTED"
+                    elif has_filled_entry or float(getattr(trade, "amount", 0) or 0) > 0:
+                        reconciled_status = "FILLED"
+                    else:
+                        reconciled_status = "UNKNOWN_IN_FLIGHT"
+                    if reconciled_status == "UNKNOWN_IN_FLIGHT":
+                        unresolved_signal_ids.add(signal_id)
+                    if reconciled_status != record.get("status"):
+                        self._post_status(
+                            signal_id,
+                            reconciled_status,
+                            "Reconciled signal lifecycle from the persisted Freqtrade trade and order records.",
+                            trade_id=getattr(trade, "id", None),
+                            filled_amount=float(getattr(trade, "amount", 0) or 0),
+                            average_fill_price=float(getattr(trade, "open_rate", 0) or 0) or None,
+                        )
 
             now_ms = int(current_time.timestamp() * 1000)
             configured_exchange = str(self.config.get("exchange", {}).get("name", "")).lower()
@@ -115,7 +146,7 @@ class SbkSignalStrategy(IStrategy):
                 status = record.get("status") if isinstance(record, dict) else None
                 if status not in ("ACCEPTED", "STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED", "FILLED"):
                     continue
-                if isinstance(signal, dict) and signal.get("signalId") in orphaned_signal_ids:
+                if isinstance(signal, dict) and signal.get("signalId") in unresolved_signal_ids:
                     continue
                 if not self._is_valid_signal(
                     signal,
@@ -257,6 +288,7 @@ class SbkSignalStrategy(IStrategy):
         amount = float(getattr(order, "amount", 0) or 0)
         filled = float(getattr(order, "filled", 0) or 0)
         if filled > 0 and amount > filled:
+            trade.set_custom_data("sbk_signal", signal)
             self._post_status(
                 signal_id,
                 "PARTIALLY_FILLED",
@@ -400,6 +432,15 @@ class SbkSignalStrategy(IStrategy):
     def _post_status(self, signal_id: str | None, status: str, reason: str, **details: Any) -> bool:
         if not signal_id or len(self._bridge_token) < 32 or not self._bridge_url:
             return False
+        status_details = {
+            target: details[source]
+            for source, target in (
+                ("trade_id", "tradeId"),
+                ("filled_amount", "filledAmount"),
+                ("average_fill_price", "averageFillPrice"),
+            )
+            if source in details and details[source] is not None
+        }
         try:
             response = requests.post(
                 f"{self._bridge_url}/api/freqtrade/signals/{signal_id}/status",
@@ -407,7 +448,7 @@ class SbkSignalStrategy(IStrategy):
                 json={
                     "status": status,
                     "reason": reason,
-                    **{key: value for key, value in details.items() if value is not None},
+                    **status_details,
                 },
                 timeout=(1.0, 2.0),
                 allow_redirects=False,

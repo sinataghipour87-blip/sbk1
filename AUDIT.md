@@ -6,6 +6,34 @@
 
 ## Executive summary
 
+### Revalidation of the delivered revision
+
+The named `sbk1-main.zip` and `freqtrade-develop.zip` are not present. The reproducible comparison is therefore Git commit `7fc2f21` (`HEAD`) against parent `f17c36f`, not a comparison of those two archives. `freqtrade/` is a regular checked-in source tree (768 tracked paths), not a submodule; its present revision identifies as `freqtrade 2026.10-dev-7fc2f21`.
+
+The previous-to-current commit changed these paths:
+
+| Change | Paths | Executable effect |
+|---|---|---|
+| Modified | `.env.example`, `package.json`, `scripts/run_sbk1.ts`, `scripts/verify_sbk1_runtime.ts`, `freqtrade_integration/strategies/SbkSignalStrategy.py`, `freqtrade_integration/strategies/sbk_signal_contract.py` | Credential template, launcher, runtime tests, signal consumer and Python contract behavior changed. |
+| Added | `scripts/test_sbk_signal_strategy.py` | New Python regression tests. |
+| Modified | `src/App.tsx`, `src/main.tsx` | Runtime/UI logic changed; these are not documentation-only changes. |
+| Modified | `index.html` | Browser page metadata/presentation changed; no execution authority is added here. |
+| Modified | `README.md`; added `AUDIT.md` | Documentation and audit evidence. |
+| Modified/deleted | `tradesv3.dryrun.sqlite`, `tradesv3.dryrun.sqlite-shm`, `tradesv3.dryrun.sqlite-wal` | The SQLite database was changed and the transient WAL/SHM sidecars were removed in the commit. The main database is source-tracked in this revision and is not source code. |
+
+At the start of this revalidation, the worktree was clean. No ZIP archive was found; `.env`, `config.json`, `freqtrade/user_data/config.json`, local signal data, `.venv`, `node_modules`, logs, and `dist/` are local/ignored artifacts and are not evidence included in the tracked source delivery.
+
+### Findings that require follow-up
+
+- The adapter and Python validator share the named contract and matching principal fields, but the adapter did not require `expiresAtMs > generatedAtMs` explicitly. Its idempotency comparison also omitted risk/configuration fields, so a reused identifier could be treated as an identical duplicate despite a changed payload.
+- `UNKNOWN_IN_FLIGHT` was present only in an older SBK1 execution-engine test, not in the Freqtrade signal lifecycle. The Freqtrade strategy reconciled only `ORDER_SUBMITTED` against open trades; a `STRATEGY_ACCEPTED` record left behind by a restart/network interruption was neither recovered from Freqtrade trade history nor made explicitly non-retryable.
+- The Python strategy regression test covered only an orphan-ID helper. It did not exercise the strategy's mocked RPC error, cancellation/fill callbacks, or the post-restart no-duplicate decision.
+- Direct Bybit handlers and client calls remained in the tree. The server rejected several of them before their handler bodies, but the UI continued to present them and a separate production-gate module still contained a direct `/api/exchange/order` fetch. Dormant code is not equivalent to a maintained integration contract.
+- The repository lacked a repeatable clean-environment setup flow and generated matching private credentials automatically. Previous installed-environment success did not establish this.
+- The SQLite file is ignored by `.gitignore` but already tracked, so the ignore rule did not keep it out of source delivery.
+
+The prior command table below is historical evidence from the earlier audit session, not a result of this revalidation. Current commands, results, and limitations are recorded at the end of this report; do not infer current runtime health from the historical table.
+
 The immediate startup failure in the observed workspace is reproducible and is not caused by missing Node/Python dependencies or a missing private Freqtrade config:
 
 1. `npm run sbk1:check` succeeds, including discovery of `SbkSignalStrategy`.

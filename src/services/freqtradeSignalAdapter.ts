@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v1';
 export const DRY_RUN_FIXTURE_SETUP_PREFIX = 'DRY_RUN_E2E_FIXTURE_';
@@ -15,7 +16,8 @@ export type SbkSignalStatus =
   | 'REJECTED'
   | 'EXPIRED'
   | 'CANCELLED'
-  | 'ERROR';
+  | 'ERROR'
+  | 'UNKNOWN_IN_FLIGHT';
 
 export interface SbkFreqtradeSignal {
   contractVersion: typeof SBK_SIGNAL_CONTRACT_VERSION;
@@ -82,14 +84,15 @@ export class SbkSignalValidationError extends Error {
 
 const allowedTransitions: Record<SbkSignalStatus, ReadonlySet<SbkSignalStatus>> = {
   ACCEPTED: new Set(['STRATEGY_ACCEPTED', 'REJECTED', 'EXPIRED', 'CANCELLED', 'ERROR']),
-  STRATEGY_ACCEPTED: new Set(['ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'FILLED', 'REJECTED', 'EXPIRED', 'CANCELLED', 'ERROR']),
-  ORDER_SUBMITTED: new Set(['PARTIALLY_FILLED', 'FILLED', 'REJECTED', 'CANCELLED', 'ERROR']),
-  PARTIALLY_FILLED: new Set(['PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'ERROR']),
+  STRATEGY_ACCEPTED: new Set(['ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'FILLED', 'REJECTED', 'EXPIRED', 'CANCELLED', 'ERROR', 'UNKNOWN_IN_FLIGHT']),
+  ORDER_SUBMITTED: new Set(['PARTIALLY_FILLED', 'FILLED', 'REJECTED', 'CANCELLED', 'ERROR', 'UNKNOWN_IN_FLIGHT']),
+  PARTIALLY_FILLED: new Set(['PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'ERROR', 'UNKNOWN_IN_FLIGHT']),
   FILLED: new Set(),
   REJECTED: new Set(),
   EXPIRED: new Set(),
   CANCELLED: new Set(),
   ERROR: new Set(),
+  UNKNOWN_IN_FLIGHT: new Set(),
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -193,6 +196,7 @@ export function validateSbkFreqtradeSignal(
     nowMs - signal.generatedAtMs > maximumSignalAgeMs ||
     !Number.isSafeInteger(signal.expiresAtMs) ||
     signal.expiresAtMs <= nowMs ||
+    signal.expiresAtMs <= signal.generatedAtMs ||
     signal.expiresAtMs - signal.generatedAtMs > 60_000
   ) {
     throw new SbkSignalValidationError('Signal is stale, future-dated, or has an invalid expiry.', 'SIGNAL_EXPIRED');
@@ -324,16 +328,7 @@ export class FreqtradeSignalAdapter {
       const signal = validateSbkFreqtradeSignal(value, options);
       const existing = this.recordsById.get(signal.signalId);
       if (existing) {
-        const oldSignal = existing.signal;
-        const sameDecision =
-          oldSignal.decisionId === signal.decisionId &&
-          oldSignal.pair === signal.pair &&
-          oldSignal.direction === signal.direction &&
-          oldSignal.timeframe === signal.timeframe &&
-          oldSignal.referencePrice === signal.referencePrice &&
-          oldSignal.entryConditions.stopLoss === signal.entryConditions.stopLoss &&
-          oldSignal.entryConditions.takeProfit === signal.entryConditions.takeProfit;
-        if (!sameDecision) {
+        if (!isDeepStrictEqual(existing.signal, signal)) {
           throw new SbkSignalValidationError('Signal ID was already used for a different decision.', 'IDEMPOTENCY_CONFLICT');
         }
         return { ...existing, duplicate: true };

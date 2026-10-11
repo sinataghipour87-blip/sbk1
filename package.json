@@ -15,7 +15,7 @@
     "lint": "tsc --noEmit",
     "verify:freqtrade": "tsx scripts/verify_freqtrade_rpc_connection.ts",
     "verify:freqtrade:dry-run": "tsx scripts/verify_freqtrade_dry_run.ts",
-    "test": "tsx scripts/verify_fail_closed_system.ts && tsx scripts/verify_freqtrade_signal_adapter.ts && tsx scripts/verify_freqtrade_dry_run_fixture.ts && tsx scripts/verify_freqtrade_rpc_contract.ts && tsx scripts/verify_sbk1_runtime.ts && python3 -m unittest scripts.test_market_models scripts.test_sbk_signal_strategy",
+    "test": "tsx scripts/verify_fail_closed_system.ts && tsx scripts/verify_freqtrade_signal_adapter.ts && tsx scripts/verify_freqtrade_dry_run_fixture.ts && tsx scripts/verify_freqtrade_rpc_contract.ts && tsx scripts/verify_sbk1_runtime.ts && tsx scripts/run_python_tests.ts",
     "verify:freqtrade:contract": "tsx scripts/verify_freqtrade_rpc_contract.ts"
   },
   "dependencies": {

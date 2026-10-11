@@ -138,17 +138,6 @@ export interface FinalProductionGateReport {
   evaluatedAt: number;
 }
 
-export interface FinalExecutionResult {
-  executed: boolean;
-  status: 'EXECUTED_LIVE' | 'NO_TRADE';
-  clientOrderId?: string;
-  exchangeOrderId?: string;
-  fillPrice?: number;
-  gateReport: FinalProductionGateReport;
-  summaryFa: string;
-  executedAt: number;
-}
-
 // ---------------------------------------------------------------------------
 // LAYER 1: PREDICTION ENGINE (PURE SIGNAL & PROBABILITY CALCULATOR)
 // ---------------------------------------------------------------------------
@@ -883,88 +872,6 @@ export class ExecutionEngine {
     };
   }
 
-  /**
-   * Executes order safely after passing all 3 layers and the 19 Production Gate checks
-   */
-  public async executeApprovedOrder(
-    riskVerdict: RiskVerdict,
-    liveAnalysis: AnalysisResult | null,
-    activePositions: TradePosition[],
-    tradeHistory: TradeHistory[]
-  ): Promise<FinalExecutionResult> {
-    const now = Date.now();
-
-    // 1. Run Final Production Gate (19 Mandatory Checks)
-    const gateReport = this.evaluateFinalProductionGate(
-      riskVerdict,
-      liveAnalysis,
-      activePositions,
-      tradeHistory
-    );
-
-    if (gateReport.overallVerdict === 'NO_TRADE') {
-      return {
-        executed: false,
-        status: 'NO_TRADE',
-        gateReport,
-        summaryFa: `🛑 ارسال سفارش مسدود گردید (نتیجه: NO_TRADE). دلایل: ${gateReport.rejectionReasonsFa.slice(0, 2).join(' | ')}`,
-        executedAt: now,
-      };
-    }
-
-    // 2. Transmit order to live exchange API
-    const approved = riskVerdict.approvedPayload!;
-    const clientOrderId = `QNT_${approved.approvedSide}_${now}_${Math.random().toString(36).substring(2, 6)}`;
-
-    try {
-      const res = await fetch('/api/exchange/order', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbol: approved.predictionPayload.symbol,
-          side: approved.approvedSide,
-          qty: approved.approvedQty,
-          price: approved.predictionPayload.entryTarget,
-          stopLoss: approved.predictionPayload.stopLoss,
-          takeProfit: approved.predictionPayload.takeProfit1,
-          clientOrderId,
-        }),
-      });
-
-      if (res.ok) {
-        const json = await res.json();
-        return {
-          executed: true,
-          status: 'EXECUTED_LIVE',
-          clientOrderId,
-          exchangeOrderId: json.orderId || `EX_${now}`,
-          fillPrice: json.fillPrice || approved.predictionPayload.entryTarget,
-          gateReport,
-          summaryFa: `✅ سفارش با موفقیت پس از قبولی در ۱۹ گیت امنیتی صادر شد (${approved.approvedSide} ${approved.approvedQty} BTC در $${approved.predictionPayload.entryTarget.toLocaleString()}).`,
-          executedAt: now,
-        };
-      } else {
-        const errJson = await res.json().catch(() => ({}));
-        return {
-          executed: false,
-          status: 'NO_TRADE',
-          clientOrderId,
-          gateReport,
-          summaryFa: `🛑 خطای صرافی در زمان شلیک سفارش: ${errJson.error || 'پاسخ ناموفق صرافی'}. نتیجه: NO_TRADE`,
-          executedAt: now,
-        };
-      }
-    } catch (err: any) {
-      return {
-        executed: false,
-        status: 'NO_TRADE',
-        clientOrderId,
-        gateReport,
-        summaryFa: `🛑 خطای شبکه در ارسال سفارش: ${err.message || 'Network Timeout'}. نتیجه: NO_TRADE`,
-        executedAt: now,
-      };
-    }
-  }
 }
 
 export const predictionEngine = PredictionEngine.getInstance();

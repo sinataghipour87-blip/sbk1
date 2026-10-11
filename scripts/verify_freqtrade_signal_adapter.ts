@@ -79,6 +79,14 @@ try {
   assert.throws(
     () => validateSbkFreqtradeSignal({
       ...signal,
+      generatedAtMs: nowMs + 500,
+      expiresAtMs: nowMs + 100,
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'SIGNAL_EXPIRED',
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
       dataQuality: { ...signal.dataQuality, observedAtMs: nowMs - 3_000, maxAgeMs: 1_000 },
     }, { nowMs }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_DATA_QUALITY',
@@ -102,6 +110,13 @@ try {
   assert.equal(concurrentSubmissions.filter((record) => !record.duplicate).length, 1);
   assert.equal(concurrentSubmissions.filter((record) => record.duplicate).length, 3);
   assert.equal(concurrentSubmissions[0].status, 'ACCEPTED');
+  await assert.rejects(
+    adapter.submit({
+      ...signal,
+      riskLimits: { ...signal.riskLimits, riskBudgetPct: 1.1 },
+    }, { nowMs, expectedPair: signal.pair }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'IDEMPOTENCY_CONFLICT',
+  );
   assert.equal((await adapter.getPending(signal.pair, signal.timeframe)).length, 1);
   assert.equal((await adapter.getForStrategy(signal.pair, signal.timeframe))[0]?.status, 'ACCEPTED');
 
@@ -126,10 +141,59 @@ try {
   });
   assert.equal(filled.status, 'FILLED');
 
+  const uncertainIds = deriveSbkSignalIds({
+    pair: signal.pair,
+    direction: signal.direction,
+    setupType: signal.entryConditions.setupType,
+    generatedAtMs: nowMs,
+    sweptLevelPrice: 62_200,
+    referencePrice: signal.referencePrice,
+    stopLoss: signal.entryConditions.stopLoss,
+    takeProfit: signal.entryConditions.takeProfit,
+  });
+  const uncertain = await adapter.submit({
+    ...signal,
+    ...uncertainIds,
+    entryConditions: { ...signal.entryConditions, setupType: 'DRY_RUN_E2E_FIXTURE_UNCERTAIN' },
+  }, { nowMs, expectedPair: signal.pair });
+  await adapter.updateStatus(uncertain.signal.signalId, { status: 'STRATEGY_ACCEPTED' });
+  const quarantined = await adapter.updateStatus(uncertain.signal.signalId, {
+    status: 'UNKNOWN_IN_FLIGHT',
+    reason: 'No matching persisted Freqtrade trade after restart.',
+  });
+  assert.equal(quarantined.status, 'UNKNOWN_IN_FLIGHT');
+  assert.equal((await adapter.getForStrategy(signal.pair, signal.timeframe)).some((record) =>
+    record.signal.signalId === uncertain.signal.signalId), false);
+  await assert.rejects(
+    adapter.updateStatus(uncertain.signal.signalId, { status: 'ACCEPTED' }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_STATUS_TRANSITION',
+  );
+
+  const cancelledIds = deriveSbkSignalIds({
+    pair: signal.pair,
+    direction: signal.direction,
+    setupType: signal.entryConditions.setupType,
+    generatedAtMs: nowMs,
+    sweptLevelPrice: 62_300,
+    referencePrice: signal.referencePrice,
+    stopLoss: signal.entryConditions.stopLoss,
+    takeProfit: signal.entryConditions.takeProfit,
+  });
+  const cancellable = await adapter.submit({
+    ...signal,
+    ...cancelledIds,
+    entryConditions: { ...signal.entryConditions, setupType: 'DRY_RUN_E2E_FIXTURE_CANCELLED' },
+  }, { nowMs, expectedPair: signal.pair });
+  await adapter.updateStatus(cancellable.signal.signalId, { status: 'STRATEGY_ACCEPTED' });
+  await adapter.updateStatus(cancellable.signal.signalId, { status: 'ORDER_SUBMITTED', tradeId: 43 });
+  assert.equal((await adapter.updateStatus(cancellable.signal.signalId, { status: 'CANCELLED' })).status, 'CANCELLED');
+
   const persisted = JSON.parse(await readFile(process.env.SBK1_SIGNAL_STORE_PATH, 'utf8'));
-  assert.equal(persisted.records[0].tradeId, 42);
+  assert.equal(persisted.records.find((record: { signal: { signalId: string } }) =>
+    record.signal.signalId === signal.signalId).tradeId, 42);
   const restored = await new FreqtradeSignalAdapter().get(signal.signalId);
   assert.equal(restored?.status, 'FILLED');
+  assert.equal((await new FreqtradeSignalAdapter().get(uncertain.signal.signalId))?.status, 'UNKNOWN_IN_FLIGHT');
 
   const pythonContractCheck = spawnSync('python3', ['-c', `
 import json
@@ -156,6 +220,12 @@ print("Python signal contract checks passed.")
     input: JSON.stringify([
       { name: 'valid', signal, nowMs, valid: true },
       { name: 'expired', signal: { ...signal, expiresAtMs: nowMs - 1 }, nowMs, valid: false },
+      {
+        name: 'expiry precedes future generation time',
+        signal: { ...signal, generatedAtMs: nowMs + 500, expiresAtMs: nowMs + 100 },
+        nowMs,
+        valid: false,
+      },
       { name: 'pair mismatch', signal: { ...signal, pair: 'ETH/USDT:USDT' }, nowMs, valid: false },
       {
         name: 'stale source evidence',
