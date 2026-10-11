@@ -12,12 +12,17 @@ let cachedExecutionSettings: { value: ExecutionSettings; expiresAt: number } | n
 let executionSettingsRequest: Promise<ExecutionSettings> | null = null;
 
 function isExecutionMode(value: unknown): value is ExecutionMode {
-  return value === 'BACKTEST' || value === 'TESTNET' || value === 'PAPER' || value === 'LIVE';
+  return value === 'BACKTEST' || value === 'DRY_RUN' || value === 'TESTNET' || value === 'PAPER' || value === 'LIVE';
 }
 
 export function getSelectedExecutionMode(): ExecutionMode {
   const savedMode = localStorage.getItem(EXECUTION_MODE_STORAGE_KEY);
-  return isExecutionMode(savedMode) ? savedMode : 'BACKTEST';
+  if (savedMode === 'LIVE' || savedMode === 'TESTNET') {
+    localStorage.setItem(EXECUTION_MODE_STORAGE_KEY, 'DRY_RUN');
+    cachedExecutionSettings = null;
+    return 'DRY_RUN';
+  }
+  return isExecutionMode(savedMode) ? savedMode : 'DRY_RUN';
 }
 
 export function saveSelectedExecutionMode(mode: ExecutionMode): void {

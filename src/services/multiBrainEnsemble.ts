@@ -646,27 +646,32 @@ export function runUnifiedMultiBrainEnsemble(
 
   // ۱۲. مغز ۱۲: پردازشگر اسپرد و تاخیر شبکه (Execution Controller - Item 5)
   // توجه: امتیازهای محاسباتی فرمولی، لزوماً معیارهای واقعی عملکرد نیستند.
-  const hasLiveExecutionMetrics = Boolean(analysis?.canonicalSnapshot?.crossExchangeLatencyMs || analysis?.realObiData?.latencyMs);
-  const exchangeLatencyMs = analysis?.canonicalSnapshot?.crossExchangeLatencyMs || analysis?.realObiData?.latencyMs || 22;
+  const exchangeLatencyMs = analysis?.canonicalSnapshot?.crossExchangeLatencyMs ??
+    analysis?.realObiData?.latencyMs ?? null;
   const spreadBtcUsd = typeof analysis?.canonicalSnapshot?.crossExchangeSpreadUsd === 'number'
     ? Math.round(analysis.canonicalSnapshot.crossExchangeSpreadUsd * 100) / 100
     : (typeof analysis?.realObiData?.spreadUsd === 'number'
       ? Math.round(analysis.realObiData.spreadUsd * 100) / 100
-      : Math.round((0.10 + Math.abs(obi) * 0.4) * 100) / 100);
-  const executionScore = Math.max(50, Math.min(95, Math.round(90 - (exchangeLatencyMs * 0.4) - (spreadBtcUsd * 5))));
+      : null);
+  const hasLiveExecutionMetrics = exchangeLatencyMs !== null && exchangeLatencyMs > 0 && spreadBtcUsd !== null;
+  const executionScore = hasLiveExecutionMetrics
+    ? Math.max(0, Math.min(95, Math.round(90 - (exchangeLatencyMs * 0.4) - (spreadBtcUsd * 5))))
+    : 0;
 
   const brain12ExecutionSniper: Brain12RealWorldExecutionSniper = {
     brainType: 'EXECUTION_CONTROLLER',
     role: 'EXECUTION_CONTROLLER',
     nameFa: 'مغز ۱۲: پردازشگر سنجش اسپرد و تاخیر صرافی (Execution Metrics Processor)',
-    exchangeLatencyMs,
+    exchangeLatencyMs: exchangeLatencyMs ?? 0,
     slippageTolerancePct: 0.02,
     makerTakerOptimized: true,
-    spreadBtcUsd,
+    spreadBtcUsd: spreadBtcUsd ?? 0,
     realWorldExecutionScore: executionScore,
     isEmpiricalMetric: false, // مدل محاسباتی شرایط بازار، نه تضمین تجربی کیفیت اجرای سفارش بروکر
     isLiveMeasured: hasLiveExecutionMetrics,
-    rationaleFa: `تاخیر ${exchangeLatencyMs}ms و اسپرد $${spreadBtcUsd} (امتیاز محاسباتی ${executionScore}/100 صرفاً ارزیابی اکتشافی پارامترهای شبکه است و سنجش تجربی دقت یا کیفیت پر شدن سفارش نیست).`
+    rationaleFa: hasLiveExecutionMetrics
+      ? `تاخیر ${exchangeLatencyMs}ms و اسپرد $${spreadBtcUsd} از دادهٔ موجود استخراج شد؛ امتیاز ${executionScore}/100 تضمین کیفیت اجرای سفارش نیست.`
+      : 'تاخیر و اسپرد بین‌صرافی قابل‌اندازه‌گیری نیست؛ امتیاز اجرای واقعی صفر است.'
   };
 
   // ۱۳. مغز ۱۳: کنترل‌کننده قوانین حد سود (Risk Controller - Item 5)
@@ -782,7 +787,7 @@ export function runUnifiedMultiBrainEnsemble(
   // ساخت مدل‌های آماری مستقل (INDEPENDENT STATISTICAL MODELS - Item 5, 7, 9 & 10)
   // sampleSize and calibration calculated from REAL dataset!
   // =========================================================================
-  const datasetPredictions = datasetService.getAllPredictions();
+  const datasetPredictions = datasetService.getFreqtradeVerifiedPredictions();
   const realResolvedSample = datasetPredictions.filter(rec => rec.outcome === 'WIN' || rec.outcome === 'LOSS').length;
 
   const masterDir: 'LONG' | 'SHORT' = rawDirection === 'SHORT' ? 'SHORT' : 'LONG';

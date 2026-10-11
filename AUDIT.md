@@ -57,11 +57,11 @@ Browser
 
 npm run sbk1
   └─ scripts/run_sbk1.ts (configuration, prerequisites, ports, lock, health, shutdown)
-       ├─ server.ts (Express API + Vite middleware + public market-data feed)
+       ├─ server.ts (Express API + Vite middleware + authenticated Freqtrade market-data bridge)
        │    ├─ marketData / analysisEngine
        │    ├─ freqtradeBridge (authenticated read-only RPC)
        │    ├─ freqtradeSignalAdapter (versioned, expiring, idempotent JSON outbox)
-       │    └─ legacy Bybit code (mutation routes rejected; old daemon has no caller)
+       │    └─ default-deny exchange API (only Freqtrade-backed status and safe live-control routes)
        └─ .venv/bin/freqtrade trade
             └─ freqtrade_integration/strategies/SbkSignalStrategy.py
                  ├─ polls authenticated SBK1 signal queue
@@ -110,25 +110,18 @@ Commands and observed outcomes (secrets intentionally omitted):
 
 ## Implemented versus illustrative dashboard behavior
 
-- The core web UI, Express endpoints, Bybit linear-futures market-data readers, signal validation, authenticated Freqtrade RPC reads, and Freqtrade strategy are executable code paths.
-- The dashboard contains calculators, research widgets, simulations and heuristic metrics. In particular, `server.ts`'s `/api/backtest/run` invokes `scripts/realistic_backtester.py --synthetic`; its output is synthetic/research output, not an exchange-backed or historical Freqtrade result.
+- The core web UI, Express endpoints, Freqtrade market-data bridge, signal validation, authenticated Freqtrade RPC reads, and Freqtrade strategy are executable code paths.
+- The dashboard contains calculators, research widgets, simulations and heuristic metrics. `/api/backtest/run` now returns `HISTORICAL_SIGNALS_UNAVAILABLE`; the standalone `scripts/realistic_backtester.py` reads local OHLCV files or explicit test-only synthetic data, makes no exchange calls, and never authorizes trading.
 - `DemoTestingSandbox`, local calculation widgets and the Python research/backtest scripts must not be interpreted as live execution evidence. A displayed status/score does not establish an order, fill or position.
 - `HunterOrderFlowDashboardWidget` can request an analysis candidate, but `/api/hunter/execute` fails closed while calibrated probability evidence is unavailable.
-- Existing `App.tsx` controls still call legacy `/api/exchange/*` and `/api/live/toggle-auto-trade` routes. Server middleware rejects the direct-execution routes before their handlers; the auto-trade toggle reports the legacy feature disabled. These controls can appear interactive while being intentionally non-operative and should be aligned with the backend contract.
+- `App.tsx` and `autoTradeGuard.ts` use `/api/exchange/status` only; no browser code calls legacy private order/credential routes. The server returns an explicit Freqtrade-owner rejection for unsupported exchange routes, and the old auto-trade toggle cannot enable a second executor.
 - Public feed fallback values are marked unavailable/zero rather than permitted as a signal. Live market-data reachability and freshness were not asserted by the read-only RPC tests.
 
 ## Execution ownership and legacy paths
 
 Freqtrade is the sole order/fill/position authority in the active integration. The TypeScript RPC bridge uses authentication and reads status, trades, balances and whitelist. The TypeScript signal adapter and Python strategy share `sbk1.freqtrade.signal.v1`; both enforce pair/exchange/timeframe, freshness/expiry and risk fields. The adapter persists signal lifecycle metadata and prevents duplicate IDs; it is not the official trade database.
 
-`server.ts` still contains substantial older Bybit mutation/recovery code. Static reference checks show:
-
-- `/api/exchange/*` mutation handlers are registered behind `rejectLegacyExchangeExecution`, so their handler bodies are not reached.
-- `evaluateStrategyCheck`, `recoverPositionsOnStartup`, and `reconcileWithBybit` have definitions but no callsites in the current server entrypoint.
-- `runServerSidePositionTicks` is called by the public WebSocket but immediately returns.
-- `liveAutoTradeEnabled` initializes false, and the current toggle route does not enable it.
-
-This establishes that the old execution daemon is not an active order owner in the current startup path, but retaining large dormant order/recovery bodies is unnecessary risk and confusion. Do not delete them until all UI callers, route compatibility, persisted legacy data and tests are accounted for. The SBK1 kill switch blocks SBK1 signal delivery; it does not represent Freqtrade's live order/position state.
+`server.ts` no longer contains direct Bybit REST/signing/credential-vault code, private order/position handlers, the old execution daemon, or the parallel exchange WebSocket. A default-deny API middleware allows only `GET /api/exchange/status` and an explicit safe `/api/live` allowlist. The HTTP integration test blocks non-loopback fetches while exercising legacy paths. Old local JSON position/history files are preserved but are no longer read or written by the server. The SBK1 kill switch blocks SBK1 signal delivery; it does not represent Freqtrade's live order/position state.
 
 ## Prioritized problems
 
@@ -136,9 +129,9 @@ This establishes that the old execution daemon is not an active order owner in t
 |---|---|---|---|
 | P0 — operational (resolved for this run) | Stale unmanaged services initially occupied the official ports; SBK1's health route served HTML. | Manager correctly refused duplicate listeners; after authorized SIGINT, managed start, JSON health and RPC all passed. | Keep manager-only launch policy; if ports are occupied, identify their owners and coordinate before stopping. |
 | P1 — setup (remediated) | Sample credentials were inconsistent for a clean private Freqtrade config. | The previous `.env.example` omitted nested Freqtrade API username/password overrides; config example leaves those fields blank. | Matching names are now explicit in `.env.example` and setup instructions; keep actual secrets private. |
-| P1 — UX/ownership | Dashboard still exposes calls to blocked legacy order routes. | `App.tsx` calls `/api/exchange/order`, close and stop-loss routes; backend rejects them. | Keep server gates; make UI explicitly read-only/disabled until it submits the supported signal contract. |
-| P1 — maintenance | Dormant direct-Bybit and local position lifecycle code remains in `server.ts`. | Unreferenced daemon/recovery routines and middleware-rejected order bodies coexist with Freqtrade. | Inventory all remaining callers and data dependencies, then replace/remove in a separate tested change; no blind deletion. |
-| P2 — truthfulness | The dashboard's backtest endpoint uses synthetic input. | `/api/backtest/run` passes `--synthetic`. | Label clearly as synthetic or wire actual historical data/Freqtrade backtesting; do not treat it as production evidence. |
+| P1 — UX/ownership (resolved) | Dashboard previously exposed calls to blocked legacy order routes. | The current browser callsites use Freqtrade-backed status and the supported signal/exit routes; direct exchange mutation callsites were removed. | Keep UI execution feedback tied to Freqtrade lifecycle and preserve the server-side default-deny boundary. |
+| P1 — maintenance (resolved) | The server previously retained dormant direct-Bybit and local position lifecycle code. | Legacy handlers, vault/signing, daemon, recovery, reconciliation and backend WebSocket were removed; the route test verifies default-deny behavior without external calls. | Keep the default-deny boundary; do not reintroduce parallel connectors or position ownership. |
+| P2 — truthfulness (resolved) | The dashboard previously exposed synthetic backtest output as a generic backtest. | `/api/backtest/run` now fails closed until historical SBK1 decision/features exist; the standalone researcher cannot grant live permission. | Keep the historical-data gate; do not treat local OHLCV alone as calibration evidence. |
 | P2 — reproducibility | Clean installs remain unverified, although managed process lifecycle is now tested. | Existing installed dependencies pass checks; a clean dependency install was not performed. | Test clean Node/Python installation in an isolated environment. |
 | P2 — maintainability | One execution-truth verification script is outside the package test command; build bundle is large. | `src/scripts/verify_full_execution_truth_chain.ts` is not referenced by package scripts; Vite emitted ~1.59 MB chunks. | Decide whether to move/integrate the test; optimize lazy-loaded bundles separately without removing capabilities. |
 
@@ -148,7 +141,7 @@ This establishes that the old execution daemon is not an active order owner in t
 |---|---|---|
 | `scripts/run_sbk1.ts` | **Keep** | Official supervisor; validates private config, Python strategy discovery, ports, lock, API/RPC readiness and child shutdown. |
 | `scripts/run_freqtrade.ts` | **Keep disabled** | Explicitly refuses standalone startup and directs users to the manager; retain as a guard against a second unmanaged bot. |
-| `server.ts` | **Keep; migrate then simplify** | Active API, Vite and public market-data feed; legacy execution code is dormant/rejected but has not yet been fully removed. |
+| `server.ts` | **Keep** | Active API, Vite middleware and Freqtrade snapshot/RPC boundary; no direct exchange connector or legacy order/position owner remains. |
 | `src/services/freqtradeBridge.ts` | **Keep** | Authenticated RPC reader used by API and runtime checks. |
 | `src/services/freqtradeSignalAdapter.ts` | **Keep** | Active versioned, validated, idempotent signal outbox and lifecycle metadata. |
 | `src/services/freqtradeDryRunFixture.ts` | **Keep** | Used by server dry-run fixture routes and tests; not a production signal generator. |
@@ -163,9 +156,18 @@ This establishes that the old execution daemon is not an active order owner in t
 | `src/scripts/verify_full_execution_truth_chain.ts` | **Move or wire into tests after review** | No package-script caller was found; preserve until its test coverage and intended use are decided. |
 | `src/components/TfjsReinforcementLearningWidget.tsx` and `tfjsReinforcementLearningEngine.ts` | **Keep** | Dynamic imports from `App.tsx`; static import-only graph would incorrectly classify them as dead. |
 | `src/App.tsx`, `src/main.tsx`, `index.html` | **Keep user changes** | These three files were already modified in the worktree before this audit. Their local changes were preserved. |
-| `scripts/realistic_backtester.py` and market-model scripts | **Keep as research/test tools** | Invoked for synthetic/research output and Python unit tests; not Freqtrade's official execution database. |
+| `scripts/realistic_backtester.py` and market-model scripts | **Keep as research/test tools** | Reads local Freqtrade Feather OHLCV, unverified JSON, or explicitly synthetic input; no direct exchange requests and no live authorization. |
 
 No source file was changed and no runtime file was removed during the initial evidence-gathering phase.
+
+## Follow-up implementation after the audited revision
+
+The work completed after the baseline audit above supersedes its legacy-backend and backtest-path findings:
+
+- Removed the direct Bybit REST/signing/credential-vault implementation, private exchange handlers, server-side order/recovery/reconciliation daemon, and backend exchange WebSocket from `server.ts`. The exchange API now defaults to rejecting every route except `GET /api/exchange/status`, which reads Freqtrade RPC; a small explicit `/api/live` allowlist remains.
+- Added an HTTP integration test that starts the real server, blocks all non-loopback `fetch` calls, checks the legacy mutation/credential routes and mixed-case paths fail closed, confirms the Freqtrade-backed status route is not masked, and verifies the legacy auto-trade toggle cannot enable itself.
+- Changed `scripts/realistic_backtester.py` to read local Freqtrade Feather files or explicit unverified JSON/synthetic inputs rather than contacting Bybit/Binance. It validates completed OHLCV shape/cadence and always reports that it cannot authorize live trading.
+- The production signal gate is still closed: no verified historical archive currently joins contemporaneous SBK1 decision/features with authoritative Freqtrade outcomes. Passing software checks or a local OHLCV backtest does not supply this evidence or justify a trade.
 
 ## Target architecture and staged remediation plan
 
@@ -173,7 +175,7 @@ No source file was changed and no runtime file was removed during the initial ev
 2. **Health/readiness:** require an explicit SBK1 JSON health identity, keep Freqtrade ping/authenticated status checks, and report stale/foreign listeners without killing them.
 3. **Signal lifecycle:** retain the versioned TypeScript/Python schema, fail-closed live signal policy, expiry, data-age, bridge authentication and idempotency. Only use Freqtrade for orders and official trade state.
 4. **UI alignment:** preserve analysis/monitoring components; clearly mark synthetic/research widgets and disable legacy execution controls instead of presenting rejected actions as live operations.
-5. **Legacy cleanup:** after enumerating route consumers, JSON data dependencies and regression tests, move/delete obsolete direct order, recovery and duplicate position ownership code. Keep Freqtrade upstream source and SQLite state.
+5. **Legacy cleanup (implemented):** removed obsolete direct order, credential, recovery, WebSocket and duplicate position ownership code after tracing callers and covering route compatibility; keep old user JSON/SQLite data untouched.
 6. **Verification gate:** after safely freeing the current ports, run the managed stack, test `/api/health`, authenticated RPC, then (with user authorization and dry-run prerequisites) exercise the fixture and verify no live mode. Test Ctrl+C/restart and inspect artifacts before declaring any readiness.
 
 ## Explicitly unverified

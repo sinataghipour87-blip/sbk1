@@ -331,7 +331,7 @@ class MetaModelEnsembleEngine {
     const empiricalModel = finalDirection === 'NEUTRAL'
       ? null
       : predictEmpiricalMetaProbability(
-          centralTradeDatasetService.getAllPredictions(),
+          centralTradeDatasetService.getFreqtradeVerifiedPredictions(),
           inputs,
           finalDirection,
           ensembleProbability
@@ -355,7 +355,7 @@ class MetaModelEnsembleEngine {
       expectedReturnR = Math.round((p * empiricalModel.averageWinR + (1 - p) * empiricalModel.averageLossR) * 100) / 100;
     }
 
-    const closedTrades = centralTradeDatasetService.getAllTradeRecords().filter(trade =>
+    const closedTrades = centralTradeDatasetService.getFreqtradeVerifiedTradeRecords().filter(trade =>
       trade.isClosed &&
       (trade.outcome === 'WIN' || trade.outcome === 'LOSS' || trade.outcome === 'BREAKEVEN') &&
       Number.isFinite(trade.entryPrice) &&

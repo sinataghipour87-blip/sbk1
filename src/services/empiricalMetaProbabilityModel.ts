@@ -1,5 +1,5 @@
 import { AdvancedRegimeType, MetaLearnerInputFeatures } from '../types/trading';
-import { PredictionDatasetRecord } from './centralTradeDataset';
+import { hasFreqtradeVerifiedOutcome, PredictionDatasetRecord } from './centralTradeDataset';
 
 const REGIMES: AdvancedRegimeType[] = [
   'TREND',
@@ -232,7 +232,8 @@ export function predictEmpiricalMetaProbability(
     inputs.fundingFeature?.fundingRate ?? null,
   );
   const samples = records
-    .filter(record => (record.outcome === 'WIN' || record.outcome === 'LOSS') &&
+    .filter(record => hasFreqtradeVerifiedOutcome(record) &&
+      (record.outcome === 'WIN' || record.outcome === 'LOSS') &&
       (record.executionStatus === 'EXECUTED_FILLED' || record.executionStatus === 'CLOSED_COMPLETED'))
     .map(record => {
       if (record.direction !== 'LONG' && record.direction !== 'SHORT') return null;

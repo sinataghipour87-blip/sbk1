@@ -46,7 +46,7 @@ export const getMaeMfeFingerprint = (
   timeframe: string,
   direction?: 'LONG' | 'SHORT' | 'NEUTRAL'
 ): MaeMfeFingerprint => {
-  const predictions = centralTradeDatasetService.getAllPredictions();
+  const predictions = centralTradeDatasetService.getFreqtradeVerifiedPredictions();
 
   // Filter for finished records matching Setup, Regime, Timeframe, and Direction
   const matchedRecords = predictions.filter(

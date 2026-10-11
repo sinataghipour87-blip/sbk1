@@ -82,18 +82,26 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected }) => {
         <div className="p-4 bg-slate-900 border border-slate-700 rounded-lg text-white">
             <h2 className="text-lg font-bold mb-4">مدیریت حالت اجرا (Execution Governor)</h2>
             <div className="flex gap-2 mb-4">
-                {(['BACKTEST', 'TESTNET', 'PAPER', 'LIVE'] as ExecutionMode[]).map(m => (
+                {(['DRY_RUN', 'BACKTEST', 'PAPER', 'TESTNET', 'LIVE'] as ExecutionMode[]).map(m => (
                     <button
                         key={m}
-                        disabled={loading}
+                        disabled={loading || m === 'TESTNET' || m === 'LIVE'}
+                        title={m === 'TESTNET' || m === 'LIVE' ? 'This integration is restricted to the Freqtrade virtual dry-run wallet.' : undefined}
                         className={`px-3 py-1 rounded ${mode === m ? 'bg-blue-600' : 'bg-slate-700'}`}
                         onClick={() => handleUpdate(m, ceiling)}
                     >
-                        {m}
+                        {m === 'DRY_RUN'
+                            ? 'FREQTRADE DRY-RUN'
+                            : m === 'TESTNET' || m === 'LIVE'
+                                ? `${m} (disabled)`
+                                : m}
                     </button>
                 ))}
             </div>
             {updateError && <p className="mb-4 text-sm text-amber-300">{updateError}</p>}
+            <p className="mb-4 text-xs text-slate-300">
+                DRY_RUN فقط کیف پول مجازی Freqtrade است؛ Testnet و LIVE در این یکپارچه‌سازی غیرفعال‌اند.
+            </p>
             <div className="mb-4">
                 <label>سقف سرمایه لایو (%):</label>
                 <input 

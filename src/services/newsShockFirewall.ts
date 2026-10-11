@@ -264,7 +264,7 @@ export class NewsShockFirewallService {
     const isVolatilityShock = volatilityExpansionRatio >= this.VOLATILITY_SHOCK_RATIO;
 
     // 2. Calculate Real Liquidity / Spread Metrics
-    const currentSpreadBps = analysis?.canonicalSnapshot?.basisSpreadBps ?? 2.5;
+    const currentSpreadBps = analysis?.canonicalSnapshot?.basisSpreadBps ?? Number.POSITIVE_INFINITY;
     const baselineSpreadBps = 2.0;
     const liquiditySpreadDeteriorationRatio = Math.round((currentSpreadBps / baselineSpreadBps) * 100) / 100;
     const isLiquidityShock = currentSpreadBps >= this.LIQUIDITY_SPREAD_SHOCK_BPS;

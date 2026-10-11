@@ -945,7 +945,8 @@ class HunterOsEngine {
     const predScore = predProb;
 
     // Ring 4: PRICE HUNTER
-    const spreadOk = (analysis?.canonicalSnapshot?.basisSpreadUsd ?? 0.5) < 3.0;
+    const spreadUsd = analysis?.canonicalSnapshot?.basisSpreadUsd;
+    const spreadOk = typeof spreadUsd === 'number' && spreadUsd < 3.0;
     const sniperScore = spreadOk ? 89 : 45;
 
     // Ring 5: TRIGGER

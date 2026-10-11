@@ -322,13 +322,13 @@ export function analyzePro(
   const currMacdH = macdH[macdH.length - 1] || 0.0;
 
   // Multi-Timeframe Checks
-  const htf1m = analyzeHtfTrend(htfCandles['Bybit 1m']);
-  const htf5m = analyzeHtfTrend(htfCandles['Bybit 5m']);
-  const htf1h = analyzeHtfTrend(htfCandles['Bybit 1H']);
-  const htf4h = analyzeHtfTrend(htfCandles['Bybit 4H']);
+  const htf1m = analyzeHtfTrend(htfCandles['Freqtrade 1m']);
+  const htf5m = analyzeHtfTrend(htfCandles['Freqtrade 5m']);
+  const htf1h = analyzeHtfTrend(htfCandles['Freqtrade 1h']);
+  const htf4h = analyzeHtfTrend(htfCandles['Freqtrade 4h']);
 
   // 1H RSI Divergence & Convergence Engine
-  const rsi1hResult = detect1hRsiDivergence(htfCandles['Bybit 1H'], candles);
+  const rsi1hResult = detect1hRsiDivergence(htfCandles['Freqtrade 1h'], candles);
 
   const mtfBull = htf1h === 'BULLISH' && (htf4h === 'BULLISH' || htf4h === 'UNKNOWN');
   const mtfBear = htf1h === 'BEARISH' && (htf4h === 'BEARISH' || htf4h === 'UNKNOWN');

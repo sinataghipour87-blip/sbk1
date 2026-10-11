@@ -257,8 +257,10 @@ export class RealWorldMasterBrainsService {
       recActionFa = 'نگه‌داری معامله سودده با تریلینگ پارابولیک برای شکار سودهای ماکزیمم';
     }
 
-    const spreadBps = analysis?.canonicalSnapshot?.basisSpreadBps ?? 2;
-    const spreadImmunity = Math.max(20, Math.min(98, Math.round(100 - spreadBps * 4)));
+    const spreadBps = analysis?.canonicalSnapshot?.basisSpreadBps;
+    const spreadImmunity = spreadBps === null || spreadBps === undefined
+      ? 20
+      : Math.max(20, Math.min(98, Math.round(100 - spreadBps * 4)));
 
     // تولید بسته‌های پیشنهادی هوشمند و پیشگیرانه بر پایه سنجش بلادرنگ شواهد
     const suggestions: MasterBrainDiagnosis['proactiveSuggestions'] = [

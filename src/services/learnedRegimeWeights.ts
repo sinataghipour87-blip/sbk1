@@ -91,7 +91,7 @@ export class LearnedRegimeWeightsService {
     isNewsShockActive: boolean
   ): Record<FeatureClusterId, number> {
     const dataset = CentralTradeDatasetService.getInstance();
-    const allRecords = dataset.getAllPredictions();
+    const allRecords = dataset.getFreqtradeVerifiedPredictions();
 
     // Base default baseline learned from empirical crypto market microstructures
     const baseWeights: Record<FeatureClusterId, number> = {

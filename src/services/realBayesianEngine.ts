@@ -163,7 +163,7 @@ export class RealBayesianEngine {
 
     const segmentKey = `${setupType.toUpperCase()}__${marketRegime.toUpperCase()}__${timeframe.toUpperCase()}__${direction}`;
     const datasetService = CentralTradeDatasetService.getInstance();
-    const allPredictions = datasetService.getAllPredictions();
+    const allPredictions = datasetService.getFreqtradeVerifiedPredictions();
 
     // 1. Gather all resolved records matching Setup × Regime × Timeframe × Direction
     let matchingRecords = allPredictions.filter(r => {

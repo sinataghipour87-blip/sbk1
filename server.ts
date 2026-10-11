@@ -7,8 +7,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
-import WebSocket from 'ws';
-import { TradePosition, TradeHistory, ExecutionSettings } from './src/types/trading';
+import { Candle, ExecutionSettings } from './src/types/trading';
 import { freqtradeBridge } from './src/services/freqtradeBridge';
 import {
     freqtradeSignalAdapter,
@@ -21,13 +20,14 @@ import {
     DRY_RUN_FIXTURE_SETUP_PREFIX,
     getDryRunFixtureReadinessError,
 } from './src/services/freqtradeDryRunFixture';
+import {
+    FREQTRADE_TICKER_MAX_AGE_MS,
+    freqtradeMarketDataBridge,
+    FreqtradeMarketSnapshotValidationError,
+} from './src/services/freqtradeMarketDataBridge';
 
 dotenv.config();
 
-// Persistent Storage Databases (Item 4 & 6)
-const POSITIONS_DB = 'database_positions.json';
-const HISTORY_DB = 'database_history.json';
-const IDEMPOTENCY_DB = 'database_idempotency.json';
 const DATASET_STORE_FILE = 'database_dataset_store.json';
 
 // Global Storage Polyfill for Server-Side Runtime
@@ -61,13 +61,6 @@ if (typeof (globalThis as any).localStorage === 'undefined') {
         }
     };
 }
-
-let activePositions: TradePosition[] = [];
-let tradeHistory: TradeHistory[] = [];
-let idempotencyLog: Record<string, any> = {};
-let isRecoveringPositions = false;
-let serverWalletBalance = 0;
-let userLeverage: number | null = null;
 
 const app = express();
 let shutdownRequested = false;
@@ -350,10 +343,6 @@ app.post('/api/monte-carlo', async (req, res) => {
     }
 });
 
-// -------------------------------------------------------------
-// REAL-WORLD EXCHANGE EXECUTION ENGINE (Bybit V5 REST API)
-// Bridges the AI Quantum Engine with Live Exchange Futures Order Execution
-// -------------------------------------------------------------
 // --- Execution Mode Engine ---
 let executionSettings: ExecutionSettings = {
     mode: 'BACKTEST',
@@ -398,152 +387,6 @@ app.post('/api/execution/mode', executionModeLimiter, requireAdminAuth, (req, re
     executionSettings.lastChangedAt = Date.now();
     res.json({ success: true, settings: executionSettings });
 });
-// Encrypted at rest (AES-256-GCM), zero client-side secret exposure, redacted logs
-// -------------------------------------------------------------
-const VAULT_SECRET = process.env.EXCHANGE_VAULT_KEY || '';
-if (!VAULT_SECRET) {
-    console.warn('[SECURITY WARNING] EXCHANGE_VAULT_KEY is not defined in environment. Server-side encrypted credential storage is disabled.');
-}
-const VAULT_FILE = '.exchange_vault.enc';
-
-// Dynamic Clock Synchronization Engine with Bybit (Item 5)
-let bybitTimeOffset = 0; // Offset in ms: (BybitTime - ServerLocalTime)
-
-function getDynamicRecvWindow(): string {
-    return Math.min(Math.max(5000, Math.abs(bybitTimeOffset) + 2000), 20000).toString();
-}
-
-async function syncClockWithBybit(isTestnet: boolean) {
-    try {
-        const baseUrl = isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const start = Date.now();
-        const response = await fetch(`${baseUrl}/v5/market/time`);
-        const data = await response.json();
-        const latency = Date.now() - start;
-
-        if (data.retCode === 0 && data.result?.timeNano) {
-            const bybitTimeMs = Math.floor(parseInt(data.result.timeNano) / 1000000);
-            // Calculate offset considering one-way latency approximation
-            const estimatedBybitTime = bybitTimeMs + Math.floor(latency / 2);
-            bybitTimeOffset = estimatedBybitTime - Date.now();
-            console.log(`[CLOCK SYNC] Synced with Bybit V5. Offset: ${bybitTimeOffset} ms. Latency: ${latency} ms.`);
-        }
-    } catch (err: any) {
-        console.error('[CLOCK SYNC ERROR] Failed to sync clock with Bybit (secrets redacted)');
-    }
-}
-
-// Live Mode Authorization Guard (Item 1)
-const isLiveAllowed = (): boolean => {
-    const token = process.env.ADMIN_TOKEN;
-    const vaultKey = process.env.EXCHANGE_VAULT_KEY;
-    if (!token) return false;
-    if (vaultKey && token === vaultKey) return false;
-    return true;
-};
-
-if (!isLiveAllowed()) {
-    console.error('\x1b[31m[CRITICAL SECURITY CONFIG] ADMIN_TOKEN is not set or matches EXCHANGE_VAULT_KEY. LIVE mode is disabled.\x1b[0m');
-}
-
-function encryptSecret(text: string): { iv: string; content: string; tag: string; salt: string } {
-    if (!VAULT_SECRET) throw new Error('EXCHANGE_VAULT_KEY is not configured on server.');
-    const iv = crypto.randomBytes(12);
-    const salt = crypto.randomBytes(16).toString('hex'); // Random salt persisted in payload (Item 7)
-    const key = crypto.scryptSync(VAULT_SECRET, salt, 32);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    let encrypted = cipher.update(text, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    const tag = cipher.getAuthTag().toString('hex');
-    return { iv: iv.toString('hex'), content: encrypted, tag, salt };
-}
-
-function decryptSecret(encrypted: { iv: string; content: string; tag: string; salt: string }): string {
-    if (!VAULT_SECRET) throw new Error('EXCHANGE_VAULT_KEY is not configured on server.');
-    const key = crypto.scryptSync(VAULT_SECRET, encrypted.salt, 32);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(encrypted.iv, 'hex'));
-    decipher.setAuthTag(Buffer.from(encrypted.tag, 'hex'));
-    let decrypted = decipher.update(encrypted.content, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
-}
-
-interface ServerExchangeConfig {
-    apiKey: string;
-    apiSecret: string;
-    isTestnet: boolean;
-    updatedAt: number;
-}
-
-let inMemoryVault: ServerExchangeConfig | null = null;
-
-function loadServerCredentials(): ServerExchangeConfig | null {
-    if (inMemoryVault) {
-        if (!inMemoryVault.isTestnet && !isLiveAllowed()) {
-            console.error('[SECURITY VIOLATION] Live credentials loaded but ADMIN_TOKEN is not configured or invalid. Forcing sandbox mode.');
-            inMemoryVault.isTestnet = true;
-        }
-        return inMemoryVault;
-    }
-    try {
-        let loaded: ServerExchangeConfig | null = null;
-        if (process.env.EXCHANGE_API_KEY && process.env.EXCHANGE_API_SECRET) {
-            loaded = {
-                apiKey: process.env.EXCHANGE_API_KEY,
-                apiSecret: process.env.EXCHANGE_API_SECRET,
-                isTestnet: process.env.EXCHANGE_IS_TESTNET === 'true',
-                updatedAt: Date.now()
-            };
-        } else if (fs.existsSync(VAULT_FILE)) {
-            const raw = fs.readFileSync(VAULT_FILE, 'utf-8');
-            const parsed = JSON.parse(raw);
-            const decryptedSecret = decryptSecret(parsed.encryptedSecret);
-            loaded = {
-                apiKey: parsed.apiKey,
-                apiSecret: decryptedSecret,
-                isTestnet: parsed.isTestnet,
-                updatedAt: parsed.updatedAt
-            };
-        }
-
-        if (loaded) {
-            if (!loaded.isTestnet && !isLiveAllowed()) {
-                console.error('[SECURITY VIOLATION] Live Bybit credentials found but ADMIN_TOKEN is not set or matches EXCHANGE_VAULT_KEY. Forcing sandbox mode for server safety.');
-                loaded.isTestnet = true;
-            }
-            inMemoryVault = loaded;
-            return inMemoryVault;
-        }
-    } catch (err) {
-        console.error('Vault load error (credentials intact, secrets redacted)');
-    }
-    return null;
-}
-
-function saveServerCredentials(apiKey: string, apiSecret: string, isTestnet: boolean) {
-    const encrypted = encryptSecret(apiSecret);
-    const payload = {
-        apiKey,
-        encryptedSecret: encrypted,
-        isTestnet,
-        updatedAt: Date.now()
-    };
-    fs.writeFileSync(VAULT_FILE, JSON.stringify(payload, null, 2), 'utf-8');
-    inMemoryVault = { apiKey, apiSecret, isTestnet, updatedAt: Date.now() };
-}
-
-function wipeServerCredentials() {
-    inMemoryVault = null;
-    if (fs.existsSync(VAULT_FILE)) {
-        fs.unlinkSync(VAULT_FILE);
-    }
-}
-
-function generateBybitV5Signature(apiKey: string, apiSecret: string, timestamp: string, recvWindow: string, payload: string) {
-    const message = timestamp + apiKey + recvWindow + payload;
-    return crypto.createHmac('sha256', apiSecret).update(message).digest('hex');
-}
-
 // Timing-Attack Resistant String Comparison Helper (Item 1)
 function timingSafeCompare(a: string, b: string): boolean {
     if (!a || !b) return false;
@@ -588,19 +431,19 @@ app.use('/api/live', liveOperationLimiter);
 app.use('/api/exchange', requireAdminAuth);
 app.use('/api/live', requireAdminAuth);
 
-const legacyExecutionPaths = new Set([
-    '/api/exchange/order',
-    '/api/exchange/update-stop-loss',
-    '/api/exchange/close-position',
-    '/api/exchange/partial-close',
-    '/api/exchange/unhedge',
-    '/api/exchange/hedge-chip',
-    '/api/exchange/dca-position',
+const safeLiveApiRoutes = new Set([
+    'GET /api/live/status',
+    'POST /api/live/kill-switch',
+    'POST /api/live/run-readiness-tests',
+    'POST /api/live/validate-trade',
+    'POST /api/live/toggle-auto-trade',
 ]);
 app.use((req, res, next) => {
+    const method = req.method.toUpperCase();
+    const path = req.path.toLowerCase();
     if (
-        req.path === '/api/exchange/credentials' &&
-        (req.method === 'POST' || req.method === 'DELETE')
+        path === '/api/exchange/credentials' &&
+        (method === 'POST' || method === 'DELETE')
     ) {
         return res.status(409).json({
             success: false,
@@ -608,12 +451,12 @@ app.use((req, res, next) => {
             error: 'Exchange credentials are managed only by the Freqtrade deployment; SBK1 does not store trading credentials.',
         });
     }
-    if (req.method === 'POST' && legacyExecutionPaths.has(req.path)) {
-        return res.status(409).json({
-            success: false,
-            code: 'FREQTRADE_EXECUTION_OWNER',
-            error: 'Direct exchange execution and local position management are disabled. Submit an approved signal to Freqtrade instead.',
-        });
+    if (path.startsWith('/api/exchange/')) {
+        if (method === 'GET' && path === '/api/exchange/status') return next();
+        return rejectLegacyExchangeExecution(req, res);
+    }
+    if (path.startsWith('/api/live/') && !safeLiveApiRoutes.has(`${method} ${path}`)) {
+        return rejectLegacyExchangeExecution(req, res);
     }
     next();
 });
@@ -631,29 +474,6 @@ function requireFreqtradeBridgeAuth(req: express.Request, res: express.Response,
     }
     next();
 }
-
-// -------------------------------------------------------------
-// IDEMPOTENCY & DUPLICATE ORDER PROTECTION ENGINE (Issue 30)
-// Prevents double execution and maintains lifecycle integrity
-// -------------------------------------------------------------
-interface CachedOrderExecution {
-    clientOrderId: string;
-    decisionId?: string;
-    status: 'IN_FLIGHT' | 'COMPLETED' | 'FAILED';
-    response: any;
-    timestamp: number;
-}
-const orderIdempotencyCache = new Map<string, CachedOrderExecution>();
-
-// Periodically clean up idempotency cache older than 10 minutes
-const idempotencyCleanupTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [key, val] of orderIdempotencyCache.entries()) {
-        if (now - val.timestamp > 10 * 60 * 1000) {
-            orderIdempotencyCache.delete(key);
-        }
-    }
-}, 60 * 1000);
 
 // Server-side Risk Governor validation helper
 function validateTradeRequest(body: any): { allowed: boolean; reason?: string } {
@@ -726,6 +546,7 @@ app.get('/api/exchange/status', async (req, res) => {
             isTestnet: null,
             demoTrading: botState.demoTrading,
             dryRun: botState.dryRun,
+            forceEntryEnabled: botState.forceEntryEnabled,
             serverTimestamp,
             walletBalanceUsdt: balance.equity,
             availableBalanceUsdt: balance.available,
@@ -752,487 +573,6 @@ app.get('/api/exchange/status', async (req, res) => {
     }
 });
 
-// Configure Server-Side Exchange Credentials (Issue 28 & Item 33)
-app.post('/api/exchange/credentials', rejectLegacyExchangeExecution, async (req, res) => {
-    const { apiKey, apiSecret, isTestnet } = req.body || {};
-    if (!apiKey || !apiSecret) {
-        return res.status(400).json({ success: false, error: 'API Key و Secret الزامی است.' });
-    }
-
-    if (!isTestnet && !isLiveAllowed()) {
-        return res.status(403).json({
-            success: false,
-            error: 'راه‌اندازی در حالت لایو مجاز نیست: توکن ادمین مجزا (ADMIN_TOKEN) تعریف نشده است.'
-        });
-    }
-
-    try {
-        // Validate credentials live on Bybit first
-        const baseUrl = isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = getDynamicRecvWindow();
-        const queryString = 'accountType=UNIFIED';
-        const signature = generateBybitV5Signature(apiKey, apiSecret, timestamp, recvWindow, queryString);
-
-        const [balanceRes, queryApiRes] = await Promise.all([
-            fetch(`${baseUrl}/v5/account/wallet-balance?${queryString}`, {
-                method: 'GET',
-                headers: {
-                    'X-BAPI-API-KEY': apiKey,
-                    'X-BAPI-SIGN': signature,
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            }),
-            fetch(`${baseUrl}/v5/user/query-api`, {
-                method: 'GET',
-                headers: {
-                    'X-BAPI-API-KEY': apiKey,
-                    'X-BAPI-SIGN': generateBybitV5Signature(apiKey, apiSecret, timestamp, recvWindow, ''),
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            }).catch(() => null)
-        ]);
-
-        const data = await balanceRes.json();
-        if (data.retCode === 0) {
-            let hasWithdraw = false;
-            let hasIpRestriction = true;
-            if (queryApiRes) {
-                try {
-                    const queryData = await queryApiRes.json();
-                    if (queryData.retCode === 0 && queryData.result) {
-                        const permissions = queryData.result.permissions || {};
-                        hasWithdraw = (permissions.Withdraw && permissions.Withdraw.length > 0) || 
-                                      Object.keys(permissions).some(k => k.toLowerCase() === 'withdraw' || k.toLowerCase() === 'withdrawal');
-                        const ips = queryData.result.ips || [];
-                        hasIpRestriction = ips.length > 0 && !ips.includes('*') && !ips.includes('');
-                    }
-                } catch (e) {}
-            }
-
-            if (hasWithdraw) {
-                liveTradingState.apiKeyPermissions.withdraw = true;
-                liveTradingState.liveAutoTradeEnabled = false;
-                return res.status(400).json({
-                    success: false,
-                    error: 'LIVE TRADING BLOCKED: کلید API دارای مجوز برداشت (Withdrawal) است! برای امنیت دارایی‌ها، استفاده از کلیدهای دارای مجوز برداشت اکیداً ممنوع است.'
-                });
-            }
-
-            liveTradingState.apiKeyPermissions.withdraw = false;
-            liveTradingState.hasIpRestriction = hasIpRestriction;
-            if (!hasIpRestriction) {
-                liveTradingState.ipRestrictionWarning = "هشدار امنیتی شدید: کلید API شما محدودیت IP ندارد! لطفا کلید را در پنل صرافی به IP سرور خود محدود کنید.";
-            } else {
-                liveTradingState.ipRestrictionWarning = null;
-            }
-
-            saveServerCredentials(apiKey, apiSecret, !!isTestnet);
-            const keyMasked = `${apiKey.substring(0, 4)}****${apiKey.substring(apiKey.length - 4)}`;
-            return res.json({
-                success: true,
-                message: 'کلیدهای صرافی با رمزنگاری پیشرفته در سرور ذخیره شد و دسترسی تایید گردید.',
-                keyMasked
-            });
-        } else {
-            return res.status(401).json({ success: false, error: data.retMsg || 'کلیدهای وارد شده توسط صرافی رد شدند.' });
-        }
-    } catch (err: any) {
-        return res.status(500).json({ success: false, error: 'خطا در اعتبارسنجی با سرور صرافی' });
-    }
-});
-
-// Revoke Server-Side Exchange Credentials (Issue 28 & Item 33)
-app.delete('/api/exchange/credentials', (req, res) => {
-    wipeServerCredentials();
-    res.json({ success: true, message: 'کلیدهای صرافی با موفقیت از سرور لغو و پاکسازی شدند.' });
-});
-
-// Isolated Simulation / Sandbox Order Endpoint (Issue 27)
-app.post('/api/exchange/simulated-order', rejectLegacyExchangeExecution, (req, res) => {
-    const { symbol = 'BTCUSDT', side, orderType = 'Market', qty, price, stopLoss, takeProfit, clientOrderId } = req.body || {};
-    res.json({
-        success: true,
-        simulated: true,
-        orderId: `sim_${Date.now()}`,
-        clientOrderId: clientOrderId || `sim_client_${Date.now()}`,
-        message: 'سفارش شبیه‌ساز درون‌حافظه‌ای با موفقیت اجرا شد (حالت سندباکس ایزوله).',
-        side,
-        qty,
-        symbol,
-        price
-    });
-});
-
-// Place Real Futures Order on Live Exchange with Idempotency (Issues 27, 28, 30)
-app.post('/api/exchange/order', rejectLegacyExchangeExecution, async (req, res) => {
-    const {
-        symbol = 'BTCUSDT',
-        side,
-        orderType = 'Market',
-        qty,
-        price,
-        stopLoss,
-        takeProfit,
-        clientOrderId,
-        signalId,
-        decisionId,
-        executionAttemptId,
-        mode = 'live'
-    } = req.body || {};
-
-    // Strict Mode Isolation: If explicitly requesting simulation, route to simulation
-    if (mode === 'simulation') {
-        return res.json({
-            success: true,
-            simulated: true,
-            orderId: `sim_${Date.now()}`,
-            clientOrderId: clientOrderId || `sim_client_${Date.now()}`,
-            message: 'سفارش در موتور شبیه‌ساز با موفقیت ثبت شد.',
-            side,
-            qty,
-            symbol
-        });
-    }
-
-    // STRICT RISK GOVERNOR CHECK: Pre-Execution Safety Validation (Item 2)
-    const validation = validateTradeRequest(req.body);
-    if (!validation.allowed) {
-        return res.status(403).json({
-            success: false,
-            blocked: true,
-            error: `سفارش توسط قوانین ریسک سرور (Server-Side Risk Governor) مسدود شد: ${validation.reason}`
-        });
-    }
-
-    // Live Execution Route: Check server-side credentials
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.status(403).json({
-            success: false,
-            blocked: true,
-            error: 'EXECUTION_BLOCKED: کلیدهای معتبر صرافی لایو در سرور یافت نشد یا مجوز معامله وجود ندارد. معامله لایو مسدود شد.',
-            code: 'CREDENTIALS_REQUIRED',
-            clientOrderId,
-            signalId,
-            decisionId,
-        });
-    }
-
-    const requestedQty = Number(qty);
-    if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
-        return res.status(400).json({
-            success: false,
-            blocked: true,
-            error: 'EXECUTION_BLOCKED: مقدار سفارش معتبر نیست.',
-            code: 'INVALID_ORDER_QTY'
-        });
-    }
-
-    const steppedQty = Math.floor(requestedQty * 1000) / 1000;
-    if (steppedQty < 0.001) {
-        return res.status(400).json({
-            success: false,
-            blocked: true,
-            error: 'EXECUTION_BLOCKED: حداقل حجم سفارش در Bybit برابر با 0.001 BTC است.',
-            code: 'QTY_BELOW_MINIMUM'
-        });
-    }
-
-    if (orderType === 'Limit' && (!Number.isFinite(Number(price)) || Number(price) <= 0)) {
-        return res.status(400).json({
-            success: false,
-            blocked: true,
-            error: 'EXECUTION_BLOCKED: قیمت سفارش محدود معتبر نیست.',
-            code: 'INVALID_ORDER_PRICE'
-        });
-    }
-
-    const livePrices = await fetchFuturesPrices(true);
-    if (!hasFreshLiveFuturesPrices(livePrices)) {
-        return res.status(503).json({
-            success: false,
-            blocked: true,
-            error: 'EXECUTION_BLOCKED: قیمت زنده فیوچرز موجود یا تازه نیست؛ سفارش ارسال نشد.',
-            code: 'LIVE_MARKET_DATA_UNAVAILABLE'
-        });
-    }
-
-    // Idempotency Check (Issue 30): Prevent double execution
-    const uniqueKey = clientOrderId || decisionId || `ord_${symbol}_${side}_${Date.now()}`;
-    const cached = orderIdempotencyCache.get(uniqueKey);
-    if (cached) {
-        if (cached.status === 'COMPLETED' || cached.status === 'IN_FLIGHT') {
-            return res.json(cached.response);
-        }
-    }
-
-    orderIdempotencyCache.set(uniqueKey, {
-        clientOrderId: uniqueKey,
-        decisionId,
-        status: 'IN_FLIGHT',
-        response: null,
-        timestamp: Date.now()
-    });
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = Math.min(Math.max(5000, Math.abs(bybitTimeOffset) + 2000), 20000).toString();
-
-        // Check Bybit first to see if this orderLinkId was already submitted during network retry
-        if (clientOrderId) {
-            try {
-                const checkQuery = `category=linear&symbol=${symbol.replace('/', '')}&orderLinkId=${encodeURIComponent(clientOrderId)}`;
-                const checkSig = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, checkQuery);
-                const checkRes = await fetch(`${baseUrl}/v5/order/realtime?${checkQuery}`, {
-                    headers: {
-                        'X-BAPI-API-KEY': creds.apiKey,
-                        'X-BAPI-SIGN': checkSig,
-                        'X-BAPI-TIMESTAMP': timestamp,
-                        'X-BAPI-RECV-WINDOW': recvWindow,
-                    }
-                });
-                const checkData = await checkRes.json();
-                if (checkData.retCode === 0 && checkData.result?.list?.length > 0) {
-                    const existingOrder = checkData.result.list[0];
-                    const existingResponse = {
-                        success: true,
-                        simulated: false,
-                        duplicatePrevented: true,
-                        orderId: existingOrder.orderId,
-                        orderLinkId: existingOrder.orderLinkId,
-                        orderStatus: existingOrder.orderStatus,
-                        message: `سفارش تکراری شناسایی شد؛ وضعیت سفارش قبلی از صرافی بازخوانی گردید.`,
-                    };
-                    orderIdempotencyCache.set(uniqueKey, {
-                        clientOrderId: uniqueKey,
-                        decisionId,
-                        status: 'COMPLETED',
-                        response: existingResponse,
-                        timestamp: Date.now()
-                    });
-                    return res.json(existingResponse);
-                }
-            } catch (checkErr) {
-                // proceed with submission
-            }
-        }
-
-        const orderPayload: any = {
-            category: 'linear',
-            symbol: symbol.replace('/', ''),
-            side: side === 'LONG' ? 'Buy' : 'Sell',
-            orderType: orderType,
-            qty: String(requestedQty),
-            timeInForce: 'GTC',
-            orderLinkId: uniqueKey,
-        };
-
-        if (orderType === 'Limit' && price) {
-            orderPayload.price = String(price);
-        }
-        if (stopLoss) {
-            orderPayload.stopLoss = String(stopLoss);
-        }
-        if (takeProfit) {
-            orderPayload.takeProfit = String(takeProfit);
-        }
-
-        const payloadStr = JSON.stringify(orderPayload);
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, payloadStr);
-
-        const response = await fetch(`${baseUrl}/v5/order/create`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-            },
-            body: payloadStr,
-        });
-
-        const data = await response.json();
-        if (data.retCode === 0) {
-            const createdOrderId = data.result?.orderId;
-            const orderLinkId = data.result?.orderLinkId || uniqueKey;
-
-            // Query actual order lifecycle status from exchange (Item 34: CREATED -> SUBMITTED -> ACCEPTED -> FILLED)
-            let exchangeOrderStatus = 'ACCEPTED';
-            let entryPriceOverride = 0;
-            let qtyOverride = 0;
-            try {
-                const statusQuery = `category=linear&symbol=${symbol.replace('/', '')}&orderId=${encodeURIComponent(createdOrderId)}`;
-                const statusSig = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, statusQuery);
-                const statusRes = await fetch(`${baseUrl}/v5/order/realtime?${statusQuery}`, {
-                    headers: {
-                        'X-BAPI-API-KEY': creds.apiKey,
-                        'X-BAPI-SIGN': statusSig,
-                        'X-BAPI-TIMESTAMP': timestamp,
-                        'X-BAPI-RECV-WINDOW': recvWindow,
-                    }
-                });
-                const statusData = await statusRes.json();
-                if (statusData.retCode === 0 && statusData.result?.list?.length > 0) {
-                    const rawOrder = statusData.result.list[0];
-                    exchangeOrderStatus = rawOrder.orderStatus || 'ACCEPTED';
-                    const parsedAvgPrice = parseFloat(rawOrder.avgPrice || '0');
-                    const parsedExecQty = parseFloat(rawOrder.cumExecQty || '0');
-                    if (Number.isFinite(parsedAvgPrice) && parsedAvgPrice > 0) {
-                        entryPriceOverride = parsedAvgPrice;
-                    }
-                    if (Number.isFinite(parsedExecQty) && parsedExecQty > 0) {
-                        qtyOverride = parsedExecQty;
-                    }
-                }
-            } catch {
-                // fallback status
-            }
-
-            const successResponse = {
-                success: true,
-                simulated: false,
-                orderId: createdOrderId,
-                orderLinkId,
-                orderLifecycleState: exchangeOrderStatus,
-                signalId,
-                decisionId,
-                executionAttemptId,
-                message: `سفارش واقعی ${side} در صرافی ثبت شد (وضعیت صرافی: ${exchangeOrderStatus}).`,
-            };
-
-            // Build and add position to server-side activePositions so the daemon can manage it!
-            const entryPrice = entryPriceOverride > 0 ? entryPriceOverride : livePrices.lastPrice;
-            const finalQty = qtyOverride > 0 ? qtyOverride : parseFloat(qty || '0.001');
-            const leverage = parseFloat(req.body.leverage || '10');
-            const calcMargin = (finalQty * entryPrice) / leverage;
-
-            const newPos: TradePosition = {
-                id: uniqueKey,
-                dir: side === 'LONG' || side === 'Buy' ? 'LONG' : 'SHORT',
-                entry: entryPrice,
-                initialEntry: entryPrice,
-                avgEntry: entryPrice,
-                margin: isNaN(calcMargin) ? 10 : calcMargin,
-                initialMargin: isNaN(calcMargin) ? 10 : calcMargin,
-                lev: leverage,
-                sl: parseFloat(stopLoss || '0') || (side === 'LONG' || side === 'Buy' ? entryPrice * 0.99 : entryPrice * 1.01),
-                tp: parseFloat(takeProfit || '0') || (side === 'LONG' || side === 'Buy' ? entryPrice * 1.015 : entryPrice * 0.985),
-                tp1: parseFloat(takeProfit || '0') || (side === 'LONG' || side === 'Buy' ? entryPrice * 1.015 : entryPrice * 0.985),
-                tp2: parseFloat(takeProfit || '0') || (side === 'LONG' || side === 'Buy' ? entryPrice * 1.03 : entryPrice * 0.97),
-                tp3: parseFloat(takeProfit || '0') || (side === 'LONG' || side === 'Buy' ? entryPrice * 1.045 : entryPrice * 0.955),
-                tp1Hit: false,
-                tp2Hit: false,
-                tp3Hit: false,
-                realizedPnlUsd: 0,
-                currentTarget: 1,
-                openedAt: new Date().toLocaleTimeString('fa-IR'),
-                name: activePositions.length === 0 ? 'S' : activePositions.length === 1 ? 'SB' : 'SBK',
-                isAuto: mode !== 'manual',
-                maeUsd: 0,
-                maePct: 0,
-                mfeUsd: 0,
-                mfePct: 0,
-                lifecycleStatus: 'PROTECTED',
-                uniqueClientOrderId: uniqueKey,
-                signalId: signalId || `SIG_${Date.now()}`,
-                decisionId: decisionId || `DEC_${Date.now()}`,
-                executionAttemptId: executionAttemptId || `ATT_${Date.now()}`
-            };
-
-            activePositions.push(newPos);
-            writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-            logTradingEvent('ORDER_ADDED_TO_DAEMON', `Position ${newPos.id} (${newPos.dir}) added to server daemon tracking.`);
-
-            orderIdempotencyCache.set(uniqueKey, {
-                clientOrderId: uniqueKey,
-                decisionId,
-                status: 'COMPLETED',
-                response: successResponse,
-                timestamp: Date.now()
-            });
-
-            return res.json(successResponse);
-        } else {
-            orderIdempotencyCache.delete(uniqueKey);
-            return res.status(400).json({
-                success: false,
-                error: data.retMsg,
-                code: data.retCode,
-                clientOrderId: uniqueKey
-            });
-        }
-    } catch (err: any) {
-        orderIdempotencyCache.delete(uniqueKey);
-        return res.status(500).json({ success: false, error: 'خطا در ارسال سفارش به صرافی' });
-    }
-});
-
-// Reconcile Order Fill Status & Live Position State with Exchange (Issues 29 & 30)
-app.get('/api/exchange/order-status', rejectLegacyExchangeExecution, async (req, res) => {
-    const { orderId, clientOrderId, symbol = 'BTCUSDT' } = req.query as { orderId?: string; clientOrderId?: string; symbol?: string };
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.status(403).json({ success: false, error: 'کلیدهای صرافی در سرور یافت نشد.' });
-    }
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = Math.min(Math.max(5000, Math.abs(bybitTimeOffset) + 2000), 20000).toString();
-
-        let queryString = `category=linear&symbol=${symbol.replace('/', '')}`;
-        if (orderId) queryString += `&orderId=${encodeURIComponent(orderId)}`;
-        else if (clientOrderId) queryString += `&orderLinkId=${encodeURIComponent(clientOrderId)}`;
-
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, queryString);
-
-        const [orderRes, posRes] = await Promise.all([
-            fetch(`${baseUrl}/v5/order/realtime?${queryString}`, {
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': signature,
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            }),
-            fetch(`${baseUrl}/v5/position/list?category=linear&symbol=${symbol.replace('/', '')}`, {
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, `category=linear&symbol=${symbol.replace('/', '')}`),
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            })
-        ]);
-
-        const orderData = await orderRes.json();
-        const posData = await posRes.json();
-
-        if (orderData.retCode === 0) {
-            const order = orderData.result?.list?.[0] || null;
-            const positions = posData.result?.list || [];
-            const activePos = positions.find((p: any) => parseFloat(p.size || '0') > 0) || positions[0] || null;
-
-            return res.json({
-                success: true,
-                order,
-                position: activePos,
-                reconciledAt: Date.now()
-            });
-        } else {
-            return res.status(400).json({ success: false, error: orderData.retMsg });
-        }
-    } catch (err: any) {
-        return res.status(500).json({ success: false, error: 'خطا در بررسی وضعیت سفارش' });
-    }
-});
-
-// API route to perform Quantum Time-Travel Multi-Horizon Forecast via Python
 app.post('/api/time-travel', async (req, res) => {
     try {
         const result = await runPythonScript('scripts/time_travel.py', [], req.body, 10000);
@@ -1936,7 +1276,8 @@ function getAiClient() {
 app.post('/api/veo/generate-video', async (req, res) => {
     try {
         const { scenario, price, symbol, trend } = req.body || {};
-        const currentP = (price && price > 0) ? price : (lastBtcPrice > 0 ? lastBtcPrice : 0);
+        const parsedPrice = Number(price);
+        const currentP = Number.isFinite(parsedPrice) && parsedPrice > 0 ? parsedPrice : 0;
         if (currentP <= 0) {
             return res.status(400).json({ error: 'DATA_UNAVAILABLE: Valid price required for chart animation' });
         }
@@ -2257,402 +1598,6 @@ app.get('/api/live/status', async (req, res) => {
     }
 });
 
-// Position closing, partial closing, unhedging, chipping, and DCA endpoints
-app.post('/api/exchange/update-stop-loss', rejectLegacyExchangeExecution, async (req, res) => {
-    const { id, stopLoss } = req.body || {};
-    if (!id || typeof stopLoss !== 'number' || !Number.isFinite(stopLoss) || stopLoss <= 0) {
-        return res.status(400).json({ success: false, error: 'شناسه پوزیشن و مقدار معتبر حد ضرر الزامی است.' });
-    }
-
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.status(403).json({ success: false, error: 'کلیدهای صرافی یافت نشد.' });
-    }
-
-    const position = activePositions.find((item) => item.id === id);
-    if (!position) {
-        return res.status(404).json({ success: false, error: 'پوزیشن در سرور یافت نشد.' });
-    }
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = getDynamicRecvWindow();
-        const payload = JSON.stringify({
-            category: 'linear',
-            symbol: 'BTCUSDT',
-            tpslMode: 'Full',
-            positionIdx: 0,
-            stopLoss: String(stopLoss),
-            slTriggerBy: 'LastPrice'
-        });
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, payload);
-        const exchangeResponse = await fetch(`${baseUrl}/v5/position/trading-stop`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow
-            },
-            body: payload
-        });
-        const data = await exchangeResponse.json();
-
-        if (exchangeResponse.status !== 200 || data.retCode !== 0) {
-            return res.status(502).json({
-                success: false,
-                error: data.retMsg || 'صرافی درخواست تغییر حد ضرر را تأیید نکرد.'
-            });
-        }
-
-        activePositions = activePositions.map((item) => item.id === id ? { ...item, sl: stopLoss } : item);
-        writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-        return res.status(200).json({ success: true, message: 'حد ضرر در صرافی با موفقیت به‌روزرسانی شد.' });
-    } catch (err) {
-        return res.status(500).json({ success: false, error: 'خطا در ارتباط با صرافی هنگام تغییر حد ضرر.' });
-    }
-});
-
-app.post('/api/exchange/close-position', rejectLegacyExchangeExecution, async (req, res) => {
-    const { id } = req.body || {};
-    if (!id) {
-        return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
-    }
-
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.status(403).json({ success: false, error: 'کلیدهای صرافی یافت نشد.' });
-    }
-
-    const pos = activePositions.find(p => p.id === id);
-    if (!pos) {
-        return res.status(404).json({ success: false, error: 'پوزیشن در سرور یافت نشد.' });
-    }
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = getDynamicRecvWindow();
-
-        const closeSide = pos.dir === 'LONG' ? 'Sell' : 'Buy';
-        const closeQty = (pos.initialMargin * pos.lev / pos.entry).toFixed(3);
-
-        const closePayload = JSON.stringify({
-            category: 'linear',
-            symbol: 'BTCUSDT',
-            side: closeSide,
-            orderType: 'Market',
-            qty: closeQty,
-            timeInForce: 'GTC',
-            orderLinkId: `CLS_${pos.id.substring(0, 10)}_${Date.now()}`
-        });
-
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, closePayload);
-
-        const response = await fetch(`${baseUrl}/v5/order/create`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow
-            },
-            body: closePayload
-        });
-
-        const data = await response.json();
-        if (data.retCode === 0) {
-            // Remove locally and save to db
-            activePositions = activePositions.filter(p => p.id !== id);
-            writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-
-            // Add to history
-            const historyEntry: TradeHistory = {
-                ...pos,
-                exitPrice: lastBtcPrice || pos.entry,
-                pnlUsd: 0,
-                pnlPct: 0,
-                closedAt: new Date().toLocaleTimeString('fa-IR'),
-                closeReason: 'بستن دستی توسط کاربر در UI 👤'
-            };
-            tradeHistory.push(historyEntry);
-            writeDb<TradeHistory[]>(HISTORY_DB, tradeHistory);
-
-            logTradingEvent('POSITION_CLOSED_MANUALLY', `Position ${pos.id} closed manually via API.`);
-            sendTelegramNotification(`🔴 <b>موقعیت بسته شد:</b> پوزیشن ${pos.dir} به صورت دستی توسط کاربر بسته شد.`);
-
-            return res.json({ success: true, message: 'پوزیشن با موفقیت در صرافی بسته شد.' });
-        } else {
-            return res.status(400).json({ success: false, error: data.retMsg || 'خطای صرافی در بستن پوزیشن' });
-        }
-    } catch (err: any) {
-        return res.status(500).json({ success: false, error: 'خطا در ارتباط با صرافی جهت بستن پوزیشن' });
-    }
-});
-
-app.post('/api/exchange/partial-close', rejectLegacyExchangeExecution, async (req, res) => {
-    const { id, fraction = 0.333 } = req.body || {};
-    if (!id) {
-        return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
-    }
-
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.status(403).json({ success: false, error: 'کلیدهای صرافی یافت نشد.' });
-    }
-
-    const pos = activePositions.find(p => p.id === id);
-    if (!pos) {
-        return res.status(404).json({ success: false, error: 'پوزیشن در سرور یافت نشد.' });
-    }
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = getDynamicRecvWindow();
-
-        const closeSide = pos.dir === 'LONG' ? 'Sell' : 'Buy';
-        const fullQty = (pos.initialMargin * pos.lev / pos.entry);
-        const partialQty = (fullQty * fraction).toFixed(3);
-
-        const closePayload = JSON.stringify({
-            category: 'linear',
-            symbol: 'BTCUSDT',
-            side: closeSide,
-            orderType: 'Market',
-            qty: partialQty,
-            timeInForce: 'GTC',
-            orderLinkId: `PRT_${pos.id.substring(0, 10)}_${Date.now()}`
-        });
-
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, closePayload);
-
-        const response = await fetch(`${baseUrl}/v5/order/create`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow
-            },
-            body: closePayload
-        });
-
-        const data = await response.json();
-        if (data.retCode === 0) {
-            // Update position details locally in server
-            const baseMargin = pos.initialMargin || pos.margin;
-            const reducedMargin = baseMargin * fraction;
-            pos.margin = Math.max(1, pos.margin - reducedMargin);
-            pos.realizedPnlUsd = (pos.realizedPnlUsd || 0) + (reducedMargin * (pos.dir === 'LONG' ? (lastBtcPrice - pos.entry)/pos.entry : (pos.entry - lastBtcPrice)/pos.entry) * pos.lev);
-            pos.tp1Hit = true;
-            pos.sl = pos.entry; // Move SL to entry on partial close (risk-free)
-
-            writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-
-            logTradingEvent('POSITION_PARTIAL_CLOSED', `Position ${pos.id} partial closed manually.`);
-            return res.json({ success: true, message: 'بخشی از پوزیشن با موفقیت در صرافی بسته شد.' });
-        } else {
-            return res.status(400).json({ success: false, error: data.retMsg || 'خطای صرافی در بستن بخشی از پوزیشن' });
-        }
-    } catch (err: any) {
-        return res.status(500).json({ success: false, error: 'خطا در ارتباط با صرافی جهت بستن بخشی از پوزیشن' });
-    }
-});
-
-app.post('/api/exchange/unhedge', rejectLegacyExchangeExecution, async (req, res) => {
-    const { id } = req.body || {};
-    if (!id) {
-        return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
-    }
-
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.status(403).json({ success: false, error: 'کلیدهای صرافی یافت نشد.' });
-    }
-
-    const pos = activePositions.find(p => p.id === id);
-    if (!pos || !pos.hedgeActive) {
-        return res.status(404).json({ success: false, error: 'پوزیشن هج‌شده در سرور یافت نشد.' });
-    }
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = getDynamicRecvWindow();
-
-        // Close the hedge leg
-        const closeSide = pos.dir === 'LONG' ? 'Buy' : 'Sell'; // hedge was opposite of primary (LONG hedge is Sell, SHORT hedge is Buy). So to close hedge, we do opposite of hedge side, which is same as primary side!
-        const primaryMargin = pos.initialMargin || pos.margin;
-        const hedgeMargin = Math.max(0, pos.margin - primaryMargin);
-        const hedgeQty = (hedgeMargin * pos.lev / (pos.hedgeEntry || pos.entry)).toFixed(3);
-
-        const closePayload = JSON.stringify({
-            category: 'linear',
-            symbol: 'BTCUSDT',
-            side: closeSide,
-            orderType: 'Market',
-            qty: hedgeQty,
-            timeInForce: 'GTC',
-            orderLinkId: `UNH_${pos.id.substring(0, 10)}_${Date.now()}`
-        });
-
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, closePayload);
-
-        const response = await fetch(`${baseUrl}/v5/order/create`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow
-            },
-            body: closePayload
-        });
-
-        const data = await response.json();
-        if (data.retCode === 0) {
-            // Restore primary leg parameters
-            pos.hedgeActive = false;
-            pos.hedgeEntry = undefined;
-            pos.margin = primaryMargin;
-            pos.sl = pos.entry; // Lock SL at entry
-
-            writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-
-            logTradingEvent('POSITION_UNHEDGED', `Position ${pos.id} unhedged manually.`);
-            sendTelegramNotification(`🔓 <b>هدج باز شد:</b> لگ هج معکوس پوزیشن ${pos.dir} با موفقیت لغو شد و معامله اصلی با استاپ نقطه ورود ادامه می‌یابد.`);
-
-            return res.json({ success: true, message: 'لگ هدج با موفقیت بسته و معامله اصلی آزاد شد.' });
-        } else {
-            return res.status(400).json({ success: false, error: data.retMsg || 'خطای صرافی در بستن لگ هدج' });
-        }
-    } catch (err: any) {
-        return res.status(500).json({ success: false, error: 'خطا در ارتباط با صرافی جهت بستن لگ هدج' });
-    }
-});
-
-app.post('/api/exchange/hedge-chip', rejectLegacyExchangeExecution, async (req, res) => {
-    const { id } = req.body || {};
-    if (!id) {
-        return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
-    }
-
-    const pos = activePositions.find(p => p.id === id);
-    if (!pos || !pos.hedgeActive) {
-        return res.status(404).json({ success: false, error: 'پوزیشن هج‌شده در سرور یافت نشد.' });
-    }
-
-    // Capture the profit and shift entry
-    const primaryMargin = pos.initialMargin || 10;
-    const hedgeMargin = Math.max(0, pos.margin - primaryMargin);
-    const lev = pos.lev || 10;
-    const isLong = pos.dir === 'LONG';
-    const hedgeEntry = pos.hedgeEntry || lastBtcPrice;
-    const hedgeLegPnlPct = isLong
-      ? ((hedgeEntry - lastBtcPrice) / hedgeEntry) * 100.0 * lev
-      : ((lastBtcPrice - hedgeEntry) / hedgeEntry) * 100.0 * lev;
-    const hedgeProfitUsd = Math.max(0.15, Math.round(hedgeMargin * (hedgeLegPnlPct / 100.0) * 100) / 100);
-    
-    pos.realizedPnlUsd = (pos.realizedPnlUsd || 0) + hedgeProfitUsd;
-    pos.hedgeEntry = lastBtcPrice; // Shift entry to current live price
-    
-    writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-    logTradingEvent('HEDGE_CHIP', `Hedge chipped: +$${hedgeProfitUsd.toFixed(2)} realized, entry shifted.`);
-
-    return res.json({ success: true, message: 'تراشیدن سود هدج با موفقیت روی سرور اعمال شد.' });
-});
-
-app.post('/api/exchange/dca-position', rejectLegacyExchangeExecution, async (req, res) => {
-    return res.status(403).json({
-        success: false,
-        error: 'DCA و میانگین‌گیری در این پارادایم مدیریت ریسک اکیداً ممنوع است (قاعده ۵).'
-    });
-});
-
-app.post('/api/live/check-api-permissions', rejectLegacyExchangeExecution, async (req, res) => {
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.status(403).json({
-            success: false,
-            blocked: true,
-            error: "کلیدهای صرافی یافت نشد یا پیکربندی نشده است."
-        });
-    }
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = Math.min(Math.max(5000, Math.abs(bybitTimeOffset) + 2000), 20000).toString();
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, '');
-
-        const response = await fetch(`${baseUrl}/v5/user/query-api`, {
-            method: 'GET',
-            headers: {
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-            }
-        });
-
-        const data = await response.json();
-        if (data.retCode !== 0) {
-            return res.status(400).json({
-                success: false,
-                blocked: true,
-                error: `خطا در واکشی اطلاعات کلید از Bybit: ${data.retMsg}`
-            });
-        }
-
-        const result = data.result || {};
-        const permissions = result.permissions || {};
-        
-        // Check if withdraw permission is enabled (Withdraw array contains "Withdraw" or keys have withdraw)
-        const hasWithdraw = (permissions.Withdraw && permissions.Withdraw.length > 0) || 
-                            Object.keys(permissions).some(k => k.toLowerCase() === 'withdraw' || k.toLowerCase() === 'withdrawal');
-
-        // Check IP restrictions
-        const ips = result.ips || [];
-        const hasIpRestriction = ips.length > 0 && !ips.includes('*') && !ips.includes('');
-
-        if (hasWithdraw) {
-            liveTradingState.apiKeyPermissions.withdraw = true;
-            liveTradingState.liveAutoTradeEnabled = false;
-            return res.status(400).json({
-                success: false,
-                blocked: true,
-                hasWithdraw: true,
-                hasIpRestriction,
-                error: "LIVE TRADING BLOCKED: کلید API دارای مجوز برداشت (Withdrawal) است! برای امنیت دارایی‌ها، مجوز برداشت باید غیرفعال باشد."
-            });
-        }
-
-        liveTradingState.apiKeyPermissions.trade = true;
-        liveTradingState.apiKeyPermissions.withdraw = false;
-        liveTradingState.apiKeyConfigured = true;
-
-        res.json({
-            success: true,
-            blocked: false,
-            hasWithdraw: false,
-            hasIpRestriction,
-            ipRestrictionWarning: !hasIpRestriction ? "هشدار امنیتی شدید: کلید API شما محدودیت IP ندارد! لطفا کلید را در پنل صرافی به IP سرور خود محدود کنید تا امنیت دارایی‌ها تضمین شود." : null,
-            message: "دسترسی کلید API با موفقیت تایید شد: دسترسی معامله فعال، دسترسی برداشت غیرفعال (کاملاً امن)."
-        });
-    } catch (err: any) {
-        return res.status(500).json({
-            success: false,
-            error: "خطا در برقراری ارتباط با صرافی Bybit"
-        });
-    }
-});
-
 app.post('/api/live/kill-switch', async (req, res) => {
     const { active } = req.body;
     if (typeof active !== 'boolean') {
@@ -2764,162 +1709,7 @@ app.post('/api/live/run-readiness-tests', async (_req, res) => {
         message: "Readiness is blocked; only the RPC state was queried and no order was placed.",
     });
 
-    const creds = loadServerCredentials();
-    const isWsConnected = wsClient !== null && wsClient.readyState === WebSocket.OPEN;
-    const isTestnet = creds ? creds.isTestnet : true;
-    const baseUrl = isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-    const pingStart = Date.now();
 
-    // 1. Real Data Test & Data Staleness Test (Real API Ping)
-    let pingLatencyMs = 0;
-    let clockDriftMs = 0;
-    let exchangeReachable = false;
-    try {
-        const timeRes = await fetch(`${baseUrl}/v5/market/time`, { signal: AbortSignal.timeout(3500) });
-        pingLatencyMs = Date.now() - pingStart;
-        if (timeRes.ok) {
-            const timeData = await timeRes.json();
-            const serverTime = parseInt(timeData?.time || timeData?.result?.timeSecond || '0') * 1000 || parseInt(timeData?.result?.timeNano || '0') / 1000000;
-            if (serverTime > 0) {
-                clockDriftMs = Math.abs(Date.now() - serverTime);
-            }
-            exchangeReachable = true;
-        }
-    } catch (e) {
-        pingLatencyMs = 999;
-    }
-
-    // 2. Real API Permissions Check
-    let apiPermissionPass = false;
-    let apiMsg = "API keys unconfigured (Required for Live Order Placement)";
-    if (creds && creds.apiKey && creds.apiSecret) {
-        if (liveTradingState.apiKeyPermissions.withdraw) {
-            apiPermissionPass = false;
-            apiMsg = "Withdrawal permission is ENABLED (Must be disabled for security)";
-        } else {
-            apiPermissionPass = true;
-            apiMsg = "Trade=true, Withdraw=false verified";
-        }
-    } else {
-        apiPermissionPass = false;
-        apiMsg = "API keys not configured on server";
-    }
-
-    // 3. Database Persistence Check
-    const dbPersistencePass = fs.existsSync(POSITIONS_DB) && fs.existsSync(HISTORY_DB);
-
-    // 4. Duplicate Order Idempotency Check
-    const idempotencyPass = typeof idempotencyLog === 'object';
-
-    // 5. Daily Loss & Drawdown bounds
-    const dailyLossPass = liveTradingState.currentDailyLossUSD < liveTradingState.dailyLossLimitUSD;
-    const drawdownPass = liveTradingState.currentDrawdownPercent < liveTradingState.globalDrawdownLimitPercent;
-
-    // 6. Real dynamic assignment of all 17 tests
-    liveTradingState.readinessTests = {
-        "Real Data Test": {
-            status: (isWsConnected || exchangeReachable) ? "PASS" : "FAIL",
-            message: isWsConnected ? "WebSocket linear stream active" : (exchangeReachable ? `REST fallback active (${pingLatencyMs}ms)` : "Market data stream disconnected")
-        },
-        "Data Staleness Test": {
-            status: pingLatencyMs < 450 ? "PASS" : "FAIL",
-            message: `Ping roundtrip latency: ${pingLatencyMs}ms`
-        },
-        "API Permission Test": {
-            status: apiPermissionPass ? "PASS" : "FAIL",
-            message: apiMsg
-        },
-        "Order Testnet Test": {
-            status: exchangeReachable ? "PASS" : "FAIL",
-            message: exchangeReachable ? `Endpoint ${baseUrl} validated and responsive` : "Exchange sandbox endpoint unreachable"
-        },
-        "Partial Fill Test": {
-            status: "PASS",
-            message: "Partial execution and scaled TP handling handler loaded"
-        },
-        "Cancel Test": {
-            status: exchangeReachable ? "PASS" : "FAIL",
-            message: exchangeReachable ? `Order cancellation endpoint latency < ${Math.min(45, pingLatencyMs)}ms` : "Cancel handler unavailable"
-        },
-        "Reconnect Test": {
-            status: isWsConnected ? "PASS" : "FAIL",
-            message: isWsConnected ? "Auto-reconnect with state sync working" : "WebSocket reconnecting..."
-        },
-        "Duplicate Order Test": {
-            status: idempotencyPass ? "PASS" : "FAIL",
-            message: "Idempotency hash keys prevent duplicate execution"
-        },
-        "Exchange/Local Reconciliation Test": {
-            status: "PASS",
-            message: `Active positions synced with server storage (${activePositions.length} active)`
-        },
-        "Kill Switch Test": {
-            status: !liveTradingState.killSwitchActive ? "PASS" : "FAIL",
-            message: !liveTradingState.killSwitchActive ? "Kill switch armed and operational" : "Kill switch currently active"
-        },
-        "Daily Loss Test": {
-            status: dailyLossPass ? "PASS" : "FAIL",
-            message: dailyLossPass ? `Current daily loss: $${liveTradingState.currentDailyLossUSD}/$${liveTradingState.dailyLossLimitUSD}` : "Daily loss threshold exceeded"
-        },
-        "Drawdown Lock Test": {
-            status: drawdownPass ? "PASS" : "FAIL",
-            message: drawdownPass ? `Drawdown: ${liveTradingState.currentDrawdownPercent.toFixed(1)}% / ${liveTradingState.globalDrawdownLimitPercent}% max` : "Drawdown limit reached"
-        },
-        "Clock Drift Test": {
-            status: clockDriftMs < 2500 ? "PASS" : "FAIL",
-            message: `NTP drift measured at ${clockDriftMs}ms`
-        },
-        "Slippage Test": {
-            status: "PASS",
-            message: "Dynamic slippage bounds enforced (Max 8 bps)"
-        },
-        "Fee Verification": {
-            status: "PASS",
-            message: "Bybit VIP0 fee schedule (0.02% maker, 0.055% taker) verified"
-        },
-        "Position Recovery Test": {
-            status: "PASS",
-            message: "Anti-Martingale independent setup check active"
-        },
-        "Server Restart Test": {
-            status: dbPersistencePass ? "PASS" : "FAIL",
-            message: dbPersistencePass ? "State recovery from persistent JSON DB verified" : "Persistence storage initializing"
-        }
-    };
-
-    const testKeys = Object.keys(liveTradingState.readinessTests);
-    const tests = liveTradingState.readinessTests as Record<string, { status: string; message: string }>;
-    let allPassed = true;
-    for (const key of testKeys) {
-        if (tests[key].status !== "PASS") {
-            allPassed = false;
-        }
-    }
-    tests["Order Testnet Test"] = {
-        status: "FAIL",
-        message: "No live order was submitted during this diagnostic; order execution has not been end-to-end verified.",
-    };
-    tests["Partial Fill Test"] = {
-        status: "FAIL",
-        message: "Partial-fill lifecycle has not been verified against a running Freqtrade instance.",
-    };
-    tests["Cancel Test"] = {
-        status: "FAIL",
-        message: "Order cancellation has not been verified against a running Freqtrade instance.",
-    };
-    tests["Exchange/Local Reconciliation Test"] = {
-        status: "FAIL",
-        message: "Freqtrade is the position authority; cross-process reconciliation has not yet been integration-tested.",
-    };
-    allPassed = false;
-    liveTradingState.liveAutoTradeEnabled = false;
-
-    res.json({
-        allPassed,
-        liveExecutionAuthorized: false,
-        readinessTests: liveTradingState.readinessTests,
-        message: "Diagnostic only: live execution is not authorized by this endpoint. Complete Freqtrade dry-run and exchange lifecycle verification before considering deployment.",
-    });
 });
 
 app.post('/api/live/validate-trade', (req, res) => {
@@ -2933,17 +1723,83 @@ app.post('/api/live/validate-trade', (req, res) => {
 // Real-time OrderFlow & Liquidity Sweep Snapshot API
 app.get('/api/orderflow/snapshot', async (req, res) => {
     try {
-        const { fetchBybit } = await import('./src/services/marketData');
+        const expectedPair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const configuredPair = freqtradeBridge.getConfiguredPair();
+        const expectedExchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+        const expectedTimeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+        const botState = await freqtradeBridge.getStatus();
+        if (
+            !expectedPair ||
+            configuredPair !== expectedPair ||
+            botState.status !== 'running' ||
+            !botState.market ||
+            botState.exchange.toLowerCase() !== expectedExchange ||
+            botState.timeframe !== expectedTimeframe
+        ) {
+            return res.status(503).json({
+                error: 'A running, configuration-matched Freqtrade instance is required for orderflow data.',
+                code: 'FREQTRADE_MARKET_DATA_UNAVAILABLE',
+            });
+        }
+        if (botState.market !== 'futures') {
+            return res.status(409).json({
+                error: 'This orderflow consumer requires futures market data; spot data is not interchangeable.',
+                code: 'ORDERFLOW_MARKET_UNSUPPORTED',
+            });
+        }
+        const marketSnapshot = freqtradeMarketDataBridge.getLatest({
+            exchange: botState.exchange,
+            market: botState.market,
+            pair: expectedPair,
+            timeframe: botState.timeframe,
+        });
+        const candles: Candle[] = marketSnapshot.candles.slice(-50).map((candle) => [
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume,
+        ]);
+        if (candles.length < 10) {
+            return res.status(503).json({
+                error: 'Freqtrade snapshot does not contain enough completed candles for orderflow analysis.',
+                code: 'FREQTRADE_CANDLES_UNAVAILABLE',
+            });
+        }
         const { orderFlowEngine } = await import('./src/services/orderFlowEngine');
-        const { candles } = await fetchBybit('15', 50);
-        const snapshot = orderFlowEngine.analyzeOrderFlowAndLiquidity(candles, null);
-        res.json(snapshot);
-    } catch (err: any) {
-        res.status(500).json({ error: err.message || 'Failed to generate orderflow snapshot' });
+        const orderflowSnapshot = orderFlowEngine.analyzeOrderFlowAndLiquidity(candles, null);
+        return res.json({
+            ...orderflowSnapshot,
+            marketData: {
+                source: marketSnapshot.source,
+                exchange: marketSnapshot.exchange,
+                market: marketSnapshot.market,
+                pair: marketSnapshot.pair,
+                timeframe: marketSnapshot.timeframe,
+                generatedAtMs: marketSnapshot.generatedAtMs,
+                latestCandleTimestampMs: marketSnapshot.candles.at(-1)?.timestampMs ?? null,
+                tickerExchangeTimestampMs: marketSnapshot.ticker?.exchangeTimestampMs ?? null,
+                tickerRetrievedAtMs: marketSnapshot.ticker?.retrievedAtMs ?? null,
+                orderBookTimestampMs: marketSnapshot.orderBook?.timestampMs ?? null,
+            },
+        });
+    } catch (error) {
+        if (error instanceof FreqtradeMarketSnapshotValidationError) {
+            return res.status(503).json({ error: error.message, code: error.code });
+        }
+        console.error(
+            '[Orderflow snapshot] Could not read Freqtrade market data:',
+            error instanceof Error ? error.message : String(error),
+        );
+        return res.status(503).json({
+            error: 'A fresh Freqtrade market snapshot is unavailable.',
+            code: 'FREQTRADE_MARKET_DATA_UNAVAILABLE',
+        });
     }
 });
 
 app.post('/api/hunter/execute', liveOperationLimiter, requireAdminAuth, async (req, res) => {
+    const correlationId = crypto.randomUUID();
     try {
         if (liveTradingState.killSwitchActive) {
             return res.status(423).json({
@@ -3001,10 +1857,19 @@ app.post('/api/hunter/execute', liveOperationLimiter, requireAdminAuth, async (r
                 error: 'Signal requires a directional setup.',
             });
         }
+        console.warn('[SBK1_SIGNAL_BLOCKED]', JSON.stringify({
+            correlationId,
+            stage: 'CALIBRATION',
+            code: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+            decisionId: typeof signal.decisionId === 'string' ? signal.decisionId : undefined,
+        }));
         return res.status(503).json({
             success: false,
             status: 'REJECTED',
             code: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+            stage: 'CALIBRATION',
+            correlationId,
+            decisionId: typeof signal.decisionId === 'string' ? signal.decisionId : undefined,
             error: 'Live execution is disabled for this heuristic setup because calibrated probability evidence is unavailable.',
         });
     } catch (error) {
@@ -3049,23 +1914,34 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             });
         }
 
-        const prices = await fetchFuturesPrices(true);
-        if (!hasFreshLiveFuturesPrices(prices)) {
+        const nowMs = Date.now();
+        const marketSnapshot = freqtradeMarketDataBridge.getLatest({
+            exchange: botState.exchange,
+            market: 'futures',
+            pair,
+            timeframe,
+        }, nowMs);
+        const ticker = marketSnapshot.ticker;
+        if (
+            !ticker ||
+            nowMs < ticker.retrievedAtMs ||
+            nowMs - ticker.retrievedAtMs > FREQTRADE_TICKER_MAX_AGE_MS
+        ) {
             return res.status(503).json({
                 success: false,
-                code: 'LIVE_MARKET_DATA_UNAVAILABLE',
-                error: 'A fresh Bybit linear-futures price is required to create a dry-run fixture.',
+                code: 'FREQTRADE_TICKER_UNAVAILABLE',
+                error: 'A fresh ticker from the Freqtrade DataProvider is required to create a dry-run fixture.',
             });
         }
 
         const signal = createDryRunFixtureSignal({
-            nowMs: Date.now(),
+            nowMs,
             exchange,
             pair,
             timeframe,
-            referencePrice: prices.lastPrice,
-            observedAtMs: prices.timestampUtc,
-            source: prices.source,
+            referencePrice: ticker.last,
+            observedAtMs: ticker.retrievedAtMs,
+            source: 'freqtrade.dataprovider.ticker',
         });
         const record = await freqtradeSignalAdapter.submit(signal, {
             expectedPair: pair,
@@ -3082,6 +1958,13 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             duplicate: record.duplicate === true,
         });
     } catch (error) {
+        if (error instanceof FreqtradeMarketSnapshotValidationError) {
+            return res.status(503).json({
+                success: false,
+                code: error.code,
+                error: error.message,
+            });
+        }
         const statusCode = error instanceof SbkSignalValidationError ? 422 : 503;
         res.status(statusCode).json({
             success: false,
@@ -3091,8 +1974,107 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
     }
 });
 
+app.post('/api/freqtrade/market-snapshot', liveOperationLimiter, requireFreqtradeBridgeAuth, async (req, res) => {
+    try {
+        const pair = process.env.FREQTRADE_PAIR?.trim() || '';
+        const sbk1Pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+        if (!pair || pair !== sbk1Pair || !exchange || !timeframe || !process.env.SBK1_FREQTRADE_BRIDGE_TOKEN) {
+            return res.status(503).json({
+                accepted: false,
+                code: 'MARKET_SNAPSHOT_BRIDGE_NOT_CONFIGURED',
+                error: 'Market snapshot bridge requires matching Freqtrade/SBK1 pair settings, exchange, timeframe, and bridge token.',
+            });
+        }
+
+        const [botState, whitelist] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getWhitelist(),
+        ]);
+        if (botState.status !== 'running' || !botState.market) {
+            return res.status(503).json({
+                accepted: false,
+                code: 'FREQTRADE_NOT_READY',
+                error: 'Freqtrade must be running with a supported spot or futures market before market data is accepted.',
+            });
+        }
+        if (
+            botState.exchange.toLowerCase() !== exchange ||
+            botState.timeframe !== timeframe ||
+            !whitelist.includes(pair)
+        ) {
+            return res.status(409).json({
+                accepted: false,
+                code: 'FREQTRADE_MARKET_CONFIGURATION_MISMATCH',
+                error: 'Freqtrade RPC exchange, pair, or timeframe does not match the SBK1 market snapshot configuration.',
+            });
+        }
+
+        const snapshot = freqtradeMarketDataBridge.accept(req.body, {
+            exchange: botState.exchange,
+            market: botState.market,
+            pair,
+            timeframe: botState.timeframe,
+        });
+        return res.status(202).json({
+            accepted: true,
+            contractVersion: snapshot.contractVersion,
+            generatedAtMs: snapshot.generatedAtMs,
+        });
+    } catch (error) {
+        if (error instanceof FreqtradeMarketSnapshotValidationError) {
+            return res.status(422).json({
+                accepted: false,
+                code: error.code,
+                error: error.message,
+            });
+        }
+        console.error(
+            '[Freqtrade market snapshot] Could not verify or accept the snapshot:',
+            error instanceof Error ? error.message : String(error),
+        );
+        return res.status(503).json({
+            accepted: false,
+            code: 'MARKET_SNAPSHOT_BRIDGE_UNAVAILABLE',
+            error: 'Freqtrade market snapshot could not be verified or stored.',
+        });
+    }
+});
+
+app.get('/api/market/freqtrade-snapshot', (_req, res) => {
+    const pair = process.env.FREQTRADE_PAIR?.trim() || '';
+    const sbk1Pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+    const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim() || '';
+    const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+    if (!pair || pair !== sbk1Pair || !exchange || !timeframe) {
+        return res.status(503).json({
+            error: 'Market snapshot read endpoint is not configured for a single Freqtrade pair.',
+            code: 'MARKET_SNAPSHOT_BRIDGE_NOT_CONFIGURED',
+        });
+    }
+    try {
+        const snapshot = freqtradeMarketDataBridge.getLatestConfigured({ exchange, pair, timeframe });
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json(snapshot);
+    } catch (error) {
+        if (error instanceof FreqtradeMarketSnapshotValidationError) {
+            return res.status(503).json({ error: error.message, code: error.code });
+        }
+        console.error(
+            '[Freqtrade market snapshot] Could not read the configured snapshot:',
+            error instanceof Error ? error.message : String(error),
+        );
+        return res.status(503).json({
+            error: 'A fresh Freqtrade market snapshot is unavailable.',
+            code: 'MARKET_SNAPSHOT_UNAVAILABLE',
+        });
+    }
+});
+
 app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) => {
     if (process.env.SBK1_DRY_RUN_FIXTURE_ENABLED !== 'true') {
+        const correlationId = crypto.randomUUID();
         try {
             await freqtradeSignalAdapter.cancelPending(
                 'Signal delivery disabled because the heuristic execution path has no calibrated probability evidence.',
@@ -3103,9 +2085,18 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
                 code: 'PENDING_SIGNAL_CANCELLATION_FAILED',
             });
         }
+        console.warn('[FREQTRADE_SIGNAL_POLL_BLOCKED]', JSON.stringify({
+            correlationId,
+            stage: 'CALIBRATION',
+            code: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+            strategyMode: 'DRY_RUN_FIXTURE_ONLY',
+        }));
         return res.status(503).json({
             error: 'Signal delivery is disabled until calibrated probability evidence is available or the guarded dry-run fixture is explicitly enabled.',
             code: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+            stage: 'CALIBRATION',
+            correlationId,
+            strategyMode: 'DRY_RUN_FIXTURE_ONLY',
         });
     }
 
@@ -3225,621 +2216,16 @@ app.post('/api/hunter/exit', liveOperationLimiter, requireAdminAuth, async (req,
     }
 });
 
-// Realistic Python Backtester Execution Route
-app.get('/api/backtest/run', async (req, res) => {
-    try {
-        const result = await runPythonScript('scripts/realistic_backtester.py', ['--synthetic'], undefined, 15000);
-        let parsed = result;
-        try {
-            parsed = typeof result === 'string' ? JSON.parse(result) : result;
-        } catch {}
-        res.json(parsed);
-    } catch (err: any) {
-        res.status(500).json({ error: err.message || 'Backtest script execution failed' });
-    }
+app.get('/api/backtest/run', (_req, res) => {
+    res.status(409).json({
+        error: 'Historical SBK1 signal and feature records are unavailable; synthetic backtest output is disabled.',
+        code: 'HISTORICAL_SIGNALS_UNAVAILABLE',
+    });
 });
 
-// DB helpers (Databases are initialized at the very top of server.ts)
-function readDb<T>(filePath: string, defaultValue: T): T {
-    try {
-        if (fs.existsSync(filePath)) {
-            const raw = fs.readFileSync(filePath, 'utf-8');
-            return JSON.parse(raw);
-        }
-    } catch (e) {
-        console.error(`Error reading database file ${filePath}:`, e);
-    }
-    return defaultValue;
-}
-
-function writeDb<T>(filePath: string, data: T) {
-    try {
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-    } catch (e) {
-        console.error(`Error writing database file ${filePath}:`, e);
-    }
-}
-
-function initPersistentStorage() {
-    activePositions = readDb<TradePosition[]>(POSITIONS_DB, []);
-    tradeHistory = readDb<TradeHistory[]>(HISTORY_DB, []);
-    idempotencyLog = readDb<Record<string, any>>(IDEMPOTENCY_DB, {});
-}
-
-// Logging and Telegram Notification Utilities (Item 7)
-function logTradingEvent(event: string, details: string) {
-    const logLine = `[${new Date().toISOString()}] ${event.toUpperCase()}: ${details}\n`;
-    fs.appendFileSync('trading_audit.log', logLine, 'utf-8');
-    console.log(logLine.trim());
-}
-
-async function sendTelegramNotification(_message: string) {
-    // ارسال به تلگرام به درخواست کاربر کاملاً غیرفعال شد
-    return;
-}
-
-// Bybit Symbol Parameter Pre-Configurator (Isolated margin and Leverage) (Item 8)
-async function setupSymbolPositionParameters(creds: any, symbol: string, leverage: number) {
-    const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-    const timestamp = (Date.now() + bybitTimeOffset).toString();
-    const recvWindow = getDynamicRecvWindow();
-
-    // 1. Switch to Isolated mode (1 = Isolated, 0 = Cross)
-    try {
-        const switchPayload = JSON.stringify({
-            category: 'linear',
-            symbol: symbol.replace('/', ''),
-            tradeMode: 1,
-            buyLeverage: String(leverage),
-            sellLeverage: String(leverage)
-        });
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, switchPayload);
-        await fetch(`${baseUrl}/v5/position/switch-isolated`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-            },
-            body: switchPayload
-        });
-    } catch (err) {
-        // Already isolated
-    }
-
-    // 2. Set Leverage
-    try {
-        const levPayload = JSON.stringify({
-            category: 'linear',
-            symbol: symbol.replace('/', ''),
-            buyLeverage: String(leverage),
-            sellLeverage: String(leverage)
-        });
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, levPayload);
-        await fetch(`${baseUrl}/v5/position/set-leverage`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-            },
-            body: levPayload
-        });
-    } catch (err) {
-        // Already configured
-    }
-}
-
-// Bybit WebSocket Price Connection Client (Item 1)
-let wsClient: WebSocket | null = null;
-let wsReconnectTimer: NodeJS.Timeout | null = null;
-let lastBtcPrice = 0;
-
-function connectBybitWs() {
-    if (shutdownRequested) return;
-    const creds = loadServerCredentials();
-    const isTestnet = creds ? creds.isTestnet : true;
-    const wsUrl = isTestnet 
-        ? 'wss://stream-testnet.bybit.com/v5/public/linear' 
-        : 'wss://stream.bybit.com/v5/public/linear';
-
-    logTradingEvent('WS_CONNECT', `Connecting to Bybit WebSocket: ${wsUrl}`);
-    wsClient = new WebSocket(wsUrl);
-
-    wsClient.on('open', () => {
-        logTradingEvent('WS_OPEN', 'Bybit WebSocket linear stream connected.');
-        wsClient?.send(JSON.stringify({
-            op: 'subscribe',
-            args: ['tickers.BTCUSDT']
-        }));
-    });
-
-    wsClient.on('message', (data: any) => {
-        try {
-            const parsed = JSON.parse(data.toString());
-            if (parsed.topic === 'tickers.BTCUSDT' && parsed.data) {
-                const tick = parsed.data;
-                const priceStr = tick.lastPrice || tick.markPrice || tick.indexPrice;
-                if (priceStr) {
-                    const price = parseFloat(priceStr);
-                    if (price > 0) {
-                        lastBtcPrice = price;
-                        // Trigger fast server-side ticks (e.g. hedging on 2% drop)
-                        runServerSidePositionTicks(price);
-                    }
-                }
-            }
-        } catch (e) {
-            // suppress parse errors
-        }
-    });
-
-    wsClient.on('close', () => {
-        if (shutdownRequested) return;
-        logTradingEvent('WS_CLOSE', 'WebSocket connection closed. Retrying in 5 seconds.');
-        wsReconnectTimer = setTimeout(connectBybitWs, 5000);
-    });
-
-    wsClient.on('error', (err) => {
-        logTradingEvent('WS_ERROR', `WebSocket error occurred: ${err.message}`);
-        wsClient?.close();
-    });
-}
-
-// Server-side live position execution ticks (for 2% drop delta neutral hedging) (Item 5 & 8)
-async function runServerSidePositionTicks(price: number) {
-    // Zone Recovery & Hedging completely disabled as per Rule 5. Standard stop-losses are placed natively on Bybit.
-    return;
-}
-
-// Active Position Recovery Engine (Item 4)
-async function recoverPositionsOnStartup() {
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        console.log('[DAEMON RECOVERY] No credentials configured. Skipping recovery.');
-        return;
-    }
-
-    isRecoveringPositions = true;
-    logTradingEvent('RECOVERY_START', 'Recovering active positions from Bybit after server restart.');
-    
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = getDynamicRecvWindow();
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, 'category=linear&symbol=BTCUSDT');
-
-        const posRes = await fetch(`${baseUrl}/v5/position/list?category=linear&symbol=BTCUSDT`, {
-            headers: {
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-            }
-        });
-
-        const posData = await posRes.json();
-        if (posData.retCode === 0 && posData.result?.list) {
-            const bybitPositions = posData.result.list.filter((p: any) => parseFloat(p.size || '0') > 0);
-            
-            const recoveredPositions: TradePosition[] = [];
-            for (const bp of bybitPositions) {
-                const side: 'LONG' | 'SHORT' = bp.side === 'Buy' ? 'LONG' : 'SHORT';
-                const qty = parseFloat(bp.size);
-                const entry = parseFloat(bp.entryPrice || bp.avgPrice || '0');
-                const lev = parseFloat(bp.leverage || '10');
-                const margin = parseFloat(bp.positionMargin || '10');
-                const stopLoss = parseFloat(bp.stopLoss || '0');
-                const takeProfit = parseFloat(bp.takeProfit || '0');
-
-                const nowMs = Date.now();
-                recoveredPositions.push({
-                    id: `POS_${nowMs}_RECOVERED`,
-                    dir: side,
-                    entry,
-                    initialEntry: entry,
-                    avgEntry: entry,
-                    margin,
-                    initialMargin: margin,
-                    lev,
-                    sl: stopLoss,
-                    tp1: takeProfit,
-                    tp2: takeProfit,
-                    tp3: takeProfit,
-                    tp: takeProfit,
-                    openedAt: new Date(nowMs).toLocaleTimeString('fa-IR'),
-                    isAuto: true,
-                    lifecycleStatus: 'PROTECTED',
-                    uniqueClientOrderId: bp.positionIdx === 1 ? 'RECOVERED_BUY' : 'RECOVERED_SELL',
-                    signalId: `SIG_RECOVERED_${nowMs}`,
-                    decisionId: `DEC_RECOVERED_${nowMs}`,
-                    executionAttemptId: `ATT_RECOVERED_${nowMs}`
-                });
-            }
-
-            writeDb<TradePosition[]>(POSITIONS_DB, recoveredPositions);
-            activePositions = recoveredPositions;
-            logTradingEvent('RECOVERY_SUCCESS', `Successfully recovered ${recoveredPositions.length} positions from Bybit.`);
-            sendTelegramNotification(`🚀 <b>سیستم بازیابی شد:</b> ${recoveredPositions.length} موقعیت فعال از صرافی بازیابی شد و معامله خودکار آماده فعالیت است.`);
-        }
-    } catch (e: any) {
-        logTradingEvent('RECOVERY_FAILED', 'Failed to recover positions');
-    } finally {
-        isRecoveringPositions = false;
-    }
-}
-
-// Live Position and Order Reconciliation Engine (Item 3)
-async function reconcileWithBybit() {
-    if (isRecoveringPositions) return;
-
-    const creds = loadServerCredentials();
-    if (!creds || !creds.apiKey || !creds.apiSecret) return;
-
-    try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (Date.now() + bybitTimeOffset).toString();
-        const recvWindow = getDynamicRecvWindow();
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, 'category=linear&symbol=BTCUSDT');
-
-        const [posRes, walletRes] = await Promise.all([
-            fetch(`${baseUrl}/v5/position/list?category=linear&symbol=BTCUSDT`, {
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': signature,
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            }),
-            fetch(`${baseUrl}/v5/account/wallet-balance?accountType=UNIFIED`, {
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, 'accountType=UNIFIED'),
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            })
-        ]);
-
-        const posData = await posRes.json();
-        const walletData = await walletRes.json();
-
-        if (walletData.retCode === 0 && walletData.result?.list) {
-            const coinData = walletData.result.list[0]?.coin?.find((c: any) => c.coin === 'USDT') || {};
-            const parsedBal = parseFloat(coinData.walletBalance || coinData.availableToWithdraw || '0');
-            serverWalletBalance = Number.isFinite(parsedBal) && parsedBal > 0 ? parsedBal : 0;
-        }
-
-        if (posData.retCode === 0 && posData.result?.list) {
-            const bybitPositions = posData.result.list.filter((p: any) => parseFloat(p.size || '0') > 0);
-            const localPositions = [...activePositions];
-
-            let mismatchDetected = false;
-            let mismatchReason = '';
-
-            // Check if every local active position exists on Bybit and matches in side and size
-            for (const loc of localPositions) {
-                const match = bybitPositions.find((bp: any) => {
-                    const sideMatches = (loc.dir === 'LONG' && bp.side === 'Buy') || (loc.dir === 'SHORT' && bp.side === 'Sell');
-                    return sideMatches;
-                });
-
-                if (!match) {
-                    logTradingEvent('CLOSE_RECONCILED', `Position ${loc.id} closed on Bybit. Reconciling locally.`);
-                    
-                    const exitPrice = lastBtcPrice > 0 ? lastBtcPrice : loc.entry;
-                    const isLong = loc.dir === 'LONG';
-                    const pnlPct = loc.entry > 0
-                        ? (isLong ? (exitPrice - loc.entry) / loc.entry : (loc.entry - exitPrice) / loc.entry) * 100 * loc.lev
-                        : 0;
-                    const posMargin = loc.initialMargin || loc.margin || 10;
-                    const finalPnlUsd = Math.round(posMargin * (pnlPct / 100) * 100) / 100;
-
-                    const historyEntry: TradeHistory = {
-                        ...loc,
-                        exitPrice,
-                        pnlUsd: finalPnlUsd,
-                        pnlPct: Math.round(pnlPct * 100) / 100,
-                        closedAt: new Date().toLocaleTimeString('fa-IR'),
-                        closeReason: 'بسته شدن در صرافی (برخورد با حد سود/ضرر بومی صرافی) 🛡'
-                    };
-
-                    tradeHistory.push(historyEntry);
-                    writeDb<TradeHistory[]>(HISTORY_DB, tradeHistory);
-
-                    activePositions = activePositions.filter(p => p.id !== loc.id);
-                    writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-
-                    sendTelegramNotification(`🎯 <b>معامله تسویه شد:</b> پوزیشن ${loc.dir} در نقطه خروج صرافی با موفقیت تسویه شد.`);
-                    continue;
-                }
-
-                const exSize = parseFloat(match.size || '0');
-                const locSize = (loc.initialMargin * loc.lev) / loc.entry;
-
-                if (Math.abs(locSize - exSize) > 0.005) {
-                    mismatchDetected = true;
-                    mismatchReason = `مغایرت حجم پوزیشن: محلی (${locSize.toFixed(3)}) در برابر صرافی (${exSize.toFixed(3)})`;
-                    break;
-                }
-            }
-
-            // Check if any position exists on Bybit but NOT locally
-            for (const bp of bybitPositions) {
-                const side = bp.side === 'Buy' ? 'LONG' : 'SHORT';
-                const hasLocal = localPositions.some(loc => loc.dir === side);
-                if (!hasLocal) {
-                    mismatchDetected = true;
-                    mismatchReason = `پوزیشن زنده در صرافی وجود دارد که در سرور ثبت نشده است (جهت: ${side})`;
-                    break;
-                }
-            }
-
-            if (mismatchDetected) {
-                console.error(`[RECONCILIATION DISCREPANCY] ${mismatchReason}`);
-                if (liveTradingState.liveAutoTradeEnabled) {
-                    liveTradingState.liveAutoTradeEnabled = false;
-                    logTradingEvent('HALT_TRIGGERED', `Emergency Halt: ${mismatchReason}`);
-                    sendTelegramNotification(`🚨 <b>توقف اضطراری معاملات:</b> ناهماهنگی بین سرور و صرافی شناسایی شد!\nدلیل: ${mismatchReason}\nربات به حالت خاموش تغییر یافت.`);
-                }
-            }
-        }
-    } catch (e: any) {
-        console.error('[RECONCILIATION ERROR] Failed to run reconciliation');
-    }
-}
-
-// Server-Side Trading strategy checking loop (Item 2)
-import { analyzePro } from './src/services/analysisEngine';
-import { evaluateSignalToExecution, buildExecutionPosition } from './src/services/signalToExecution';
-import { fetchBybit, fetchFearGreed, fetchDerivatives, fetchRealOrderBookImbalance, fetchFuturesPrices, evaluateMarketDataQuality } from './src/services/marketData';
-
-function hasFreshLiveFuturesPrices(prices: Awaited<ReturnType<typeof fetchFuturesPrices>>): boolean {
-    const ageMs = Date.now() - prices.timestampUtc;
-    return prices.status === 'LIVE' &&
-        Number.isFinite(prices.lastPrice) && prices.lastPrice > 0 &&
-        Number.isFinite(prices.markPrice) && prices.markPrice > 0 &&
-        Number.isFinite(prices.indexPrice) && prices.indexPrice > 0 &&
-        Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= 5000;
-}
-
-async function fetchLiveAvailableUsdtBalance(creds: { apiKey: string; apiSecret: string; isTestnet: boolean }): Promise<number> {
-    const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-    const timestamp = (Date.now() + bybitTimeOffset).toString();
-    const recvWindow = getDynamicRecvWindow();
-    const queryString = 'accountType=UNIFIED';
-    const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, queryString);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-
-    try {
-        const response = await fetch(`${baseUrl}/v5/account/wallet-balance?${queryString}`, {
-            signal: controller.signal,
-            headers: {
-                'X-BAPI-API-KEY': creds.apiKey,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-            }
-        });
-        if (!response.ok) throw new Error(`Balance API HTTP ${response.status}`);
-        const data = await response.json();
-        if (data.retCode !== 0 || !Array.isArray(data.result?.list)) {
-            throw new Error('Exchange did not return a valid account balance');
-        }
-        const usdt = data.result.list[0]?.coin?.find((coin: any) => coin.coin === 'USDT');
-        const availableBalance = Number(usdt?.availableToWithdraw);
-        if (!Number.isFinite(availableBalance) || availableBalance <= 0) {
-            throw new Error('Exchange available USDT balance is unavailable or invalid');
-        }
-        return availableBalance;
-    } finally {
-        clearTimeout(timeout);
-    }
-}
-
-let isAnalyzing = false;
-let lastStrategyCheckTime = 0;
-
-async function evaluateStrategyCheck() {
-    if (!liveTradingState.liveAutoTradeEnabled || isAnalyzing || isRecoveringPositions) return;
-
-    // Strict Server-Side Risk Governor check before strategy run
-    const validation = validateTradeRequest({});
-    if (!validation.allowed) {
-        logTradingEvent('DAEMON_STRATEGY_BLOCKED', `Daemon strategy execution blocked by Risk Governor: ${validation.reason}`);
-        return;
-    }
-
-    const now = Date.now();
-    if (now - lastStrategyCheckTime < 10000) return; // limit to 10 seconds frequency
-    lastStrategyCheckTime = now;
-
-    isAnalyzing = true;
-    try {
-        const creds = loadServerCredentials();
-        if (!creds || !creds.apiKey || !creds.apiSecret) return;
-
-        const [candleData, fng, deriv, realObiData, futuresPrices] = await Promise.all([
-            fetchBybit('15', 150),
-            fetchFearGreed(),
-            fetchDerivatives(),
-            fetchRealOrderBookImbalance(),
-            fetchFuturesPrices()
-        ]);
-
-        const dataQualityReport = evaluateMarketDataQuality(candleData as any, realObiData as any, deriv as any, fng as any, futuresPrices as any);
-        if (dataQualityReport.status === 'DATA_UNAVAILABLE') return;
-
-        const sentiment = {
-            score: 0.5,
-            label: 'NEUTRAL',
-            trend: 'STABLE',
-            drivers: []
-        };
-
-        const htf = {
-            trend1h: 'UNKNOWN',
-            trend4h: 'UNKNOWN',
-            trend15m: 'UNKNOWN',
-            trend5m: 'UNKNOWN',
-            detailsFa: ''
-        };
-
-        const analysisResult = analyzePro(
-            candleData.candles,
-            fng,
-            sentiment as any,
-            htf as any,
-            deriv,
-            realObiData.obi || 0.0,
-            serverWalletBalance,
-            1.5,
-            candleData.candles,
-            dataQualityReport.status,
-            dataQualityReport,
-            realObiData,
-            undefined,
-            futuresPrices
-        );
-
-        if (userLeverage !== null) {
-            analysisResult.leverage = userLeverage;
-        }
-
-        const evalLong = evaluateSignalToExecution(analysisResult, 'LONG', null, tradeHistory, 70);
-        const evalShort = evaluateSignalToExecution(analysisResult, 'SHORT', null, tradeHistory, 70);
-
-        let signalEval = evalLong;
-        if (evalLong.canExecute && evalShort.canExecute) {
-            signalEval = evalLong.totalScorePct >= evalShort.totalScorePct ? evalLong : evalShort;
-        } else if (evalLong.canExecute) {
-            signalEval = evalLong;
-        } else if (evalShort.canExecute) {
-            signalEval = evalShort;
-        }
-
-        if (signalEval.canExecute && activePositions.length < 3) {
-            if (serverWalletBalance <= 0) {
-                try {
-                    serverWalletBalance = await fetchLiveAvailableUsdtBalance(creds);
-                } catch {
-                    serverWalletBalance = 0;
-                }
-            }
-            if (serverWalletBalance <= 0) {
-                logTradingEvent('DAEMON_STRATEGY_BLOCKED', 'Live execution blocked: Exchange available USDT balance is zero or unavailable.');
-                return;
-            }
-
-            const targetDir: 'LONG' | 'SHORT' = signalEval.direction === 'SHORT' ? 'SHORT' : 'LONG';
-            
-            const newPos = buildExecutionPosition(analysisResult, targetDir, serverWalletBalance, tradeHistory, analysisResult.leverage, false, null);
-            if (!newPos) {
-                logTradingEvent('DAEMON_STRATEGY_BLOCKED', 'Trade position was not created because required market evidence is unavailable.');
-                return;
-            }
-            if (newPos.lifecycleStatus === 'REJECTED') {
-                logTradingEvent('DAEMON_STRATEGY_REJECTED', `Trade rejected: ${newPos.rejectionReason}`);
-                sendTelegramNotification(`⚠️ <b>معامله خودکار رد شد:</b>\nدلیل: ${newPos.rejectionReason}`);
-                return;
-            }
-            newPos.name = activePositions.length === 0 ? 'S' : activePositions.length === 1 ? 'SB' : 'SBK';
-            newPos.isAuto = true;
-            newPos.lifecycleStatus = 'APPROVED';
-
-            const decisionId = newPos.decisionId || `DEC_${Date.now()}`;
-            newPos.decisionId = decisionId;
-
-            // PERSISTENT IDEMPOTENCY CHECK (Item 6):
-            if (idempotencyLog[decisionId]) {
-                logTradingEvent('IDEMPOTENCY_BLOCK', `Blocked duplicate order for decision ID: ${decisionId}`);
-                return;
-            }
-
-            idempotencyLog[decisionId] = {
-                timestamp: Date.now(),
-                direction: targetDir,
-                status: 'SUBMITTED'
-            };
-            writeDb(IDEMPOTENCY_DB, idempotencyLog);
-
-            logTradingEvent('ORDER_DAEMON_TRIGGER', `Strategy triggered ${targetDir} at price $${analysisResult.price}`);
-            await setupSymbolPositionParameters(creds, 'BTCUSDT', newPos.lev);
-
-            const rawQtyBtc = (newPos.initialMargin * newPos.lev) / Math.max(1, analysisResult.price);
-            const steppedQtyBtc = Math.floor(rawQtyBtc * 1000) / 1000;
-            if (steppedQtyBtc < 0.001 || (steppedQtyBtc * analysisResult.price) < 5.0) {
-                delete idempotencyLog[decisionId];
-                writeDb(IDEMPOTENCY_DB, idempotencyLog);
-                logTradingEvent('DAEMON_STRATEGY_BLOCKED', `Order quantity ${steppedQtyBtc} BTC ($${(steppedQtyBtc * analysisResult.price).toFixed(2)}) is below Bybit minimum (0.001 BTC / $5).`);
-                return;
-            }
-            const orderQtyBtc = steppedQtyBtc.toFixed(3);
-            
-            const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-            const orderTimestamp = (Date.now() + bybitTimeOffset).toString();
-            const orderRecvWindow = Math.min(Math.max(5000, Math.abs(bybitTimeOffset) + 2000), 20000).toString();
-
-            const orderPayload = JSON.stringify({
-                category: 'linear',
-                symbol: 'BTCUSDT',
-                side: targetDir === 'LONG' ? 'Buy' : 'Sell',
-                orderType: 'Market',
-                qty: orderQtyBtc,
-                timeInForce: 'GTC',
-                orderLinkId: newPos.uniqueClientOrderId,
-                takeProfit: String(newPos.tp1),
-                stopLoss: String(newPos.sl),
-                tpTriggerBy: 'LastPrice',
-                slTriggerBy: 'MarkPrice',
-                tpslMode: 'Full'
-            });
-
-            const orderSignature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, orderTimestamp, orderRecvWindow, orderPayload);
-
-            const response = await fetch(`${baseUrl}/v5/order/create`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': orderSignature,
-                    'X-BAPI-TIMESTAMP': orderTimestamp,
-                    'X-BAPI-RECV-WINDOW': orderRecvWindow
-                },
-                body: orderPayload
-            });
-
-            const orderData = await response.json();
-            if (orderData.retCode === 0) {
-                newPos.lifecycleStatus = 'PROTECTED';
-                activePositions.push(newPos);
-                writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-
-                logTradingEvent('ORDER_DAEMON_SUCCESS', `Successfully opened live ${targetDir} with linked native SL/TP.`);
-                sendTelegramNotification(`🟢 <b>سیگنال ورود خودکار صادر شد:</b>\nجهت: ${targetDir}\nاهرم: ${newPos.lev}x\nمارجین: $${newPos.initialMargin}\nقیمت ورود: $${analysisResult.price}\nحد سود: $${newPos.tp1}\nحد ضرر: $${newPos.sl}`);
-            } else {
-                delete idempotencyLog[decisionId];
-                writeDb(IDEMPOTENCY_DB, idempotencyLog);
-                logTradingEvent('ORDER_DAEMON_FAILED', `Bybit order rejected: ${orderData.retMsg}`);
-            }
-        }
-    } catch (e: any) {
-        console.error('[DAEMON STRATEGY ERROR] Strategy evaluation failed');
-    } finally {
-        isAnalyzing = false;
-    }
-}
-
-// Active background Daemon starter function
-async function startServerSideMarketFeed() {
-    console.log('[MARKET DATA] Starting Bybit feed; SBK1 no longer manages exchange orders or positions.');
-    initPersistentStorage();
-    connectBybitWs();
+// Market data is accepted only from the authenticated Freqtrade DataProvider bridge.
+async function initializeServerRuntime() {
+    console.log('[MARKET DATA] Waiting for Freqtrade DataProvider snapshots; no direct Bybit feed is started.');
 }
 
 // API Live Toggling Routes (Item 2)
@@ -3873,24 +2259,24 @@ async function startServer() {
 
   app.use(viteServer.middlewares);
 
-  // Start market data only. Trade lifecycle and position reconciliation belong to Freqtrade.
-  await startServerSideMarketFeed();
+  // Freqtrade owns exchange connectivity, market feeds, and the trade lifecycle.
+  await initializeServerRuntime();
   if (shutdownRequested) {
-    wsClient?.close();
     await viteServer.close();
     return;
   }
 
-  httpServer = app.listen(3000, '0.0.0.0', () => console.log('Server running on port 3000'));
+  const port = Number(process.env.SBK1_PORT || 3000);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
+  }
+  httpServer = app.listen(port, '0.0.0.0', () => console.log(`Server running on port ${port}`));
 }
 
 async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
   if (shutdownRequested) return;
   shutdownRequested = true;
   console.log(`[SBK1] Received ${signal}; shutting down server and market feed.`);
-  clearInterval(idempotencyCleanupTimer);
-  if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-  wsClient?.close();
 
   const forceCloseTimer = setTimeout(() => {
     httpServer?.closeAllConnections();

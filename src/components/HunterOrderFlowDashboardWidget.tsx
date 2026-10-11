@@ -27,6 +27,8 @@ interface SignalSubmissionResult {
   status: string;
   signalId?: string;
   decisionId?: string;
+  code?: string;
+  correlationId?: string;
   reason: string;
 }
 
@@ -41,9 +43,7 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
     )
   );
   const [executionResult, setExecutionResult] = useState<SignalSubmissionResult | null>(null);
-  const [backtestData, setBacktestData] = useState<any | null>(null);
   const [isExecuting, setIsExecuting] = useState<boolean>(false);
-  const [isRunningBacktest, setIsRunningBacktest] = useState<boolean>(false);
   const analysisDataTimestamp =
     analysis?.futuresPrices?.timestampUtc ?? analysis?.canonicalSnapshot?.timestampUtc;
   const isSubmissionDataReady =
@@ -119,6 +119,8 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
           accepted: false,
           status: result.status || 'REJECTED',
           reason: result.error || `HTTP ${response.status}`,
+          code: typeof result.code === 'string' ? result.code : undefined,
+          correlationId: typeof result.correlationId === 'string' ? result.correlationId : undefined,
         });
         return;
       }
@@ -133,21 +135,6 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
       console.error(err);
     } finally {
       setIsExecuting(false);
-    }
-  };
-
-  const handleRunBacktest = async () => {
-    setIsRunningBacktest(true);
-    try {
-      const res = await fetch('/api/backtest/run');
-      if (res.ok) {
-        const data = await res.json();
-        setBacktestData(data);
-      }
-    } catch (err: any) {
-      console.error(err);
-    } finally {
-      setIsRunningBacktest(false);
     }
   };
 
@@ -181,12 +168,12 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
 
         <div className="flex items-center gap-2">
           <button
-            onClick={handleRunBacktest}
-            disabled={isRunningBacktest}
-            className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium text-xs transition flex items-center gap-1.5"
+            disabled
+            title="آرشیو تاریخی سیگنال‌های واقعی SBK1 موجود نیست"
+            className="px-3 py-1.5 rounded-lg bg-indigo-600 disabled:opacity-50 text-white font-medium text-xs flex items-center gap-1.5"
           >
             <BarChart3 className="w-3.5 h-3.5" />
-            <span>{isRunningBacktest ? 'در حال بک‌تست...' : 'بک‌تست واقعی'}</span>
+            <span>بک‌تست: آرشیو سیگنال در دسترس نیست</span>
           </button>
           <button
             onClick={updateOrderFlow}
@@ -207,19 +194,19 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 text-center text-[10px]">
           <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-200">
             <span className="text-amber-400 font-bold block mb-0.5">۱. Market Data Feed</span>
-            <span>Bybit V5 WS + REST</span>
+            <span>Freqtrade DataProvider</span>
           </div>
           <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-200">
-            <span className="text-cyan-400 font-bold block mb-0.5">۲. OrderFlow & Sweep</span>
-            <span>CVD Delta + Liquidity Sweep</span>
+            <span className="text-cyan-400 font-bold block mb-0.5">۲. SBK1 Analysis</span>
+            <span>Order flow / setup detection</span>
           </div>
           <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-200">
-            <span className="text-indigo-400 font-bold block mb-0.5">۳. Risk Governor</span>
-            <span>Hard SL + Min 1:2.5 R:R</span>
+            <span className="text-indigo-400 font-bold block mb-0.5">۳. Evidence & Risk Gates</span>
+            <span>Calibration required; fail closed</span>
           </div>
           <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-200">
-            <span className="text-emerald-400 font-bold block mb-0.5">۴. Execution Broker</span>
-            <span>Bybit HMAC Signature</span>
+            <span className="text-emerald-400 font-bold block mb-0.5">۴. Execution</span>
+            <span>Freqtrade virtual dry-run wallet</span>
           </div>
         </div>
       </div>
@@ -300,7 +287,7 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
               className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs transition flex items-center gap-1.5 shadow-lg"
             >
               <Zap className="w-4 h-4 fill-current" />
-              <span>اجرای زنده مسدود: احتمال کالیبره نشده</span>
+              <span>ارسال سیگنال production مسدود</span>
             </button>
           )}
         </div>
@@ -345,41 +332,28 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
             <span>چرخه سیگنال Freqtrade: {executionResult.status}</span>
           </div>
           <p>{executionResult.reason}</p>
+          {executionResult.code && <p className="mt-1 font-mono">Reason code: {executionResult.code}</p>}
+          {executionResult.correlationId && <p className="mt-1 font-mono">Correlation ID: {executionResult.correlationId}</p>}
           {executionResult.signalId && <p className="mt-1 font-mono">Signal ID: {executionResult.signalId}</p>}
         </div>
       )}
 
-      {/* Realistic Backtest Output Report */}
-      {backtestData && (
-        <div className="p-4 rounded-xl bg-slate-950/80 border border-indigo-500/30 space-y-3 text-xs">
-          <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
-            <span className="font-bold text-indigo-300 flex items-center gap-1.5">
-              <BarChart3 className="w-4 h-4" />
-              نتایج بک‌تست واقعی (Realistic Quant Backtest Results)
-            </span>
-            <span className="text-[10px] text-slate-400 font-mono">کارمزد: 0.055% | اسلیپیج: 2 Ticks</span>
-          </div>
-
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
-            <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-              <span className="text-slate-400 text-[10px] block">سود خالص (Net Return)</span>
-              <strong className="text-emerald-400">+{backtestData.total_net_return_pct}%</strong>
-            </div>
-            <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-              <span className="text-slate-400 text-[10px] block">وین‌ریت (Win Rate)</span>
-              <strong className="text-cyan-400">{backtestData.win_rate_pct}%</strong>
-            </div>
-            <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-              <span className="text-slate-400 text-[10px] block">پرافیت فاکتور (Profit Factor)</span>
-              <strong className="text-amber-400">{backtestData.profit_factor}</strong>
-            </div>
-            <div className="p-2 rounded bg-slate-900/60 border border-slate-800">
-              <span className="text-slate-400 text-[10px] block">نسبت شارپ (Sharpe Ratio)</span>
-              <strong className="text-indigo-400">{backtestData.sharpe_ratio}</strong>
-            </div>
-          </div>
+      <div role="status" className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-950/20 p-3 text-xs text-rose-100">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+        <div>
+          <p className="font-bold">NO TRADE — CALIBRATED_CONFIDENCE_UNAVAILABLE</p>
+          <p className="mt-1">آرشیو معتبر تصمیم‌ها، ویژگی‌های هم‌زمان و نتایج تأییدشدهٔ Freqtrade برای کالیبراسیون و آزمون خارج از نمونه موجود نیست؛ ارسال سیگنال عادی SBK1 به صف Freqtrade عمداً بسته است. درخواست ردشده با `CALIBRATED_CONFIDENCE_UNAVAILABLE` و correlation ID ثبت می‌شود.</p>
+          <p className="mt-1">در حال حاضر strategy فقط fixture صریحاً فعال‌شدهٔ Dry-run را برای آزمون قرارداد می‌پذیرد؛ fixture شاهد برتری آماری یا مجوز ورود واقعی نیست. این گیت برای افزایش تعداد معامله دور زده نمی‌شود.</p>
+          <p className="mt-1">
+            وضعیت Last/Mark/Index: {analysis?.futuresPrices?.status ?? 'UNAVAILABLE'}
+            {typeof analysis?.futuresPrices?.ageMs === 'number' ? `؛ سن داده ${analysis.futuresPrices.ageMs}ms` : ''}
+          </p>
+          {analysis?.dataQualityReport?.reasonsFa.map((reason, index) => (
+            <p key={`${index}-${reason}`} className="mt-1">{reason}</p>
+          ))}
+          <p className="mt-1">داده‌های CVD/جریان معاملات یا هر feature پشتیبانی‌نشدهٔ دیگر `UNKNOWN/UNAVAILABLE` می‌مانند و نباید از اعداد شبیه‌سازی‌شده پر شوند.</p>
         </div>
-      )}
+      </div>
     </div>
   );
 };

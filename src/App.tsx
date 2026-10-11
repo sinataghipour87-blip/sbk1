@@ -88,10 +88,10 @@ import { loadSettings, saveSettings } from './services/settings';
 import { saveTradeToHistory, getTradeHistory } from './services/history';
 import { calculateKellyRisk, getAntiTiltStatus, calculateDynamicKellyMargin, evaluateCognitiveConviction } from './services/kellyRisk';
 import { requestNotificationPermission, sendNotification } from './services/notifications';
-import { setupBybitWebSocket } from './services/websocket';
+import { setupFreqtradeMarketFeed } from './services/websocket';
 import { validatePrecisionEntry, generateClientSidePredictionFallback, updatePredictiveModelFeedbackLoop, evaluate15mTimingAndLifecycle, runDistributedMultiTimeframeBrains, calculateAiMtfConsensusCorrelation, evaluateFuturePredictability } from './services/predictiveEngine';
 import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTargets } from './services/signalToExecution';
-import { verifyAutoTradePrerequisites, reconcileOrderWithExchange } from './services/autoTradeGuard';
+import { verifyAutoTradePrerequisites } from './services/autoTradeGuard';
 import { getExecutionMode } from './services/executionMode';
 import type { FreqtradeTrade } from './services/freqtradeBridge';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
@@ -204,17 +204,23 @@ export default function App() {
   const [freqtradeDashboard, setFreqtradeDashboard] = useState<{
     status: 'CHECKING' | 'CONNECTED' | 'UNAVAILABLE' | 'SIMULATION';
     openTrades: FreqtradeTrade[];
+    dryRun?: boolean;
+    virtualWalletBalanceUsdt?: number;
     error?: string;
   }>({ status: 'CHECKING', openTrades: [] });
   const handleExecutionModeSelected = useCallback((mode: ExecutionMode, _isLocalSelection: boolean) => {
     executionModeRef.current = mode;
-    if (mode === 'PAPER') {
+    if (mode === 'PAPER' || mode === 'BACKTEST') {
       setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
       setActivePositions([]);
       return;
     }
-    if (mode === 'BACKTEST') {
-      setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
+    if (mode !== 'DRY_RUN') {
+      setFreqtradeDashboard({
+        status: 'UNAVAILABLE',
+        openTrades: [],
+        error: 'Only the Freqtrade virtual DRY_RUN wallet is in scope; Testnet and live execution are disabled.',
+      });
       setActivePositions([]);
       return;
     }
@@ -1269,7 +1275,7 @@ export default function App() {
     }
 
     requestNotificationPermission();
-    wsRef.current = setupBybitWebSocket((rawPrice) => {
+    wsRef.current = setupFreqtradeMarketFeed((rawPrice) => {
       if (!rawPrice || rawPrice <= 0) return;
       const price = rawPrice;
       smoothedPriceRef.current = rawPrice;
@@ -1319,20 +1325,41 @@ export default function App() {
     setIsFetching(true);
     try {
       try {
-        const usesFreqtrade = executionModeRef.current === 'LIVE' || executionModeRef.current === 'TESTNET';
-        if (!usesFreqtrade) {
+        const selectedMode = executionModeRef.current;
+        if (selectedMode === 'BACKTEST' || selectedMode === 'PAPER') {
           setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
+        } else if (selectedMode !== 'DRY_RUN') {
+          setFreqtradeDashboard({
+            status: 'UNAVAILABLE',
+            openTrades: [],
+            error: 'Only the Freqtrade virtual DRY_RUN wallet is in scope; Testnet and live execution are disabled.',
+          });
+          setActivePositions([]);
+          activePositionsRef.current = [];
+          setBalance(0);
+          balanceRef.current = 0;
         } else {
-          const exchangeStatusRes = await fetch('/api/exchange/status');
+          const adminToken = localStorage.getItem('admin_token');
+          const exchangeStatusRes = await fetch('/api/exchange/status', {
+            headers: adminToken ? { 'x-admin-token': adminToken } : undefined,
+            cache: 'no-store',
+          });
           const exchangeStatusData = await exchangeStatusRes.json();
           if (
             exchangeStatusRes.ok &&
             exchangeStatusData.connected === true &&
+            exchangeStatusData.dryRun === true &&
+            exchangeStatusData.demoTrading !== true &&
+            exchangeStatusData.forceEntryEnabled === false &&
             Array.isArray(exchangeStatusData.openTrades)
           ) {
             setFreqtradeDashboard({
               status: 'CONNECTED',
               openTrades: exchangeStatusData.openTrades as FreqtradeTrade[],
+              dryRun: true,
+              virtualWalletBalanceUsdt: typeof exchangeStatusData.walletBalanceUsdt === 'number'
+                ? exchangeStatusData.walletBalanceUsdt
+                : undefined,
             });
             setActivePositions([]);
             activePositionsRef.current = [];
@@ -1345,7 +1372,11 @@ export default function App() {
             setFreqtradeDashboard({
               status: 'UNAVAILABLE',
               openTrades: [],
-              error: typeof exchangeStatusData.error === 'string' ? exchangeStatusData.error : 'Freqtrade did not return an authoritative trading state.',
+              error: typeof exchangeStatusData.error === 'string'
+                ? exchangeStatusData.error
+                : exchangeStatusData.connected === true
+                  ? 'Freqtrade must confirm dry_run=true, demo_trading=false, and force_entry_enable=false.'
+                  : 'Freqtrade did not return an authoritative trading state.',
             });
             setActivePositions([]);
             activePositionsRef.current = [];
@@ -1354,7 +1385,7 @@ export default function App() {
           }
         }
       } catch (err) {
-        if (executionModeRef.current === 'LIVE' || executionModeRef.current === 'TESTNET') {
+        if (executionModeRef.current === 'DRY_RUN') {
           setFreqtradeDashboard({
             status: 'UNAVAILABLE',
             openTrades: [],
@@ -1429,7 +1460,6 @@ export default function App() {
       if (res.price > 0) {
         if (!smoothedPriceRef.current || smoothedPriceRef.current <= 0) {
           smoothedPriceRef.current = res.price;
-          wsRef.current?.seedPrice?.(res.price);
         } else {
           // Keep live websocket tick price to eliminate 5-second flickering jumps
           res.price = smoothedPriceRef.current;
@@ -1667,13 +1697,18 @@ export default function App() {
             >
               <p className="font-bold">
                 {freqtradeDashboard.status === 'CONNECTED'
-                  ? `وضعیت معاملات از Freqtrade دریافت شد؛ ${freqtradeDashboard.openTrades.length} معاملهٔ باز.`
+                  ? `کیف پول مجازی Freqtrade DRY_RUN تایید شد؛ ${freqtradeDashboard.openTrades.length} معاملهٔ باز.`
                   : freqtradeDashboard.status === 'CHECKING'
                     ? 'در حال دریافت وضعیت معتبر معاملات از Freqtrade؛ وضعیت محلی به‌عنوان وضعیت زنده نمایش داده نمی‌شود.'
                     : 'وضعیت معاملات Freqtrade در دسترس نیست؛ هیچ وضعیت محلی به‌عنوان وضعیت زنده نمایش داده نمی‌شود.'}
               </p>
               {freqtradeDashboard.status === 'UNAVAILABLE' && freqtradeDashboard.error && (
                 <p className="mt-1 text-xs opacity-90">{freqtradeDashboard.error}</p>
+              )}
+              {freqtradeDashboard.status === 'CONNECTED' && typeof freqtradeDashboard.virtualWalletBalanceUsdt === 'number' && (
+                <p className="mt-1 text-xs opacity-90">
+                  موجودی مجازی Freqtrade: {freqtradeDashboard.virtualWalletBalanceUsdt.toFixed(2)} USDT؛ این موجودی صرافی واقعی نیست.
+                </p>
               )}
               {freqtradeDashboard.status === 'CONNECTED' && freqtradeDashboard.openTrades.length > 0 && (
                 <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
