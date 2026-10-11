@@ -13,11 +13,17 @@
 export type PriceSourceType = 'LAST_PRICE' | 'MARK_PRICE' | 'INDEX_PRICE';
 
 export interface PriceContextMap {
-  lastPrice: number;
-  markPrice: number;
-  indexPrice: number;
+  lastPrice: number | null;
+  markPrice: number | null;
+  indexPrice: number | null;
   timestampUtc: number;
-  spreadBps?: number;
+  receivedTimestampUtc: number;
+  symbol: string;
+  timeframe: 'TICK';
+  source: 'bybit' | 'binance' | 'okx';
+  status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
+  quality: 'HIGH' | 'DEGRADED' | 'UNRELIABLE' | 'UNKNOWN';
+  spreadBps?: number | null;
 }
 
 export interface PriceUsagePolicyRule {
@@ -82,32 +88,57 @@ export class CentralPriceSourcePolicyService {
   public getCompliantPrice(
     operation: PriceUsagePolicyRule['operation'],
     prices: PriceContextMap
-  ): { price: number; source: PriceSourceType; isDivergenceSafe: boolean; warningFa?: string } {
+  ): { price: number | null; source: PriceSourceType; isDivergenceSafe: boolean; warningFa?: string } {
     const policy = CENTRAL_PRICE_SOURCE_POLICIES[operation];
-    let price = prices.lastPrice;
+    const sourceAgeMs = Date.now() - prices.timestampUtc;
+    const receivedAgeMs = prices.receivedTimestampUtc - prices.timestampUtc;
+    const hasValidProvenance = prices.status === 'LIVE' &&
+      prices.quality === 'HIGH' &&
+      prices.symbol.trim().length > 0 &&
+      Number.isFinite(prices.timestampUtc) &&
+      Number.isFinite(prices.receivedTimestampUtc) &&
+      sourceAgeMs >= 0 &&
+      sourceAgeMs <= 3000 &&
+      receivedAgeMs >= 0 &&
+      receivedAgeMs <= 3000;
 
-    if (policy.requiredSource === 'MARK_PRICE') {
-      price = prices.markPrice && prices.markPrice > 0 ? prices.markPrice : prices.lastPrice;
-    } else if (policy.requiredSource === 'INDEX_PRICE') {
-      price = prices.indexPrice && prices.indexPrice > 0 ? prices.indexPrice : (prices.markPrice || prices.lastPrice);
-    } else {
-      price = prices.lastPrice && prices.lastPrice > 0 ? prices.lastPrice : (prices.markPrice && prices.markPrice > 0 ? prices.markPrice : (prices.indexPrice || 0));
+    const sourcePrice = policy.requiredSource === 'LAST_PRICE'
+      ? prices.lastPrice
+      : policy.requiredSource === 'MARK_PRICE'
+        ? prices.markPrice
+        : prices.indexPrice;
+    if (!hasValidProvenance || typeof sourcePrice !== 'number' || !Number.isFinite(sourcePrice) || sourcePrice <= 0) {
+      return {
+        price: null,
+        source: policy.requiredSource,
+        isDivergenceSafe: false,
+        warningFa: `Fail-closed: قیمت ${policy.requiredSource} یا provenance زنده و تازه آن موجود نیست.`,
+      };
     }
 
     // Mark vs Last divergence check
-    let isDivergenceSafe = true;
-    let warningFa: string | undefined;
+    let isDivergenceSafe = false;
+    let warningFa: string | undefined = 'واگرایی Mark/Last قابل‌محاسبه نیست؛ داده یکی از قیمت‌ها موجود نیست.';
 
-    if (prices.markPrice > 0 && prices.lastPrice > 0) {
+    if (
+      typeof prices.markPrice === 'number' &&
+      typeof prices.lastPrice === 'number' &&
+      Number.isFinite(prices.markPrice) &&
+      Number.isFinite(prices.lastPrice) &&
+      prices.markPrice > 0 &&
+      prices.lastPrice > 0
+    ) {
       const divergencePct = (Math.abs(prices.markPrice - prices.lastPrice) / prices.markPrice) * 100;
+      isDivergenceSafe = true;
+      warningFa = undefined;
       if (divergencePct > policy.maxAllowableMarkLastDivergencePct) {
         isDivergenceSafe = false;
-        warningFa = `⚠️ واگرایی شدید بین Mark Price ($${prices.markPrice}) و Last Price ($${prices.lastPrice}) به میزان ${divergencePct.toFixed(2)}% (بیش از سقف مجاز ${policy.maxAllowableMarkLastDivergencePct}%).`;
+        warningFa = `واگرایی بین Mark Price و Last Price به میزان ${divergencePct.toFixed(2)}% بیش از سقف مجاز ${policy.maxAllowableMarkLastDivergencePct}٪ است.`;
       }
     }
 
     return {
-      price: Math.round(price * 100) / 100,
+      price: Math.round(sourcePrice * 100) / 100,
       source: policy.requiredSource,
       isDivergenceSafe,
       warningFa,

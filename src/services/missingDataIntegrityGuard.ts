@@ -61,13 +61,29 @@ export class MissingDataIntegrityGuardService {
       };
     }
 
+    const snapshotTimestamp = analysis.canonicalSnapshot?.timestampUtc;
+    const snapshotAgeMs = typeof snapshotTimestamp === 'number' ? now - snapshotTimestamp : Number.POSITIVE_INFINITY;
+    const sourceIsLive = analysis.dataStatus === 'LIVE' || analysis.dataStatus === 'VERIFIED_REALTIME';
+    const provenanceValid = sourceIsLive &&
+      Number.isFinite(snapshotAgeMs) &&
+      snapshotAgeMs >= 0 &&
+      snapshotAgeMs <= 15000 &&
+      analysis.dataQualityReport?.status === 'LIVE' &&
+      analysis.dataQualityReport.isTradeAllowed === true;
+    const validityFor = (hasValue: boolean): FeatureStatus3State =>
+      !sourceIsLive || snapshotAgeMs < 0 || snapshotAgeMs > 15000
+        ? 'STALE'
+        : hasValue
+          ? 'VALID'
+          : 'UNKNOWN';
+
     // 1. Ticker / Live Price (CRITICAL) - Item 50
-    const hasPrice = typeof analysis.price === 'number' && analysis.price > 1000 && !isNaN(analysis.price);
+    const hasPrice = typeof analysis.price === 'number' && Number.isFinite(analysis.price) && analysis.price > 0;
     features.push({
       featureKey: 'TICKER_PRICE',
       nameFa: 'قیمت زنده تیکر (Last Price)',
       importance: 'CRITICAL',
-      status: hasPrice ? 'VALID' : 'UNKNOWN',
+      status: validityFor(hasPrice),
       valueRepr: hasPrice ? `$${analysis.price}` : 'UNKNOWN',
       isFatalIfMissing: true,
       diagnosticFa: hasPrice ? 'داده قیمت تیکر با کیفیت زنده دریافت شد.' : 'قیمت تیکر مفقود یا نامعتبر است (UNKNOWN).',
@@ -75,12 +91,12 @@ export class MissingDataIntegrityGuardService {
 
     // 2. Order Book Depth & OBI (CRITICAL) - Item 51: OBI missing is NOT OBI=0
     const rawObi = analysis.obi;
-    const isObiPresent = rawObi !== undefined && rawObi !== null && typeof rawObi === 'number' && !isNaN(rawObi);
+    const isObiPresent = typeof rawObi === 'number' && Number.isFinite(rawObi) && rawObi >= -1 && rawObi <= 1;
     features.push({
       featureKey: 'ORDER_BOOK_OBI',
       nameFa: 'عدم‌توازن دفتر سفارشات (OBI)',
       importance: 'CRITICAL',
-      status: isObiPresent ? 'VALID' : 'UNKNOWN',
+      status: validityFor(isObiPresent),
       valueRepr: isObiPresent ? `${rawObi > 0 ? '+' : ''}${rawObi.toFixed(2)}` : 'UNKNOWN',
       isFatalIfMissing: true,
       diagnosticFa: isObiPresent
@@ -90,12 +106,12 @@ export class MissingDataIntegrityGuardService {
 
     // 3. Derivatives Funding Rate & OI (CRITICAL) - Item 52
     const rawFunding = analysis.fundingRate ?? analysis.funding;
-    const isFundingPresent = rawFunding !== undefined && rawFunding !== null && typeof rawFunding === 'number' && !isNaN(rawFunding);
+    const isFundingPresent = typeof rawFunding === 'number' && Number.isFinite(rawFunding);
     features.push({
-      featureKey: 'DERIVATIVES_FUNDING_OI',
-      nameFa: 'داده‌های مشتقه و فاندینگ ریت',
+      featureKey: 'DERIVATIVES_FUNDING',
+      nameFa: 'نرخ Funding مشتقه',
       importance: 'CRITICAL',
-      status: isFundingPresent ? 'VALID' : 'UNKNOWN',
+      status: validityFor(isFundingPresent),
       valueRepr: isFundingPresent ? `${(rawFunding * 100).toFixed(4)}%` : 'UNKNOWN',
       isFatalIfMissing: true,
       diagnosticFa: isFundingPresent
@@ -103,13 +119,24 @@ export class MissingDataIntegrityGuardService {
         : '🛑 داده فاندینگ ریت یا بهره باز قطع است؛ صفر به عنوان مقدار واقعی وارد Prediction نمی‌شود (UNKNOWN).',
     });
 
+    const hasOpenInterest = typeof analysis.oi === 'number' && Number.isFinite(analysis.oi) && analysis.oi > 0;
+    features.push({
+      featureKey: 'DERIVATIVES_OPEN_INTEREST',
+      nameFa: 'بهره باز (Open Interest)',
+      importance: 'CRITICAL',
+      status: validityFor(hasOpenInterest),
+      valueRepr: hasOpenInterest ? String(analysis.oi) : 'UNKNOWN',
+      isFatalIfMissing: true,
+      diagnosticFa: hasOpenInterest ? 'داده Open Interest موجود است.' : 'Open Interest معتبر از منبع پشتیبانی‌شده موجود نیست.',
+    });
+
     // 4. Volatility / ATR / GARCH (CRITICAL)
-    const hasAtr = typeof analysis.atr === 'number' && analysis.atr > 0 && !isNaN(analysis.atr);
+    const hasAtr = typeof analysis.atr === 'number' && Number.isFinite(analysis.atr) && analysis.atr > 0;
     features.push({
       featureKey: 'VOLATILITY_ATR',
       nameFa: 'شاخص نوسانات بازار (ATR/GARCH)',
       importance: 'CRITICAL',
-      status: hasAtr ? 'VALID' : 'UNKNOWN',
+      status: validityFor(hasAtr),
       valueRepr: hasAtr ? `$${analysis.atr.toFixed(1)}` : 'UNKNOWN',
       isFatalIfMissing: true,
       diagnosticFa: hasAtr ? 'نوسان‌سنج فعال است.' : 'نوسان ATR نامشخص است (UNKNOWN). ریسک پوزیشن بدون نوسان قابل محاسبه نیست.',
@@ -117,28 +144,47 @@ export class MissingDataIntegrityGuardService {
 
     // 5. Calibrated Probability (CRITICAL) - Item 57
     const rawProb = analysis.calibratedWinProbability;
-    const hasCalibratedProb = rawProb !== null && rawProb !== undefined && !isNaN(rawProb);
+    const hasCalibratedProb = typeof rawProb === 'number' &&
+      Number.isFinite(rawProb) &&
+      rawProb >= 0 &&
+      rawProb <= 1 &&
+      analysis.calibratedMetadata?.isCalibrationVerified === true &&
+      analysis.calibratedMetadata.dataSufficient === true;
     features.push({
       featureKey: 'CALIBRATED_PROBABILITY',
       nameFa: 'احتمال کالیبره‌شده آماری',
       importance: 'CRITICAL',
-      status: hasCalibratedProb ? 'VALID' : 'UNKNOWN',
+      status: validityFor(hasCalibratedProb),
       valueRepr: hasCalibratedProb ? `${((rawProb as number) * 100).toFixed(1)}%` : 'UNKNOWN',
       isFatalIfMissing: true,
       diagnosticFa: hasCalibratedProb ? 'احتمال کالیبره‌شده تایید گردید.' : 'احتمال کالیبره‌شده مفقود است (UNKNOWN). معامله در حالت احتمال فرضی مسدود است.',
     });
 
     // 6. Market Regime Classification (CRITICAL)
-    const regimeVal = (analysis as any).regime || (analysis as any).marketRegime || analysis.regimeClassification?.activeRegime;
-    const hasRegime = Boolean(regimeVal);
+    const regimeVal = analysis.regimeClassification?.activeRegime ?? analysis.marketRegime;
+    const hasRegime = typeof regimeVal === 'string' &&
+      regimeVal.trim().length > 0 &&
+      !['UNKNOWN', 'UNAVAILABLE', 'UNCLASSIFIED'].includes(regimeVal.toUpperCase());
     features.push({
       featureKey: 'MARKET_REGIME',
       nameFa: 'رژیم طبقه‌بندی‌شده بازار',
       importance: 'CRITICAL',
-      status: hasRegime ? 'VALID' : 'UNKNOWN',
+      status: validityFor(hasRegime),
       valueRepr: regimeVal || 'UNKNOWN',
       isFatalIfMissing: true,
       diagnosticFa: hasRegime ? 'رژیم بازار شناسایی شده است.' : 'رژیم بازار مشخص نیست (UNKNOWN).',
+    });
+
+    features.push({
+      featureKey: 'MARKET_DATA_PROVENANCE',
+      nameFa: 'اعتبار و تازگی provenance فید بازار',
+      importance: 'CRITICAL',
+      status: provenanceValid ? 'VALID' : 'UNKNOWN',
+      valueRepr: provenanceValid ? `LIVE / ${Math.round(snapshotAgeMs)}ms` : 'UNKNOWN',
+      isFatalIfMissing: true,
+      diagnosticFa: provenanceValid
+        ? 'منبع، وضعیت و زمان snapshot بازار معتبر و تازه هستند.'
+        : 'وضعیت فید LIVE، snapshot تازه یا گزارش کیفیت مجاز موجود نیست.',
     });
 
     // 7. Sentiment Index / Social (NON_CRITICAL)
@@ -164,10 +210,7 @@ export class MissingDataIntegrityGuardService {
       (analysis as any)?.__isSyntheticUnsafeForLive__ === true ||
       (analysis as any)?.__isLiveSafe === false;
 
-    const isTradePermitted = missingCriticals.length === 0 &&
-      analysis.dataStatus !== 'DATA_UNAVAILABLE' &&
-      analysis.dataStatus !== 'UNAVAILABLE' &&
-      !isSynthetic;
+    const isTradePermitted = missingCriticals.length === 0 && provenanceValid && !isSynthetic;
     let blockReasonFa: string | undefined;
 
     if (isSynthetic) {

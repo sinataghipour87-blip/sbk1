@@ -95,6 +95,7 @@ import { validatePrecisionEntry, generateClientSidePredictionFallback, updatePre
 import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTargets } from './services/signalToExecution';
 import { verifyAutoTradePrerequisites, reconcileOrderWithExchange } from './services/autoTradeGuard';
 import { getExecutionMode } from './services/executionMode';
+import type { FreqtradeTrade } from './services/freqtradeBridge';
 import { TfjsReinforcementLearningEngine } from './services/tfjsReinforcementLearningEngine';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
 import { tradeThesisAndSmartExitEngine } from './services/tradeThesisAndSmartExitEngine';
@@ -197,8 +198,37 @@ export default function App() {
   const [settings, setSettings] = useState<UserSettings>(() => loadSettings());
   const [showSidebar, setShowSidebar] = useState(false);
   const executionModeRef = useRef<ExecutionMode | null>(null);
+  const [freqtradeDashboard, setFreqtradeDashboard] = useState<{
+    status: 'CHECKING' | 'CONNECTED' | 'UNAVAILABLE' | 'SIMULATION';
+    openTrades: FreqtradeTrade[];
+    error?: string;
+  }>({ status: 'CHECKING', openTrades: [] });
   const handleExecutionModeSelected = useCallback((mode: ExecutionMode, _isLocalSelection: boolean) => {
     executionModeRef.current = mode;
+    if (mode === 'PAPER') {
+      setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
+      try {
+        const saved = localStorage.getItem('quantum_positions');
+        if (saved) {
+          const parsed: unknown = JSON.parse(saved);
+          setActivePositions(Array.isArray(parsed) ? parsed : []);
+        } else {
+          const legacyPosition = localStorage.getItem('quantum_position');
+          setActivePositions(legacyPosition ? [JSON.parse(legacyPosition)] : []);
+        }
+      } catch (error) {
+        console.error('[PAPER] Could not restore local paper positions:', error);
+        setActivePositions([]);
+      }
+      return;
+    }
+    if (mode === 'BACKTEST') {
+      setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
+      setActivePositions([]);
+      return;
+    }
+    setFreqtradeDashboard({ status: 'CHECKING', openTrades: [] });
+    setActivePositions([]);
   }, []);
   const [activeTab, setActiveTab] = useState<'chart' | 'strategy' | 'ai_risk' | 'smart_engines' | 'history_backtest'>('chart');
   const [rightActiveTab, setRightActiveTab] = useState<'trades' | 'wallet'>('trades');
@@ -222,27 +252,7 @@ export default function App() {
   const walletRef = useRef<HTMLDivElement>(null);
   const [systemHubTab, setSystemHubTab] = useState<'hunter_os' | 'sb_models' | 'brains' | 'scenarios' | 'volatility_risk' | 'flow_whales'>('hunter_os');
 
-  const [activePositions, setActivePositions] = useState<TradePosition[]>(() => {
-    let positions: TradePosition[] = [];
-    const saved = localStorage.getItem('quantum_positions');
-    if (saved) {
-      try {
-        positions = JSON.parse(saved);
-      } catch (e) {}
-    } else {
-      const single = localStorage.getItem('quantum_position');
-      if (single) {
-        try {
-          positions = [JSON.parse(single)];
-        } catch (e) {}
-      }
-    }
-    // Normalize names based on position index so first is always S, second SB, third SBK
-    return positions.map((p, idx) => ({
-      ...p,
-      name: idx === 0 ? 'S' : idx === 1 ? 'SB' : 'SBK',
-    }));
-  });
+  const [activePositions, setActivePositions] = useState<TradePosition[]>([]);
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [aiPrediction, setAiPrediction] = useState<any | null>(null);
@@ -1324,98 +1334,54 @@ export default function App() {
     isFetchingRef.current = true;
     setIsFetching(true);
     try {
-      // Sync positions, balance, and state with server daemon (Item 2)
       try {
-        const liveStatusRes = await fetch('/api/live/status');
-        if (liveStatusRes.ok) {
-          const liveStatusData = await liveStatusRes.json();
-          if (executionModeRef.current !== 'PAPER') {
-            if (liveStatusData.activePositions) {
-              setActivePositions(liveStatusData.activePositions);
-              activePositionsRef.current = liveStatusData.activePositions;
-              localStorage.setItem('quantum_positions', JSON.stringify(liveStatusData.activePositions));
-            }
-            if (liveStatusData.liveAutoTradeEnabled !== undefined) {
-              if (settings.autoTradeEnabled !== liveStatusData.liveAutoTradeEnabled) {
-                const updated = { ...settings, autoTradeEnabled: liveStatusData.liveAutoTradeEnabled };
-                setSettings(updated);
-                saveSettings(updated);
-              }
-            }
-          }
-        }
-      } catch (err) {
-        // handled silently
-      }
-
-      try {
-        const exchangeStatusRes = await fetch('/api/exchange/status');
-        if (exchangeStatusRes.ok) {
+        const usesFreqtrade = executionModeRef.current === 'LIVE' || executionModeRef.current === 'TESTNET';
+        if (!usesFreqtrade) {
+          setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
+        } else {
+          const exchangeStatusRes = await fetch('/api/exchange/status');
           const exchangeStatusData = await exchangeStatusRes.json();
-          if (executionModeRef.current !== 'PAPER' && exchangeStatusData.connected && exchangeStatusData.walletBalanceUsdt !== undefined) {
-            setBalance(exchangeStatusData.walletBalanceUsdt);
-            balanceRef.current = exchangeStatusData.walletBalanceUsdt;
-            localStorage.setItem('quantum_balance', exchangeStatusData.walletBalanceUsdt.toString());
-          }
-
-          // 84. Exchange Reconciliation - Exchange is the Source of Truth
-          if (executionModeRef.current !== 'PAPER' && exchangeStatusData.connected && exchangeStatusData.activePositions) {
-            const exchangePositions = exchangeStatusData.activePositions || [];
-            const currentLocalPositions = [...activePositionsRef.current];
-            let reconciledLocalPositions: TradePosition[] = [];
-            let anyReconciled = false;
-
-            for (const localPos of currentLocalPositions) {
-              if (!localPos.isAuto) {
-                reconciledLocalPositions.push(localPos);
-                continue;
-              }
-              // Find matching active position on Bybit/Exchange
-              const matchingExchangePos = exchangePositions.find((ep: any) => {
-                const epSize = parseFloat(ep.size || '0');
-                return epSize > 0 && (
-                  (localPos.dir === 'LONG' && ep.side === 'Buy') ||
-                  (localPos.dir === 'SHORT' && ep.side === 'Sell')
-                );
-              });
-
-              if (matchingExchangePos) {
-                // Keep the local position, sync properties if slightly deviated
-                const exEntryPrice = parseFloat(matchingExchangePos.avgPrice || matchingExchangePos.entryPrice || '0');
-                if (exEntryPrice > 0 && Math.abs(localPos.entry - exEntryPrice) > 0.05) {
-                  localPos.entry = exEntryPrice;
-                  anyReconciled = true;
-                }
-                reconciledLocalPositions.push(localPos);
-              } else {
-                // If not found on Exchange, it means the position was closed/liquidated/stopped out there
-                anyReconciled = true;
-                const now = new Date();
-                const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-                
-                const historyEntry: TradeHistory = {
-                  ...localPos,
-                  pnlUsd: localPos.floatingPnlUsd || 0,
-                  pnlPct: localPos.peakPnlPct || 0,
-                  closedAt: timeStr,
-                  closeReason: `همگام‌سازی اضطراری صرافی (Exchange Reconciliation): پوزیشن بر روی صرافی باز نبود. هم‌ترازی خودکار با مرجع حقیقت صرافی.`,
-                };
-                saveTradeToHistory(historyEntry);
-                showNotification(
-                  `🔄 همگام‌سازی صرافی: پوزیشن [${localPos.name}] در صرافی یافت نشد و با مرجع حقیقت صرافی هماهنگ و بسته شد.`
-                );
-              }
+          if (
+            exchangeStatusRes.ok &&
+            exchangeStatusData.connected === true &&
+            Array.isArray(exchangeStatusData.openTrades)
+          ) {
+            setFreqtradeDashboard({
+              status: 'CONNECTED',
+              openTrades: exchangeStatusData.openTrades as FreqtradeTrade[],
+            });
+            setActivePositions([]);
+            activePositionsRef.current = [];
+            if (typeof exchangeStatusData.walletBalanceUsdt === 'number') {
+              setBalance(exchangeStatusData.walletBalanceUsdt);
+              balanceRef.current = exchangeStatusData.walletBalanceUsdt;
+              localStorage.setItem('quantum_balance', exchangeStatusData.walletBalanceUsdt.toString());
             }
-
-            if (anyReconciled) {
-              setActivePositions(reconciledLocalPositions);
-              activePositionsRef.current = reconciledLocalPositions;
-              localStorage.setItem('quantum_positions', JSON.stringify(reconciledLocalPositions));
-            }
+          } else {
+            setFreqtradeDashboard({
+              status: 'UNAVAILABLE',
+              openTrades: [],
+              error: typeof exchangeStatusData.error === 'string' ? exchangeStatusData.error : 'Freqtrade did not return an authoritative trading state.',
+            });
+            setActivePositions([]);
+            activePositionsRef.current = [];
+            setBalance(0);
+            balanceRef.current = 0;
           }
         }
       } catch (err) {
-        // handled silently
+        if (executionModeRef.current === 'LIVE' || executionModeRef.current === 'TESTNET') {
+          setFreqtradeDashboard({
+            status: 'UNAVAILABLE',
+            openTrades: [],
+            error: err instanceof Error ? err.message : String(err),
+          });
+          setActivePositions([]);
+          activePositionsRef.current = [];
+          setBalance(0);
+          balanceRef.current = 0;
+        }
+        console.error('[Freqtrade] Could not refresh authoritative trading state:', err);
       }
 
       let sentiment = {
@@ -1912,6 +1878,10 @@ export default function App() {
     }
 
     const newPos = buildExecutionPosition(currentRes, targetDir, activeBalance, history, effectiveLev, false, pred);
+    if (!newPos) {
+      showNotification('🛑 داده یا پیش‌نیاز حیاتی برای ساخت پوزیشن موجود نیست؛ هیچ معامله‌ای ایجاد نشد.');
+      return;
+    }
     if (newPos.lifecycleStatus === 'REJECTED') {
       showNotification(`⚠️ معامله خودکار رد شد: ${newPos.rejectionReason}`);
       return;
@@ -2947,6 +2917,49 @@ export default function App() {
           />
            <TickerBar btcPrice={liveEffectivePrice} />
           </div>
+
+          {freqtradeDashboard.status !== 'SIMULATION' && (
+            <section
+              role="status"
+              aria-live="polite"
+              className={`rounded-xl border px-4 py-3 text-sm ${
+                freqtradeDashboard.status === 'CONNECTED'
+                  ? 'border-emerald-700/60 bg-emerald-950/30 text-emerald-100'
+                  : 'border-amber-700/60 bg-amber-950/30 text-amber-100'
+              }`}
+            >
+              <p className="font-bold">
+                {freqtradeDashboard.status === 'CONNECTED'
+                  ? `وضعیت معاملات از Freqtrade دریافت شد؛ ${freqtradeDashboard.openTrades.length} معاملهٔ باز.`
+                  : freqtradeDashboard.status === 'CHECKING'
+                    ? 'در حال دریافت وضعیت معتبر معاملات از Freqtrade؛ وضعیت محلی به‌عنوان وضعیت زنده نمایش داده نمی‌شود.'
+                    : 'وضعیت معاملات Freqtrade در دسترس نیست؛ هیچ وضعیت محلی به‌عنوان وضعیت زنده نمایش داده نمی‌شود.'}
+              </p>
+              {freqtradeDashboard.status === 'UNAVAILABLE' && freqtradeDashboard.error && (
+                <p className="mt-1 text-xs opacity-90">{freqtradeDashboard.error}</p>
+              )}
+              {freqtradeDashboard.status === 'CONNECTED' && freqtradeDashboard.openTrades.length > 0 && (
+                <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  {freqtradeDashboard.openTrades.map((trade) => (
+                    <div key={trade.trade_id} className="rounded-lg border border-emerald-800/50 bg-black/20 p-2 text-xs">
+                      <strong>{trade.pair}</strong>
+                      <span className="mx-2">{trade.is_short ? 'SHORT' : 'LONG'}</span>
+                      <span>شناسهٔ Freqtrade: {trade.trade_id}</span>
+                      <div className="mt-1">
+                        مقدار {trade.amount}، قیمت ورود {trade.open_rate}، وثیقه {trade.stake_amount}
+                      </div>
+                      <div className="mt-1">
+                        سفارش‌ها: {trade.orders.map((order) => `${order.ft_order_side} ${order.status}`).join('، ') || 'ندارد'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <p className="mt-2 text-xs opacity-80">
+                تاریخچهٔ بسته‌شدهٔ نمایش‌داده‌شده در ابزارهای قدیمی هنوز از ذخیرهٔ محلی است و از Freqtrade تأیید نشده است.
+              </p>
+            </section>
+          )}
 
           {/* Pro TradingView Style Terminal: Chart (6 cols) + Manual Order Desk (3 cols) + Auto Bot Desk (3 cols) */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[600px]">

@@ -10,10 +10,13 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx scripts/verify_fail_closed_system.ts"
+    "verify:freqtrade": "tsx scripts/verify_freqtrade_rpc_connection.ts",
+    "verify:freqtrade:dry-run": "tsx scripts/verify_freqtrade_dry_run.ts",
+    "test": "tsx scripts/verify_fail_closed_system.ts && tsx scripts/verify_freqtrade_signal_adapter.ts && tsx scripts/verify_freqtrade_dry_run_fixture.ts && tsx scripts/verify_freqtrade_rpc_contract.ts && python3 -m unittest scripts.test_market_models",
+    "verify:freqtrade:contract": "tsx scripts/verify_freqtrade_rpc_contract.ts"
   },
   "dependencies": {
-    "@google/genai": "latest",
+    "@google/genai": "2.28.0",
     "@tailwindcss/vite": "^4.0.0",
     "@tensorflow/tfjs": "^4.22.0",
     "@vitejs/plugin-react": "^4.3.4",

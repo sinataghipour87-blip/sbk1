@@ -516,19 +516,29 @@ export class TrendSurvivalAndMfeTrailingEngine {
   }
 
   private createMissingPriceComprehensiveState(): ComprehensiveTrendAndTrailingState {
+    const unavailableFactor = (factorName: string, weightPct: number): TrendSurvivalEvaluation['factors']['momentumHealth'] => ({
+      factorName,
+      weightPct,
+      score: null,
+      status: 'UNKNOWN',
+      descriptionFa: 'قیمت بازار مفقود است؛ ارزیابی این عامل ممکن نیست.',
+    });
+
     return {
       timestamp: Date.now(),
       trendSurvival: {
         trendSurvivalProbabilityPct: 0,
         runnerStatus: 'FULL_HARVEST_EXIT',
         steppedExitRecommendedPct: 100,
-        survivalFactors: {
-          momentumHealth: { factorKey: 'MOMENTUM', nameFa: 'سلامت مومنتوم', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
-          orderFlowCvdHealth: { factorKey: 'CVD_ORDER_FLOW', nameFa: 'جریان سفارشات', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
-          orderBookImbalanceHealth: { factorKey: 'OBI', nameFa: 'عدم توازن بوک', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
-          marketStructureIntegrity: { factorKey: 'STRUCTURE', nameFa: 'ساختار بازار', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
-          liquidityAbsorptionHealth: { factorKey: 'ABSORPTION', nameFa: 'جذب نقدینگی', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
-          volatilityRegimeStability: { factorKey: 'VOLATILITY', nameFa: 'نوسانات', score: 0, status: 'CRITICAL', diagnosticFa: 'قیمت مفقود است.' },
+        statusTitleFa: 'قیمت ناموجود',
+        primaryActionFa: 'معامله را ببندید؛ وضعیت روند قابل ارزیابی نیست.',
+        factors: {
+          momentumHealth: unavailableFactor('مومنتوم', 25),
+          orderFlowCvdHealth: unavailableFactor('جریان سفارشات CVD', 20),
+          orderBookImbalanceHealth: unavailableFactor('عدم توازن دفتر سفارش', 15),
+          marketStructureIntegrity: unavailableFactor('یکپارچگی ساختار بازار', 15),
+          liquidityAbsorptionHealth: unavailableFactor('جذب نقدینگی', 15),
+          volatilityRegimeStability: unavailableFactor('پایداری رژیم نوسان', 10),
         },
         survivalConfidence: 0,
         isRunnerSafeToHold: false,
@@ -542,7 +552,7 @@ export class TrendSurvivalAndMfeTrailingEngine {
         dynamicTrailingStopPrice: 0,
         dynamicTrailingOffsetPct: 0,
         stopDistanceInAtr: 0,
-        activeRung: 'RUNG_1_INITIAL_RUNNER',
+        activeRung: 'INITIAL_BREATHING_ROOM',
         isBreakevenCovered: false,
         lockedProfitUsd: 0,
         lockedProfitPct: 0,

@@ -10,8 +10,8 @@
  * - 48: Real-time Reconciliation Engine between Local State & Exchange State (Halts on desync)
  */
 
-import { BybitCredentials } from './hunterExecutionEngine';
 import { centralPriceSourcePolicy } from './priceSourcePolicy';
+import { FreqtradeRpcError, FreqtradeTrade, freqtradeBridge } from './freqtradeBridge';
 
 export type InstitutionalOrderLifecycleState =
   | 'DECISION_APPROVED'
@@ -56,14 +56,10 @@ export interface RealOrderExecutionRecord {
 
 export interface DetailedExecutionAccounting {
   expectedPrice: number;
-  submittedPrice: number;
-  averageFillPrice: number;
-  actualSlippageUsd: number;
-  actualSlippageBps: number;
-  feeUsd: number;
-  orderSubmittedAtMs: number;
-  orderFilledAtMs: number;
-  executionDurationMs: number;
+  estimatedFillPrice: number;
+  estimatedSlippageUsd: number;
+  estimatedSlippageBps: number;
+  estimatedFeeUsd: number;
 }
 
 export interface PartialFillState {
@@ -117,6 +113,14 @@ export interface ReconciliationStatusReport {
   reconciledAt: number;
 }
 
+export interface FreqtradeLifecycleResult {
+  success: boolean;
+  tradeId: string;
+  state: InstitutionalOrderLifecycleState;
+  trade?: FreqtradeTrade;
+  messageFa: string;
+}
+
 export class OrderExecutionLifecycleService {
   private static instance: OrderExecutionLifecycleService;
   private isSystemTradingHalted = false;
@@ -130,45 +134,40 @@ export class OrderExecutionLifecycleService {
   }
 
   /**
-   * 43 & 44. Computes realistic fill price and non-zero slippage accounting
+   * Estimates simulation fill costs; it never represents an exchange fill.
    */
-  public calculateExchangeFillAccounting(
+  public estimateSimulatedFillAccounting(
     expectedPrice: number,
     requestedQtyBtc: number,
     side: 'Buy' | 'Sell',
-    volatilityPct = 1.0,
-    spreadBps = 1.8
+    volatilityPct: number,
+    spreadBps: number
   ): DetailedExecutionAccounting {
-    const now = Date.now();
-    const submitTime = now - 65; // ~65ms submission flight
+    if (
+      !Number.isFinite(expectedPrice) || expectedPrice <= 0 ||
+      !Number.isFinite(requestedQtyBtc) || requestedQtyBtc <= 0 ||
+      !Number.isFinite(volatilityPct) || volatilityPct < 0 ||
+      !Number.isFinite(spreadBps) || spreadBps < 0
+    ) {
+      throw new Error('Simulation fill estimate requires valid price, quantity, volatility, and spread inputs.');
+    }
 
-    // 44. Calculate dynamic realistic non-zero slippage based on book depth and volatility
-    // Standard minimal institutional slippage: 2 ticks ($0.20/BTC) + spread impact
-    const baseSlippageTicks = 0.20; // $0.20 / BTC
-    const volSpreadMultiplier = Math.max(1.0, (volatilityPct / 1.0) * (spreadBps / 1.8));
-    const dynamicSlippageUsdPerBtc = Number((baseSlippageTicks * volSpreadMultiplier).toFixed(2));
+    const estimatedSlippageBps = Math.max(0, spreadBps / 2) * Math.max(1, volatilityPct);
+    const estimatedSlippagePerBtc = expectedPrice * estimatedSlippageBps / 10000;
 
-    const averageFillPrice = side === 'Buy'
-      ? Number((expectedPrice + dynamicSlippageUsdPerBtc).toFixed(2))
-      : Number((expectedPrice - dynamicSlippageUsdPerBtc).toFixed(2));
+    const estimatedFillPrice = side === 'Buy'
+      ? expectedPrice + estimatedSlippagePerBtc
+      : expectedPrice - estimatedSlippagePerBtc;
 
-    const totalSlippageUsd = Number((Math.abs(averageFillPrice - expectedPrice) * requestedQtyBtc).toFixed(4));
-    const actualSlippageBps = Number(((Math.abs(averageFillPrice - expectedPrice) / expectedPrice) * 10000).toFixed(2));
-    
-    // Taker fee: 0.055% standard Bybit / Binance Futures
-    const notionalValue = averageFillPrice * requestedQtyBtc;
-    const feeUsd = Number((notionalValue * 0.00055).toFixed(4));
+    const estimatedSlippageUsd = Math.abs(estimatedFillPrice - expectedPrice) * requestedQtyBtc;
+    const estimatedFeeUsd = estimatedFillPrice * requestedQtyBtc * 0.00055;
 
     return {
       expectedPrice,
-      submittedPrice: expectedPrice,
-      averageFillPrice,
-      actualSlippageUsd: Math.max(0.01, totalSlippageUsd),
-      actualSlippageBps: Math.max(0.2, actualSlippageBps),
-      feeUsd,
-      orderSubmittedAtMs: submitTime,
-      orderFilledAtMs: now,
-      executionDurationMs: now - submitTime,
+      estimatedFillPrice,
+      estimatedSlippageUsd,
+      estimatedSlippageBps,
+      estimatedFeeUsd,
     };
   }
 
@@ -537,6 +536,102 @@ export class OrderExecutionLifecycleService {
 
   public getAllOrderRecords(): RealOrderExecutionRecord[] {
     return Array.from(this.orderExecutionRegistry.values());
+  }
+
+  public async queryFreqtradeOrderStatus(tradeId: string | number): Promise<FreqtradeLifecycleResult> {
+    const normalizedTradeId = String(tradeId);
+    try {
+      const trade = await freqtradeBridge.getTrade(normalizedTradeId);
+      const relevantOrders = trade.orders.filter(
+        (order) => order.ft_order_side.toLowerCase() !== 'stoploss',
+      );
+      const filledQty = relevantOrders.reduce(
+        (total, order) => total + (Number.isFinite(order.filled) ? order.filled ?? 0 : 0),
+        0,
+      );
+      const hasPendingOrder = relevantOrders.some((order) => order.is_open);
+      const state: InstitutionalOrderLifecycleState = hasPendingOrder
+        ? (filledQty > 0 ? 'PARTIALLY_FILLED' : 'ACKNOWLEDGED')
+        : (filledQty > 0 ? 'FILLED' : trade.is_open ? 'ACKNOWLEDGED' : 'CANCELLED');
+      return {
+        success: true,
+        tradeId: normalizedTradeId,
+        state,
+        trade,
+        messageFa: `وضعیت معامله ${normalizedTradeId} مستقیماً از Freqtrade دریافت شد: ${state}.`,
+      };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.isSystemTradingHalted = true;
+      this.haltReasonFa = `استعلام وضعیت معامله ${normalizedTradeId} از Freqtrade ناموفق بود؛ عملیات جدید متوقف شد: ${reason}`;
+      console.error('[OrderExecutionLifecycleService] Freqtrade order status unavailable:', reason);
+      return {
+        success: false,
+        tradeId: normalizedTradeId,
+        state: 'UNKNOWN_IN_FLIGHT',
+        messageFa: `⚠️ وضعیت سفارش از Freqtrade در دسترس نیست؛ وضعیت نامعلوم ثبت شد و ارسال مجدد ممنوع است: ${reason}`,
+      };
+    }
+  }
+
+  public async forceExitFreqtradeTrade(tradeId: string | number): Promise<FreqtradeLifecycleResult> {
+    const normalizedTradeId = String(tradeId);
+    let exitRequestStarted = false;
+    try {
+      const botState = await freqtradeBridge.getStatus();
+      if (!botState.ping || botState.status !== 'running' || botState.dryRun) {
+        throw new FreqtradeRpcError(
+          `Freqtrade is not ready for live exits (state: ${botState.status}, dry-run: ${botState.dryRun}).`,
+        );
+      }
+      const existingTrade = await freqtradeBridge.getTrade(normalizedTradeId);
+      if (!existingTrade.is_open) {
+        return {
+          success: false,
+          tradeId: normalizedTradeId,
+          state: 'REJECTED',
+          trade: existingTrade,
+          messageFa: `معامله ${normalizedTradeId} در Freqtrade باز نیست؛ درخواست خروج ارسال نشد.`,
+        };
+      }
+
+      exitRequestStarted = true;
+      const acknowledgement = await freqtradeBridge.forceExit(normalizedTradeId);
+      const reconciled = await this.queryFreqtradeOrderStatus(normalizedTradeId);
+      if (!reconciled.success) return reconciled;
+      const exitSide = reconciled.trade?.is_short ? 'buy' : 'sell';
+      const exitOrderPending = Boolean(
+        reconciled.trade?.orders.some(
+          (order) => order.ft_order_side.toLowerCase() === exitSide && order.is_open,
+        ),
+      );
+      const exitState = reconciled.trade?.is_open
+        ? (exitOrderPending ? 'PARTIALLY_FILLED' : 'ACKNOWLEDGED')
+        : 'FILLED';
+      return {
+        ...reconciled,
+        success: true,
+        state: exitState,
+        messageFa: `درخواست Force Exit از Freqtrade تأیید شد (${acknowledgement.result})؛ وضعیت جاری: ${exitState}.`,
+      };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const knownRejection =
+        error instanceof FreqtradeRpcError &&
+        error.statusCode !== undefined &&
+        error.statusCode >= 400 &&
+        error.statusCode < 500;
+      const state = knownRejection || !exitRequestStarted ? 'REJECTED' : 'UNKNOWN_IN_FLIGHT';
+      this.isSystemTradingHalted = true;
+      this.haltReasonFa = `Force Exit برای معامله ${normalizedTradeId} موفق/قابل‌تأیید نبود: ${reason}`;
+      console.error('[OrderExecutionLifecycleService] Freqtrade force-exit failed:', reason);
+      return {
+        success: false,
+        tradeId: normalizedTradeId,
+        state,
+        messageFa: `🛑 ${state === 'REJECTED' ? 'درخواست خروج رد شد یا پیش‌بررسی شکست خورد' : 'نتیجه ارسال خروج نامعلوم است'}؛ Fill فرضی ثبت نشد: ${reason}`,
+      };
+    }
   }
 }
 

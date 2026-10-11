@@ -9,6 +9,18 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import WebSocket from 'ws';
 import { TradePosition, TradeHistory, ExecutionSettings } from './src/types/trading';
+import { freqtradeBridge } from './src/services/freqtradeBridge';
+import {
+    freqtradeSignalAdapter,
+    isValidBridgeToken,
+    SBK_SIGNAL_CONTRACT_VERSION,
+    SbkSignalValidationError,
+} from './src/services/freqtradeSignalAdapter';
+import {
+    createDryRunFixtureSignal,
+    DRY_RUN_FIXTURE_SETUP_PREFIX,
+    getDryRunFixtureReadinessError,
+} from './src/services/freqtradeDryRunFixture';
 
 dotenv.config();
 
@@ -67,19 +79,41 @@ app.use(helmet({
     contentSecurityPolicy: false, // Vite works better with this disabled in development
 }));
 
-// Setup Universal CORS for AI Studio preview iframe and dev environments
+// CORS is opt-in for cross-origin clients. Same-origin requests need no CORS header.
+const configuredAllowedOrigins = new Set(
+    (process.env.SBK1_ALLOWED_ORIGINS || '')
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+);
+
+function isAllowedOrigin(origin: string, req: express.Request): boolean {
+    try {
+        const parsedOrigin = new URL(origin);
+        if (!['http:', 'https:'].includes(parsedOrigin.protocol) || parsedOrigin.origin !== origin) {
+            return false;
+        }
+        const sameOrigin = `${req.protocol}://${req.get('host')}`;
+        return origin === sameOrigin || configuredAllowedOrigins.has(origin);
+    } catch {
+        return false;
+    }
+}
+
 app.use((req, res, next) => {
     const origin = req.headers.origin;
     if (origin) {
+        if (!isAllowedOrigin(origin, req)) {
+            return res.status(403).json({ error: 'Cross-origin request is not allowed.' });
+        }
+        res.setHeader('Vary', 'Origin');
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
-    } else {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token');
     }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-token');
     if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
+        return origin ? res.sendStatus(204) : res.sendStatus(403);
     }
     next();
 });
@@ -131,9 +165,8 @@ const liveModeLimiter = rateLimit({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Fast In-Memory Prediction & Volatility Cache to eliminate process spawn lag
-let lastPredictCache: { key: string; data: any; time: number } = { key: '', data: null, time: 0 };
-let lastGarchCache: { key: string; data: any; time: number } = { key: '', data: null, time: 0 };
+// Fast in-memory cache for the exact prediction input (never used as a failure fallback).
+let lastPredictCache: { key: string; data: any; time: number } | null = null;
 
 // Python Concurrency and Timeout Controller (Item 6)
 let activePythonProcesses = 0;
@@ -201,33 +234,25 @@ function runPythonScript(scriptPath: string, args: string[] = [], inputData?: an
 // API route to get prediction from Python with sub-millisecond cache
 app.post('/api/predict', async (req, res) => {
     try {
-        const lastCandleClose = req.body?.candles && req.body.candles.length > 0 ? req.body.candles[req.body.candles.length - 1][3] : 0;
-        const cacheKey = `${lastCandleClose}_${req.body?.obi || 0}_${req.body?.symbol || 'BTC'}`;
+        const cacheKey = crypto.createHash('sha256').update(JSON.stringify(req.body ?? null)).digest('hex');
         const now = Date.now();
 
-        if (lastPredictCache.data && lastPredictCache.key === cacheKey && (now - lastPredictCache.time < 3000)) {
+        if (lastPredictCache && lastPredictCache.key === cacheKey && (now - lastPredictCache.time < 3000)) {
             return res.json(lastPredictCache.data);
         }
 
         const result = await runPythonScript('scripts/predictor.py', [], req.body, 10000);
         const parsed = typeof result === 'string' ? JSON.parse(result) : result;
-        lastPredictCache = { key: cacheKey, data: parsed, time: Date.now() };
-        res.json(parsed);
-    } catch (err: any) {
-        if (lastPredictCache.data) return res.json(lastPredictCache.data);
-        const obi = Number(req.body?.obi) || 0;
-        const trend = obi > 0.1 ? 'BULLISH' : (obi < -0.1 ? 'BEARISH' : 'NEUTRAL');
-        const fallback = {
-            trend,
-            confidenceScore: 70,
-            confidence: 70,
-            isRangeBound: Math.abs(obi) < 0.1,
-            reversal30m: { isReversalLikely: false, direction: 'NEUTRAL', probability: 40 },
-            quantumCertainty: { overallScore: 70, grade: 'A', lossAvoidanceStatus: 'مدیریت آماری ریسک چندلایه فعال است' },
-            microVector: { nextCandleDirection: trend === 'BEARISH' ? 'BEARISH' : 'BULLISH', velocityScore: 60 },
-            whaleTrap: { detected: false, trapType: 'NONE' }
-        };
-        res.json(fallback);
+        if (parsed?.status !== 'DATA_UNAVAILABLE') {
+            lastPredictCache = { key: cacheKey, data: parsed, time: Date.now() };
+        }
+        return res.json(parsed);
+    } catch {
+        return res.status(503).json({
+            status: 'DATA_UNAVAILABLE',
+            tradeEligible: false,
+            error: 'Prediction analysis is unavailable; no fallback signal was generated.',
+        });
     }
 });
 
@@ -236,17 +261,15 @@ app.post('/api/garch', async (req, res) => {
     try {
         const result = await runPythonScript('scripts/garch_volatility.py', [], req.body, 10000);
         const parsed = typeof result === 'string' ? JSON.parse(result) : result;
-        res.json(parsed);
-    } catch (err: any) {
-        res.json({
-            regime: "BALANCED_REGIME",
-            currentVol: 1.5,
-            meanVol: 1.5,
-            volRatio: 1.0,
-            expansionProbability: 50.0,
-            targetMultiplier: 1.0,
-            description: "رژیم تعادل حرکتی نوسان آماری",
-            series: []
+        return res.json(parsed);
+    } catch {
+        return res.status(503).json({
+            status: 'DATA_UNAVAILABLE',
+            tradeEligible: false,
+            regime: null,
+            expansionProbability: null,
+            targetMultiplier: null,
+            error: 'Volatility analysis is unavailable; no fallback regime was generated.',
         });
     }
 });
@@ -346,7 +369,26 @@ app.get('/api/execution/settings', (req, res) => {
 
 app.post('/api/execution/mode', executionModeLimiter, requireAdminAuth, (req, res) => {
     const { mode, liveCapitalCeilingPct } = req.body || {};
-    if (mode) executionSettings.mode = mode;
+    const supportedModes = ['BACKTEST', 'TESTNET', 'PAPER'] as const;
+    if (mode !== undefined && !supportedModes.includes(mode)) {
+        return res.status(409).json({
+            success: false,
+            error: 'SBK1 cannot enable LIVE mode. Live execution is exclusively controlled and audited by the Freqtrade deployment.',
+        });
+    }
+    if (
+        liveCapitalCeilingPct !== undefined &&
+        (typeof liveCapitalCeilingPct !== 'number' ||
+            !Number.isFinite(liveCapitalCeilingPct) ||
+            liveCapitalCeilingPct < 1 ||
+            liveCapitalCeilingPct > 5)
+    ) {
+        return res.status(400).json({
+            success: false,
+            error: 'liveCapitalCeilingPct must be a finite percentage between 1 and 5.',
+        });
+    }
+    if (mode !== undefined) executionSettings.mode = mode;
     if (liveCapitalCeilingPct !== undefined) executionSettings.liveCapitalCeilingPct = liveCapitalCeilingPct;
     executionSettings.lastChangedAt = Date.now();
     res.json({ success: true, settings: executionSettings });
@@ -385,16 +427,6 @@ async function syncClockWithBybit(isTestnet: boolean) {
         console.error('[CLOCK SYNC ERROR] Failed to sync clock with Bybit (secrets redacted)');
     }
 }
-
-// Initial clock sync on startup
-syncClockWithBybit(process.env.EXCHANGE_IS_TESTNET !== 'false');
-
-// Periodically sync clock every 1 minute
-setInterval(() => {
-    const creds = loadServerCredentials();
-    const isTestnet = creds ? creds.isTestnet : true;
-    syncClockWithBybit(isTestnet);
-}, 60 * 1000);
 
 // Live Mode Authorization Guard (Item 1)
 const isLiveAllowed = (): boolean => {
@@ -551,6 +583,50 @@ app.use('/api/live', liveOperationLimiter);
 app.use('/api/exchange', requireAdminAuth);
 app.use('/api/live', requireAdminAuth);
 
+const legacyExecutionPaths = new Set([
+    '/api/exchange/order',
+    '/api/exchange/update-stop-loss',
+    '/api/exchange/close-position',
+    '/api/exchange/partial-close',
+    '/api/exchange/unhedge',
+    '/api/exchange/hedge-chip',
+    '/api/exchange/dca-position',
+]);
+app.use((req, res, next) => {
+    if (
+        req.path === '/api/exchange/credentials' &&
+        (req.method === 'POST' || req.method === 'DELETE')
+    ) {
+        return res.status(409).json({
+            success: false,
+            code: 'FREQTRADE_CREDENTIAL_OWNER',
+            error: 'Exchange credentials are managed only by the Freqtrade deployment; SBK1 does not store trading credentials.',
+        });
+    }
+    if (req.method === 'POST' && legacyExecutionPaths.has(req.path)) {
+        return res.status(409).json({
+            success: false,
+            code: 'FREQTRADE_EXECUTION_OWNER',
+            error: 'Direct exchange execution and local position management are disabled. Submit an approved signal to Freqtrade instead.',
+        });
+    }
+    next();
+});
+
+function requireFreqtradeBridgeAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const authorization = req.headers.authorization;
+    const candidate = typeof authorization === 'string' && authorization.startsWith('Bearer ')
+        ? authorization.slice(7)
+        : undefined;
+    if (!process.env.SBK1_FREQTRADE_BRIDGE_TOKEN || process.env.SBK1_FREQTRADE_BRIDGE_TOKEN.length < 32) {
+        return res.status(503).json({ error: 'Freqtrade signal bridge is not configured.' });
+    }
+    if (!isValidBridgeToken(candidate, process.env.SBK1_FREQTRADE_BRIDGE_TOKEN)) {
+        return res.status(401).json({ error: 'Freqtrade signal bridge authentication failed.' });
+    }
+    next();
+}
+
 // -------------------------------------------------------------
 // IDEMPOTENCY & DUPLICATE ORDER PROTECTION ENGINE (Issue 30)
 // Prevents double execution and maintains lifecycle integrity
@@ -608,118 +684,71 @@ function validateTradeRequest(body: any): { allowed: boolean; reason?: string } 
     return { allowed: true };
 }
 
-// Get Exchange Connection & Status (Issue 28 & 26: Never expose secret)
+// Freqtrade is the only authority for executable exchange state and positions.
+function rejectLegacyExchangeExecution(_req: express.Request, res: express.Response) {
+    return res.status(410).json({
+        success: false,
+        accepted: false,
+        executionAuthority: 'freqtrade',
+        code: 'LEGACY_EXECUTION_DISABLED',
+        error: 'SBK1 direct exchange execution is disabled. Read and manage trading state through Freqtrade.',
+    });
+}
+
 app.get('/api/exchange/status', async (req, res) => {
-    const creds = loadServerCredentials();
     const serverTimestamp = Date.now();
-
-    if (!creds || !creds.apiKey || !creds.apiSecret) {
-        return res.json({
-            connected: false,
-            hasTradePermissions: false,
-            keyMasked: null,
-            isTestnet: false,
-            serverTimestamp,
-            activePositions: [],
-            message: 'کلیدهای صرافی پیکربندی نشده است.'
-        });
-    }
-
     try {
-        const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-        const timestamp = (serverTimestamp + bybitTimeOffset).toString();
-        const recvWindow = Math.min(Math.max(5000, Math.abs(bybitTimeOffset) + 2000), 20000).toString();
-        const queryString = 'accountType=UNIFIED';
-        const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, queryString);
-
-        const [balanceRes, posRes, queryApiRes] = await Promise.all([
-            fetch(`${baseUrl}/v5/account/wallet-balance?${queryString}`, {
-                method: 'GET',
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': signature,
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            }),
-            fetch(`${baseUrl}/v5/position/list?category=linear&symbol=BTCUSDT`, {
-                method: 'GET',
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, 'category=linear&symbol=BTCUSDT'),
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            }),
-            fetch(`${baseUrl}/v5/user/query-api`, {
-                method: 'GET',
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, ''),
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            }).catch(() => null)
+        const [botState, balance, openTrades] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getBalance(),
+            freqtradeBridge.getOpenTrades(),
         ]);
-
-        const balanceData = await balanceRes.json();
-        const posData = await posRes.json();
-
-        let ipRestrictionWarning = null;
-        let hasIpRestriction = true;
-        if (queryApiRes) {
-            try {
-                const queryData = await queryApiRes.json();
-                if (queryData.retCode === 0 && queryData.result) {
-                    const ips = queryData.result.ips || [];
-                    hasIpRestriction = ips.length > 0 && !ips.includes('*') && !ips.includes('');
-                    if (!hasIpRestriction) {
-                        ipRestrictionWarning = "هشدار امنیتی شدید: کلید API شما محدودیت IP ندارد! لطفا کلید را در پنل صرافی به IP سرور خود محدود کنید.";
-                    }
-                }
-            } catch (e) {}
-        }
-
-        if (balanceData.retCode === 0) {
-            const coinData = balanceData.result?.list?.[0]?.coin?.find((c: any) => c.coin === 'USDT') || {};
-            const keyMasked = creds.apiKey.length > 8 
-                ? `${creds.apiKey.substring(0, 4)}****${creds.apiKey.substring(creds.apiKey.length - 4)}` 
-                : 'BYB_****';
-
-            return res.json({
-                connected: true,
-                hasTradePermissions: true,
-                keyMasked,
-                isTestnet: creds.isTestnet,
-                serverTimestamp,
-                walletBalanceUsdt: parseFloat(coinData.walletBalance || '0'),
-                availableBalanceUsdt: parseFloat(coinData.availableToWithdraw || coinData.walletBalance || '0'),
-                activePositions: posData.result?.list || [],
-                hasIpRestriction,
-                ipRestrictionWarning
-            });
-        } else {
-            return res.json({
-                connected: false,
-                hasTradePermissions: false,
-                keyMasked: null,
-                isTestnet: creds.isTestnet,
-                serverTimestamp,
-                error: balanceData.retMsg || 'خطای احراز هویت صرافی'
-            });
-        }
-    } catch (err: any) {
+        const activePositions = openTrades.map((trade) => ({
+            symbol: trade.pair.split(':')[0].replace('/', ''),
+            side: trade.is_short ? 'Sell' : 'Buy',
+            size: String(trade.amount),
+            avgPrice: String(trade.open_rate),
+            tradeId: trade.trade_id,
+            isOpen: trade.is_open,
+        }));
         return res.json({
+            connected: botState.ping && botState.status === 'running',
+            hasTradePermissions: false,
+            permissionsVerified: false,
+            liveModeConfigured: !botState.dryRun && botState.market === 'futures',
+            executionAuthority: 'freqtrade',
+            keyMasked: null,
+            isTestnet: null,
+            demoTrading: botState.demoTrading,
+            dryRun: botState.dryRun,
+            serverTimestamp,
+            walletBalanceUsdt: balance.equity,
+            availableBalanceUsdt: balance.available,
+            activePositions,
+            openTrades,
+            exchange: botState.exchange,
+            market: botState.market,
+            strategy: botState.strategy,
+        });
+    } catch (error) {
+        return res.status(503).json({
             connected: false,
             hasTradePermissions: false,
+            permissionsVerified: false,
+            liveModeConfigured: false,
+            isTestnet: null,
+            dryRun: null,
             serverTimestamp,
-            error: 'خطا در ارتباط با صرافی (جزئیات حساس بازنویسی شد)'
+            executionAuthority: 'freqtrade',
+            activePositions: [],
+            openTrades: [],
+            error: error instanceof Error ? error.message : 'Freqtrade state is unavailable.',
         });
     }
 });
 
 // Configure Server-Side Exchange Credentials (Issue 28 & Item 33)
-app.post('/api/exchange/credentials', async (req, res) => {
+app.post('/api/exchange/credentials', rejectLegacyExchangeExecution, async (req, res) => {
     const { apiKey, apiSecret, isTestnet } = req.body || {};
     if (!apiKey || !apiSecret) {
         return res.status(400).json({ success: false, error: 'API Key و Secret الزامی است.' });
@@ -817,7 +846,7 @@ app.delete('/api/exchange/credentials', (req, res) => {
 });
 
 // Isolated Simulation / Sandbox Order Endpoint (Issue 27)
-app.post('/api/exchange/simulated-order', (req, res) => {
+app.post('/api/exchange/simulated-order', rejectLegacyExchangeExecution, (req, res) => {
     const { symbol = 'BTCUSDT', side, orderType = 'Market', qty, price, stopLoss, takeProfit, clientOrderId } = req.body || {};
     res.json({
         success: true,
@@ -833,7 +862,7 @@ app.post('/api/exchange/simulated-order', (req, res) => {
 });
 
 // Place Real Futures Order on Live Exchange with Idempotency (Issues 27, 28, 30)
-app.post('/api/exchange/order', async (req, res) => {
+app.post('/api/exchange/order', rejectLegacyExchangeExecution, async (req, res) => {
     const {
         symbol = 'BTCUSDT',
         side,
@@ -1139,7 +1168,7 @@ app.post('/api/exchange/order', async (req, res) => {
 });
 
 // Reconcile Order Fill Status & Live Position State with Exchange (Issues 29 & 30)
-app.get('/api/exchange/order-status', async (req, res) => {
+app.get('/api/exchange/order-status', rejectLegacyExchangeExecution, async (req, res) => {
     const { orderId, clientOrderId, symbol = 'BTCUSDT' } = req.query as { orderId?: string; clientOrderId?: string; symbol?: string };
     const creds = loadServerCredentials();
     if (!creds || !creds.apiKey || !creds.apiSecret) {
@@ -2126,6 +2155,25 @@ Analyze current sentiment and output ONLY a JSON object:
 });
 
 // --- Live Trading Safety & Production Readiness Gate Engine (Items 36-40) ---
+const KILL_SWITCH_STATE_DB = 'database_kill_switch.json';
+
+function loadKillSwitchState(): boolean {
+    if (!fs.existsSync(KILL_SWITCH_STATE_DB)) return true;
+    try {
+        const parsed = JSON.parse(fs.readFileSync(KILL_SWITCH_STATE_DB, 'utf-8'));
+        return typeof parsed.active === 'boolean' ? parsed.active : true;
+    } catch {
+        console.error('[KILL_SWITCH] Persisted state is unreadable; keeping new entries blocked.');
+        return true;
+    }
+}
+
+function persistKillSwitchState(active: boolean): void {
+    const temporaryPath = `${KILL_SWITCH_STATE_DB}.tmp`;
+    fs.writeFileSync(temporaryPath, JSON.stringify({ active, updatedAt: Date.now() }), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(temporaryPath, KILL_SWITCH_STATE_DB);
+}
+
 let liveTradingState = {
     apiKeyConfigured: false,
     apiKeyPermissions: {
@@ -2134,7 +2182,7 @@ let liveTradingState = {
     },
     hasIpRestriction: true,
     ipRestrictionWarning: null as string | null,
-    killSwitchActive: false,
+    killSwitchActive: loadKillSwitchState(),
     killSwitchSettings: {
         cancelOpenOrders: true,
         closePositions: false
@@ -2145,37 +2193,67 @@ let liveTradingState = {
     currentDrawdownPercent: 2.1,
     antiMartingaleEnforced: true,
     readinessTests: {
-        "Real Data Test": { status: "PASS", message: "WebSocket & REST feeds active" },
-        "Data Staleness Test": { status: "PASS", message: "Latency < 45ms" },
-        "API Permission Test": { status: "PASS", message: "Trade=true, Withdraw=false verified" },
-        "Order Testnet Test": { status: "PASS", message: "Sandbox order placement successful" },
-        "Partial Fill Test": { status: "PASS", message: "Partial execution handling verified" },
-        "Cancel Test": { status: "PASS", message: "Order cancellation latency < 12ms" },
-        "Reconnect Test": { status: "PASS", message: "Auto-reconnect with state sync working" },
-        "Duplicate Order Test": { status: "PASS", message: "Idempotency keys prevent duplicates" },
-        "Exchange/Local Reconciliation Test": { status: "PASS", message: "Position sync delta = 0" },
-        "Kill Switch Test": { status: "PASS", message: "Instant order halt verified" },
-        "Daily Loss Test": { status: "PASS", message: "Hard stop on daily loss limit working" },
-        "Drawdown Lock Test": { status: "PASS", message: "Global drawdown freeze verified" },
-        "Clock Drift Test": { status: "PASS", message: "NTP sync within 2ms" },
-        "Slippage Test": { status: "PASS", message: "Slippage tolerance bounds enforced" },
-        "Fee Verification": { status: "PASS", message: "Maker/taker fee calculation correct" },
-        "Position Recovery Test": { status: "PASS", message: "Anti-Martingale independent setup check active" },
-        "Server Restart Test": { status: "PASS", message: "State recovery from persistent storage verified" }
+        "Real Data Test": { status: "NOT_RUN", message: "No validated exchange-data integration test has been run." },
+        "Data Staleness Test": { status: "NOT_RUN", message: "No end-to-end data-age test has been run." },
+        "API Permission Test": { status: "NOT_RUN", message: "SBK1 does not own exchange credentials." },
+        "Order Testnet Test": { status: "NOT_RUN", message: "No Freqtrade testnet order has been submitted." },
+        "Partial Fill Test": { status: "NOT_RUN", message: "No partial-fill lifecycle test has been run." },
+        "Cancel Test": { status: "NOT_RUN", message: "No exchange cancellation test has been run." },
+        "Reconnect Test": { status: "NOT_RUN", message: "No service restart recovery test has been run." },
+        "Duplicate Order Test": { status: "NOT_RUN", message: "No exchange-level duplicate-order test has been run." },
+        "Exchange/Local Reconciliation Test": { status: "NOT_RUN", message: "Freqtrade is the position authority; reconciliation is unverified." },
+        "Kill Switch Test": { status: "NOT_RUN", message: "No end-to-end kill-switch test has been run." },
+        "Daily Loss Test": { status: "NOT_RUN", message: "No exchange-backed daily-loss test has been run." },
+        "Drawdown Lock Test": { status: "NOT_RUN", message: "No exchange-backed drawdown test has been run." },
+        "Clock Drift Test": { status: "NOT_RUN", message: "No exchange clock-drift test has been run." },
+        "Slippage Test": { status: "NOT_RUN", message: "No exchange slippage test has been run." },
+        "Fee Verification": { status: "NOT_RUN", message: "Exchange fee schedule has not been verified." },
+        "Position Recovery Test": { status: "NOT_RUN", message: "No Freqtrade restart/recovery test has been run." },
+        "Server Restart Test": { status: "NOT_RUN", message: "No restart/recovery test has been run." }
     },
     liveAutoTradeEnabled: false
 };
 
-app.get('/api/live/status', (req, res) => {
-    res.json({
-        ...liveTradingState,
-        activePositions,
-        tradeHistory
-    });
+app.get('/api/live/status', async (req, res) => {
+    try {
+        const [botState, openTrades] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getOpenTrades(),
+        ]);
+        res.json({
+            killSwitchActive: liveTradingState.killSwitchActive,
+            liveAutoTradeEnabled: false,
+            positionAuthority: 'freqtrade',
+            executionAuthority: 'freqtrade',
+            freqtrade: botState,
+            openTrades,
+            activePositions: openTrades.map((trade) => ({
+                id: String(trade.trade_id),
+                tradeId: trade.trade_id,
+                pair: trade.pair,
+                direction: trade.is_short ? 'SHORT' : 'LONG',
+                isOpen: trade.is_open,
+                amount: trade.amount,
+                openRate: trade.open_rate,
+                stakeAmount: trade.stake_amount,
+                hasOpenOrders: trade.has_open_orders,
+                orders: trade.orders,
+            })),
+        });
+    } catch (error) {
+        res.status(503).json({
+            killSwitchActive: liveTradingState.killSwitchActive,
+            liveAutoTradeEnabled: false,
+            positionAuthority: 'freqtrade',
+            executionAuthority: 'freqtrade',
+            activePositions: [],
+            error: error instanceof Error ? error.message : 'Freqtrade state is unavailable.',
+        });
+    }
 });
 
 // Position closing, partial closing, unhedging, chipping, and DCA endpoints
-app.post('/api/exchange/update-stop-loss', async (req, res) => {
+app.post('/api/exchange/update-stop-loss', rejectLegacyExchangeExecution, async (req, res) => {
     const { id, stopLoss } = req.body || {};
     if (!id || typeof stopLoss !== 'number' || !Number.isFinite(stopLoss) || stopLoss <= 0) {
         return res.status(400).json({ success: false, error: 'شناسه پوزیشن و مقدار معتبر حد ضرر الزامی است.' });
@@ -2232,7 +2310,7 @@ app.post('/api/exchange/update-stop-loss', async (req, res) => {
     }
 });
 
-app.post('/api/exchange/close-position', async (req, res) => {
+app.post('/api/exchange/close-position', rejectLegacyExchangeExecution, async (req, res) => {
     const { id } = req.body || {};
     if (!id) {
         return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
@@ -2310,7 +2388,7 @@ app.post('/api/exchange/close-position', async (req, res) => {
     }
 });
 
-app.post('/api/exchange/partial-close', async (req, res) => {
+app.post('/api/exchange/partial-close', rejectLegacyExchangeExecution, async (req, res) => {
     const { id, fraction = 0.333 } = req.body || {};
     if (!id) {
         return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
@@ -2381,7 +2459,7 @@ app.post('/api/exchange/partial-close', async (req, res) => {
     }
 });
 
-app.post('/api/exchange/unhedge', async (req, res) => {
+app.post('/api/exchange/unhedge', rejectLegacyExchangeExecution, async (req, res) => {
     const { id } = req.body || {};
     if (!id) {
         return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
@@ -2454,7 +2532,7 @@ app.post('/api/exchange/unhedge', async (req, res) => {
     }
 });
 
-app.post('/api/exchange/hedge-chip', async (req, res) => {
+app.post('/api/exchange/hedge-chip', rejectLegacyExchangeExecution, async (req, res) => {
     const { id } = req.body || {};
     if (!id) {
         return res.status(400).json({ success: false, error: 'شناسه پوزیشن (id) الزامی است.' });
@@ -2485,14 +2563,14 @@ app.post('/api/exchange/hedge-chip', async (req, res) => {
     return res.json({ success: true, message: 'تراشیدن سود هدج با موفقیت روی سرور اعمال شد.' });
 });
 
-app.post('/api/exchange/dca-position', async (req, res) => {
+app.post('/api/exchange/dca-position', rejectLegacyExchangeExecution, async (req, res) => {
     return res.status(403).json({
         success: false,
         error: 'DCA و میانگین‌گیری در این پارادایم مدیریت ریسک اکیداً ممنوع است (قاعده ۵).'
     });
 });
 
-app.post('/api/live/check-api-permissions', async (req, res) => {
+app.post('/api/live/check-api-permissions', rejectLegacyExchangeExecution, async (req, res) => {
     const creds = loadServerCredentials();
     if (!creds || !creds.apiKey || !creds.apiSecret) {
         return res.status(403).json({
@@ -2570,23 +2648,117 @@ app.post('/api/live/check-api-permissions', async (req, res) => {
     }
 });
 
-app.post('/api/live/kill-switch', (req, res) => {
-    const { active, cancelOpenOrders, closePositions } = req.body;
-    liveTradingState.killSwitchActive = Boolean(active);
-    if (liveTradingState.killSwitchActive) {
-        liveTradingState.liveAutoTradeEnabled = false;
-        if (cancelOpenOrders !== undefined) liveTradingState.killSwitchSettings.cancelOpenOrders = Boolean(cancelOpenOrders);
-        if (closePositions !== undefined) liveTradingState.killSwitchSettings.closePositions = Boolean(closePositions);
+app.post('/api/live/kill-switch', async (req, res) => {
+    const { active } = req.body;
+    if (typeof active !== 'boolean') {
+        return res.status(400).json({
+            success: false,
+            error: '`active` must be a boolean. Use true to block new signals, false to disarm.',
+        });
     }
+    if (active) {
+        liveTradingState.killSwitchActive = true;
+    }
+    let statePersisted = true;
+    try {
+        persistKillSwitchState(active);
+    } catch {
+        liveTradingState.killSwitchActive = true;
+        console.error('[KILL_SWITCH] State persistence failed; keeping new entries blocked.');
+        statePersisted = false;
+        if (!active) {
+            return res.status(503).json({
+                success: false,
+                killSwitchActive: true,
+                error: 'Kill switch state could not be safely persisted; new entries remain blocked.',
+            });
+        }
+    }
+    let cancelledSignals = 0;
+    if (active) {
+        liveTradingState.liveAutoTradeEnabled = false;
+        try {
+            cancelledSignals = await freqtradeSignalAdapter.cancelPending('SBK1 kill switch cancelled this queued signal.');
+        } catch (error) {
+            console.error('[KILL_SWITCH] Signal cancellation persistence failed; switch remains engaged.');
+            return res.status(503).json({
+                success: false,
+                killSwitchActive: true,
+                liveAutoTradeEnabled: false,
+                error: 'Kill switch is active, but queued signal cancellation could not be confirmed.',
+            });
+        }
+    }
+    if (!statePersisted) {
+        return res.status(503).json({
+            success: false,
+            killSwitchActive: true,
+            liveAutoTradeEnabled: false,
+            cancelledSignals,
+            error: 'Kill switch is active in this process and queued signals were cancelled, but durable state persistence failed.',
+        });
+    }
+    liveTradingState.killSwitchActive = active;
     res.json({
         success: true,
         killSwitchActive: liveTradingState.killSwitchActive,
         liveAutoTradeEnabled: liveTradingState.liveAutoTradeEnabled,
-        message: liveTradingState.killSwitchActive ? "KILL SWITCH ENGAGED: New Orders = OFF, Open Orders Cancelled, Positions Secured." : "Kill Switch Disarmed."
+        cancelledSignals,
+        existingExchangeOrdersAffected: false,
+        existingPositionsAffected: false,
+        positionAuthority: 'freqtrade',
+        message: liveTradingState.killSwitchActive
+            ? 'KILL SWITCH ENGAGED: New SBK1 signals are blocked and unclaimed queued signals were cancelled. Existing exchange orders and positions are not changed; reconcile and manage them through Freqtrade.'
+            : 'Kill switch disarmed by administrator. Confirm exchange and Freqtrade health before re-enabling signals.',
     });
 });
 
-app.post('/api/live/run-readiness-tests', async (req, res) => {
+app.post('/api/live/run-readiness-tests', async (_req, res) => {
+    let freqtradeState: Awaited<ReturnType<typeof freqtradeBridge.getStatus>> | undefined;
+    let rpcFailure: string | undefined;
+    try {
+        freqtradeState = await freqtradeBridge.getStatus();
+    } catch (error) {
+        rpcFailure = error instanceof Error ? error.message : String(error);
+    }
+    liveTradingState.readinessTests = Object.fromEntries([
+        ["Freqtrade RPC", {
+            status: freqtradeState ? "PASS" : "FAIL",
+            message: rpcFailure ?? "Authenticated RPC state was fetched from Freqtrade.",
+        }],
+        ["Real Data Test", { status: "NOT_RUN", message: "Exchange data provenance was not tested end-to-end." }],
+        ["Data Staleness Test", { status: "NOT_RUN", message: "No data-age fault-injection test was run." }],
+        ["API Permission Test", { status: "NOT_RUN", message: "Exchange permissions were not verified against a testnet account." }],
+        ["Order Testnet Test", { status: "NOT_RUN", message: "No testnet order was submitted." }],
+        ["Partial Fill Test", { status: "NOT_RUN", message: "Partial fills were not exercised against an exchange." }],
+        ["Cancel Test", { status: "NOT_RUN", message: "No exchange cancellation was exercised." }],
+        ["Reconnect Test", { status: "NOT_RUN", message: "No service restart test was run." }],
+        ["Duplicate Order Test", { status: "NOT_RUN", message: "No exchange-level duplicate-order test was run." }],
+        ["Exchange/Local Reconciliation Test", { status: "NOT_RUN", message: "No exchange reconciliation was exercised." }],
+        ["Kill Switch Test", { status: "NOT_RUN", message: "No end-to-end kill-switch test was run." }],
+        ["Daily Loss Test", { status: "NOT_RUN", message: "No exchange-backed daily-loss test was run." }],
+        ["Drawdown Lock Test", { status: "NOT_RUN", message: "No exchange-backed drawdown test was run." }],
+        ["Clock Drift Test", { status: "NOT_RUN", message: "No exchange clock-drift test was run." }],
+        ["Slippage Test", { status: "NOT_RUN", message: "No exchange slippage test was run." }],
+        ["Fee Verification", { status: "NOT_RUN", message: "Exchange fees were not verified." }],
+        ["Position Recovery Test", { status: "NOT_RUN", message: "No Freqtrade recovery test was run." }],
+        ["Server Restart Test", { status: "NOT_RUN", message: "No SBK1/Freqtrade restart test was run." }],
+        ["Calibrated Signal Delivery", {
+            status: "BLOCKED",
+            message: "The current heuristic signal has no validated calibration evidence; signal delivery remains disabled.",
+        }],
+    ].map(([name, result]) => [name, result]));
+    liveTradingState.liveAutoTradeEnabled = false;
+    return res.status(503).json({
+        allPassed: false,
+        liveExecutionAuthorized: false,
+        executionAuthority: 'freqtrade',
+        freqtrade: freqtradeState ?? null,
+        readinessTests: liveTradingState.readinessTests,
+        ordersPlaced: 0,
+        message: "Readiness is blocked; only the RPC state was queried and no order was placed.",
+    });
+
     const creds = loadServerCredentials();
     const isWsConnected = wsClient !== null && wsClient.readyState === WebSocket.OPEN;
     const isTestnet = creds ? creds.isTestnet : true;
@@ -2718,13 +2890,30 @@ app.post('/api/live/run-readiness-tests', async (req, res) => {
             allPassed = false;
         }
     }
+    tests["Order Testnet Test"] = {
+        status: "FAIL",
+        message: "No live order was submitted during this diagnostic; order execution has not been end-to-end verified.",
+    };
+    tests["Partial Fill Test"] = {
+        status: "FAIL",
+        message: "Partial-fill lifecycle has not been verified against a running Freqtrade instance.",
+    };
+    tests["Cancel Test"] = {
+        status: "FAIL",
+        message: "Order cancellation has not been verified against a running Freqtrade instance.",
+    };
+    tests["Exchange/Local Reconciliation Test"] = {
+        status: "FAIL",
+        message: "Freqtrade is the position authority; cross-process reconciliation has not yet been integration-tested.",
+    };
+    allPassed = false;
+    liveTradingState.liveAutoTradeEnabled = false;
 
     res.json({
         allPassed,
+        liveExecutionAuthorized: false,
         readinessTests: liveTradingState.readinessTests,
-        message: allPassed
-            ? "ALL PRODUCTION READINESS TESTS EXECUTED & PASSED. Live trading authorized."
-            : "LIVE AUTO TRADE = BLOCKED (One or more dynamic readiness tests failed)."
+        message: "Diagnostic only: live execution is not authorized by this endpoint. Complete Freqtrade dry-run and exchange lifecycle verification before considering deployment.",
     });
 });
 
@@ -2749,57 +2938,285 @@ app.get('/api/orderflow/snapshot', async (req, res) => {
     }
 });
 
-// Authenticated Hunter Order Execution Router with mandatory server-side auth & rate limiter
 app.post('/api/hunter/execute', liveOperationLimiter, requireAdminAuth, async (req, res) => {
     try {
-        const { hunterExecutionEngine } = await import('./src/services/hunterExecutionEngine');
-        const { signal } = req.body || {};
-        const creds = loadServerCredentials();
-        if (!creds?.apiKey || !creds.apiSecret) {
-            return res.status(403).json({
-                success: false,
+        if (liveTradingState.killSwitchActive) {
+            return res.status(423).json({
+                accepted: false,
                 status: 'REJECTED',
-                error: 'EXECUTION_BLOCKED: اعتبارنامهٔ صرافی در سرور موجود نیست.',
-                code: 'CREDENTIALS_REQUIRED'
+                code: 'KILL_SWITCH_ACTIVE',
+                error: 'SBK1 kill switch is active; signal submission is blocked.',
             });
         }
-        const accountBalance = await fetchLiveAvailableUsdtBalance(creds);
-        if (!signal || !Number.isFinite(signal.entryPrice) || signal.entryPrice <= 0) {
-            return res.status(400).json({
-                success: false,
-                status: 'REJECTED',
-                error: 'EXECUTION_BLOCKED: قیمت سیگنال معتبر نیست.',
-                code: 'INVALID_SIGNAL_PRICE'
-            });
-        }
-        const signalAgeMs = Date.now() - Number(signal.timestamp);
-        if (!Number.isFinite(signalAgeMs) || signalAgeMs < 0 || signalAgeMs > 500) {
-            return res.status(409).json({
-                success: false,
-                status: 'REJECTED',
-                error: 'EXECUTION_BLOCKED: سیگنال کهنه یا فاقد زمان معتبر است.',
-                code: 'STALE_SIGNAL'
-            });
-        }
-        const livePrices = await fetchFuturesPrices(true);
-        if (!hasFreshLiveFuturesPrices(livePrices)) {
+        const { signal, marketData } = req.body || {};
+        const pair = process.env.FREQTRADE_PAIR?.trim();
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase();
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim();
+        if (!pair || !exchange || !timeframe || !process.env.SBK1_FREQTRADE_BRIDGE_TOKEN) {
             return res.status(503).json({
                 success: false,
                 status: 'REJECTED',
-                error: 'EXECUTION_BLOCKED: قیمت زنده فیوچرز موجود یا تازه نیست.',
-                code: 'LIVE_MARKET_DATA_UNAVAILABLE'
+                code: 'SIGNAL_BRIDGE_NOT_CONFIGURED',
+                error: 'Signal bridge requires FREQTRADE_PAIR, SBK1_SIGNAL_EXCHANGE, SBK1_FREQTRADE_TIMEFRAME, and a server-side bridge token.',
             });
         }
-        const validatedSignal = { ...signal, entryPrice: livePrices.lastPrice };
-        const result = await hunterExecutionEngine.executeHunterOrder(
-            validatedSignal,
-            creds,
-            accountBalance,
-            10
-        );
-        res.json(result);
+        if (
+            !signal ||
+            !marketData ||
+            marketData.status !== 'LIVE' ||
+            marketData.qualityAllowed !== true ||
+            !Number.isSafeInteger(marketData.dataTimestamp) ||
+            Date.now() - marketData.dataTimestamp > 15_000 ||
+            Date.now() < marketData.dataTimestamp
+        ) {
+            return res.status(422).json({
+                success: false,
+                status: 'REJECTED',
+                code: 'INVALID_MARKET_DATA',
+                error: 'Only a current, quality-approved live SBK1 analysis can be submitted.',
+            });
+        }
+        const signalAgeMs = Date.now() - Number(signal.timestamp);
+        if (!Number.isFinite(signalAgeMs) || signalAgeMs < 0 || signalAgeMs > 15_000) {
+            return res.status(409).json({
+                success: false,
+                status: 'REJECTED',
+                code: 'STALE_SIGNAL',
+                error: 'Signal timestamp is stale or invalid.',
+            });
+        }
+        if (
+            signal.direction !== 'LONG' && signal.direction !== 'SHORT' ||
+            signal.setupType === 'NONE'
+        ) {
+            return res.status(422).json({
+                success: false,
+                status: 'REJECTED',
+                code: 'SIGNAL_QUALITY_REJECTED',
+                error: 'Signal requires a directional setup.',
+            });
+        }
+        return res.status(503).json({
+            success: false,
+            status: 'REJECTED',
+            code: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+            error: 'Live execution is disabled for this heuristic setup because calibrated probability evidence is unavailable.',
+        });
+    } catch (error) {
+        const statusCode = error instanceof SbkSignalValidationError ? 422 : 503;
+        const code = error instanceof SbkSignalValidationError ? error.code : 'SIGNAL_BRIDGE_UNAVAILABLE';
+        const message = error instanceof Error ? error.message : String(error);
+        res.status(statusCode).json({ accepted: false, status: 'REJECTED', code, error: message });
+    }
+});
+
+app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdminAuth, async (_req, res) => {
+    try {
+        const configuredPair = freqtradeBridge.getConfiguredPair();
+        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim() || '';
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+        const [botState, whitelist] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getWhitelist(),
+        ]);
+        const readinessError = getDryRunFixtureReadinessError(botState, {
+            enabled: process.env.SBK1_DRY_RUN_FIXTURE_ENABLED === 'true',
+            killSwitchActive: liveTradingState.killSwitchActive,
+            configuredPair,
+            expectedPair: pair,
+            expectedExchange: exchange,
+            expectedTimeframe: timeframe,
+            whitelist,
+        });
+        if (readinessError) {
+            return res.status(409).json({
+                success: false,
+                code: 'DRY_RUN_FIXTURE_NOT_READY',
+                error: readinessError,
+            });
+        }
+        if (liveTradingState.killSwitchActive) {
+            return res.status(409).json({
+                success: false,
+                code: 'KILL_SWITCH_ENGAGED',
+                error: 'The SBK1 kill switch is engaged; no dry-run fixture will be created.',
+            });
+        }
+
+        const prices = await fetchFuturesPrices(true);
+        if (!hasFreshLiveFuturesPrices(prices)) {
+            return res.status(503).json({
+                success: false,
+                code: 'LIVE_MARKET_DATA_UNAVAILABLE',
+                error: 'A fresh Bybit linear-futures price is required to create a dry-run fixture.',
+            });
+        }
+
+        const signal = createDryRunFixtureSignal({
+            nowMs: Date.now(),
+            exchange,
+            pair,
+            timeframe,
+            referencePrice: prices.lastPrice,
+            observedAtMs: prices.timestampUtc,
+            source: prices.source,
+        });
+        const record = await freqtradeSignalAdapter.submit(signal, {
+            expectedPair: pair,
+            expectedExchange: exchange,
+            expectedTimeframe: timeframe,
+        });
+        res.status(record.duplicate ? 200 : 201).json({
+            success: true,
+            dryRun: true,
+            testOnly: true,
+            signalId: record.signal.signalId,
+            status: record.status,
+            expiresAtMs: record.signal.expiresAtMs,
+            duplicate: record.duplicate === true,
+        });
+    } catch (error) {
+        const statusCode = error instanceof SbkSignalValidationError ? 422 : 503;
+        res.status(statusCode).json({
+            success: false,
+            code: error instanceof SbkSignalValidationError ? error.code : 'DRY_RUN_FIXTURE_FAILED',
+            error: error instanceof Error ? error.message : String(error),
+        });
+    }
+});
+
+app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) => {
+    if (process.env.SBK1_DRY_RUN_FIXTURE_ENABLED !== 'true') {
+        try {
+            await freqtradeSignalAdapter.cancelPending(
+                'Signal delivery disabled because the heuristic execution path has no calibrated probability evidence.',
+            );
+        } catch (error) {
+            return res.status(503).json({
+                error: `Signal delivery is disabled, but pending-signal cancellation failed: ${error instanceof Error ? error.message : String(error)}`,
+                code: 'PENDING_SIGNAL_CANCELLATION_FAILED',
+            });
+        }
+        return res.status(503).json({
+            error: 'Signal delivery is disabled until calibrated probability evidence is available or the guarded dry-run fixture is explicitly enabled.',
+            code: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+        });
+    }
+
+    try {
+        if (liveTradingState.killSwitchActive) {
+            await freqtradeSignalAdapter.cancelPending('SBK1 kill switch cancelled this queued dry-run fixture.');
+            return res.status(409).json({
+                error: 'The SBK1 kill switch is engaged; no dry-run fixture will be delivered.',
+                code: 'KILL_SWITCH_ENGAGED',
+            });
+        }
+
+        const configuredPair = freqtradeBridge.getConfiguredPair();
+        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim() || '';
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+        const [botState, whitelist] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getWhitelist(),
+        ]);
+        const readinessError = getDryRunFixtureReadinessError(botState, {
+            enabled: true,
+            killSwitchActive: false,
+            configuredPair,
+            expectedPair: pair,
+            expectedExchange: exchange,
+            expectedTimeframe: timeframe,
+            whitelist,
+        }, { requireNoOpenTrades: false });
+        if (readinessError) {
+            await freqtradeSignalAdapter.cancelPending(readinessError);
+            return res.status(409).json({
+                error: readinessError,
+                code: 'DRY_RUN_FIXTURE_NOT_READY',
+            });
+        }
+        if (liveTradingState.killSwitchActive) {
+            await freqtradeSignalAdapter.cancelPending('SBK1 kill switch engaged before fixture delivery.');
+            return res.status(409).json({
+                error: 'The SBK1 kill switch is engaged; no dry-run fixture will be delivered.',
+                code: 'KILL_SWITCH_ENGAGED',
+            });
+        }
+
+        if (req.query.pair !== pair || req.query.timeframe !== timeframe) {
+            return res.status(409).json({
+                error: 'Requested pair and timeframe must match the verified Freqtrade dry-run configuration.',
+                code: 'FREQTRADE_CONFIGURATION_MISMATCH',
+            });
+        }
+
+        const records = await freqtradeSignalAdapter.getForStrategy(pair, timeframe);
+        return res.json({
+            contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
+            signals: records.filter((record) =>
+                record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX)
+            ),
+        });
+    } catch (error) {
+        return res.status(503).json({
+            error: `Could not verify or deliver the dry-run fixture: ${error instanceof Error ? error.message : String(error)}`,
+            code: 'DRY_RUN_FIXTURE_VERIFICATION_FAILED',
+        });
+    }
+});
+
+app.post('/api/freqtrade/signals/:signalId/status', requireFreqtradeBridgeAuth, async (req, res) => {
+    try {
+        const record = await freqtradeSignalAdapter.updateStatus(req.params.signalId, req.body || {});
+        res.json({
+            signalId: record.signal.signalId,
+            status: record.status,
+            updatedAtMs: record.updatedAtMs,
+            tradeId: record.tradeId,
+            filledAmount: record.filledAmount,
+            averageFillPrice: record.averageFillPrice,
+        });
+    } catch (error) {
+        const statusCode = error instanceof SbkSignalValidationError ? 422 : 503;
+        res.status(statusCode).json({
+            error: error instanceof Error ? error.message : String(error),
+            code: error instanceof SbkSignalValidationError ? error.code : 'SIGNAL_STATUS_UPDATE_FAILED',
+        });
+    }
+});
+
+app.get('/api/hunter/signals/:signalId', requireAdminAuth, async (req, res) => {
+    try {
+        const record = await freqtradeSignalAdapter.get(req.params.signalId);
+        if (!record) return res.status(404).json({ error: 'Signal was not found.' });
+        res.json(record);
+    } catch (error) {
+        res.status(503).json({ error: `Could not read signal lifecycle: ${error instanceof Error ? error.message : String(error)}` });
+    }
+});
+
+app.post('/api/hunter/exit', liveOperationLimiter, requireAdminAuth, async (req, res) => {
+    const tradeId = req.body?.tradeId;
+    if (!(typeof tradeId === 'string' || typeof tradeId === 'number') || !/^\d+$/.test(String(tradeId))) {
+        return res.status(400).json({
+            success: false,
+            state: 'REJECTED',
+            messageFa: 'شناسه عددی معامله Freqtrade الزامی است؛ درخواست خروج ارسال نشد.'
+        });
+    }
+
+    try {
+        const { orderExecutionLifecycleService } = await import('./src/services/orderExecutionLifecycleEngine');
+        const result = await orderExecutionLifecycleService.forceExitFreqtradeTrade(tradeId);
+        res.status(result.success ? 200 : 503).json(result);
     } catch (err: any) {
-        res.status(500).json({ error: err.message || 'Order execution error' });
+        res.status(500).json({
+            success: false,
+            state: 'REJECTED',
+            messageFa: `خطای امن هنگام خروج از معامله Freqtrade: ${err.message || 'خطای نامشخص'}`
+        });
     }
 });
 
@@ -3314,6 +3731,10 @@ async function evaluateStrategyCheck() {
             const targetDir: 'LONG' | 'SHORT' = signalEval.direction === 'SHORT' ? 'SHORT' : 'LONG';
             
             const newPos = buildExecutionPosition(analysisResult, targetDir, serverWalletBalance, tradeHistory, analysisResult.leverage, false, null);
+            if (!newPos) {
+                logTradingEvent('DAEMON_STRATEGY_BLOCKED', 'Trade position was not created because required market evidence is unavailable.');
+                return;
+            }
             if (newPos.lifecycleStatus === 'REJECTED') {
                 logTradingEvent('DAEMON_STRATEGY_REJECTED', `Trade rejected: ${newPos.rejectionReason}`);
                 sendTelegramNotification(`⚠️ <b>معامله خودکار رد شد:</b>\nدلیل: ${newPos.rejectionReason}`);
@@ -3407,159 +3828,25 @@ async function evaluateStrategyCheck() {
 }
 
 // Active background Daemon starter function
-async function startServerSideTradingDaemon() {
-    console.log('[DAEMON] Launching trading background service...');
+async function startServerSideMarketFeed() {
+    console.log('[MARKET DATA] Starting Bybit feed; SBK1 no longer manages exchange orders or positions.');
     initPersistentStorage();
-    await recoverPositionsOnStartup();
-
-    // Query loaded API key permissions on startup to check for Withdrawal or IP restrictions
-    const creds = loadServerCredentials();
-    if (creds && creds.apiKey && creds.apiSecret) {
-        try {
-            const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-            const timestamp = (Date.now() + bybitTimeOffset).toString();
-            const recvWindow = getDynamicRecvWindow();
-            const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, '');
-            const response = await fetch(`${baseUrl}/v5/user/query-api`, {
-                method: 'GET',
-                headers: {
-                    'X-BAPI-API-KEY': creds.apiKey,
-                    'X-BAPI-SIGN': signature,
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': recvWindow,
-                }
-            });
-            const data = await response.json();
-            if (data.retCode === 0 && data.result) {
-                const permissions = data.result.permissions || {};
-                const hasWithdraw = (permissions.Withdraw && permissions.Withdraw.length > 0) || 
-                                    Object.keys(permissions).some(k => k.toLowerCase() === 'withdraw' || k.toLowerCase() === 'withdrawal');
-                const ips = data.result.ips || [];
-                const hasIp = ips.length > 0 && !ips.includes('*') && !ips.includes('');
-                
-                liveTradingState.apiKeyPermissions.withdraw = hasWithdraw;
-                liveTradingState.hasIpRestriction = hasIp;
-                if (!hasIp) {
-                    liveTradingState.ipRestrictionWarning = "هشدار امنیتی شدید: کلید API شما محدودیت IP ندارد! لطفا کلید را در پنل صرافی به IP سرور خود محدود کنید.";
-                } else {
-                    liveTradingState.ipRestrictionWarning = null;
-                }
-                if (hasWithdraw) {
-                    liveTradingState.liveAutoTradeEnabled = false;
-                    console.error('[CRITICAL SECURITY WARNING] Loaded API key has withdrawal permissions. Auto-trade disabled.');
-                }
-            }
-        } catch (e) {
-            console.error('[DAEMON STARTUP] Failed to verify API key permissions on startup.');
-        }
-    }
-
     connectBybitWs();
-
-    // Reconcile and run strategy checks
-    setInterval(reconcileWithBybit, 3000);
-    setInterval(evaluateStrategyCheck, 3000);
 }
 
 // API Live Toggling Routes (Item 2)
 app.post('/api/live/toggle-auto-trade', (req, res) => {
     const { enable } = req.body;
-    
     if (enable) {
-        if (liveTradingState.killSwitchActive) {
-            return res.status(400).json({ success: false, error: "Cannot enable: Kill Switch is active." });
-        }
-        if (liveTradingState.apiKeyPermissions.withdraw) {
-            return res.status(400).json({ success: false, error: "LIVE TRADING BLOCKED: API Withdrawal permission enabled." });
-        }
-        if (liveTradingState.currentDailyLossUSD >= liveTradingState.dailyLossLimitUSD) {
-            return res.status(400).json({ success: false, error: "Cannot enable: Daily Loss limit reached." });
-        }
-        if (liveTradingState.currentDrawdownPercent >= liveTradingState.globalDrawdownLimitPercent) {
-            return res.status(400).json({ success: false, error: "Cannot enable: Global Drawdown freeze active." });
-        }
-
-        logTradingEvent('AUTO_TRADE_ON', 'Auto trade was manually activated via UI.');
-        sendTelegramNotification('🔄 <b>ترید خودکار روشن شد:</b> ربات ترید فعال شد و در حال اسکن بازار است.');
-    } else {
-        logTradingEvent('AUTO_TRADE_OFF', 'Auto trade was manually deactivated via UI.');
-        sendTelegramNotification('⏸️ <b>ترید خودکار خاموش شد:</b> ربات ترید موقتاً متوقف گردید.');
-    }
-
-    liveTradingState.liveAutoTradeEnabled = Boolean(enable);
-    res.json({ success: true, liveAutoTradeEnabled: liveTradingState.liveAutoTradeEnabled });
-});
-
-app.post('/api/live/kill-switch', async (req, res) => {
-    const { active, cancelOpenOrders, closePositions } = req.body;
-    liveTradingState.killSwitchActive = Boolean(active);
-    
-    if (liveTradingState.killSwitchActive) {
         liveTradingState.liveAutoTradeEnabled = false;
-        logTradingEvent('KILL_SWITCH_ENGAGED', 'Kill switch ENGAGED manually.');
-        sendTelegramNotification('🚨 <b>کلید قطع اضطراری (Kill Switch) فعال شد!</b> ربات خاموش شد، کلیه سفارش‌های باز لغو و پوزیشن‌ها تثبیت شدند.');
-
-        const creds = loadServerCredentials();
-        if (creds && creds.apiKey && creds.apiSecret) {
-            const baseUrl = creds.isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
-            const timestamp = (Date.now() + bybitTimeOffset).toString();
-            const recvWindow = getDynamicRecvWindow();
-
-            if (cancelOpenOrders) {
-                const cancelPayload = JSON.stringify({
-                    category: 'linear',
-                    symbol: 'BTCUSDT'
-                });
-                const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, cancelPayload);
-                await fetch(`${baseUrl}/v5/order/cancel-all`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-BAPI-API-KEY': creds.apiKey,
-                        'X-BAPI-SIGN': signature,
-                        'X-BAPI-TIMESTAMP': timestamp,
-                        'X-BAPI-RECV-WINDOW': recvWindow
-                    },
-                    body: cancelPayload
-                }).catch(() => null);
-            }
-
-            if (closePositions && activePositions.length > 0) {
-                for (const pos of activePositions) {
-                    const closeSide = pos.dir === 'LONG' ? 'Sell' : 'Buy';
-                    const closeQty = (pos.initialMargin * pos.lev / pos.entry).toFixed(3);
-                    const closePayload = JSON.stringify({
-                        category: 'linear',
-                        symbol: 'BTCUSDT',
-                        side: closeSide,
-                        orderType: 'Market',
-                        qty: closeQty,
-                        timeInForce: 'GTC'
-                    });
-                    const signature = generateBybitV5Signature(creds.apiKey, creds.apiSecret, timestamp, recvWindow, closePayload);
-                    await fetch(`${baseUrl}/v5/order/create`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-BAPI-API-KEY': creds.apiKey,
-                            'X-BAPI-SIGN': signature,
-                            'X-BAPI-TIMESTAMP': timestamp,
-                            'X-BAPI-RECV-WINDOW': recvWindow
-                        },
-                        body: closePayload
-                    }).catch(() => null);
-                }
-                activePositions = [];
-                writeDb<TradePosition[]>(POSITIONS_DB, activePositions);
-            }
-        }
+        return res.status(409).json({
+            success: false,
+            liveAutoTradeEnabled: false,
+            error: 'Legacy SBK1 auto-trading is disabled. Freqtrade is the sole execution and position-management owner.',
+        });
     }
-    res.json({
-        success: true,
-        killSwitchActive: liveTradingState.killSwitchActive,
-        liveAutoTradeEnabled: liveTradingState.liveAutoTradeEnabled,
-        message: liveTradingState.killSwitchActive ? "KILL SWITCH ENGAGED: New Orders = OFF, Open Orders Cancelled, Positions Secured." : "Kill Switch Disarmed."
-    });
+    liveTradingState.liveAutoTradeEnabled = false;
+    res.json({ success: true, liveAutoTradeEnabled: false });
 });
 
 // Vite middleware
@@ -3571,8 +3858,8 @@ async function startServer() {
 
   app.use(vite.middlewares);
 
-  // Initialize and spin up Server-Side Trading Background Service
-  await startServerSideTradingDaemon();
+  // Start market data only. Trade lifecycle and position reconciliation belong to Freqtrade.
+  await startServerSideMarketFeed();
 
   app.listen(3000, '0.0.0.0', () => console.log('Server running on port 3000'));
 }

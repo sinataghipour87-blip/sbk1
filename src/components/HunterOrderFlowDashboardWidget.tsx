@@ -16,11 +16,18 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 import { orderFlowEngine, OrderFlowSnapshot } from '../services/orderFlowEngine';
-import type { ExecutedOrderResult } from '../services/hunterExecutionEngine';
 import { AnalysisResult } from '../types/trading';
 
 interface HunterOrderFlowDashboardWidgetProps {
   analysis?: AnalysisResult | null;
+}
+
+interface SignalSubmissionResult {
+  accepted: boolean;
+  status: string;
+  signalId?: string;
+  decisionId?: string;
+  reason: string;
 }
 
 export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWidgetProps> = ({
@@ -33,10 +40,19 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
       analysis?.orderFlowFeatures
     )
   );
-  const [executionResult, setExecutionResult] = useState<ExecutedOrderResult | null>(null);
+  const [executionResult, setExecutionResult] = useState<SignalSubmissionResult | null>(null);
   const [backtestData, setBacktestData] = useState<any | null>(null);
   const [isExecuting, setIsExecuting] = useState<boolean>(false);
   const [isRunningBacktest, setIsRunningBacktest] = useState<boolean>(false);
+  const analysisDataTimestamp =
+    analysis?.futuresPrices?.timestampUtc ?? analysis?.canonicalSnapshot?.timestampUtc;
+  const isSubmissionDataReady =
+    analysis?.dataStatus === 'LIVE' &&
+    analysis.dataQualityReport?.isTradeAllowed === true &&
+    typeof analysisDataTimestamp === 'number' &&
+    Number.isSafeInteger(analysisDataTimestamp) &&
+    Date.now() - analysisDataTimestamp >= 0 &&
+    Date.now() - analysisDataTimestamp <= 5_000;
 
   const updateOrderFlow = () => {
     if (analysis?.rawCandles) {
@@ -55,8 +71,32 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
     return () => clearInterval(interval);
   }, [analysis]);
 
+  useEffect(() => {
+    const signalId = executionResult?.signalId;
+    if (!signalId || ['FILLED', 'REJECTED', 'EXPIRED', 'CANCELLED', 'ERROR'].includes(executionResult.status)) {
+      return;
+    }
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/hunter/signals/${encodeURIComponent(signalId)}`);
+        if (!response.ok) return;
+        const record = await response.json();
+        setExecutionResult((current) => current?.signalId === signalId
+          ? { ...current, status: record.status, reason: record.reason || current.reason }
+          : current);
+      } catch (error) {
+        console.error('Could not refresh the Freqtrade signal lifecycle:', error);
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [executionResult?.signalId, executionResult?.status]);
+
   const handleExecuteOrder = async () => {
-    if (snapshot.activeSignal.signalConfidencePct === null) {
+    if (
+      snapshot.activeSignal.signalConfidencePct === null ||
+      !analysis ||
+      !isSubmissionDataReady
+    ) {
       return;
     }
     setIsExecuting(true);
@@ -65,14 +105,30 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          signal: snapshot.activeSignal
+          signal: snapshot.activeSignal,
+          marketData: {
+            status: analysis.dataStatus,
+            qualityAllowed: analysis.dataQualityReport.isTradeAllowed,
+            dataTimestamp: Number(analysisDataTimestamp),
+          },
         })
       });
       const result = await response.json();
       if (!response.ok) {
-        throw new Error(result.error || `HTTP ${response.status}`);
+        setExecutionResult({
+          accepted: false,
+          status: result.status || 'REJECTED',
+          reason: result.error || `HTTP ${response.status}`,
+        });
+        return;
       }
-      setExecutionResult(result as ExecutedOrderResult);
+      setExecutionResult({
+        accepted: result.accepted === true,
+        status: result.status,
+        signalId: result.signalId,
+        decisionId: result.decisionId,
+        reason: result.reason || 'Signal queued; Freqtrade has not confirmed an order yet.',
+      });
     } catch (err: any) {
       console.error(err);
     } finally {
@@ -233,18 +289,18 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
               <span className="text-sm font-bold text-slate-100 block">
                 سیگنال شکار نقدینگی: {sig.setupType !== 'NONE' ? sig.setupType : 'در حال پایش سطح بعدی...'}
               </span>
-              <span className="text-[10px] text-slate-400">اطمینان CVD: {sig.signalConfidencePct === null ? 'UNKNOWN' : `${sig.signalConfidencePct}%`}</span>
+              <span className="text-[10px] text-slate-400">احتمال کالیبره‌شده: موجود نیست</span>
             </div>
           </div>
 
           {sig.direction !== 'NEUTRAL' && (
             <button
               onClick={handleExecuteOrder}
-              disabled={isExecuting || sig.signalConfidencePct === null}
+              disabled
               className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs transition flex items-center gap-1.5 shadow-lg"
             >
               <Zap className="w-4 h-4 fill-current" />
-              <span>{isExecuting ? 'در حال ارسال سفارش...' : sig.signalConfidencePct === null ? 'اجرای مسدود: CVD نامشخص' : 'شلیک سفارش (Execute Hunter)'}</span>
+              <span>اجرای زنده مسدود: احتمال کالیبره نشده</span>
             </button>
           )}
         </div>
@@ -273,20 +329,23 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
         )}
       </div>
 
-      {/* Executed Order Result Notice */}
+      {/* Freqtrade Signal Lifecycle Notice */}
       {executionResult && (
         <div
           className={`p-3.5 rounded-xl border mb-5 text-xs ${
-            executionResult.success
+            executionResult.accepted
               ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-200'
               : 'bg-rose-950/40 border-rose-500/40 text-rose-200'
           }`}
         >
           <div className="flex items-center gap-2 font-bold mb-1">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-            <span>پاسخ بروکر اجرای سفارش:</span>
+            {executionResult.accepted
+              ? <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+              : <AlertTriangle className="w-4 h-4 text-rose-400" />}
+            <span>چرخه سیگنال Freqtrade: {executionResult.status}</span>
           </div>
-          <p>{executionResult.messageFa}</p>
+          <p>{executionResult.reason}</p>
+          {executionResult.signalId && <p className="mt-1 font-mono">Signal ID: {executionResult.signalId}</p>}
         </div>
       )}
 

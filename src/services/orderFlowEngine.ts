@@ -304,9 +304,6 @@ export class OrderFlowEngine {
         const tp1 = currentPrice + riskUsd * 2.8; // Minimum 1:2.8 R:R
         const tp2 = currentPrice + riskUsd * 4.2; // 1:4.2 R:R
 
-          const cvdConfirmed = deltaRatio !== null && deltaRatio > 0;
-          const confidence = cvdConfirmed ? 82 : null;
-
         activeSignal = {
           symbol: 'BTCUSDT',
           timestamp: Date.now(),
@@ -318,10 +315,10 @@ export class OrderFlowEngine {
           takeProfitTarget1: parseFloat(tp1.toFixed(2)),
           takeProfitTarget2: parseFloat(tp2.toFixed(2)),
           riskRewardRatio: 2.8,
-          cvdDivergenceConfirmed: cvdConfirmed,
+          cvdDivergenceConfirmed: false,
           orderbookAbsorptionRatio: absorptionRatio,
-          signalConfidencePct: confidence,
-          rationaleFa: `🎯 سوئیپ نقدینگی صعودی: سطح $${sLow.price.toLocaleString()} شکسته و بازیابی شد. CVD ${cvdConfirmed ? 'با داده ترید تایید شد' : 'نامشخص است'}؛ تا دریافت جریان ترید، سیگنال تایید آماری ندارد.`,
+          signalConfidencePct: null,
+          rationaleFa: `الگوی heuristic سوئیپ صعودی در سطح $${sLow.price.toLocaleString()} دیده شد. هم‌جهتی دلتا، واگرایی CVD یا احتمال کالیبره‌شده از این تشخیص نتیجه نمی‌شود؛ معامله مجاز نیست.`,
         };
         break;
       }
@@ -338,9 +335,6 @@ export class OrderFlowEngine {
           const tp1 = currentPrice - riskUsd * 2.8; // Minimum 1:2.8 R:R
           const tp2 = currentPrice - riskUsd * 4.2;
 
-          const cvdConfirmed = deltaRatio !== null && deltaRatio < 0;
-          const confidence = cvdConfirmed ? 82 : null;
-
           activeSignal = {
             symbol: 'BTCUSDT',
             timestamp: Date.now(),
@@ -352,10 +346,10 @@ export class OrderFlowEngine {
             takeProfitTarget1: parseFloat(tp1.toFixed(2)),
             takeProfitTarget2: parseFloat(tp2.toFixed(2)),
             riskRewardRatio: 2.8,
-            cvdDivergenceConfirmed: cvdConfirmed,
+            cvdDivergenceConfirmed: false,
             orderbookAbsorptionRatio: absorptionRatio,
-            signalConfidencePct: confidence,
-            rationaleFa: `🎯 سوئیپ نقدینگی نزولی: سطح $${sHigh.price.toLocaleString()} شکسته و بازیابی شد. CVD ${cvdConfirmed ? 'با داده ترید تایید شد' : 'نامشخص است'}؛ تا دریافت جریان ترید، سیگنال تایید آماری ندارد.`,
+            signalConfidencePct: null,
+            rationaleFa: `الگوی heuristic سوئیپ نزولی در سطح $${sHigh.price.toLocaleString()} دیده شد. هم‌جهتی دلتا، واگرایی CVD یا احتمال کالیبره‌شده از این تشخیص نتیجه نمی‌شود؛ معامله مجاز نیست.`,
           };
           break;
         }

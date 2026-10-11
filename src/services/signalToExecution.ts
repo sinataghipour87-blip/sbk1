@@ -54,13 +54,38 @@ export function evaluateSignalToExecution(
   tradeHistoryList?: TradeHistory[],
   minWinProbGate: number = 70
 ): SignalToExecutionResult {
-  const dir: 'LONG' | 'SHORT' =
-    targetDirection ||
-    (analysis.direction === 'LONG' || analysis.direction === 'SHORT'
-      ? analysis.direction
-      : aiPrediction?.trend === 'BEARISH'
-      ? 'SHORT'
-      : 'LONG');
+  const requestedDirection = targetDirection ??
+    (analysis.direction === 'LONG' || analysis.direction === 'SHORT' ? analysis.direction : undefined);
+  if (!requestedDirection) {
+    return {
+      canExecute: false,
+      totalScorePct: 0,
+      direction: 'NEUTRAL',
+      breakdown: [],
+      reasonFa: 'جهت معتبر و صریح برای تصمیم معاملاتی موجود نیست؛ معامله مسدود شد.',
+      executionQuality: 'NOISY_REJECTED',
+      allSystemsPassed: false,
+      totalPillarsPassed: 0,
+      totalPillarsCount: 9,
+      executionThreshold: 70,
+    };
+  }
+  const dir = requestedDirection;
+  const feedAudit = missingDataIntegrityGuard.auditMarketDataIntegrity(analysis);
+  if (!feedAudit.isTradePermitted) {
+    return {
+      canExecute: false,
+      totalScorePct: 0,
+      direction: 'NEUTRAL',
+      breakdown: [],
+      reasonFa: feedAudit.blockReasonFa || 'داده بازار معتبر و کامل نیست؛ معامله مسدود شد.',
+      executionQuality: 'NOISY_REJECTED',
+      allSystemsPassed: false,
+      totalPillarsPassed: 0,
+      totalPillarsCount: 9,
+      executionThreshold: 70,
+    };
+  }
   const isLong = dir === 'LONG';
 
   const price = analysis.price || 0;
@@ -156,8 +181,16 @@ export function evaluateSignalToExecution(
   // 1. AI Ensemble & Neural ML Prediction (Dynamic Weight: wAi)
   // -------------------------------------------------------------
   let aiScore = 0;
-  const predTrend = aiPrediction?.trend || (analysis.direction === 'LONG' ? 'BULLISH' : 'BEARISH');
-  const predConf = aiPrediction?.confidence ? aiPrediction.confidence * 100 : 80;
+  const calibratedPrediction = aiPrediction?.calibratedMetadata?.isCalibrationVerified === true &&
+    typeof aiPrediction?.calibratedWinProbability === 'number' &&
+    Number.isFinite(aiPrediction.calibratedWinProbability) &&
+    aiPrediction.calibratedWinProbability >= 0 &&
+    aiPrediction.calibratedWinProbability <= 1;
+  const predTrend = calibratedPrediction &&
+    (aiPrediction.trend === 'BULLISH' || aiPrediction.trend === 'BEARISH')
+    ? aiPrediction.trend
+    : 'NEUTRAL';
+  const predConf = calibratedPrediction ? aiPrediction.calibratedWinProbability * 100 : 0;
   if (isExhaustedWave || isDivergenceTrap) {
     aiScore = Math.round(wAi * 0.15); // موج تمام شده یا تله واگرایی؛ هوش مصنوعی نمره ورود نمی‌دهد
   } else if ((isWaveGenesis || isPullbackSniper) && ((isLong && predTrend === 'BULLISH') || (!isLong && predTrend === 'BEARISH'))) {
@@ -177,12 +210,12 @@ export function evaluateSignalToExecution(
   // 2. Order Book Imbalance (OBI), Whale CVD Delta & Funding Rate Squeeze Buffer (Dynamic Weight: wObi)
   // -------------------------------------------------------------
   let obiScore = 0;
-  const fundingRate = analysis.funding ?? analysis.fundingRate ?? 0.01; // default neutral 0.01%
+  const fundingRate = analysis.funding ?? analysis.fundingRate;
   let fundingBoost = 0;
-  if (isLong) {
+  if (fundingRate !== null && fundingRate !== undefined && Number.isFinite(fundingRate) && isLong) {
     if (fundingRate < -0.02) fundingBoost = 2; // Short squeeze buffer favors Long
     else if (fundingRate > 0.05) fundingBoost = -3; // Long crowd trap hazard
-  } else {
+  } else if (fundingRate !== null && fundingRate !== undefined && Number.isFinite(fundingRate)) {
     if (fundingRate > 0.04) fundingBoost = 2; // Long squeeze buffer favors Short
     else if (fundingRate < -0.03) fundingBoost = -3; // Short crowd trap hazard
   }
@@ -497,8 +530,11 @@ export function evaluateSignalToExecution(
   const corePillarsPassed = aiPassed && htfPassed && obiPassed && trendPassed;
 
   // 🚀 هماهنگی ۱۰۰٪ ارکان شکارچی با موج‌سواری و صدور مجوز معامله:
-  const isDataQualityAllowed = analysis.dataQualityReport ? analysis.dataQualityReport.isTradeAllowed : true;
-  const isDataAvailable = analysis.dataStatus !== 'DATA_UNAVAILABLE' && isDataQualityAllowed;
+  const isDataQualityAllowed = analysis.dataQualityReport?.isTradeAllowed === true &&
+    analysis.dataQualityReport.status === 'LIVE';
+  const isDataAvailable =
+    (analysis.dataStatus === 'LIVE' || analysis.dataStatus === 'VERIFIED_REALTIME') &&
+    isDataQualityAllowed;
   const isPositiveEv = analysis.expectedValue !== undefined && analysis.expectedValue !== null && analysis.expectedValue > 0;
   const isTradeAllowedByTiming = analysis.entryTiming !== 'NO_TRADE';
   const isTriggerConfirmed = !analysis.setupContext || analysis.setupContext.isTriggerConfirmed;
@@ -593,12 +629,19 @@ export function evaluateSignalToExecution(
   // -------------------------------------------------------------
   // RULE 7: Funding Rate constraint (holding cost safety)
   // -------------------------------------------------------------
-  const funding = analysis.funding ?? analysis.fundingRate ?? 0.0;
-  const normalizedFunding = Math.abs(funding) < 0.01 ? funding * 100 : funding; // ensure % format (e.g. 0.1 means 0.1%)
+  const funding = analysis.funding ?? analysis.fundingRate;
+  if (funding === null || funding === undefined || !Number.isFinite(funding)) {
+    canExecute = false;
+    reasonFa = 'فاندینگ ریت معتبر موجود نیست؛ ورود معاملاتی مسدود شد.';
+  }
+  const normalizedFunding = funding === null || funding === undefined
+    ? null
+    : Math.abs(funding) < 0.01 ? funding * 100 : funding;
   
-  const isHighFundingConflict = 
+  const isHighFundingConflict = normalizedFunding !== null && (
     (dir === 'LONG' && normalizedFunding > 0.1) ||
-    (dir === 'SHORT' && normalizedFunding < -0.1);
+    (dir === 'SHORT' && normalizedFunding < -0.1)
+  );
 
   if (isHighFundingConflict && canExecute) {
     canExecute = false;
@@ -753,18 +796,30 @@ export function buildExecutionPosition(
   userLeverage?: number,
   usePrecisionPullback = false,
   aiPrediction?: any
-): TradePosition {
-  const effectiveLev = userLeverage ?? analysis.leverage ?? 10;
-  
+): TradePosition | null {
   // ۵۰. اعتبارسنجی یکپارچه سلامت داده‌ها و ممانعت از صفرسازی داده‌های مفقود (Missing Data Guard)
   const feedAudit = missingDataIntegrityGuard.auditMarketDataIntegrity(analysis);
+  if (!feedAudit.isTradePermitted) {
+    return null;
+  }
+  const effectiveLev = userLeverage ?? analysis.leverage;
+  if (
+    typeof balance !== 'number' ||
+    !Number.isFinite(balance) ||
+    balance <= 0 ||
+    typeof effectiveLev !== 'number' ||
+    !Number.isFinite(effectiveLev) ||
+    effectiveLev <= 0 ||
+    typeof analysis.confScore !== 'number' ||
+    !Number.isFinite(analysis.confScore) ||
+    typeof analysis.margin !== 'number' ||
+    !Number.isFinite(analysis.margin) ||
+    analysis.margin <= 0
+  ) {
+    return null;
+  }
   let isRejected = false;
   let rejectionReason = '';
-
-  if (!feedAudit.isTradePermitted) {
-    isRejected = true;
-    rejectionReason = feedAudit.blockReasonFa || 'داده‌های فید بازار ناقص یا در وضعیت UNKNOWN هستند.';
-  }
 
   // 🧠 ادراک شناختی رژیم بازار و تعیین درجه جسارت (بیشتر در آلفا، کمتر در شرایط نویز)
   const conviction = evaluateCognitiveConviction(analysis, aiPrediction, (analysis.confScore || 3.8) * 20);
@@ -776,18 +831,16 @@ export function buildExecutionPosition(
   const quantumBrain = runQuantumProcessingBrain(analysis, aiPrediction, analysis.price);
 
   const dynamicKellyMargin = calculateDynamicKellyMargin(
-    balance || 1000,
+    balance,
     tradeHistory,
-    analysis.confScore || 4,
-    analysis.margin || 50,
+    analysis.confScore,
+    analysis.margin,
     direction
   );
 
   // ۴۳ & ۴۴. قیمت اجرای واقعی صرافی (Actual Exchange Fill) به همراه اسلیپیج و کارمزد واقعی (بدون اسلیپیج صفر)
-  const lastCandle = analysis.candles && analysis.candles.length > 0 ? analysis.candles[analysis.candles.length - 1] : null;
-  const candleClose = lastCandle ? ((lastCandle as any).close ?? (Array.isArray(lastCandle) ? lastCandle[3] : 0)) : 0;
-  const expectedAnalysisPrice = analysis.price || candleClose;
-  if (!expectedAnalysisPrice || expectedAnalysisPrice <= 0) {
+  const expectedAnalysisPrice = analysis.price;
+  if (!Number.isFinite(expectedAnalysisPrice) || expectedAnalysisPrice <= 0) {
     return null;
   }
   const targetSide = direction === 'LONG' ? 'Buy' : 'Sell';
@@ -810,7 +863,7 @@ export function buildExecutionPosition(
   // RULE 1: True Risk Budget & Preliminary Stop Distance
   // -------------------------------------------------------------
   const targetRiskPct = 1.5; // Standard 1.5% fixed risk of account balance (Rule 1)
-  const riskUsd = (balance || 1000) * (targetRiskPct / 100) * lossSizeScale;
+  const riskUsd = balance * (targetRiskPct / 100) * lossSizeScale;
 
   // Execute Dynamic Logic-Targeting based on Multi-Timeframe ATR + Key S/R levels
   const preliminaryTargets = calculateLogicTargets(expectedAnalysisPrice, direction, analysis);
@@ -833,15 +886,28 @@ export function buildExecutionPosition(
   }
 
   // ۴۳ & ۴۴. قیمت اجرای واقعی صرافی یا شبیه‌سازی مبتنی بر اسلیپیج و کارمزد دقیق متناسب با حجم واقعی
-  const fillAccounting = orderExecutionLifecycleService.calculateExchangeFillAccounting(
+  const spreadBps = typeof analysis.realObiData?.spreadUsd === 'number' &&
+    Number.isFinite(analysis.realObiData.spreadUsd) &&
+    analysis.price > 0
+    ? (analysis.realObiData.spreadUsd / analysis.price) * 10000
+    : null;
+  if (
+    typeof analysis.volatilityPct !== 'number' ||
+    !Number.isFinite(analysis.volatilityPct) ||
+    typeof spreadBps !== 'number' ||
+    !Number.isFinite(spreadBps)
+  ) {
+    return null;
+  }
+  const fillAccounting = orderExecutionLifecycleService.estimateSimulatedFillAccounting(
     expectedAnalysisPrice,
     dynamicCalculatedQtyBtc,
     targetSide,
-    analysis.volatilityPct || 1.0,
-    analysis.canonicalSnapshot?.basisSpreadBps || (analysis as any).spreadBps || 1.8
+    analysis.volatilityPct,
+    spreadBps
   );
 
-  const entryPrice = fillAccounting.averageFillPrice;
+  const entryPrice = fillAccounting.estimatedFillPrice;
   const now = new Date();
   const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 
@@ -852,7 +918,7 @@ export function buildExecutionPosition(
   // RULE 3 & 4: absolute leverage ceiling and auto-reduction parameters
   // -------------------------------------------------------------
   const MAX_LEVERAGE_CEILING = 5; // Absolute leverage ceiling (Rule 3)
-  const garchRegime = aiPrediction?.garch?.regime || 'NORMAL';
+  const garchRegime = aiPrediction?.garch?.regime;
   const isHighVol = (analysis.volatilityPct && analysis.volatilityPct > 1.5) || garchRegime === 'HIGH';
 
   const slPrice = logicTargets.sl;
@@ -1052,8 +1118,10 @@ export function buildExecutionPosition(
     maePct: 0,
     mfeUsd: 0,
     mfePct: 0,
-    realizedFeesUsd: fillAccounting.feeUsd || exchangeFeeEstimateUsd,
-    slippageUsd: fillAccounting.actualSlippageUsd || 0.05,
+    realizedFeesUsd: 0,
+    slippageUsd: 0,
+    estimatedSlippageUsd: fillAccounting.estimatedSlippageUsd,
+    estimatedSlippageBps: fillAccounting.estimatedSlippageBps,
     expectedPrice: expectedAnalysisPrice,
     submittedPrice: expectedAnalysisPrice,
     averageFillPrice: undefined, // Must NOT record estimated price as actual exchange fill
@@ -1061,7 +1129,7 @@ export function buildExecutionPosition(
     fillSource: 'SIMULATION',
     isSimulatedFill: true,
     actualQtyBtc: dynamicCalculatedQtyBtc,
-    actualSlippageBps: fillAccounting.actualSlippageBps || 0.5,
+    actualSlippageBps: 0,
     actualRiskUsd: riskUsd,
     protectiveOrderVerified: !isRejected,
     emergencyProtectionActive: false,
@@ -1071,7 +1139,6 @@ export function buildExecutionPosition(
     signalId,
     decisionId,
     executionAttemptId,
-    lifecycleStatus: isRejected ? 'REJECTED' : 'FILLED',
-    rejectionReason: isRejected ? rejectionReason : undefined,
+    lifecycleStatus: 'FILLED',
   };
 }
