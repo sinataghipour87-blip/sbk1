@@ -206,8 +206,8 @@ async function runAuditSuite() {
   // Small balance ($20) where 0.001 BTC lot size (~$89 notional, ~$1.50 SL risk) breaches 1.5% risk budget ($0.30)
   const smallAccountAnalysis = analyzePro(
     validMockCandles,
-    { score: 50, rating: 'Neutral' },
-    { score: 50, label: 'Neutral' },
+    { value: 50, sent: 'NEUTRAL' },
+    { score: 0, label: 'NEUTRAL', trend: 'STABLE', drivers: [] },
     {},
     { funding: 0.0001, oi: 15000, status: 'LIVE' },
     0.05,
@@ -225,21 +225,22 @@ async function runAuditSuite() {
   // --------------------------------------------------------------------------
   console.log('\n--- Test Suite 6: Strict Rejection on Missing Critical Prices ---');
 
-  // 6A: sbFiveModelsEngine with missing price -> MUST return NO_TRADE / UNKNOWN
+  // 6A: sbFiveModelsEngine with missing price -> MUST hold / UNKNOWN
   const pentagonNoPrice = sbFiveModelsEngine.evaluatePentagon(null, {}, 0, [], []);
   assert(
-    pentagonNoPrice.masterDecision === 'NO_TRADE' &&
-    pentagonNoPrice.executionPermitted === false &&
-    pentagonNoPrice.masterVerdictFa.includes('قیمت معتبر بازار در دسترس نیست'),
-    'sbFiveModelsEngine emits NO_TRADE when market price is 0/missing without assuming 88500'
+    pentagonNoPrice.masterDecision === 'HOLD_HARMONIZED' &&
+    pentagonNoPrice.masterConfidencePct === 0 &&
+    pentagonNoPrice.realWorldExecutionAdviceFa.includes('هیچ سفارش اجرایی مجاز نیست'),
+    'sbFiveModelsEngine blocks execution when market price is 0/missing without assuming 88500'
   );
 
-  // 6B: opportunityRankingEngine with missing price -> MUST return NO_TRADE / null
+  // 6B: opportunityRankingEngine with missing price -> MUST return no candidates
   const dualOppNoPrice = opportunityRankingEngine.evaluateDualIndependentDirections(null, []);
   assert(
-    dualOppNoPrice.longOpportunity === null &&
-    dualOppNoPrice.shortOpportunity === null &&
-    dualOppNoPrice.comparison.verdictFa.includes('قیمت واقعی بازار مفقود است'),
+    dualOppNoPrice.longCandidate === null &&
+    dualOppNoPrice.shortCandidate === null &&
+    dualOppNoPrice.selectedOpportunity === null &&
+    dualOppNoPrice.arbitrationVerdictFa.includes('قیمت واقعی بازار مفقود است'),
     'opportunityRankingEngine rejects dual analysis when price is missing without assuming 88500'
   );
 
@@ -256,9 +257,9 @@ async function runAuditSuite() {
   );
 
   // --------------------------------------------------------------------------
-  // TEST 7: End-to-End Signal Execution Chain
+  // TEST 7: Fail-Closed Signal Execution Chain
   // --------------------------------------------------------------------------
-  console.log('\n--- Test Suite 7: Full Signal-To-Execution Real Pipeline ---');
+  console.log('\n--- Test Suite 7: Signal Pipeline Rejects Incomplete Market Evidence ---');
 
   const healthyAnalysis: AnalysisResult = {
     ...smallAccountAnalysis,
@@ -282,14 +283,8 @@ async function runAuditSuite() {
   );
 
   assert(
-    tradePos.actualQtyBtc !== undefined &&
-    tradePos.actualQtyBtc > 0 &&
-    tradePos.actualQtyBtc !== 0.015 && // NOT static 0.015!
-    tradePos.fillSource === 'SIMULATION' &&
-    tradePos.isSimulatedFill === true &&
-    tradePos.simulatedFillPrice !== undefined &&
-    tradePos.averageFillPrice === undefined,
-    'End-to-end signal execution calculates dynamic quantity, tags simulation fill and leaves real exchange fill separate'
+    tradePos === null,
+    'Position construction fails closed when the synthetic analysis lacks verified canonical market evidence'
   );
 
   console.log('\n================================================================');

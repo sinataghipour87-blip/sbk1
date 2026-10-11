@@ -313,6 +313,9 @@ export function analyzePro(
   const vwapVal = calcVwap(candles, 50);
 
   const price = closes[closes.length - 1];
+  const markPrice = Number.isFinite(futuresPrices?.markPrice) && (futuresPrices?.markPrice ?? 0) > 0
+    ? futuresPrices.markPrice
+    : price;
   const currAtr = aVals[aVals.length - 1] || 150.0;
   const currRsi = rVals[rVals.length - 1] || 50.0;
   const rsiPrev = rVals.length > 1 ? rVals[rVals.length - 2] : currRsi;
@@ -744,7 +747,7 @@ export function analyzePro(
 
   // 3. Position Notional proportional strictly to Risk Budget (NOT arbitrary leverage)
   let posUsd = Math.round((dollarRiskBudget / Math.max(0.005, totalUnitRiskFraction)) * 100) / 100;
-  let qtyBtc = Math.round((posUsd / executableEntryPrice) * 1000) / 1000;
+  let qtyBtc = Math.floor((posUsd / executableEntryPrice) * 1000) / 1000;
   let isRiskBudgetBreachedByMinLot = false;
   if (qtyBtc < 0.001 && realEquity > 10) {
     qtyBtc = 0.001; // Exchange minimum contract size
@@ -782,7 +785,7 @@ export function analyzePro(
   if (marginNeeded > realEquity * 0.85 && realEquity > 0) {
     // Scale position down if margin exceeds 85% of available free equity
     posUsd = Math.round(realEquity * 0.85 * leverage * 100) / 100;
-    qtyBtc = Math.round((posUsd / executableEntryPrice) * 1000) / 1000;
+    qtyBtc = Math.floor((posUsd / executableEntryPrice) * 1000) / 1000;
     marginNeeded = Math.round((posUsd / leverage) * 100) / 100;
   }
   const riskUsd = Math.round((posUsd * totalUnitRiskFraction) * 100) / 100;
@@ -849,7 +852,13 @@ export function analyzePro(
   const isDataQualityBroken = Boolean(dataQualityReport && !dataQualityReport.isTradeAllowed);
 
   // 0) Central Probability Engine, Risk-Adjusted Edge & Trade Quality Gating (Rules 5 & 6)
-  if (
+  if (isRiskBudgetBreachedByMinLot) {
+    entryTiming = 'NO_TRADE';
+    signalOk = false;
+    lifecycleState = 'CANCELLED';
+    tradeThesis = `🛑 لغو معامله: حداقل لات سایز مجاز صرافی (0.001 BTC) ریسک این معامله را از سقف بودجه ریسک (${dollarRiskBudget} USD) فراتر می‌برد. حساب برای این فاصله استاپ نیاز به بالانس بیشتری دارد.`;
+  }
+  else if (
     calibratedMetadata.selectiveMode.recommendation === 'WAIT_NO_TRADE' ||
     calibratedMetadata.calibratedWinProbability === null ||
     calibratedMetadata.isExpectancyNegative ||
@@ -878,13 +887,6 @@ export function analyzePro(
     entryTiming = 'NO_TRADE';
     signalOk = false;
     tradeThesis = 'صبر کنید (WAIT): روند بازار مشخص است اما ست‌آپ ساختاری معتبر شکل نگرفته است (Trend ≠ Setup).';
-  }
-  // ۳.۵) پایش سخت‌گیرانه سقف بودجه ریسک بر اثر حداقل حجم و حاشیه امن لیکوییدیشن
-  else if (isRiskBudgetBreachedByMinLot) {
-    entryTiming = 'NO_TRADE';
-    signalOk = false;
-    lifecycleState = 'CANCELLED';
-    tradeThesis = `🛑 لغو معامله: حداقل لات سایز مجاز صرافی (0.001 BTC) ریسک این معامله را از سقف بودجه ریسک (${dollarRiskBudget} USD) فراتر می‌برد. حساب برای این فاصله استاپ نیاز به بالانس بیشتری دارد.`;
   }
   else if (isLiquidationUnsafe) {
     entryTiming = 'NO_TRADE';

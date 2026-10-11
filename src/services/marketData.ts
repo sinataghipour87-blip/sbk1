@@ -38,34 +38,64 @@ export interface BybitCandlesResult {
 
 // 1. Fetch candles from Bybit Linear Futures Market (Item 31)
 export async function fetchBybit(interval = '15', limit = 150): Promise<BybitCandlesResult> {
+  if (!/^\d+$/.test(interval) || Number(interval) <= 0 || !Number.isInteger(limit) || limit < 20 || limit > 1000) {
+    throw new Error('Invalid Bybit candle interval or limit');
+  }
   const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=${interval}&limit=${limit}`;
   interface BybitResp {
+    time?: number;
     result?: {
       list?: string[][];
     };
   }
   const { data, latencyMs } = await safeFetchJson<BybitResp>(url);
   const receivedTimestampMs = Date.now();
-  if (!data?.result?.list || data.result.list.length < 20) {
+  if (!data?.result?.list || data.result.list.length < 20 || !Number.isFinite(data.time)) {
     throw new Error('Invalid Bybit Futures data');
   }
   // Bybit returns list descending: [startTime, open, high, low, close, volume, turnover]
   const reversed = [...data.result.list].reverse();
-  const candles: Candle[] = reversed.map(item => [
-    parseFloat(item[1]),
-    parseFloat(item[2]),
-    parseFloat(item[3]),
-    parseFloat(item[4]),
-    parseFloat(item[5]),
-  ]);
-  if (!candles.every(isValidMarketCandle)) {
+  const intervalMinutes = Number(interval);
+  const intervalMs = intervalMinutes * 60 * 1000;
+  const parsedRows = reversed.map((item) => ({
+    startTimeMs: Number(item[0]),
+    candle: [
+      Number(item[1]),
+      Number(item[2]),
+      Number(item[3]),
+      Number(item[4]),
+      Number(item[5]),
+    ] as Candle,
+  }));
+  if (
+    parsedRows.some(({ startTimeMs, candle }) =>
+      !Number.isSafeInteger(startTimeMs) ||
+      startTimeMs <= 0 ||
+      startTimeMs % intervalMs !== 0 ||
+      !isValidMarketCandle(candle)
+    ) ||
+    parsedRows.some((row, index) =>
+      index > 0 && row.startTimeMs - parsedRows[index - 1].startTimeMs !== intervalMs
+    )
+  ) {
     throw new Error('Bybit returned invalid futures candles');
   }
 
-  const lastRaw = reversed[reversed.length - 1];
-  const sourceStartTimeMs = parseInt(lastRaw[0], 10);
-  const intervalMinutes = parseInt(interval, 10) || 15;
-  const sourceCloseTimeMs = sourceStartTimeMs + (intervalMinutes * 60 * 1000);
+  const latestCompleteRow = parsedRows
+    .filter(({ startTimeMs }) => startTimeMs + intervalMs <= receivedTimestampMs - 1500)
+    .at(-1);
+  if (!latestCompleteRow) {
+    throw new Error('Bybit has not returned a completed candle for the configured timeframe');
+  }
+  const completeRows = parsedRows.filter(({ startTimeMs }) =>
+    startTimeMs <= latestCompleteRow.startTimeMs
+  );
+  const candles = completeRows.map(({ candle }) => candle);
+  if (candles.length < 20) {
+    throw new Error('Bybit returned fewer than 20 completed futures candles');
+  }
+  const sourceStartTimeMs = latestCompleteRow.startTimeMs;
+  const sourceCloseTimeMs = sourceStartTimeMs + intervalMs;
 
   return {
     candles,
@@ -104,6 +134,7 @@ export async function fetchFuturesPrices(forceRefresh = false): Promise<FuturesP
 
   try {
     interface BybitTickerResp {
+      time?: number | string;
       result?: {
         list?: Array<{
           lastPrice?: string;
@@ -114,26 +145,34 @@ export async function fetchFuturesPrices(forceRefresh = false): Promise<FuturesP
     }
     const url = 'https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT';
     const { data, latencyMs } = await safeFetchJson<BybitTickerResp>(url, 3000);
+    const receivedTimestampMs = Date.now();
     const item = data?.result?.list?.[0];
     if (item?.lastPrice && item.markPrice && item.indexPrice) {
       const lastPrice = parseFloat(item.lastPrice);
       const markPrice = parseFloat(item.markPrice);
       const indexPrice = parseFloat(item.indexPrice);
+      const sourceTimestampMs = Number(data.time);
 
-      if (![lastPrice, markPrice, indexPrice].every(value => Number.isFinite(value) && value > 0)) {
+      if (
+        ![lastPrice, markPrice, indexPrice].every(value => Number.isFinite(value) && value > 0) ||
+        !Number.isSafeInteger(sourceTimestampMs) ||
+        sourceTimestampMs <= 0
+      ) {
         throw new Error('Bybit returned invalid live futures prices');
       }
 
+      const ageMs = receivedTimestampMs - sourceTimestampMs;
       const result: FuturesPrices = {
         lastPrice,   // Used for Entry Execution & Order Fill
         markPrice,   // Used for Stop Loss Trigger, Liquidation Engine & Risk Evaluation
         indexPrice,  // Spot Underlying Index Benchmark
-        timestampUtc: Date.now(),
-        isoTimeUtc: new Date().toISOString(),
-        ageMs: Date.now() - now,
+        timestampUtc: sourceTimestampMs,
+        receivedTimestampMs,
+        isoTimeUtc: new Date(sourceTimestampMs).toISOString(),
+        ageMs,
         latencyMs,
         source: 'Bybit Linear Futures Ticker (BTCUSDT)',
-        status: 'LIVE'
+        status: ageMs >= 0 && ageMs <= 3000 ? 'LIVE' : 'STALE'
       };
       dataProvenanceLayerService.registerAndAuditFeedProvenance({
         feedKey: 'TICKER_FUTURES',
@@ -142,16 +181,19 @@ export async function fetchFuturesPrices(forceRefresh = false): Promise<FuturesP
         symbol: 'BTCUSDT',
         marketType: 'LINEAR_PERPETUAL',
         timeframe: 'TICK',
-        sourceTimestampMs: result.timestampUtc,
-        receivedTimestampMs: Date.now(),
+        sourceTimestampMs,
+        receivedTimestampMs,
         networkLatencyMs: latencyMs,
+        customStatus: result.status === 'STALE' ? 'STALE' : undefined,
         rawPriceValues: {
           lastPrice,
           markPrice,
           indexPrice,
         },
       });
-      setCache(cacheKey, result);
+      if (result.status === 'LIVE') {
+        setCache(cacheKey, result);
+      }
       return result;
     }
   } catch {
@@ -178,6 +220,7 @@ export async function fetchFuturesPrices(forceRefresh = false): Promise<FuturesP
     markPrice: 0,
     indexPrice: 0,
     timestampUtc: now,
+    receivedTimestampMs: now,
     isoTimeUtc: new Date(now).toISOString(),
     ageMs: Infinity,
     latencyMs: 0,
@@ -209,22 +252,43 @@ export async function fetchKucoin(type = '15min'): Promise<KucoinCandlesResult> 
     if (data?.data && data.data.length >= 20) {
       // KuCoin Futures returns: [time, open, high, low, close, volume]
       const reversed = [...data.data].reverse();
-      const candles: Candle[] = reversed.map(item => [
-        item[1], // open
-        item[2], // high
-        item[3], // low
-        item[4], // close
-        item[5], // volume
-      ]);
-      if (!candles.every(isValidMarketCandle)) {
+      const intervalMs = gran * 60 * 1000;
+      const parsedRows = reversed.map((item) => {
+        const rawTime = Number(item[0]);
+        const startTimeMs = rawTime < 1e11 ? rawTime * 1000 : rawTime;
+        return {
+          startTimeMs,
+          candle: [Number(item[1]), Number(item[2]), Number(item[3]), Number(item[4]), Number(item[5])] as Candle,
+        };
+      });
+      if (
+        parsedRows.some(({ startTimeMs, candle }) =>
+          !Number.isSafeInteger(startTimeMs) ||
+          startTimeMs <= 0 ||
+          startTimeMs % intervalMs !== 0 ||
+          !isValidMarketCandle(candle)
+        ) ||
+        parsedRows.some((row, index) =>
+          index > 0 && row.startTimeMs - parsedRows[index - 1].startTimeMs !== intervalMs
+        )
+      ) {
         throw new Error('KuCoin returned invalid futures candles');
       }
 
-      const lastRaw = reversed[reversed.length - 1];
-      // KuCoin time is in seconds or milliseconds
-      const rawTime = lastRaw[0];
-      const sourceStartTimeMs = rawTime < 1e11 ? rawTime * 1000 : rawTime;
-      const sourceCloseTimeMs = sourceStartTimeMs + (gran * 60 * 1000);
+      const latestCompleteRow = parsedRows
+        .filter(({ startTimeMs }) => startTimeMs + intervalMs <= receivedTimestampMs - 1500)
+        .at(-1);
+      if (!latestCompleteRow) {
+        throw new Error('KuCoin has not returned a completed candle for the configured timeframe');
+      }
+      const candles = parsedRows
+        .filter(({ startTimeMs }) => startTimeMs <= latestCompleteRow.startTimeMs)
+        .map(({ candle }) => candle);
+      if (candles.length < 20) {
+        throw new Error('KuCoin returned fewer than 20 completed futures candles');
+      }
+      const sourceStartTimeMs = latestCompleteRow.startTimeMs;
+      const sourceCloseTimeMs = sourceStartTimeMs + intervalMs;
 
       return {
         candles,
@@ -423,7 +487,7 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
         symbol: 'BTCUSDT',
         marketType: 'LINEAR_PERPETUAL',
         timeframe: '15m',
-        sourceTimestampMs: bybitRes.sourceStartTimeMs,
+        sourceTimestampMs: bybitRes.sourceCloseTimeMs,
         receivedTimestampMs: bybitRes.receivedTimestampMs,
         networkLatencyMs: bybitRes.latencyMs,
         candles: rawCandles,
@@ -433,12 +497,12 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
         rawCandles,
         source: 'Bybit Linear Futures BTCUSDT (Primary)',
         status: 'LIVE',
-        timestamp: bybitRes.sourceStartTimeMs,
+        timestamp: bybitRes.receivedTimestampMs,
         candleStartTimeMs: bybitRes.sourceStartTimeMs,
         candleCloseTimeMs: bybitRes.sourceCloseTimeMs,
         receivedTimestampMs: bybitRes.receivedTimestampMs,
         lastUpdateTimestampMs: now,
-        ageMs: Math.max(0, now - bybitRes.sourceStartTimeMs),
+        ageMs: Math.max(0, now - bybitRes.sourceCloseTimeMs),
         latencyMs: bybitRes.latencyMs,
       };
       setCache(cacheKey, result);
@@ -459,31 +523,32 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
         { exchange: 'BYBIT', symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' },
         { exchange: 'KUCOIN', symbol: 'XBTUSDTM', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' }
       );
-      if (compatCheck.isCompatible) {
-        dataProvenanceLayerService.registerAndAuditFeedProvenance({
-          feedKey: 'CANDLES_FALLBACK',
-          source: 'KuCoin Linear Futures XBTUSDTM (Secondary Futures Fallback)',
-          exchange: 'KUCOIN',
-          symbol: 'BTCUSDT',
-          marketType: 'LINEAR_PERPETUAL',
-          timeframe: '15m',
-          sourceTimestampMs: kucoinRes.sourceStartTimeMs,
-          receivedTimestampMs: kucoinRes.receivedTimestampMs,
-          networkLatencyMs: kucoinRes.latencyMs,
-          candles: rawCandles,
-        });
+      if (!compatCheck.isCompatible) {
+        throw new Error(`KuCoin fallback contract mapping failed: ${compatCheck.rejectionReasonFa}`);
       }
+      dataProvenanceLayerService.registerAndAuditFeedProvenance({
+        feedKey: 'CANDLES_FALLBACK',
+        source: 'KuCoin Linear Futures XBTUSDTM (Secondary Futures Fallback)',
+        exchange: 'KUCOIN',
+        symbol: 'XBTUSDTM',
+        marketType: 'LINEAR_PERPETUAL',
+        timeframe: '15m',
+        sourceTimestampMs: kucoinRes.sourceCloseTimeMs,
+        receivedTimestampMs: kucoinRes.receivedTimestampMs,
+        networkLatencyMs: kucoinRes.latencyMs,
+        candles: rawCandles,
+      });
       const result: FetchCandlesResult = {
         candles: rawCandles,
         rawCandles,
         source: 'KuCoin Linear Futures XBTUSDTM (Secondary Futures Fallback)',
         status: 'LIVE',
-        timestamp: kucoinRes.sourceStartTimeMs,
+        timestamp: kucoinRes.receivedTimestampMs,
         candleStartTimeMs: kucoinRes.sourceStartTimeMs,
         candleCloseTimeMs: kucoinRes.sourceCloseTimeMs,
         receivedTimestampMs: kucoinRes.receivedTimestampMs,
         lastUpdateTimestampMs: now,
-        ageMs: Math.max(0, now - kucoinRes.sourceStartTimeMs),
+        ageMs: Math.max(0, now - kucoinRes.sourceCloseTimeMs),
         latencyMs: kucoinRes.latencyMs,
       };
       setCache(cacheKey, result);
@@ -497,7 +562,7 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
   // Check if last known real futures data can serve as a short-lived STALE fallback (max 120 seconds)
   if (lastKnownLiveCandles && (now - (lastKnownLiveCandles.timestamp || 0)) <= 120000) {
     isCurrentMarketDataLive = false;
-    const ageMs = now - (lastKnownLiveCandles.timestamp || 0);
+    const ageMs = now - (lastKnownLiveCandles.candleCloseTimeMs || 0);
     return {
       ...lastKnownLiveCandles,
       status: 'STALE',

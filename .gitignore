@@ -3,8 +3,12 @@ venv/
 __pycache__/
 *.pyc
 .env
+/data/freqtrade-signals.json
+/data/freqtrade-signals.json.*.tmp
+/tradesv3.dryrun.sqlite*
+database_kill_switch.json
+database_kill_switch.json.tmp
 node_modules
 dist/
 bun.lock
 *.log
-

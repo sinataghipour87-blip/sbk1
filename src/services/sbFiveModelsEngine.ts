@@ -69,21 +69,36 @@ export class SbFiveModelsEngine {
   }
 
   private createMissingPriceUnknownPentagon(): SbPentagonOutput {
+    const unavailableModel = (id: SbModelStatus['id'], nameFa: string): SbModelStatus => ({
+      id,
+      nameFa,
+      roleFa: 'تحلیل به دلیل نبود قیمت بازار در دسترس نیست.',
+      dutyFa: 'هیچ تصمیم اجرایی بدون داده معتبر صادر نمی‌شود.',
+      status: 'CALIBRATING',
+      confidencePct: 0,
+      bias: 'NEUTRAL',
+      metricLabelFa: 'وضعیت داده',
+      metricValue: 'UNKNOWN',
+      liveDirectiveFa: 'قیمت واقعی بازار موجود نیست؛ ورود به معامله ممنوع است.',
+      learningCycles: this.learningIteration,
+      learningEfficiencyPct: null,
+    });
+
     return {
-      iteration: this.learningIteration,
-      timestamp: Date.now(),
       models: [
-        { id: 'SB1', name: 'SB1 Macro Trend', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
-        { id: 'SB2', name: 'SB2 OrderBook Depth', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
-        { id: 'SB3', name: 'SB3 Profit Maximizer', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
-        { id: 'SB4', name: 'SB4 Crisis Escaper', weight: 0.2, bias: 'NEUTRAL', confidenceScore: 0, reasoningFa: '⚠️ قیمت بازار مفقود است (UNKNOWN).' },
-        { id: 'SB5', name: 'SB5 Super Orchestrator', weight: 0.2, bias: 'NO_TRADE', confidenceScore: 0, reasoningFa: '🛑 عدم دسترسی به قیمت واقعی بازار؛ صدور وضعیت NO_TRADE.' },
+        unavailableModel('SB1', 'روند کلان (SB1)'),
+        unavailableModel('SB2', 'عمق دفتر سفارشات (SB2)'),
+        unavailableModel('SB3', 'مدیریت سود (SB3)'),
+        unavailableModel('SB4', 'حفاظت ریسک (SB4)'),
+        unavailableModel('SB5', 'هماهنگ‌کننده (SB5)'),
       ],
-      masterDecision: 'NO_TRADE',
+      harmonizationIndexPct: 0,
+      masterDecision: 'HOLD_HARMONIZED',
       masterConfidencePct: 0,
-      executionPermitted: false,
-      masterVerdictFa: '🛑 لغو تصمیم‌گیری مدل‌های پنج‌گانه: قیمت معتبر بازار در دسترس نیست (UNKNOWN)؛ جایگزینی با قیمت فرضی اکیداً ممنوع است.',
-      consensusStrengthPct: 0,
+      riskProtectionActive: true,
+      profitHarvestMultiplier: 0,
+      unificationReportFa: '🛑 تصمیم‌گیری مدل‌های پنج‌گانه متوقف شد: قیمت معتبر بازار در دسترس نیست (UNKNOWN).',
+      realWorldExecutionAdviceFa: 'هیچ سفارش اجرایی مجاز نیست تا زمانی که داده معتبر بازار در دسترس باشد.',
     };
   }
 

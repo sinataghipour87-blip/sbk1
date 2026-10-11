@@ -1,20 +1,113 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# SBK1 + Freqtrade
 
-# Run and deploy your AI Studio app
+SBK1 remains the TypeScript/React analysis and monitoring application. Freqtrade is the sole owner of exchange credentials, order placement, fills, open positions, stop-losses, exits, and trade persistence. The Node service validates a narrow, versioned SBK1 signal contract and provides an authenticated pull queue to a Freqtrade strategy. Production SBK1 signals remain blocked pending calibrated-probability evidence; an explicitly enabled, tightly gated dry-run fixture is available only for integration testing. The browser never calls the Freqtrade API.
 
-This contains everything you need to run your app locally.
+This integration is **not declared production-ready**. The checked-in Freqtrade configuration is a dry-run template; no live exchange order, fill, restart recovery, or end-to-end deployment was executed in this workspace.
 
-View your app in AI Studio: https://ai.studio/apps/e84cf235-6cad-4505-a1e4-d7de5d8f3afa
+## Review and capability decisions
 
-## Run Locally
+The requested `sbk1-main.zip` and `freqtrade-develop.zip` were not present in the workspace. The review below is based on the checked-out SBK1 source and the `freqtrade/` source tree that is present. It is an implementation-oriented audit of the execution, analysis, API, persistence, strategy, backtest, and test surfaces, not a claim that every file in either upstream project was exhaustively reviewed.
 
-**Prerequisites:**  Node.js
+| Capability | Evidence and runtime status | Inputs / outputs and dependencies | Overlap and decision |
+|---|---|---|---|
+| SBK1 React UI | Real React components in `src/components/`; signal/order-flow widgets call the Node service. UI status labels alone do not prove a fill. | `AnalysisResult`, order-flow snapshots; renders opportunities and submissions. | **Preserve** analysis and monitoring UI; execution feedback now says “queued” until Freqtrade reports lifecycle updates. |
+| SBK1 analysis and data services | `analysisEngine.ts`, `marketData.ts`, `orderFlowEngine.ts`, and decision/risk services contain executable calculations. Data may be LIVE, stale, unavailable, or heuristic depending on the source and quality report. | Candles, derivatives, order-book/trade-flow feeds; returns analysis, levels, and candidate signals. Depends on feed status, timestamps, and data-quality gates. | **Preserve** analysis and monitoring. The order-flow sweep is heuristic and has no calibrated probability; it cannot authorize live execution. |
+| SBK1 Bybit order executor and order lifecycle | `server.ts` retains legacy direct-Bybit handler bodies, but all `/api/exchange` and `/api/live` routes are admin-protected and the legacy mutation routes return 410 before their handlers run. Legacy recovery/reconciliation/strategy helpers are not called by startup. `hunterExecutionEngine.ts` no longer makes private Bybit REST calls; `orderExecutionLifecycleEngine.ts` reads Freqtrade lifecycle state. | Legacy code refers to Bybit credentials and local `TradePosition` state; it is not an active execution path. Public market-data readers remain separate from private order/position APIs. | **Freqtrade is the only active execution authority**: the server starts its public market-data WebSocket only; the auto-trade enable route rejects; the Kill Switch cancels queued SBK1 signals but does not claim to alter existing Freqtrade orders or positions. Keep the legacy routes guarded and remove their obsolete handler bodies before any future reactivation. |
+| SBK1 auto-trade and local position state | The previous background strategy loop submitted Bybit orders and persisted positions/history in JSON. Several readiness checks were static assertions, not exchange tests. | Local analysis, JSON state and Bybit responses; had a separate lifecycle from Freqtrade. | **Disable** live auto-trade and recovery/reconciliation timers. Kill switch blocks new SBK1 signals and cancels queued, unclaimed signals; it does not falsely claim to cancel Freqtrade orders or close positions. |
+| Freqtrade strategy and order engine | Present under `freqtrade/freqtrade/strategy`, `freqtrade/freqtrade/rpc`, `freqtrade/freqtrade/persistence`, and `freqtrade/freqtrade/exchange`; `pyproject.toml` specifies Python 3.12+ and the exchange/database/API dependencies. The included `user_data/strategies/SbkExecutionStrategy.py` was a no-op strategy. | Strategy candle signals enter the Freqtrade bot loop; exchange interfaces, order callbacks, trade DB and RPC manage execution and state. | **Use as the only execution authority**. `freqtrade_integration/strategies/SbkSignalStrategy.py` implements a strategy-native external signal consumer; manual `/forceenter` injection is disabled. |
+| Signal transport and lifecycle | New Node adapter validates and persists `sbk1.freqtrade.signal.v1` records in an atomic JSON file. Freqtrade polls the authenticated Node endpoint and posts lifecycle updates. | Decision/signal IDs, exchange, market, pair, timeframe, timestamps/expiry, price provenance, entry invalidation/target, and risk limits; statuses include accepted, strategy-accepted, submitted, partial/full fill, rejection, expiry, cancellation, and error. | **Add as the adapter**. Idempotency is keyed by a deterministic signal ID; conflicting payload reuse is rejected. Node records decision/lifecycle metadata only; Freqtrade remains authoritative for trade/position state. |
+| Freqtrade dry-run, backtesting, hyperopt, FreqAI, API and tests | These are actual Freqtrade source and documented/tested subsystems, backed by the Python package dependencies and `freqtrade/tests/`. The SBK1 queue strategy intentionally does not fetch live signals during backtesting/hyperopt. | Freqtrade strategy/data/configuration and historical OHLCV; outputs simulated/backtested trades, reports, or model results. | **Preserve**. Run normal Freqtrade backtests with historical strategies/data; this live signal queue is not a substitute for a historical signal archive. |
+| Existing SBK1 Python backtester | `scripts/realistic_backtester.py` runs separately and supports a synthetic mode; it is not Freqtrade’s exchange or historical execution engine. | Script parameters or `--synthetic`; returns local backtest metrics. | **Keep as an isolated research utility**, do not treat synthetic output as live readiness evidence. |
 
+## Signal and state ownership
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+1. SBK1 analysis can create heuristic, time-bounded monitoring candidates. The order-flow sweep does not establish CVD divergence or calibrated probability.
+2. `POST /api/hunter/execute` currently fails closed with `CALIBRATED_CONFIDENCE_UNAVAILABLE`; this heuristic path cannot enqueue a live signal or authorize an order. Enablement requires an independently validated calibration source and corresponding execution tests.
+3. Production signal delivery is disabled. Authenticated polls to `GET /api/freqtrade/signals` cancel unclaimed production candidates and return `CALIBRATED_CONFIDENCE_UNAVAILABLE`. For integration testing only, `POST /api/freqtrade/dry-run-test-signal` can enqueue a real-price, low-stake fixture when the explicit fixture flag is enabled and authenticated Freqtrade RPC confirms the running `SbkSignalStrategy` is in `dry_run=true`. The poll endpoint rechecks this state on every request and serves fixture records only. This fixture bypasses model calibration by design and is not evidence for production eligibility.
+4. Freqtrade strategy callbacks send status updates to `POST /api/freqtrade/signals/:signalId/status`; the admin-only `GET /api/hunter/signals/:signalId` is a signal audit view. Freqtrade RPC `/status`, `/trade`, and `/balance` are used for trading-state reads.
+5. Freqtrade's database is the source of truth for trades, orders, balances and positions. The SBK1 JSON signal store is an outbox/audit record, not a parallel trade database.
+
+## Market-data and model truth policy
+
+- Live OHLCV uses completed candles only. The Bybit and KuCoin readers validate finite OHLCV geometry, monotonic interval timestamps, and remove the still-forming candle; a missing interval or invalid timestamp rejects the feed. Candle event/close time, response receipt time, measured request latency, symbol, market type, and timeframe remain distinct.
+- Bybit linear-futures `BTCUSDT` is primary. KuCoin `XBTUSDTM` can be used only after base asset, settlement, contract type, and timeframe compatibility checks pass. Spot, synthetic candles, and stale cache entries are never substitutes for live futures data. Failed or unproven provenance is unavailable, not zero or neutral.
+- Price roles are not interchangeable: Last is the execution reference, Mark is the risk/stop/liquidation reference, and Index is the underlying benchmark. A missing required price is returned as unavailable; another price type is never substituted. Divergence cannot be considered safe unless both Last and Mark are fresh and valid.
+- Order-book imbalance, Funding, Open Interest, and trade flow are valid only when the supporting live feed provides them with provenance. Unsupported or missing metrics remain unknown. Backtests must use only information available at or before each simulated event; use completed historical bars and do not forward-fill future values.
+- `scripts/predictor.py` is a heuristic moving-average/price-change/order-imbalance analysis, not a trained or calibrated probability model. `scripts/garch_volatility.py` is a fixed-parameter, unfitted volatility approximation, not a validated forecast. Both explicitly return `tradeEligible: false`; missing input and process failures do not produce directional, confidence, regime, or target fallbacks. Their definitions are analysis-only and must not differ between backtest, dry-run, and live signal eligibility.
+- SBK1's pre-trade data gate requires a fresh LIVE/VERIFIED_REALTIME snapshot, an allowed quality report, valid OBI, supported Funding and Open Interest, ATR, a classified regime, and verified calibrated probability evidence. If any evidence is missing, stale, simulated, or uncalibrated, it returns NO TRADE. Static pattern-library win rates and fabricated out-of-sample metrics are not used.
+
+## Safety controls and order lifecycle
+
+- SBK1 starts with its server-side kill switch engaged unless a valid persisted state says otherwise. Engaging it blocks new SBK1 signals, stops SBK1 auto-trade, and cancels unclaimed queued signals. It does **not** cancel exchange orders already submitted by Freqtrade or close/modify open positions; the API reports those as unaffected. Reconciliation and position management remain Freqtrade's responsibility. State is persisted in the ignored runtime file `database_kill_switch.json`.
+- SBK1 supports BACKTEST, TESTNET, and PAPER selection only. Its mode endpoint rejects LIVE; the order-flow execution route and production Freqtrade signal delivery fail closed because this heuristic path has no calibrated probability evidence. The optional dry-run fixture is a separate admin-only test path, refuses delivery unless Freqtrade RPC verifies `dry_run=true`, and never turns off Freqtrade's force-entry guard. Freqtrade's example config listens on loopback with authentication enabled and force-entry disabled. Never expose the Freqtrade management API publicly; configure credentials and permissions (withdrawal disabled and IP-restricted keys) only in the private Freqtrade deployment.
+- Cross-origin browser access is denied unless the request is same-origin or its exact origin is listed in `SBK1_ALLOWED_ORIGINS`. Admin and bridge routes require server-side authentication. Keep `.env`, Freqtrade configuration, bridge tokens, and API credentials private.
+- Order states are `CREATED → SUBMITTED → ACKNOWLEDGED → PARTIALLY_FILLED → FILLED`, with explicit `REJECTED`, `CANCELLED`, and `UNKNOWN_IN_FLIGHT` branches. Unknown submissions must be reconciled with Freqtrade/exchange before retry; repeated signal IDs are idempotent. Actual fill prices, fees, protective orders, orders, and positions are only confirmed from Freqtrade/exchange state, never from a local estimate.
+
+The Node signal store is single-process and file-backed. Run one SBK1 writer, place the store on durable storage, and use a private network for the Node-to-Freqtrade bridge. Multi-instance deployments require a transactional shared store/queue before enabling this integration.
+
+## Configuration and dry-run
+
+1. Supply runtime-only configuration through your secret manager/service environment; do not commit `.env`, Freqtrade configs, passwords, JWT keys, bridge tokens, or exchange keys. Node needs `FREQTRADE_BASE_URL`, `FREQTRADE_USERNAME`, `FREQTRADE_PASSWORD`, `FREQTRADE_PAIR`, `ADMIN_TOKEN`, `SBK1_SIGNAL_EXCHANGE`, and `SBK1_FREQTRADE_TIMEFRAME`. Freqtrade supports `FREQTRADE__API_SERVER__USERNAME`, `FREQTRADE__API_SERVER__PASSWORD`, `FREQTRADE__API_SERVER__JWT_SECRET_KEY`, `FREQTRADE__EXCHANGE__KEY`, and `FREQTRADE__EXCHANGE__SECRET` as environment overrides. Generate a random bridge token outside the repository and set the same value in `SBK1_FREQTRADE_BRIDGE_TOKEN` for Node and Freqtrade. Never expose credentials to browser code. Do not configure exchange keys in SBK1; its legacy direct exchange mutation routes return `410 LEGACY_EXECUTION_DISABLED`.
+2. Copy `freqtrade_integration/config.example.json` to a private Freqtrade config only if your deployment requires a separate config file; its credential fields are intentionally blank and should be supplied as environment overrides. Keep `dry_run: true` for validation. For an actual testnet/live environment, configure exchange credentials only in Freqtrade and independently verify exchange permissions and IP restrictions.
+3. Export `SBK1_FREQTRADE_PAIR`, `SBK1_FREQTRADE_TIMEFRAME`, `SBK1_FREQTRADE_BRIDGE_TOKEN`, and `SBK1_BRIDGE_URL` into the Freqtrade process environment. These must agree with Node settings and the Freqtrade config. The strategy rejects remote HTTP bridge URLs and does not follow redirects while sending its token.
+4. From the Freqtrade checkout, load the strategy from the SBK1 integration path, e.g. `freqtrade trade --config /path/to/config.json --strategy-path /path/to/sbk1/freqtrade_integration/strategies --strategy SbkSignalStrategy`. Ensure Node and Freqtrade are on the same private network. Non-loopback Node-to-Freqtrade RPC and Freqtrade-to-Node bridge traffic must use HTTPS.
+5. Validate in Freqtrade dry-run first. `npm run verify:freqtrade` is a read-only readiness probe and places no orders. SBK1's readiness diagnostic does not authorize live execution: calibrated probability evidence and real dry-run/exchange lifecycle verification remain unavailable.
+
+For a controlled integration exercise, set `SBK1_DRY_RUN_FIXTURE_ENABLED=true` only in the private Node environment, keep the Freqtrade config at `dry_run: true`, and verify `force_entry_enable: false`. With the SBK1 kill switch disarmed, call the admin-only `POST /api/freqtrade/dry-run-test-signal`; this creates a 60-second LONG fixture from a fresh Bybit futures ticker with 1x leverage, a 0.1% stop-risk budget, and a 100 USDT maximum stake. The larger notional cap accommodates Bybit's BTC futures minimum order size; actual stake is further bounded by the risk budget and Freqtrade's exchange minimums. Freqtrade RPC is checked both when creating the fixture and on each strategy poll. Disable the fixture flag after testing. This verifies the bridge path only; it does not validate SBK1 model quality, live trading, or an exchange fill.
+
+The example targets Bybit USDT futures and `BTC/USDT:USDT`, because SBK1's current signal feed is a Bybit linear-futures feed. A different venue/pair requires matching SBK1 market data and Freqtrade configuration; mismatches fail closed. Spot shorts are rejected. The sample config cancels unfilled orders after 15 seconds; SBK1 signals expire after 45 seconds. The strategy also defines a 5% hard stop-loss ceiling as a fallback if its signal-specific stop cannot be recovered.
+
+## Validation
+
+- `npm test` runs the SBK1 fail-closed checks, TypeScript/Python signal-contract checks, dry-run fixture guard tests, authenticated local mock RPC checks, and Python model/contract tests. The mock never calls a real Freqtrade instance or order endpoint.
+- `npm run verify:freqtrade:contract` runs the same local authenticated mock RPC contract check independently.
+- `npm run lint` runs the repository-wide TypeScript check; TypeScript errors are not suppressed.
+- `python3 -m py_compile freqtrade_integration/strategies/SbkSignalStrategy.py` checks strategy syntax only. Standard-library tests exercise the same versioned signal contract used by the strategy. Full Freqtrade strategy loading and exchange behavior require the Freqtrade Python dependencies and a running instance.
+
+## Source, change, and license record
+
+- No SBK1 or Freqtrade input ZIP/archive was present. Inspection used the checked-out SBK1 source and its Freqtrade Git submodule; the archives mentioned in the initial review notes are not part of this workspace.
+- The SBK1 Git baseline is `d8fa238` (`feat: enhance system integrity and monitoring`). That commit and its tracked originals remain available in Git. The working branch is `integration/sbk1-freqtrade`. A large pre-existing SBK1 worktree diff was present before this pass; it was preserved rather than reset.
+- Freqtrade is pinned to tagged release `2026.9`, commit `1f394eaebc2f46a83d26971388628707802f8602`. Its source directory is clean and unmodified. The previous submodule commit `9a2f03a6bf8408f155591304c78aab20ca5c44cc` remains in the submodule Git history. Selected strategy/API source was compared between the release and develop commit; the develop-only changes were not required by this adapter. The parent gitlink is the only Freqtrade change.
+- Freqtrade carries its GPLv3 license in `freqtrade/LICENSE`. SBK1 has no root license/NOTICE in the checked-in files, so this repository does not claim a project-wide license or resolve distribution compatibility. Obtain legal review before distributing the combined product; retain Freqtrade notices and provide the corresponding source/changes as required by GPLv3.
+- Node dependencies are captured in `package-lock.json`; the project-level Python model scripts use only the standard library. Freqtrade declares Python `>=3.12` and its dependencies in its own `pyproject.toml`, but the upstream checkout has no committed Python lockfile. The source commit is fixed; a fully hash-locked Python environment and clean-install verification are still outstanding.
+- No data migration or deletion was performed. Existing SBK1 local position/history files are not authoritative Freqtrade state; preserve and back them up, but do not import them as open trades without reconciliation against the exchange and Freqtrade database.
+
+Files added by this integration pass:
+
+- `freqtrade_integration/strategies/sbk_signal_contract.py` — Python-side validation for the shared signal contract and safe bridge URL.
+
+Files modified by this integration pass:
+
+- `.env.example` — removed SBK1-owned exchange keys and the legacy `EXCHANGE_VAULT_KEY`; the sample contains no real credentials.
+- `freqtrade` — parent submodule pointer changed from develop to tagged release `2026.9`; no upstream source files changed.
+- `freqtrade_integration/strategies/SbkSignalStrategy.py` — uses the tested Python contract validator and rejects unsafe remote HTTP/redirected bridge traffic.
+- `package.json` and `package-lock.json` — pinned `@google/genai` to the version already resolved in the lockfile.
+- `scripts/test_market_models.py` — Python contract, stale-data, risk, and bridge URL tests, including oversized numeric input and invalid ports.
+- `scripts/verify_freqtrade_rpc_connection.ts` and `scripts/verify_freqtrade_signal_adapter.ts` — reflect the actual force-entry configuration and concurrent idempotency tests.
+- `server.ts` — disables legacy SBK1 exchange mutation routes, reports Freqtrade-sourced state, and stops presenting unrun readiness checks as passing.
+- `src/services/freqtradeBridge.ts` — reads the actual Freqtrade `force_entry_enable` setting instead of hard-coding it and coalesces concurrent login/refresh calls.
+- `src/services/hunterExecutionEngine.ts` and `src/services/orderExecutionLifecycleEngine.ts` — remove SBK1 private Bybit REST execution/position-query paths and use Freqtrade as the lifecycle authority.
+- `scripts/verify_freqtrade_rpc_contract.ts` — verifies authenticated RPC shapes and token refresh against a local mock without calling an order endpoint.
+
+No files were replaced or deleted in this pass. No Freqtrade core source file was modified.
+
+## Validation evidence and remaining blockers
+
+- In this workspace, `npm test` passed: 18 fail-closed scenarios, signal-adapter/cross-language contract checks, authenticated mock RPC checks, and 9 Python unit tests. The mock did not contact an exchange or invoke an order endpoint.
+- `npm run build` passed. Vite reports a 3.19 MB minified JS chunk-size warning; no Node `crypto` browser-import warning remains.
+- The initial `npm run lint` exposed 17 pre-existing TypeScript errors in files unchanged from `HEAD`; they were corrected without removing tests or weakening fail-closed behavior. The final `npm run lint` passed.
+- `npx tsx src/scripts/verify_full_execution_truth_chain.ts` passed 14/14 checks, including a fail-closed missing-evidence case. This is not a successful signal-to-order end-to-end test.
+- `python3 -m py_compile` passed for the strategy and shared contract module. The workspace Python is 3.14.2; `pytest`, `pandas`, and `numpy` are not installed, so the Freqtrade core suite and actual strategy loading were not run.
+- `npm run verify:freqtrade` was attempted and stopped before an RPC request because `FREQTRADE_USERNAME` and `FREQTRADE_PASSWORD` are not configured. No Freqtrade process or exchange testnet was available.
+- A clean `npm ci`, clean Python dependency install, running Freqtrade RPC/API test, exchange testnet connection, order/fill/restart/reconciliation/Kill Switch E2E, backtest/OOS evaluation, and end-to-end dry-run were not run. They must not be inferred as successful from unit tests or the Vite build.
+- Production signal delivery intentionally remains blocked: current SBK1 predictors are uncalibrated heuristics. No validated calibration/OOS evidence is present to authorize production signals. The guarded dry-run fixture code is available, but no Freqtrade instance was configured here, so no dry-run order was sent. This is not a production or live-capital readiness approval.
+- Browser requests do not supply the server's admin token to protected live/status endpoints; those requests fail authorization and the dashboard explicitly shows Freqtrade status as unavailable. Local closed-trade history remains unverified and is labeled as such. Live UI controls and status access are not validated.
+
+## Clean setup, backup, and upgrade notes
+
+- Runtime versions observed during validation were Node.js `v24.21.0`, npm `11.19.0`, and Python `3.14.2`. Freqtrade declares Python `>=3.12`. Node installs should use `npm ci`. Freqtrade is installed in the ignored `.venv` with `python -m pip install -e ./freqtrade`; upstream dependencies are not hash-locked, so recreating the venv may resolve newer compatible dependency versions.
+- Start SBK1 with `npm run dev`. Start Freqtrade only after private credentials/configuration are set, using the dry-run config first and the strategy command above. Do not switch `dry_run` off for initial validation. `npm run verify:freqtrade` only reads RPC state and never submits an order.
+- Before upgrades, stop both services and back up the Freqtrade database configured by `db_url`, the private Freqtrade config, Freqtrade `user_data/`, the SBK1 signal outbox (default `data/freqtrade-signals.json`), and `database_kill_switch.json`. Verify a restore against copies before resuming. Keep the Freqtrade submodule at a reviewed release commit; do not update it to `develop` without compatibility tests.
+- On an RPC failure, check the Freqtrade API is listening only on a private/loopback interface, credentials match `FREQTRADE_USERNAME` / `FREQTRADE_PASSWORD`, the RPC base URL uses HTTPS off-loopback, and pair/timeframe/exchange configuration agrees across both processes. On a bridge failure, verify the same private token is set in both processes and use HTTPS for non-loopback traffic. The bridge fails closed on mismatches.
+- If SBK1's signal JSON is invalid, do not delete or edit it to resume trading. Stop the services, preserve a copy for diagnosis, and restore from a verified backup or repair the record under review. The JSON store is single-process and is not safe as a multi-instance queue.

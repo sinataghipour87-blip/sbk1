@@ -28,6 +28,9 @@ import { dataProvenanceLayerService } from '../src/services/dataProvenanceLayer'
 import { analyzePro } from '../src/services/analysisEngine';
 import { orderExecutionLifecycleService } from '../src/services/orderExecutionLifecycleEngine';
 import { autoTradeDecisionTracer } from '../src/services/autoTradeGuard';
+import { evaluateSignalToExecution } from '../src/services/signalToExecution';
+import { predict30mTrendReversalPatternLayer } from '../src/services/predictiveEngine';
+import { centralPriceSourcePolicy } from '../src/services/priceSourcePolicy';
 
 console.log('🧪 Starting 18 Mandatory System & Fail-Closed Integrity Verification Tests...');
 
@@ -37,6 +40,21 @@ async function runTests() {
   // =========================================================================
   const feedAuditNull = MissingDataIntegrityGuardService.getInstance().auditMarketDataIntegrity(null);
   assert.strictEqual(feedAuditNull.isTradePermitted, false, 'Missing data must prohibit trades');
+  const missingDataSignal = evaluateSignalToExecution({ price: 0, direction: 'LONG' } as any);
+  assert.strictEqual(missingDataSignal.canExecute, false, 'Signal generation must fail closed on missing provenance');
+  const missingPatternAnalysis = predict30mTrendReversalPatternLayer([], undefined);
+  assert.strictEqual(missingPatternAnalysis.tradeEligible, false, 'Pattern similarity must never authorize execution');
+  assert.strictEqual(missingPatternAnalysis.expectedPrice30m, null, 'Missing candles must not create a target price');
+  assert.equal(missingPatternAnalysis.sniperActionRecommendation.action, 'NO_TRADE_UNCALIBRATED');
+  const sweepCandles = Array.from({ length: 25 }, (_, index) => {
+    const low = index === 20 ? 90 : index === 24 ? 89 : 95;
+    const close = index === 24 ? 100 : 100;
+    return [100, 110, low, close, 10] as [number, number, number, number, number];
+  });
+  const sweepAnalysis = orderFlowEngine.analyzeOrderFlowAndLiquidity(sweepCandles);
+  assert.equal(sweepAnalysis.activeSignal.direction, 'LONG', 'Structural sweep detection remains analysis-only');
+  assert.equal(sweepAnalysis.activeSignal.signalConfidencePct, null, 'Heuristic sweep detection must not invent confidence');
+  assert.equal(sweepAnalysis.activeSignal.cvdDivergenceConfirmed, false, 'A single delta direction must not be labeled CVD divergence');
   console.log('✅ سناریو ۱ پاس شد: داده بازار ناموجود منجر به منع قطعی معامله شد.');
 
   // =========================================================================
@@ -135,9 +153,9 @@ async function runTests() {
   // =========================================================================
   // سناریو ۸: درخواست بدون احراز هویت -> عملیات حساس انجام نشود
   // =========================================================================
-  const unauthExec = await hunterExecutionEngine.fetchLiveExchangeAccountBalance({ apiKey: '', apiSecret: '', isTestnet: true });
-  assert.strictEqual(unauthExec.success, false, 'Unauthenticated Bybit call must fail');
-  console.log('✅ سناریو ۸ پاس شد: فراخوانی بدون کلید احراز هویت رد شد.');
+  const unavailableFreqtradeBalance = await hunterExecutionEngine.fetchLiveFreqtradeAccountBalance();
+  assert.strictEqual(unavailableFreqtradeBalance.success, false, 'Unavailable Freqtrade RPC balance must fail closed');
+  console.log('✅ سناریو ۸ پاس شد: موجودی بدون اتصال معتبر Freqtrade در دسترس اعلام نشد.');
 
   // =========================================================================
   // سناریو ۹: ارسال همزمان یک تصمیم -> فقط یک سفارش مجاز باشد (Idempotency)
@@ -250,6 +268,20 @@ async function runTests() {
     dataQualityReport: { overallScore: 40, isTradeAllowed: false, status: 'STALE' }
   } as any);
   assert.strictEqual(spreadDivergence.isTradePermitted, false, 'Price source divergence must block execution');
+  const missingMark = centralPriceSourcePolicy.getCompliantPrice('STOP_LOSS_TRIGGER', {
+    lastPrice: 88000,
+    markPrice: null,
+    indexPrice: 87990,
+    timestampUtc: Date.now(),
+    receivedTimestampUtc: Date.now(),
+    symbol: 'BTCUSDT',
+    timeframe: 'TICK',
+    source: 'bybit',
+    status: 'LIVE',
+    quality: 'HIGH',
+  });
+  assert.strictEqual(missingMark.price, null, 'Mark price must not fall back to Last or Index');
+  assert.strictEqual(missingMark.isDivergenceSafe, false, 'Missing Mark/Last divergence evidence must fail closed');
   console.log('✅ سناریو ۱۷ پاس شد: اختلاف غیرعادی منابع قیمت از ورود به موتور اجرا جلوگیری کرد.');
 
   // =========================================================================
@@ -376,14 +408,14 @@ async function runTests() {
 
   // ۲. اعتبارسنجی تطابق منبع جایگزین (Fallback Compatibility)
   const compatValid = dataProvenanceLayerService.verifyFallbackCompatibility(
-    { symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' },
-    { symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' }
+    { exchange: 'BYBIT', symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' },
+    { exchange: 'BYBIT', symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' }
   );
   assert.strictEqual(compatValid.isCompatible, true, 'Matching fallback contract specs must be compatible');
 
   const compatMismatchMarket = dataProvenanceLayerService.verifyFallbackCompatibility(
-    { symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' },
-    { symbol: 'BTCUSDT', marketType: 'SPOT', timeframe: '15m' }
+    { exchange: 'BYBIT', symbol: 'BTCUSDT', marketType: 'LINEAR_PERPETUAL', timeframe: '15m' },
+    { exchange: 'BYBIT', symbol: 'BTCUSDT', marketType: 'SPOT', timeframe: '15m' }
   );
   assert.strictEqual(compatMismatchMarket.isCompatible, false, 'Spot must NEVER fallback for Linear Perpetual');
   console.log('✅ منع قطعی جایگزینی منابع ناهمگون (Spot به جای Futures) تایید شد.');
@@ -415,6 +447,9 @@ async function runTests() {
     lastPrice: 88120,
     markPrice: 88100,
     indexPrice: 88090,
+    sourceTimestampMs: Date.now() - 1000,
+    receivedTimestampMs: Date.now(),
+    networkLatencyMs: 20,
     candles: validCandles,
   });
   assert.strictEqual(reportValidAll.isLiveTradePermitted, true, 'Valid prices and feeds must permit trade');
@@ -587,4 +622,3 @@ runTests().catch((err) => {
   console.error('❌ Test failed:', err);
   process.exit(1);
 });
-
