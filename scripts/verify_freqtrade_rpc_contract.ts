@@ -98,6 +98,52 @@ const mockFreqtrade = createServer(async (request, response) => {
     }]);
     return;
   }
+  if (url.pathname === '/api/v1/trades') {
+    respond(response, 200, {
+      trades: [{
+        trade_id: 6,
+        pair: 'BTC/USDT:USDT',
+        is_open: false,
+        is_short: false,
+        amount: 0.001,
+        amount_requested: 0.001,
+        open_rate: 59_000,
+        stake_amount: 59,
+        has_open_orders: false,
+        orders: [],
+        fee_open_cost: null,
+        fee_close_cost: null,
+        open_fill_timestamp: null,
+        close_timestamp: 1_700_000_000_000,
+      }, {
+        trade_id: 7,
+        pair: 'BTC/USDT:USDT',
+        is_open: true,
+        is_short: false,
+        amount: 0.001,
+        amount_requested: 0.002,
+        open_rate: 60_000,
+        stake_amount: 60,
+        has_open_orders: true,
+        orders: [{
+          order_id: 'mock-order-7',
+          status: 'open',
+          amount: 0.002,
+          filled: 0.001,
+          safe_price: 60_000,
+          cost: 60,
+          ft_order_side: 'buy',
+          is_open: true,
+          order_filled_timestamp: null,
+        }],
+        fee_open_cost: null,
+        fee_close_cost: null,
+        open_fill_timestamp: null,
+        close_timestamp: null,
+      }],
+    });
+    return;
+  }
   if (url.pathname === '/api/v1/balance') {
     respond(response, 200, {
       total: 125,
@@ -141,6 +187,9 @@ try {
   const trades = await freqtradeBridge.getOpenTrades();
   assert.equal(trades[0]?.trade_id, 7);
   assert.equal(trades[0]?.orders[0]?.filled, 0.001);
+  const closedTrades = await freqtradeBridge.getClosedTrades(10);
+  assert.deepEqual(closedTrades.map((trade) => trade.trade_id), [6]);
+  await assert.rejects(freqtradeBridge.getClosedTrades(501), /between 1 and 500/);
   const balance = await freqtradeBridge.getBalance();
   assert.deepEqual(balance, { equity: 125, available: 100, currency: 'USDT' });
   assert.deepEqual(await freqtradeBridge.getWhitelist(), ['BTC/USDT:USDT']);

@@ -21,6 +21,7 @@ if (!existsSync(python)) {
       'scripts.test_sbk_signal_strategy',
       'scripts.test_realistic_backtester',
       'scripts.test_init_sbk1_config',
+      'scripts.test_prediction_archive',
     ],
     { stdio: 'inherit' },
   );

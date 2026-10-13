@@ -53,6 +53,7 @@ export interface RunPipelineOptions {
   userLeverage?: number;
   minWinProbability?: number;
   isAutoTrade?: boolean;
+  dryRunCollectionEvaluation?: boolean;
 }
 
 /**
@@ -70,6 +71,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     userLeverage,
     minWinProbability = 68,
     isAutoTrade = true,
+    dryRunCollectionEvaluation = false,
   } = options;
 
   const now = new Date();
@@ -93,6 +95,30 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     const waitReasonFa = hasDirectionConflict
       ? `تعارض جهت: سیگنال ${targetDirection} با ارزیابی مستقل ${selectedDirection} هم‌راستا نیست؛ اقدام نهایی HOLD است.`
       : `${dualOppEvaluation.arbitrationVerdictFa} اقدام نهایی HOLD است.`;
+
+    const rejectedFeatureSnapshot = dataProvenanceLayerService.createImmutableFeatureSnapshot(
+      traceableIds.predictionId,
+      analysis,
+      analysis?.price ?? 0,
+    );
+    centralTradeDatasetService.recordPrediction(
+      analysis,
+      'NEUTRAL',
+      traceableIds,
+      'DECISION_REJECTED',
+      waitReasonFa,
+      {
+        featureSnapshot: rejectedFeatureSnapshot,
+        dataQualityReport: analysis?.dataQualityReport ?? null,
+        gateEligible: false,
+        gateReasons: [waitReasonFa],
+        entry: null,
+        stop: null,
+        target: null,
+        modelVersion: null,
+        predictorVersion: null,
+      },
+    );
 
     return {
       decision: 'WAIT_NO_TRADE',
@@ -578,7 +604,14 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   const isSegmentExpectancyNegative = analysis?.calibratedMetadata?.isExpectancyNegative ?? false;
   const isTqsTradeWorthy = analysis?.calibratedMetadata?.tradeQualityScore ? analysis.calibratedMetadata.tradeQualityScore.isTradeWorthy : true;
   const isEdgeProven = isCalibrationVerified && isWinProbQualified && isEvPositive && !isSegmentExpectancyNegative && isTqsTradeWorthy;
-  const stage12Passed = !pipelineHalted && isEdgeProven;
+  const hasIndependentCollectionEdgeEvidence =
+    calibratedMetadata?.isExpectancyNegative === false &&
+    calibratedMetadata.tradeQualityScore?.isTradeWorthy === true;
+  const collectionCalibrationBypass =
+    dryRunCollectionEvaluation &&
+    winProb === null &&
+    hasIndependentCollectionEdgeEvidence;
+  const stage12Passed = !pipelineHalted && (isEdgeProven || collectionCalibrationBypass);
   const tqsScore = analysis?.calibratedMetadata?.tradeQualityScore?.totalScore ?? 0;
 
   stages.push({
@@ -587,11 +620,15 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     nameFa: '۱۲. تفکیک کیفیت معامله، شانس برد کالیبره‌شده و امید ریاضی',
     passed: stage12Passed,
     status: pipelineHalted ? 'SKIPPED' : stage12Passed ? 'PASSED' : 'FAILED',
-    value: winProb !== null
+    value: collectionCalibrationBypass
+      ? 'DRY_RUN_COLLECTION: calibrated probability and dependent EV are unavailable; independent gates are evaluated separately.'
+      : winProb !== null
       ? `Trade Quality: ${tqsScore}/100 | Calibrated Win Probability: ${(winProb * 100).toFixed(1)}% | Expected Value: ${expectedR > 0 ? '+' : ''}${expectedR.toFixed(2)}R (+$${(expectedValueUsd ?? 0).toFixed(2)})`
       : 'احتمال کالیبره‌شده یا بازه اطمینان OOS معتبر نیست؛ ورود مسدود است.',
     threshold: `EV > ۰ و امید ریاضی مثبت و TQS >= ۶۵ و احتمال کالیبره‌شده >= ${minWinProbability}٪`,
-    reasonFa: stage12Passed
+    reasonFa: collectionCalibrationBypass
+      ? 'Dry-run collection only: calibrated probability and dependent EV are unavailable; independent expectancy and trade-quality gates passed.'
+      : stage12Passed
       ? `معامله دارای برتری آماری کالیبره‌شده با امید ریاضی مثبت (+$${(expectedValueUsd ?? 0).toFixed(2)}) و TQS قابل قبول است.`
       : winProb === null
       ? '🛑 توقف معامله: مدل روی داده‌های مستقل کالیبره نشده یا نمونه‌های تاریخی ناکافی است. وضعیت: WAIT / NO TRADE'
@@ -1108,13 +1145,26 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     ? rejectionReasonsFa[0]
     : 'نبود برتری آماری قطعی (Edge) در وضعیت فعلی بازار';
 
-  centralTradeDatasetService.recordPrediction(
-    { ...analysis, modelAgreementPct: 100 - disagreementReport.disagreementIndex },
-    resolvedDir,
-    traceableIds,
-    stage14Passed ? 'PREDICTED_ONLY' : 'DECISION_REJECTED',
-    stage14Passed ? undefined : defaultWaitReason
-  );
+  if (!dryRunCollectionEvaluation) {
+    centralTradeDatasetService.recordPrediction(
+      { ...analysis, modelAgreementPct: 100 - disagreementReport.disagreementIndex },
+      resolvedDir,
+      traceableIds,
+      stage14Passed ? 'PREDICTED_ONLY' : 'DECISION_REJECTED',
+      stage14Passed ? undefined : defaultWaitReason,
+      {
+        featureSnapshot: immutableFeatureSnapshot,
+        dataQualityReport: analysis?.dataQualityReport ?? null,
+        gateEligible: stage14Passed,
+        gateReasons: rejectionReasonsFa,
+        entry: entryTargetPrice,
+        stop: stopLossPrice,
+        target: tp1Price,
+        modelVersion: 'v3.8-hybrid',
+        predictorVersion: 'v2.1-orderflow',
+      },
+    );
+  }
 
   const versions: VersionMetadata = {
     decisionId: contractId,
@@ -1239,13 +1289,14 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
 
   if (stage14Passed && !isLatencyStale && masterDecisionObject.executionPermitted) {
     return {
-      decision: 'EXECUTE_APPROVED',
+      decision: dryRunCollectionEvaluation ? 'WAIT_NO_TRADE' : 'EXECUTE_APPROVED',
       direction: resolvedDir,
+      collectionEligible: dryRunCollectionEvaluation,
       activeStage: 'STAGE_14_EXECUTION',
       stages,
       passedStagesCount: passedCount,
       totalStagesCount: totalCount,
-      isEdgeProven: true,
+      isEdgeProven: !dryRunCollectionEvaluation,
       expectedValueUsd,
       expectedR,
       calibratedWinProb: winProb,

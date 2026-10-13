@@ -153,15 +153,67 @@ export interface TraceableIdsPack {
   executionAttemptId: string;
 }
 
-const PREDICTIONS_DATASET_KEY = 'quantum_central_predictions_dataset';
 const TRADES_DATASET_KEY = 'quantum_central_trades_dataset';
 const PERFORMANCE_MATRIX_KEY = 'quantum_performance_matrix_freqtrade_v1';
+
+export interface PredictionArchiveContext {
+  featureSnapshot: unknown;
+  dataQualityReport: unknown;
+  gateEligible: boolean;
+  gateReasons: string[];
+  entry?: number | null;
+  stop?: number | null;
+  target?: number | null;
+  modelVersion?: string | null;
+  predictorVersion?: string | null;
+}
+
+interface PredictionArchiveRecord {
+  signalId: string;
+  datasetRecord: unknown;
+}
+
+function preserveMissingFeatureValues(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(preserveMissingFeatureValues);
+  if (typeof value !== 'object' || value === null) return value;
+
+  const feature = value as Record<string, unknown>;
+  const hasUnknownProvenance = feature.status === 'UNKNOWN' ||
+    feature.timestampMs === null ||
+    feature.timestampMs === undefined;
+  return Object.fromEntries(
+    Object.entries(feature).map(([key, nested]) => [
+      key,
+      key === 'value' && (nested === 'UNKNOWN' || hasUnknownProvenance)
+        ? null
+        : preserveMissingFeatureValues(nested),
+    ]),
+  );
+}
+
+function isPredictionDatasetRecord(value: unknown): value is PredictionDatasetRecord {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.predictionId === 'string' &&
+    typeof record.timestamp === 'number' &&
+    typeof record.market === 'string' &&
+    typeof record.direction === 'string' &&
+    typeof record.modelVersion === 'string';
+}
 
 export class CentralTradeDatasetService {
   private static instance: CentralTradeDatasetService;
   private batchCycleCount = 14;
+  private predictionsCache: PredictionDatasetRecord[] = [];
+  private archiveRefresh: Promise<void> | null = null;
 
-  private constructor() {}
+  private constructor() {
+    if (typeof window !== 'undefined') {
+      void this.refreshFromArchive().catch((error) => {
+        console.error('[Prediction archive] Could not load the server-side dataset:', error);
+      });
+    }
+  }
 
   public static getInstance(): CentralTradeDatasetService {
     if (!CentralTradeDatasetService.instance) {
@@ -196,7 +248,8 @@ export class CentralTradeDatasetService {
     targetDir: 'LONG' | 'SHORT' | 'NEUTRAL',
     idsPack?: TraceableIdsPack,
     executionStatus: PredictionDatasetRecord['executionStatus'] = 'PREDICTED_ONLY',
-    rejectionReasonFa?: string
+    rejectionReasonFa?: string,
+    archiveContext?: PredictionArchiveContext,
   ): PredictionDatasetRecord {
     const ids = idsPack || this.generateTraceableIds();
     const price = analysis?.price ?? null;
@@ -204,6 +257,7 @@ export class CentralTradeDatasetService {
     const obi = analysis?.obi ?? null;
     const cvd = analysis?.cvdDelta ?? null;
     const vol = analysis?.volatilityPct ?? null;
+    const decisionTimestampMs = Date.now();
 
     const record: PredictionDatasetRecord = {
       predictionId: ids.predictionId,
@@ -212,8 +266,8 @@ export class CentralTradeDatasetService {
       orderId: ids.orderId,
       executionAttemptId: ids.executionAttemptId,
 
-      timestamp: Date.now(),
-      timestampIso: new Date().toISOString(),
+      timestamp: decisionTimestampMs,
+      timestampIso: new Date(decisionTimestampMs).toISOString(),
       market: 'BTC/USDT',
       exchange: analysis?.canonicalSnapshot?.feeds?.[0]?.exchange || 'UNAVAILABLE',
       marketType: 'PERPETUAL',
@@ -277,11 +331,53 @@ export class CentralTradeDatasetService {
       decisionRejectionReasonFa: rejectionReasonFa,
     };
 
-    const predictions = this.getAllPredictions();
-    predictions.push(record);
-    // Keep max 2000 predictions history for real historical traceability
-    const trimmed = predictions.slice(-2000);
-    localStorage.setItem(PREDICTIONS_DATASET_KEY, JSON.stringify(trimmed));
+    this.predictionsCache.push(record);
+    if (archiveContext) {
+      const adminToken = typeof localStorage === 'undefined'
+        ? null
+        : localStorage.getItem('admin_token');
+      if (!adminToken) {
+        console.error('[Prediction archive] Candidate decision was not archived because admin authentication is unavailable.');
+        return record;
+      }
+      const payload = {
+        decisionTimestampMs: record.timestamp,
+        pair: record.market || null,
+        timeframe: record.timeframe || null,
+        direction: record.direction,
+        entry: archiveContext.entry === undefined ? record.entryPrice : archiveContext.entry,
+        stop: archiveContext.stop === undefined ? record.stopPrice : archiveContext.stop,
+        target: archiveContext.target === undefined ? record.tpLevels.tp1 : archiveContext.target,
+        featureSnapshot: preserveMissingFeatureValues(archiveContext.featureSnapshot),
+        modelVersion: archiveContext.modelVersion === undefined
+          ? record.modelVersion ?? null
+          : archiveContext.modelVersion,
+        predictorVersion: archiveContext.predictorVersion === undefined
+          ? record.featureVersion ?? null
+          : archiveContext.predictorVersion,
+        dataQualityReport: archiveContext.dataQualityReport,
+        gateResult: {
+          eligible: archiveContext.gateEligible,
+          reasons: archiveContext.gateReasons,
+        },
+        source: 'SBK1_DECISION',
+        datasetRecord: record,
+      };
+      void fetch('/api/prediction-archive/records', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': adminToken,
+        },
+        body: JSON.stringify(payload),
+      }).then((response) => {
+        if (!response.ok) {
+          throw new Error(`Archive append failed with HTTP ${response.status}.`);
+        }
+      }).catch((error: unknown) => {
+        console.error('[Prediction archive] Could not append the candidate decision:', error);
+      });
+    }
 
     return record;
   }
@@ -337,30 +433,9 @@ export class CentralTradeDatasetService {
     feeUsd: number,
     exitReason: string
   ): boolean {
-    const predictions = this.getAllPredictions();
-    const predIndex = predictions.findIndex(p => p.predictionId === predictionId || p.tradeId === predictionId);
-
-    if (predIndex !== -1) {
-      predictions[predIndex].outcome = outcome;
-      predictions[predIndex].outcomeSource = 'UNVERIFIED_LOCAL';
-      predictions[predIndex].PnL = pnlUsd;
-      predictions[predIndex].R = rMultiple;
-      predictions[predIndex].MAE = maeUsd;
-      predictions[predIndex].MFE = mfeUsd;
-      predictions[predIndex].timeInTrade = durationSeconds;
-      predictions[predIndex].slippage = slippageUsd;
-      predictions[predIndex].fees = feeUsd;
-      predictions[predIndex].exitReason = exitReason;
-      predictions[predIndex].executionStatus = 'CLOSED_COMPLETED';
-      predictions[predIndex].feedbackProcessedAtMs = Date.now();
-
-      localStorage.setItem(PREDICTIONS_DATASET_KEY, JSON.stringify(predictions));
-
-      // Trigger batch model evaluation cycle if queue reaches threshold
-      this.checkAndTriggerBatchModelEvaluation();
-      return true;
-    }
-
+    console.warn(
+      `[Prediction archive] Outcome writeback for ${predictionId} was not applied; archived records are immutable.`,
+    );
     return false;
   }
 
@@ -508,14 +583,48 @@ export class CentralTradeDatasetService {
   }
 
   public getAllPredictions(): PredictionDatasetRecord[] {
-    if (typeof window === 'undefined' || typeof localStorage === 'undefined') return [];
-    const saved = localStorage.getItem(PREDICTIONS_DATASET_KEY);
-    if (!saved) return [];
-    try {
-      return JSON.parse(saved);
-    } catch {
-      return [];
-    }
+    return [...this.predictionsCache];
+  }
+
+  public async refreshFromArchive(): Promise<void> {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined') return;
+    if (this.archiveRefresh) return this.archiveRefresh;
+
+    this.archiveRefresh = (async () => {
+      const adminToken = localStorage.getItem('admin_token');
+      if (!adminToken) return;
+      const archived: PredictionDatasetRecord[] = [];
+      let offset = 0;
+      let total = 0;
+      do {
+        const response = await fetch(`/api/prediction-archive?limit=500&offset=${offset}`, {
+          headers: { 'x-admin-token': adminToken },
+          cache: 'no-store',
+        });
+        if (!response.ok) {
+          throw new Error(`Archive read failed with HTTP ${response.status}.`);
+        }
+        const result = await response.json() as { records?: PredictionArchiveRecord[]; total?: number };
+        if (!Array.isArray(result.records) || typeof result.total !== 'number') {
+          throw new Error('Archive read returned an invalid response.');
+        }
+        for (const archivedRecord of result.records) {
+          if (isPredictionDatasetRecord(archivedRecord.datasetRecord)) {
+            archived.push(archivedRecord.datasetRecord);
+          }
+        }
+        total = result.total;
+        offset += result.records.length;
+      } while (offset < total && offset > 0);
+
+      const currentById = new Map(this.predictionsCache.map((record) => [record.predictionId, record]));
+      for (const record of archived) currentById.set(record.predictionId, record);
+      this.predictionsCache = [...currentById.values()].slice(-2000);
+    })().finally(() => {
+      this.archiveRefresh = null;
+    });
+
+    return this.archiveRefresh;
   }
 
   public getFreqtradeVerifiedPredictions(): PredictionDatasetRecord[] {

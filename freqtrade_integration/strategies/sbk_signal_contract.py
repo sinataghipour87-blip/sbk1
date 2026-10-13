@@ -7,6 +7,8 @@ from urllib.parse import urlsplit
 
 SIGNAL_CONTRACT_VERSION = "sbk1.freqtrade.signal.v1"
 DRY_RUN_FIXTURE_SETUP_PREFIX = "DRY_RUN_E2E_FIXTURE_"
+DRY_RUN_COLLECTION_MODE = "DRY_RUN_COLLECTION"
+DRY_RUN_COLLECTION_TAG_PREFIX = "DRY_RUN_COLLECTION:"
 _SIGNAL_ID_PATTERN = re.compile(r"^sbk1_[a-f0-9]{32}$")
 _PAIR_PATTERN = re.compile(r"^[A-Z0-9]{2,20}/[A-Z0-9]{2,20}(?::[A-Z0-9]{2,20})?$")
 _TIMEFRAME_PATTERN = re.compile(r"^\d+[mhdw]$")
@@ -57,6 +59,25 @@ def is_dry_run_fixture_runtime(config: dict[str, Any], runmode: str) -> bool:
     return config.get("dry_run") is True and runmode == "dry_run"
 
 
+def signal_id_from_entry_tag(entry_tag: Any) -> str | None:
+    if not isinstance(entry_tag, str):
+        return None
+    if entry_tag.startswith(DRY_RUN_COLLECTION_TAG_PREFIX):
+        return entry_tag[len(DRY_RUN_COLLECTION_TAG_PREFIX):]
+    return entry_tag
+
+
+def format_entry_tag(signal: dict[str, Any]) -> str:
+    signal_id = signal.get("signalId")
+    if not isinstance(signal_id, str):
+        raise ValueError("Signal ID is missing from the validated signal.")
+    return (
+        f"{DRY_RUN_COLLECTION_TAG_PREFIX}{signal_id}"
+        if signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE
+        else signal_id
+    )
+
+
 def unresolved_inflight_signal_ids(
     records: list[Any],
     freqtrade_trade_signal_ids: set[str],
@@ -93,6 +114,8 @@ def is_valid_sbk_signal(
     entry_conditions = signal.get("entryConditions")
     risk_limits = signal.get("riskLimits")
     if not all(isinstance(section, dict) for section in (data_quality, entry_conditions, risk_limits)):
+        return False
+    if signal.get("collectionMode") not in (None, DRY_RUN_COLLECTION_MODE):
         return False
     is_dry_run_fixture = (
         isinstance(entry_conditions.get("setupType"), str)
@@ -174,6 +197,10 @@ def is_valid_sbk_signal(
         or not _positive_number(max_stake_quote)
         or not _finite_number(max_leverage)
         or not 1 <= max_leverage <= 20
+        or (
+            signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE
+            and (max_leverage != 1 or max_stake_quote > 100)
+        )
     ):
         return False
 

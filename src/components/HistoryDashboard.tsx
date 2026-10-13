@@ -3,6 +3,7 @@ import { getTradeHistory, clearTradeHistory, calculateTotalHistoryDashboardPnL, 
 import { TradeHistory, TradePosition } from '../types/trading';
 import { BarChart3, TrendingUp, TrendingDown, Layers, ShieldCheck, CheckCircle2, Trash2, Activity, Eye, FileCheck } from 'lucide-react';
 import { VolatilityHarvestingWidget } from './VolatilityHarvestingWidget';
+import FreqtradeHistoryPanel from './FreqtradeHistoryPanel';
 
 interface HistoryDashboardProps {
   activePositions?: TradePosition[];
@@ -122,6 +123,8 @@ const HistoryDashboardComponent: React.FC<HistoryDashboardProps> = ({
         activePositions={activePositions}
         currentPrice={currentPrice}
       />
+
+      <FreqtradeHistoryPanel />
 
       <div className="max-h-64 overflow-y-auto space-y-2 pr-1">
         {historyList.length === 0 ? (
@@ -331,4 +334,3 @@ const HistoryDashboardComponent: React.FC<HistoryDashboardProps> = ({
 };
 
 export const HistoryDashboard = React.memo(HistoryDashboardComponent);
-

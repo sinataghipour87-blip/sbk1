@@ -1,5 +1,6 @@
 import unittest
 import sys
+import copy
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ sys.path.insert(0, str(ROOT / "freqtrade_integration" / "strategies"))
 
 import requests
 from SbkSignalStrategy import SbkSignalStrategy
-from sbk_signal_contract import unresolved_inflight_signal_ids
+from sbk_signal_contract import is_valid_sbk_signal, unresolved_inflight_signal_ids
 
 
 class InflightSignalReconciliationTests(unittest.TestCase):
@@ -88,6 +89,81 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "contractVersion": "sbk1.freqtrade.signal.v1",
             "signals": [{"signal": self.signal, "status": "STRATEGY_ACCEPTED"}],
         }
+
+    def test_collection_signal_uses_explicit_collection_entry_tag(self):
+        signal = copy.deepcopy(self.signal)
+        signal["collectionMode"] = "DRY_RUN_COLLECTION"
+        signal["generatedAtMs"] = self.now_ms
+        signal["dataQuality"]["observedAtMs"] = self.now_ms
+        signal["dataQuality"]["maxAgeMs"] = 5_000
+        signal["entryConditions"]["setupType"] = "LIVE_SBK1_SETUP"
+        self.strategy._signals = {self.signal_id: signal}
+        self.strategy._signal_statuses = {self.signal_id: "ACCEPTED"}
+        self.strategy._signals_by_pair = {"BTC/USDT:USDT": signal}
+        dataframe = pd.DataFrame([{
+            "date": datetime.fromtimestamp(self.now_ms / 1000, UTC),
+            "close": signal["referencePrice"],
+        }])
+
+        result = self.strategy.populate_entry_trend(dataframe, {"pair": "BTC/USDT:USDT"})
+
+        self.assertEqual(result.iloc[-1]["enter_long"], 1)
+        self.assertEqual(result.iloc[-1]["enter_tag"], f"DRY_RUN_COLLECTION:{self.signal_id}")
+
+    def test_collection_entry_is_blocked_when_another_trade_is_open(self):
+        signal = copy.deepcopy(self.signal)
+        signal["collectionMode"] = "DRY_RUN_COLLECTION"
+        signal["generatedAtMs"] = self.now_ms
+        signal["dataQuality"]["observedAtMs"] = self.now_ms
+        signal["dataQuality"]["maxAgeMs"] = 5_000
+        signal["entryConditions"]["setupType"] = "LIVE_SBK1_SETUP"
+        self.strategy._signals = {self.signal_id: signal}
+        self.strategy._signal_statuses = {self.signal_id: "ACCEPTED"}
+
+        with (
+            patch("SbkSignalStrategy.Trade.get_open_trade_count", return_value=1),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            accepted = self.strategy.confirm_trade_entry(
+                "BTC/USDT:USDT",
+                "limit",
+                0.001,
+                signal["referencePrice"],
+                "GTC",
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                f"DRY_RUN_COLLECTION:{self.signal_id}",
+                "long",
+            )
+
+        self.assertFalse(accepted)
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "REJECTED",
+            "Dry-run collection permits at most one open Freqtrade trade.",
+        )
+
+    def test_collection_contract_enforces_one_x_and_stake_cap(self):
+        signal = copy.deepcopy(self.signal)
+        signal["collectionMode"] = "DRY_RUN_COLLECTION"
+        signal["generatedAtMs"] = self.now_ms
+        signal["expiresAtMs"] = self.now_ms + 60_000
+        signal["dataQuality"]["observedAtMs"] = self.now_ms
+        signal["dataQuality"]["maxAgeMs"] = 5_000
+        signal["entryConditions"]["setupType"] = "LIVE_SBK1_SETUP"
+        arguments = {
+            "now_ms": self.now_ms,
+            "expected_exchange": "bybit",
+            "expected_market": "futures",
+            "expected_pair": "BTC/USDT:USDT",
+            "expected_timeframe": "15m",
+        }
+
+        self.assertTrue(is_valid_sbk_signal(signal, **arguments))
+        signal["riskLimits"]["maxLeverage"] = 2
+        self.assertFalse(is_valid_sbk_signal(signal, **arguments))
+        signal["riskLimits"]["maxLeverage"] = 1
+        signal["riskLimits"]["maxStakeQuote"] = 101
+        self.assertFalse(is_valid_sbk_signal(signal, **arguments))
 
     def test_market_snapshot_uses_only_completed_dataprovider_candles(self):
         now = datetime.now(UTC)
@@ -218,6 +294,22 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
         )
 
+    def test_restart_keeps_queued_signal_available_without_duplicate_delivery(self):
+        self.response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [{"signal": self.signal, "status": "ACCEPTED"}],
+        }
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=self.response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy") as get_trades,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        self.assertEqual(list(self.strategy._signals), [self.signal_id])
+        self.assertEqual(list(self.strategy._signals_by_pair), ["BTC/USDT:USDT"])
+        self.assertEqual(self.strategy._signal_statuses[self.signal_id], "ACCEPTED")
+        get_trades.assert_not_called()
+
     def test_persisted_open_entry_order_is_reconciled_without_reentry(self):
         order = SimpleNamespace(ft_order_side="buy", safe_filled=0)
         trade = SimpleNamespace(
@@ -245,6 +337,72 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             average_fill_price=62_100.0,
         )
         self.assertIn(self.signal_id, self.strategy._signals)
+        self.assertNotIn("BTC/USDT:USDT", self.strategy._signals_by_pair)
+
+    def test_persisted_partial_entry_is_reconciled_without_reentry(self):
+        self.response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [{"signal": self.signal, "status": "ORDER_SUBMITTED"}],
+        }
+        order = SimpleNamespace(ft_order_side="buy", safe_filled=0.001)
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            open_orders=[order],
+            entry_side="buy",
+            select_filled_orders=lambda _side: [],
+            amount=0.001,
+            open_rate=62_105,
+            id=43,
+        )
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=self.response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[trade]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "PARTIALLY_FILLED",
+            "Reconciled signal lifecycle from the persisted Freqtrade trade and order records.",
+            trade_id=43,
+            filled_amount=0.001,
+            average_fill_price=62_105.0,
+        )
+        self.assertEqual(self.strategy._signal_statuses[self.signal_id], "PARTIALLY_FILLED")
+        self.assertNotIn("BTC/USDT:USDT", self.strategy._signals_by_pair)
+
+    def test_persisted_fill_reconciles_submitted_record_after_restart(self):
+        self.response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [{"signal": self.signal, "status": "ORDER_SUBMITTED"}],
+        }
+        order = SimpleNamespace(ft_order_side="buy", safe_filled=0.002)
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            open_orders=[],
+            entry_side="buy",
+            select_filled_orders=lambda _side: [order],
+            amount=0.002,
+            open_rate=62_105,
+            id=44,
+        )
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=self.response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[trade]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "FILLED",
+            "Reconciled signal lifecycle from the persisted Freqtrade trade and order records.",
+            trade_id=44,
+            filled_amount=0.002,
+            average_fill_price=62_105.0,
+        )
+        self.assertEqual(self.strategy._signal_statuses[self.signal_id], "FILLED")
         self.assertNotIn("BTC/USDT:USDT", self.strategy._signals_by_pair)
 
     def test_bridge_disconnect_clears_cached_signals(self):

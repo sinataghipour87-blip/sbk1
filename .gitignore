@@ -3,11 +3,17 @@ venv/
 __pycache__/
 *.pyc
 .env
+/freqtrade/user_data/config.json
 /config.json
 /.sbk1-run.lock
+/data/
 /data/freqtrade-signals.json
 /data/freqtrade-signals.json.*.tmp
+/data/prediction-archive/
+backups/
 /tradesv3.dryrun.sqlite*
+*.sqlite
+*.sqlite-*
 database_kill_switch.json
 database_kill_switch.json.tmp
 node_modules

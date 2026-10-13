@@ -610,6 +610,7 @@ export interface DecisionPipelineStageState {
 export interface DecisionPipelineResult {
   decision: 'EXECUTE_APPROVED' | 'WAIT_NO_TRADE';
   direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  collectionEligible?: boolean;
   activeStage: PipelineStageId;
   stages: DecisionPipelineStageState[];
   passedStagesCount: number;

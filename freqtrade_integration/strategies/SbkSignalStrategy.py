@@ -10,8 +10,11 @@ from pandas import DataFrame
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
 from sbk_signal_contract import (
+    DRY_RUN_COLLECTION_MODE,
     is_dry_run_fixture_runtime,
     is_valid_sbk_signal,
+    format_entry_tag,
+    signal_id_from_entry_tag,
     unresolved_inflight_signal_ids,
     validate_bridge_url,
 )
@@ -104,9 +107,9 @@ class SbkSignalStrategy(IStrategy):
             trades_by_signal_id: dict[str, Any] = {}
             if inflight_signal_records:
                 trades_by_signal_id = {
-                    trade.enter_tag: trade
+                    signal_id_from_entry_tag(trade.enter_tag): trade
                     for trade in Trade.get_trades_proxy()
-                    if isinstance(trade.enter_tag, str)
+                    if signal_id_from_entry_tag(trade.enter_tag)
                 }
                 unresolved_signal_ids = set(
                     unresolved_inflight_signal_ids(
@@ -141,7 +144,7 @@ class SbkSignalStrategy(IStrategy):
                     if reconciled_status == "UNKNOWN_IN_FLIGHT":
                         unresolved_signal_ids.add(signal_id)
                     if reconciled_status != record.get("status"):
-                        self._post_status(
+                        status_updated = self._post_status(
                             signal_id,
                             reconciled_status,
                             "Reconciled signal lifecycle from the persisted Freqtrade trade and order records.",
@@ -149,6 +152,8 @@ class SbkSignalStrategy(IStrategy):
                             filled_amount=float(getattr(trade, "amount", 0) or 0),
                             average_fill_price=float(getattr(trade, "open_rate", 0) or 0) or None,
                         )
+                        if status_updated:
+                            record["status"] = reconciled_status
 
             now_ms = int(current_time.timestamp() * 1000)
             configured_exchange = str(self.config.get("exchange", {}).get("name", "")).lower()
@@ -507,7 +512,7 @@ class SbkSignalStrategy(IStrategy):
             dataframe.loc[last_index, "enter_long"] = 1
         else:
             dataframe.loc[last_index, "enter_short"] = 1
-        dataframe.loc[last_index, "enter_tag"] = signal["signalId"]
+        dataframe.loc[last_index, "enter_tag"] = format_entry_tag(signal)
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -528,7 +533,8 @@ class SbkSignalStrategy(IStrategy):
         side: str,
         **kwargs: Any,
     ) -> bool:
-        signal = self._signals.get(entry_tag or "")
+        signal_id = signal_id_from_entry_tag(entry_tag)
+        signal = self._signals.get(signal_id or "")
         if (
             not is_dry_run_fixture_runtime(
                 self.config,
@@ -536,7 +542,7 @@ class SbkSignalStrategy(IStrategy):
             )
             or
             not signal
-            or self._signal_statuses.get(entry_tag or "") != "ACCEPTED"
+            or self._signal_statuses.get(signal_id or "") != "ACCEPTED"
             or not self._is_valid_signal(
                 signal,
                 int(current_time.timestamp() * 1000),
@@ -544,21 +550,31 @@ class SbkSignalStrategy(IStrategy):
                 str(self.config.get("trading_mode", "spot")).lower(),
             )
         ):
-            self._post_status(entry_tag, "REJECTED", "Signal missing, stale, or incompatible at entry confirmation.")
+            self._post_status(signal_id, "REJECTED", "Signal missing, stale, or incompatible at entry confirmation.")
             return False
         if pair != signal["pair"] or side.lower() != signal["direction"].lower():
-            self._post_status(entry_tag, "REJECTED", "Pair or side changed between signal validation and entry.")
+            self._post_status(signal_id, "REJECTED", "Pair or side changed between signal validation and entry.")
             return False
         if not math.isfinite(rate) or rate <= 0:
-            self._post_status(entry_tag, "REJECTED", "Freqtrade supplied an invalid entry rate.")
+            self._post_status(signal_id, "REJECTED", "Freqtrade supplied an invalid entry rate.")
             return False
         drift_bps = abs(rate - signal["referencePrice"]) / signal["referencePrice"] * 10_000
         if drift_bps > signal["entryConditions"]["maxPriceDeviationBps"]:
-            self._post_status(entry_tag, "REJECTED", "Entry price exceeded the signal price-deviation limit.")
+            self._post_status(signal_id, "REJECTED", "Entry price exceeded the signal price-deviation limit.")
             return False
-        if not self._post_status(entry_tag, "STRATEGY_ACCEPTED", "Validated by SbkSignalStrategy before order submission."):
+        if (
+            signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE
+            and Trade.get_open_trade_count() != 0
+        ):
+            self._post_status(
+                signal_id,
+                "REJECTED",
+                "Dry-run collection permits at most one open Freqtrade trade.",
+            )
             return False
-        self._signal_statuses[entry_tag or ""] = "STRATEGY_ACCEPTED"
+        if not self._post_status(signal_id, "STRATEGY_ACCEPTED", "Validated by SbkSignalStrategy before order submission."):
+            return False
+        self._signal_statuses[signal_id or ""] = "STRATEGY_ACCEPTED"
         return True
 
     def check_entry_timeout(
@@ -569,7 +585,7 @@ class SbkSignalStrategy(IStrategy):
         current_time: datetime,
         **kwargs: Any,
     ) -> bool:
-        signal_id = getattr(trade, "enter_tag", None)
+        signal_id = signal_id_from_entry_tag(getattr(trade, "enter_tag", None))
         signal = self._signals.get(signal_id or "")
         if not signal or getattr(order, "ft_order_side", "").lower() != ("sell" if trade.is_short else "buy"):
             return False
@@ -613,7 +629,7 @@ class SbkSignalStrategy(IStrategy):
         side: str,
         **kwargs: Any,
     ) -> float:
-        signal = self._signals.get(entry_tag or "")
+        signal = self._signals.get(signal_id_from_entry_tag(entry_tag) or "")
         if not signal or signal["market"] == "spot":
             return 1.0
         return min(float(signal["riskLimits"]["maxLeverage"]), float(max_leverage), float(proposed_leverage))
@@ -631,7 +647,7 @@ class SbkSignalStrategy(IStrategy):
         side: str,
         **kwargs: Any,
     ) -> float:
-        signal = self._signals.get(entry_tag or "")
+        signal = self._signals.get(signal_id_from_entry_tag(entry_tag) or "")
         if not signal or current_rate <= 0 or max_stake <= 0:
             return 0.0
         stop_fraction = abs(current_rate - signal["entryConditions"]["stopLoss"]) / current_rate
@@ -650,7 +666,7 @@ class SbkSignalStrategy(IStrategy):
         return max(0.0, selected_stake)
 
     def order_filled(self, pair: str, trade: Any, order: Any, current_time: datetime, **kwargs: Any) -> None:
-        signal_id = getattr(trade, "enter_tag", None)
+        signal_id = signal_id_from_entry_tag(getattr(trade, "enter_tag", None))
         signal = self._signals.get(signal_id or "")
         if not signal or getattr(order, "ft_order_side", "").lower() != ("sell" if trade.is_short else "buy"):
             return
@@ -678,7 +694,7 @@ class SbkSignalStrategy(IStrategy):
     ) -> float | None:
         signal = trade.get_custom_data("sbk_signal")
         if not isinstance(signal, dict):
-            signal = self._signals.get(getattr(trade, "enter_tag", "") or "")
+            signal = self._signals.get(signal_id_from_entry_tag(getattr(trade, "enter_tag", None)) or "")
         if not signal or current_rate <= 0:
             return None
         return stoploss_from_absolute(
@@ -699,7 +715,7 @@ class SbkSignalStrategy(IStrategy):
     ) -> str | None:
         signal = trade.get_custom_data("sbk_signal")
         if not isinstance(signal, dict):
-            signal = self._signals.get(getattr(trade, "enter_tag", "") or "")
+            signal = self._signals.get(signal_id_from_entry_tag(getattr(trade, "enter_tag", None)) or "")
         if not signal:
             return None
         target = float(signal["entryConditions"]["takeProfit"])

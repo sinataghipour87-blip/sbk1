@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { orderFlowEngine, OrderFlowSnapshot } from '../services/orderFlowEngine';
 import { AnalysisResult } from '../types/trading';
+import { getLatestMultiBrainConsensusReport } from '../services/multiBrainEnsemble';
 
 interface HunterOrderFlowDashboardWidgetProps {
   analysis?: AnalysisResult | null;
@@ -29,6 +30,7 @@ interface SignalSubmissionResult {
   decisionId?: string;
   code?: string;
   correlationId?: string;
+  collectionMode?: string;
   reason: string;
 }
 
@@ -44,6 +46,7 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
   );
   const [executionResult, setExecutionResult] = useState<SignalSubmissionResult | null>(null);
   const [isExecuting, setIsExecuting] = useState<boolean>(false);
+  const [collectionEnabled, setCollectionEnabled] = useState(false);
   const analysisDataTimestamp =
     analysis?.futuresPrices?.timestampUtc ?? analysis?.canonicalSnapshot?.timestampUtc;
   const isSubmissionDataReady =
@@ -53,6 +56,30 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
     Number.isSafeInteger(analysisDataTimestamp) &&
     Date.now() - analysisDataTimestamp >= 0 &&
     Date.now() - analysisDataTimestamp <= 5_000;
+
+  useEffect(() => {
+    let active = true;
+    void fetch('/api/hunter/dry-run-collection/status', { cache: 'no-store' })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Collection status request failed with HTTP ${response.status}.`);
+        const status: unknown = await response.json();
+        if (
+          typeof status !== 'object' ||
+          status === null ||
+          !('enabled' in status) ||
+          typeof status.enabled !== 'boolean'
+        ) {
+          throw new Error('Collection status response is invalid.');
+        }
+        if (active) setCollectionEnabled(status.enabled);
+      })
+      .catch((error: unknown) => {
+        console.error('Could not read the dry-run collection feature flag:', error);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const updateOrderFlow = () => {
     if (analysis?.rawCandles) {
@@ -133,6 +160,50 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
       });
     } catch (err: any) {
       console.error(err);
+    } finally {
+      setIsExecuting(false);
+    }
+  };
+
+  const handleDryRunCollection = async () => {
+    if (!analysis || !isSubmissionDataReady || !collectionEnabled) return;
+    setIsExecuting(true);
+    try {
+      const sourceTimestamp =
+        analysis.canonicalSnapshot?.timestampUtc ?? analysis.realObiData?.timestamp ?? null;
+      const multiBrainReport = getLatestMultiBrainConsensusReport(analysis.price, sourceTimestamp);
+      const response = await fetch('/api/hunter/dry-run-collection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ analysis, multiBrainReport }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setExecutionResult({
+          accepted: false,
+          status: result.status || 'REJECTED',
+          reason: result.error || `HTTP ${response.status}`,
+          code: typeof result.code === 'string' ? result.code : undefined,
+          correlationId: typeof result.correlationId === 'string' ? result.correlationId : undefined,
+          collectionMode: typeof result.collectionMode === 'string' ? result.collectionMode : undefined,
+        });
+        return;
+      }
+      setExecutionResult({
+        accepted: result.accepted === true,
+        status: result.status,
+        signalId: result.signalId,
+        decisionId: result.decisionId,
+        collectionMode: result.collectionMode,
+        reason: result.reason || 'Dry-run collection signal queued; no live execution is authorized.',
+      });
+    } catch (error) {
+      console.error('Dry-run collection submission failed:', error);
+      setExecutionResult({
+        accepted: false,
+        status: 'REJECTED',
+        reason: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       setIsExecuting(false);
     }
@@ -290,6 +361,16 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
               <span>ارسال سیگنال production مسدود</span>
             </button>
           )}
+          {collectionEnabled && analysis && (
+            <button
+              onClick={handleDryRunCollection}
+              disabled={isExecuting || !isSubmissionDataReady}
+              className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-bold text-xs transition flex items-center gap-1.5 shadow-lg"
+            >
+              <Play className="w-4 h-4" />
+              <span>{isExecuting ? 'در حال بررسی گیت‌ها...' : 'فقط جمع‌آوری دادهٔ Dry-run'}</span>
+            </button>
+          )}
         </div>
 
         <p className="text-xs text-slate-300 leading-relaxed">{sig.rationaleFa}</p>
@@ -333,6 +414,7 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
           </div>
           <p>{executionResult.reason}</p>
           {executionResult.code && <p className="mt-1 font-mono">Reason code: {executionResult.code}</p>}
+          {executionResult.collectionMode && <p className="mt-1 font-mono">Mode: {executionResult.collectionMode}</p>}
           {executionResult.correlationId && <p className="mt-1 font-mono">Correlation ID: {executionResult.correlationId}</p>}
           {executionResult.signalId && <p className="mt-1 font-mono">Signal ID: {executionResult.signalId}</p>}
         </div>
@@ -344,6 +426,7 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
           <p className="font-bold">NO TRADE — CALIBRATED_CONFIDENCE_UNAVAILABLE</p>
           <p className="mt-1">آرشیو معتبر تصمیم‌ها، ویژگی‌های هم‌زمان و نتایج تأییدشدهٔ Freqtrade برای کالیبراسیون و آزمون خارج از نمونه موجود نیست؛ ارسال سیگنال عادی SBK1 به صف Freqtrade عمداً بسته است. درخواست ردشده با `CALIBRATED_CONFIDENCE_UNAVAILABLE` و correlation ID ثبت می‌شود.</p>
           <p className="mt-1">در حال حاضر strategy فقط fixture صریحاً فعال‌شدهٔ Dry-run را برای آزمون قرارداد می‌پذیرد؛ fixture شاهد برتری آماری یا مجوز ورود واقعی نیست. این گیت برای افزایش تعداد معامله دور زده نمی‌شود.</p>
+          {collectionEnabled && <p className="mt-1">حالت DRY_RUN_COLLECTION روشن است: فقط تصمیم‌های کامل SBK1 که همهٔ گیت‌های مستقل را پاس کرده‌اند می‌توانند در Freqtrade با 1x و سقف stake محدود آزمایش شوند؛ این حالت هرگز live نیست.</p>}
           <p className="mt-1">
             وضعیت Last/Mark/Index: {analysis?.futuresPrices?.status ?? 'UNAVAILABLE'}
             {typeof analysis?.futuresPrices?.ageMs === 'number' ? `؛ سن داده ${analysis.futuresPrices.ageMs}ms` : ''}

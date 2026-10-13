@@ -21,6 +21,7 @@ dotenv.config({ path: path.join(ROOT_DIR, '.env') });
 
 interface FreqtradeConfig {
   dry_run?: boolean;
+  max_open_trades?: number;
   strategy?: string;
   trading_mode?: string;
   timeframe?: string;
@@ -122,6 +123,9 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   }
   if (config.force_entry_enable !== false) {
     throw new Error('force_entry_enable must be false; entries must pass through the SBK1 signal strategy.');
+  }
+  if (env.SBK1_DRY_RUN_COLLECTION_ENABLED === 'true' && config.max_open_trades !== 1) {
+    throw new Error('Dry-run collection requires max_open_trades to be exactly 1.');
   }
   if (
     config.exchange?.name?.toLowerCase() !== exchange ||

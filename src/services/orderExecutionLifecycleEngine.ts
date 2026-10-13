@@ -118,6 +118,7 @@ export interface FreqtradeLifecycleResult {
   tradeId: string;
   state: InstitutionalOrderLifecycleState;
   trade?: FreqtradeTrade;
+  positionOpen?: boolean;
   messageFa: string;
 }
 
@@ -542,22 +543,35 @@ export class OrderExecutionLifecycleService {
     const normalizedTradeId = String(tradeId);
     try {
       const trade = await freqtradeBridge.getTrade(normalizedTradeId);
-      const relevantOrders = trade.orders.filter(
-        (order) => order.ft_order_side.toLowerCase() !== 'stoploss',
+      const entrySide = trade.is_short ? 'sell' : 'buy';
+      const entryOrders = trade.orders.filter(
+        (order) => order.ft_order_side.toLowerCase() === entrySide,
       );
-      const filledQty = relevantOrders.reduce(
+      const filledQty = entryOrders.reduce(
         (total, order) => total + (Number.isFinite(order.filled) ? order.filled ?? 0 : 0),
         0,
       );
-      const hasPendingOrder = relevantOrders.some((order) => order.is_open);
-      const state: InstitutionalOrderLifecycleState = hasPendingOrder
-        ? (filledQty > 0 ? 'PARTIALLY_FILLED' : 'ACKNOWLEDGED')
-        : (filledQty > 0 ? 'FILLED' : trade.is_open ? 'ACKNOWLEDGED' : 'CANCELLED');
+      const requestedQty = entryOrders.reduce((total, order) => total + order.amount, 0);
+      const hasPendingOrder = entryOrders.some((order) => order.is_open);
+      const hasPartialFill = filledQty > 0 && requestedQty > filledQty + Number.EPSILON;
+      const entryStatuses = entryOrders.map((order) => order.status.toLowerCase());
+      const state: InstitutionalOrderLifecycleState = hasPartialFill
+        ? 'PARTIALLY_FILLED'
+        : hasPendingOrder
+          ? 'ACKNOWLEDGED'
+          : filledQty > 0
+            ? 'FILLED'
+            : entryStatuses.some((status) => status === 'rejected')
+              ? 'REJECTED'
+              : entryStatuses.some((status) => ['cancelled', 'canceled', 'expired'].includes(status)) || !trade.is_open
+                ? 'CANCELLED'
+                : 'ACKNOWLEDGED';
       return {
         success: true,
         tradeId: normalizedTradeId,
         state,
         trade,
+        positionOpen: trade.is_open,
         messageFa: `وضعیت معامله ${normalizedTradeId} مستقیماً از Freqtrade دریافت شد: ${state}.`,
       };
     } catch (error) {
@@ -579,9 +593,14 @@ export class OrderExecutionLifecycleService {
     let exitRequestStarted = false;
     try {
       const botState = await freqtradeBridge.getStatus();
-      if (!botState.ping || botState.status !== 'running' || botState.dryRun) {
+      if (
+        !botState.ping ||
+        botState.status !== 'running' ||
+        botState.dryRun !== true ||
+        botState.forceEntryEnabled
+      ) {
         throw new FreqtradeRpcError(
-          `Freqtrade is not ready for live exits (state: ${botState.status}, dry-run: ${botState.dryRun}).`,
+          `Freqtrade is not ready for a dry-run exit (state: ${botState.status}, dry-run: ${botState.dryRun}, force-entry: ${botState.forceEntryEnabled}).`,
         );
       }
       const existingTrade = await freqtradeBridge.getTrade(normalizedTradeId);
@@ -612,6 +631,7 @@ export class OrderExecutionLifecycleService {
         ...reconciled,
         success: true,
         state: exitState,
+        positionOpen: reconciled.trade?.is_open,
         messageFa: `درخواست Force Exit از Freqtrade تأیید شد (${acknowledgement.result})؛ وضعیت جاری: ${exitState}.`,
       };
     } catch (error) {

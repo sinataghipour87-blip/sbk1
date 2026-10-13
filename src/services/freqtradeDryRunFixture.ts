@@ -22,12 +22,15 @@ export interface DryRunFixtureConfiguration {
 export function getDryRunFixtureReadinessError(
   state: FreqtradeBotState,
   configuration: DryRunFixtureConfiguration,
-  options: { requireNoOpenTrades?: boolean } = {},
+  options: { requireNoOpenTrades?: boolean; requireDemoTradingOff?: boolean } = {},
 ): string | undefined {
   if (!configuration.enabled) return 'Dry-run fixture mode is not explicitly enabled.';
   if (configuration.killSwitchActive) return 'The SBK1 kill switch is engaged.';
   if (state.status !== 'running') return 'Freqtrade is not running.';
   if (!state.dryRun) return 'Freqtrade RPC did not confirm dry_run=true.';
+  if (options.requireDemoTradingOff === true && state.demoTrading !== false) {
+    return 'Freqtrade RPC did not confirm demo_trading=false.';
+  }
   if (options.requireNoOpenTrades !== false && state.openTradesCount !== 0) {
     return 'Close or reconcile existing Freqtrade trades before starting a dry-run fixture test.';
   }
@@ -64,6 +67,7 @@ export function createDryRunFixtureSignal(input: {
   referencePrice: number;
   observedAtMs: number;
   source: string;
+  maxStakeQuote: number;
 }): SbkFreqtradeSignal {
   const stopLoss = input.referencePrice * 0.99;
   const takeProfit = input.referencePrice * 1.02;
@@ -105,7 +109,7 @@ export function createDryRunFixtureSignal(input: {
       },
       riskLimits: {
         riskBudgetPct: 0.1,
-        maxStakeQuote: 100,
+        maxStakeQuote: input.maxStakeQuote,
         maxLeverage: 1,
       },
     },

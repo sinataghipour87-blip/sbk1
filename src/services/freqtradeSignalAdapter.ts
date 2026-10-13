@@ -5,6 +5,8 @@ import { isDeepStrictEqual } from 'node:util';
 
 export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v1';
 export const DRY_RUN_FIXTURE_SETUP_PREFIX = 'DRY_RUN_E2E_FIXTURE_';
+export const DRY_RUN_COLLECTION_MODE = 'DRY_RUN_COLLECTION';
+export const DRY_RUN_COLLECTION_TAG_PREFIX = 'DRY_RUN_COLLECTION:';
 
 export type SbkSignalDirection = 'LONG' | 'SHORT';
 export type SbkSignalStatus =
@@ -48,6 +50,7 @@ export interface SbkFreqtradeSignal {
     maxStakeQuote: number;
     maxLeverage: number;
   };
+  collectionMode?: typeof DRY_RUN_COLLECTION_MODE;
 }
 
 export interface SbkFreqtradeSignalRecord {
@@ -154,6 +157,12 @@ export function validateSbkFreqtradeSignal(
   const maximumSignalAgeMs = isDryRunFixture ? 55_000 : 15_000;
   if (signal.contractVersion !== SBK_SIGNAL_CONTRACT_VERSION) {
     throw new SbkSignalValidationError('Unsupported signal contract version.', 'UNSUPPORTED_CONTRACT_VERSION');
+  }
+  if (
+    signal.collectionMode !== undefined &&
+    signal.collectionMode !== DRY_RUN_COLLECTION_MODE
+  ) {
+    throw new SbkSignalValidationError('Signal collection mode is invalid.', 'INVALID_COLLECTION_MODE');
   }
   if (!/^sbk1_[a-f0-9]{32}$/.test(signal.decisionId) || !/^sbk1_[a-f0-9]{32}$/.test(signal.signalId)) {
     throw new SbkSignalValidationError('Decision and signal identifiers are invalid.', 'INVALID_SIGNAL_ID');
@@ -346,6 +355,104 @@ export class FreqtradeSignalAdapter {
     });
   }
 
+  async submitDryRunCollection(
+    value: unknown,
+    options: {
+      expectedPair: string;
+      expectedExchange: string;
+      expectedTimeframe: string;
+      maxSignalsPerDay: number;
+      minimumSpacingMs: number;
+      nowMs?: number;
+    },
+  ): Promise<SbkFreqtradeSignalRecord> {
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      const nowMs = options.nowMs ?? Date.now();
+      const signal = validateSbkFreqtradeSignal(value, {
+        nowMs,
+        expectedPair: options.expectedPair,
+        expectedExchange: options.expectedExchange,
+        expectedTimeframe: options.expectedTimeframe,
+      });
+      if (signal.collectionMode !== DRY_RUN_COLLECTION_MODE) {
+        throw new SbkSignalValidationError(
+          'Dry-run collection signals must be explicitly tagged.',
+          'INVALID_COLLECTION_MODE',
+        );
+      }
+      if (
+        !Number.isSafeInteger(options.maxSignalsPerDay) ||
+        options.maxSignalsPerDay < 1 ||
+        !Number.isSafeInteger(options.minimumSpacingMs) ||
+        options.minimumSpacingMs < 1
+      ) {
+        throw new SbkSignalValidationError(
+          'Dry-run collection limits are invalid.',
+          'INVALID_COLLECTION_LIMITS',
+        );
+      }
+
+      const existing = this.recordsById.get(signal.signalId);
+      if (existing) {
+        if (!isDeepStrictEqual(existing.signal, signal)) {
+          throw new SbkSignalValidationError(
+            'Signal ID was already used for a different decision.',
+            'IDEMPOTENCY_CONFLICT',
+          );
+        }
+        return { ...existing, duplicate: true };
+      }
+
+      const dayStartMs = new Date(nowMs).setUTCHours(0, 0, 0, 0);
+      const collectionRecords = [...this.recordsById.values()].filter((record) =>
+        record.signal.collectionMode === DRY_RUN_COLLECTION_MODE
+      );
+      const activeCollectionRecord = collectionRecords.find((record) =>
+        record.status === 'ACCEPTED' ||
+        record.status === 'STRATEGY_ACCEPTED' ||
+        record.status === 'ORDER_SUBMITTED' ||
+        record.status === 'PARTIALLY_FILLED' ||
+        record.status === 'UNKNOWN_IN_FLIGHT'
+      );
+      if (activeCollectionRecord) {
+        throw new SbkSignalValidationError(
+          'An earlier dry-run collection signal is still active.',
+          'COLLECTION_SIGNAL_ALREADY_ACTIVE',
+        );
+      }
+      const signalsToday = collectionRecords.filter((record) =>
+        record.createdAtMs >= dayStartMs && record.createdAtMs <= nowMs
+      ).length;
+      if (signalsToday >= options.maxSignalsPerDay) {
+        throw new SbkSignalValidationError(
+          'The configured daily dry-run collection signal limit has been reached.',
+          'COLLECTION_DAILY_LIMIT_REACHED',
+        );
+      }
+      const mostRecent = collectionRecords.reduce(
+        (latest, record) => Math.max(latest, record.createdAtMs),
+        0,
+      );
+      if (mostRecent > 0 && nowMs - mostRecent < options.minimumSpacingMs) {
+        throw new SbkSignalValidationError(
+          'The minimum spacing between dry-run collection signals has not elapsed.',
+          'COLLECTION_SPACING_NOT_ELAPSED',
+        );
+      }
+
+      const record: SbkFreqtradeSignalRecord = {
+        signal,
+        status: 'ACCEPTED',
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+      this.recordsById.set(signal.signalId, record);
+      await this.persist();
+      return { ...record };
+    });
+  }
+
   async getPending(pair: string, timeframe: string): Promise<SbkFreqtradeSignalRecord[]> {
     return this.withExclusiveAccess(async () => {
       await this.load();
@@ -431,6 +538,18 @@ export class FreqtradeSignalAdapter {
       await this.load();
       const record = this.recordsById.get(signalId);
       return record ? { ...record } : null;
+    });
+  }
+
+  async findByTradeId(tradeId: number): Promise<SbkFreqtradeSignalRecord[]> {
+    if (!Number.isSafeInteger(tradeId) || tradeId <= 0) {
+      throw new SbkSignalValidationError('Freqtrade trade ID must be a positive integer.', 'INVALID_TRADE_ID');
+    }
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      return [...this.recordsById.values()]
+        .filter((record) => record.tradeId === tradeId)
+        .map((record) => ({ ...record }));
     });
   }
 

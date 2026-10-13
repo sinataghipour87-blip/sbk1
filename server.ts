@@ -7,14 +7,27 @@ import fs from 'fs';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
-import { Candle, ExecutionSettings } from './src/types/trading';
+import { AnalysisResult, Candle, ExecutionSettings } from './src/types/trading';
 import { freqtradeBridge } from './src/services/freqtradeBridge';
+import { retryWithBackoff } from './src/services/boundedRetry';
 import {
+    DRY_RUN_COLLECTION_MODE,
+    DRY_RUN_COLLECTION_TAG_PREFIX,
     freqtradeSignalAdapter,
     isValidBridgeToken,
     SBK_SIGNAL_CONTRACT_VERSION,
     SbkSignalValidationError,
 } from './src/services/freqtradeSignalAdapter';
+import {
+    createDryRunCollectionSignal,
+    DRY_RUN_COLLECTION_DEFAULT_MAX_SIGNALS_PER_DAY,
+    DRY_RUN_COLLECTION_MINIMUM_SPACING_MS,
+    getDryRunCollectionReadinessError,
+    isDryRunCollectionDecisionEligible,
+    validateDryRunCollectionMarketEvidence,
+} from './src/services/freqtradeDryRunCollection';
+import { runUnifiedDecisionPipeline } from './src/services/decisionPipeline';
+import type { MultiBrainConsensusReport } from './src/services/multiBrainEnsemble';
 import {
     createDryRunFixtureSignal,
     DRY_RUN_FIXTURE_SETUP_PREFIX,
@@ -431,8 +444,199 @@ app.use('/api/live', liveOperationLimiter);
 app.use('/api/exchange', requireAdminAuth);
 app.use('/api/live', requireAdminAuth);
 
+async function runPredictionArchiveAction(
+    action: 'append' | 'list' | 'import' | 'sync-outcomes' | 'status',
+    payload: Record<string, unknown>,
+): Promise<any> {
+    const result = await runPythonScript(
+        'scripts/prediction_archive.py',
+        [],
+        { action, ...payload },
+        10000,
+    );
+    return JSON.parse(result);
+}
+
+let outcomeSyncPromise: Promise<any> | null = null;
+
+async function syncFreqtradeOutcomes(): Promise<any> {
+    if (outcomeSyncPromise) return outcomeSyncPromise;
+    const sync = (async () => {
+        const [botState, closedTrades] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getAllClosedTrades(),
+        ]);
+        const archiveTrades = await Promise.all(closedTrades.map(async (trade) => {
+            const signalTag = trade.enter_tag?.trim() || null;
+            const tagSignalId = signalTag?.startsWith(DRY_RUN_COLLECTION_TAG_PREFIX)
+                ? signalTag.slice(DRY_RUN_COLLECTION_TAG_PREFIX.length)
+                : signalTag;
+            const lifecycleRecords = await freqtradeSignalAdapter.findByTradeId(trade.trade_id);
+            const lifecycleSignalIds = [...new Set(lifecycleRecords.map((record) => record.signal.signalId))];
+            let signalId = tagSignalId;
+            let linkError: string | undefined;
+            if (lifecycleSignalIds.length > 1) {
+                signalId = null;
+                linkError = 'AMBIGUOUS_LIFECYCLE_LINK';
+            } else if (tagSignalId && lifecycleSignalIds.length === 1 &&
+                tagSignalId !== lifecycleSignalIds[0]) {
+                signalId = null;
+                linkError = 'SIGNAL_TAG_LIFECYCLE_CONFLICT';
+            } else if (!tagSignalId && lifecycleSignalIds.length === 1) {
+                signalId = lifecycleSignalIds[0] ?? null;
+            }
+            return {
+                ...trade,
+                signalId,
+                linkError,
+                executionMode: botState.dryRun ? 'DRY_RUN' : 'LIVE',
+            };
+        }));
+        return runPredictionArchiveAction('sync-outcomes', { trades: archiveTrades });
+    })();
+    outcomeSyncPromise = sync;
+    try {
+        return await sync;
+    } finally {
+        if (outcomeSyncPromise === sync) outcomeSyncPromise = null;
+    }
+}
+
+function csvCell(value: unknown): string {
+    let text = value === null || value === undefined
+        ? ''
+        : typeof value === 'string'
+            ? value
+            : JSON.stringify(value);
+    if (/^[=+\-@]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
+}
+
+app.post('/api/prediction-archive/records', requireAdminAuth, async (req, res) => {
+    try {
+        const result = await runPredictionArchiveAction('append', { record: req.body });
+        res.setHeader('Cache-Control', 'no-store');
+        return res.status(result.duplicate ? 200 : 201).json({
+            signalId: result.signalId,
+            duplicate: result.duplicate,
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const isInvalidRecord = message.includes('ARCHIVE_VALIDATION_ERROR');
+        console.error('[Prediction archive] Append failed:', message);
+        return res.status(isInvalidRecord ? 422 : 503).json({
+            error: isInvalidRecord
+                ? message.replace(/^.*ARCHIVE_VALIDATION_ERROR:\s*/, '')
+                : 'Prediction archive is unavailable; no record was confirmed.',
+        });
+    }
+});
+
+app.get('/api/prediction-archive', requireAdminAuth, async (req, res) => {
+    const limit = Number(req.query.limit ?? 100);
+    const offset = Number(req.query.offset ?? 0);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500 ||
+        !Number.isSafeInteger(offset) || offset < 0) {
+        return res.status(400).json({ error: 'limit must be 1-500 and offset must be non-negative.' });
+    }
+    try {
+        const result = await runPredictionArchiveAction('list', { limit, offset });
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.query.format === 'csv') {
+            const columns = [
+                'signalId',
+                'decisionTimestampMs',
+                'pair',
+                'timeframe',
+                'direction',
+                'entry',
+                'stop',
+                'target',
+                'featureSnapshot',
+                'modelVersion',
+                'predictorVersion',
+                'dataQualityReport',
+                'gateResult',
+                'source',
+            ];
+            const lines = [
+                columns.join(','),
+                ...result.records.map((record: Record<string, unknown>) =>
+                    columns.map((column) => csvCell(record[column])).join(','),
+                ),
+            ];
+            res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+            res.setHeader('Content-Disposition', 'attachment; filename="sbk1-prediction-archive.csv"');
+            return res.send(lines.join('\r\n'));
+        }
+        return res.json(result);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Prediction archive] Read failed:', message);
+        return res.status(503).json({ error: 'Prediction archive is unavailable.' });
+    }
+});
+
+app.post('/api/prediction-archive/import-local', requireAdminAuth, async (req, res) => {
+    if (!Array.isArray(req.body?.records)) {
+        return res.status(400).json({ error: 'records must be an exported localStorage array.' });
+    }
+    try {
+        const result = await runPredictionArchiveAction('import', { records: req.body.records });
+        res.setHeader('Cache-Control', 'no-store');
+        return res.status(201).json({
+            importedCount: result.results.length,
+            records: result.results.map((item: { signalId: string; duplicate: boolean }) => ({
+                signalId: item.signalId,
+                duplicate: item.duplicate,
+                source: 'UNVERIFIED_LOCAL',
+            })),
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const isInvalidRecord = message.includes('ARCHIVE_VALIDATION_ERROR');
+        console.error('[Prediction archive] Local import failed:', message);
+        return res.status(isInvalidRecord ? 422 : 503).json({
+            error: isInvalidRecord
+                ? message.replace(/^.*ARCHIVE_VALIDATION_ERROR:\s*/, '')
+                : 'Prediction archive is unavailable; local data was not confirmed imported.',
+        });
+    }
+});
+
+app.get('/api/prediction-archive/status', requireAdminAuth, async (_req, res) => {
+    try {
+        const result = await runPredictionArchiveAction('status', {});
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json(result);
+    } catch (error) {
+        console.error(
+            '[Prediction archive] Calibration status read failed:',
+            error instanceof Error ? error.message : String(error),
+        );
+        return res.status(503).json({ error: 'Prediction archive status is unavailable.' });
+    }
+});
+
+app.post('/api/prediction-archive/sync-freqtrade', requireAdminAuth, async (_req, res) => {
+    try {
+        const result = await syncFreqtradeOutcomes();
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json(result);
+    } catch (error) {
+        console.error(
+            '[Prediction archive] Authenticated Freqtrade outcome sync failed:',
+            error instanceof Error ? error.message : String(error),
+        );
+        return res.status(503).json({
+            error: 'Authenticated Freqtrade closed-trade synchronization failed; no outcomes were confirmed.',
+        });
+    }
+});
+
 const safeLiveApiRoutes = new Set([
     'GET /api/live/status',
+    'GET /api/live/closed-trades',
     'POST /api/live/kill-switch',
     'POST /api/live/run-readiness-tests',
     'POST /api/live/validate-trade',
@@ -1501,7 +1705,7 @@ Analyze current sentiment and output ONLY a JSON object:
 });
 
 // --- Live Trading Safety & Production Readiness Gate Engine (Items 36-40) ---
-const KILL_SWITCH_STATE_DB = 'database_kill_switch.json';
+const KILL_SWITCH_STATE_DB = process.env.SBK1_KILL_SWITCH_STATE_PATH?.trim() || 'database_kill_switch.json';
 
 function loadKillSwitchState(): boolean {
     if (!fs.existsSync(KILL_SWITCH_STATE_DB)) return true;
@@ -1594,6 +1798,23 @@ app.get('/api/live/status', async (req, res) => {
             executionAuthority: 'freqtrade',
             activePositions: [],
             error: error instanceof Error ? error.message : 'Freqtrade state is unavailable.',
+        });
+    }
+});
+
+app.get('/api/live/closed-trades', async (_req, res) => {
+    try {
+        const trades = await freqtradeBridge.getClosedTrades();
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json({ trades });
+    } catch (error) {
+        console.error(
+            '[Freqtrade closed-trade history] Could not read authoritative history:',
+            error instanceof Error ? error.message : String(error),
+        );
+        return res.status(503).json({
+            error: error instanceof Error ? error.message : 'Freqtrade trade history is unavailable.',
+            trades: [],
         });
     }
 });
@@ -1880,6 +2101,334 @@ app.post('/api/hunter/execute', liveOperationLimiter, requireAdminAuth, async (r
     }
 });
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCollectionBrainReport(value: unknown): value is MultiBrainConsensusReport {
+    if (
+        !isRecord(value) ||
+        typeof value.timestampMs !== 'number' ||
+        typeof value.currentPrice !== 'number' ||
+        !(value.sourceTimestampMs === null || typeof value.sourceTimestampMs === 'number') ||
+        !Array.isArray(value.independentModels) ||
+        !isRecord(value.modelDisagreement) ||
+        typeof value.modelDisagreement.vetoTriggered !== 'boolean' ||
+        typeof value.modelDisagreement.verdictFa !== 'string'
+    ) return false;
+    return value.independentModels.every((model) =>
+        isRecord(model) &&
+        typeof model.modelId === 'string' &&
+        typeof model.nameFa === 'string' &&
+        typeof model.sampleSize === 'number' &&
+        typeof model.effectiveWeight === 'number' &&
+        (model.rawProbabilityPct === null || typeof model.rawProbabilityPct === 'number') &&
+        typeof model.healthState === 'string' &&
+        typeof model.prediction === 'string'
+    );
+}
+
+app.get('/api/hunter/dry-run-collection/status', requireAdminAuth, (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({
+        enabled: process.env.SBK1_DRY_RUN_COLLECTION_ENABLED === 'true',
+        mode: DRY_RUN_COLLECTION_MODE,
+    });
+});
+
+app.post('/api/hunter/dry-run-collection', liveOperationLimiter, requireAdminAuth, async (req, res) => {
+    if (process.env.SBK1_DRY_RUN_COLLECTION_ENABLED !== 'true') {
+        return res.status(404).json({
+            accepted: false,
+            code: 'DRY_RUN_COLLECTION_DISABLED',
+            error: 'The SBK1 dry-run collection path is not explicitly enabled.',
+        });
+    }
+    if (liveTradingState.killSwitchActive) {
+        return res.status(423).json({
+            accepted: false,
+            code: 'KILL_SWITCH_ACTIVE',
+            error: 'SBK1 kill switch is active; dry-run collection is blocked.',
+        });
+    }
+
+    try {
+        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+        if (
+            !pair ||
+            !exchange ||
+            !timeframe ||
+            pair !== freqtradeBridge.getConfiguredPair() ||
+            !process.env.SBK1_FREQTRADE_BRIDGE_TOKEN ||
+            process.env.SBK1_FREQTRADE_BRIDGE_TOKEN.length < 32
+        ) {
+            return res.status(503).json({
+                accepted: false,
+                code: 'SIGNAL_BRIDGE_NOT_CONFIGURED',
+                error: 'Dry-run collection requires a configured, authenticated Freqtrade signal bridge.',
+            });
+        }
+
+        const [botState, whitelist] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getWhitelist(),
+        ]);
+        const readinessError = getDryRunCollectionReadinessError(botState, {
+            enabled: true,
+            killSwitchActive: false,
+            configuredPair: pair,
+            expectedPair: pair,
+            expectedExchange: exchange,
+            expectedTimeframe: timeframe,
+            whitelist,
+        });
+        if (readinessError) {
+            return res.status(409).json({
+                accepted: false,
+                code: 'DRY_RUN_COLLECTION_NOT_READY',
+                error: readinessError,
+            });
+        }
+
+        const marketSnapshot = freqtradeMarketDataBridge.getLatest({
+            exchange: botState.exchange!,
+            market: 'futures',
+            pair,
+            timeframe,
+        });
+        const analysisValue = req.body?.analysis;
+        const direction = isRecord(analysisValue) ? analysisValue.direction : undefined;
+        const multiBrainReport = req.body?.multiBrainReport;
+        if (
+            !isRecord(analysisValue) ||
+            (direction !== 'LONG' && direction !== 'SHORT') ||
+            !isCollectionBrainReport(multiBrainReport)
+        ) {
+            return res.status(422).json({
+                accepted: false,
+                code: 'INVALID_COLLECTION_DECISION',
+                error: 'A directional SBK1 analysis and current MultiBrain evidence are required.',
+            });
+        }
+
+        const nowMs = Date.now();
+        const marketEvidence = validateDryRunCollectionMarketEvidence(
+            analysisValue,
+            marketSnapshot,
+            direction,
+            nowMs,
+        );
+        if (
+            !marketSnapshot.ticker ||
+            Math.abs(marketSnapshot.ticker.last - Number(analysisValue.price)) /
+                marketSnapshot.ticker.last > 0.0015
+        ) {
+            return res.status(409).json({
+                accepted: false,
+                code: 'COLLECTION_PRICE_MISMATCH',
+                error: 'The SBK1 analysis price does not match the authenticated Freqtrade ticker.',
+            });
+        }
+
+        const rawOrderBook = analysisValue.realObiData;
+        const rawCanonicalSnapshot = analysisValue.canonicalSnapshot;
+        if (!isRecord(rawOrderBook) || !isRecord(rawCanonicalSnapshot)) {
+            return res.status(422).json({
+                accepted: false,
+                code: 'INVALID_COLLECTION_DECISION',
+                error: 'The SBK1 analysis is missing its live order-book or canonical snapshot evidence.',
+            });
+        }
+        const normalizedAnalysis: AnalysisResult = {
+            ...analysisValue,
+            price: marketSnapshot.ticker.last,
+            dataStatus: 'LIVE',
+            atr: marketEvidence.atr,
+            funding: marketEvidence.fundingRate,
+            fundingRate: marketEvidence.fundingRate,
+            realObiData: {
+                ...rawOrderBook,
+                obi: marketEvidence.obi,
+                status: 'LIVE',
+                timestamp: marketSnapshot.orderBook!.timestampMs,
+                ageMs: nowMs - marketSnapshot.orderBook!.timestampMs,
+            },
+            candles: marketSnapshot.candles.map((candle) => [
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+            ] as Candle),
+            canonicalSnapshot: {
+                ...rawCanonicalSnapshot,
+                timestampUtc: marketSnapshot.generatedAtMs,
+            },
+        } as AnalysisResult;
+        const balance = await freqtradeBridge.getBalance();
+        const collectionDecision = runUnifiedDecisionPipeline({
+            analysis: normalizedAnalysis,
+            targetDirection: direction,
+            multiBrainReport,
+            balance: balance.available,
+            userLeverage: 1,
+            minWinProbability: 68,
+            isAutoTrade: false,
+            dryRunCollectionEvaluation: true,
+        });
+        if (
+            !isDryRunCollectionDecisionEligible({
+                collectionEligible: collectionDecision.collectionEligible,
+                direction: collectionDecision.direction,
+                hasTradeContract: Boolean(collectionDecision.tradeContract),
+                stages: collectionDecision.stages,
+            }, direction)
+        ) {
+            return res.status(409).json({
+                accepted: false,
+                code: 'COLLECTION_NON_CALIBRATION_GATE_FAILED',
+                error: collectionDecision.waitReasonFa ||
+                    'At least one independent SBK1 decision gate did not pass.',
+                activeStage: collectionDecision.activeStage,
+            });
+        }
+
+        const setupContext = analysisValue.setupContext;
+        if (
+            !isRecord(setupContext) ||
+            typeof setupContext.setupType !== 'string' ||
+            typeof setupContext.currentMarketPrice !== 'number' ||
+            !Number.isFinite(setupContext.currentMarketPrice)
+        ) {
+            return res.status(422).json({
+                accepted: false,
+                code: 'INVALID_COLLECTION_SETUP',
+                error: 'The SBK1 decision is missing its validated setup context.',
+            });
+        }
+        const maxStakeText = process.env.SBK1_SIGNAL_MAX_STAKE_QUOTE?.trim();
+        const maxStakeQuote = Number(maxStakeText);
+        if (!maxStakeText || !Number.isFinite(maxStakeQuote) || maxStakeQuote <= 0 || maxStakeQuote > 100) {
+            return res.status(409).json({
+                accepted: false,
+                code: 'INVALID_COLLECTION_STAKE_CAP',
+                error: 'SBK1_SIGNAL_MAX_STAKE_QUOTE must be positive and no greater than 100 quote units.',
+            });
+        }
+        const maxSignalsText = process.env.SBK1_DRY_RUN_COLLECTION_MAX_SIGNALS_PER_DAY?.trim();
+        const maxSignalsPerDay = maxSignalsText
+            ? Number(maxSignalsText)
+            : DRY_RUN_COLLECTION_DEFAULT_MAX_SIGNALS_PER_DAY;
+        if (!Number.isSafeInteger(maxSignalsPerDay) || maxSignalsPerDay < 1) {
+            return res.status(409).json({
+                accepted: false,
+                code: 'INVALID_COLLECTION_DAILY_LIMIT',
+                error: 'SBK1_DRY_RUN_COLLECTION_MAX_SIGNALS_PER_DAY must be a positive integer.',
+            });
+        }
+        const signal = createDryRunCollectionSignal({
+            nowMs,
+            generatedAtMs: marketSnapshot.generatedAtMs,
+            exchange,
+            pair,
+            timeframe,
+            direction,
+            setupType: setupContext.setupType,
+            sweptLevelPrice: setupContext.currentMarketPrice,
+            referencePrice: marketSnapshot.ticker.last,
+            stopLoss: collectionDecision.tradeContract.stop,
+            takeProfit: collectionDecision.tradeContract.tp3,
+            observedAtMs: marketSnapshot.ticker.retrievedAtMs,
+            maxStakeQuote,
+        });
+        const analysisTimestamp = Number(rawCanonicalSnapshot.timestampUtc);
+        const featureSnapshot = {
+            ticker: { value: marketSnapshot.ticker.last, timestampMs: marketSnapshot.ticker.retrievedAtMs },
+            atr: { value: marketEvidence.atr, timestampMs: marketSnapshot.candles.at(-1)!.timestampMs },
+            obi: { value: marketEvidence.obi, timestampMs: marketSnapshot.orderBook!.timestampMs },
+            funding: { value: marketEvidence.fundingRate, timestampMs: marketSnapshot.fundingRate!.retrievedAtMs },
+            regime: { value: analysisValue.marketRegime, timestampMs: analysisTimestamp },
+        };
+        const archiveRecord = {
+            signalId: signal.signalId,
+            decisionTimestampMs: nowMs,
+            pair,
+            timeframe,
+            direction,
+            entry: collectionDecision.tradeContract.entryZone.target,
+            stop: signal.entryConditions.stopLoss,
+            target: signal.entryConditions.takeProfit,
+            featureSnapshot,
+            modelVersion: null,
+            predictorVersion: null,
+            dataQualityReport: { status: 'LIVE', timestampMs: analysisTimestamp },
+            gateResult: {
+                eligible: true,
+                reasons: ['DRY_RUN_COLLECTION', 'CALIBRATED_PROBABILITY_UNAVAILABLE'],
+            },
+            source: 'SBK1_DECISION',
+            collectionMode: DRY_RUN_COLLECTION_MODE,
+            datasetRecord: {
+                decisionId: signal.decisionId,
+                signalId: signal.signalId,
+                collectionMode: DRY_RUN_COLLECTION_MODE,
+                executionStatus: 'PREDICTED_ONLY',
+                timestamp: nowMs,
+                timestampIso: new Date(nowMs).toISOString(),
+                market: pair,
+                direction,
+                entryPrice: collectionDecision.tradeContract.entryZone.target,
+                stopPrice: signal.entryConditions.stopLoss,
+                tpLevels: { tp1: collectionDecision.tradeContract.tp1 },
+                features: featureSnapshot,
+                probability: null,
+            },
+        };
+        await runPredictionArchiveAction('append', { record: archiveRecord });
+        const record = await freqtradeSignalAdapter.submitDryRunCollection(signal, {
+            expectedPair: pair,
+            expectedExchange: exchange,
+            expectedTimeframe: timeframe,
+            maxSignalsPerDay,
+            minimumSpacingMs: DRY_RUN_COLLECTION_MINIMUM_SPACING_MS,
+            nowMs,
+        });
+        return res.status(record.duplicate ? 200 : 201).json({
+            accepted: true,
+            status: record.status,
+            signalId: signal.signalId,
+            decisionId: signal.decisionId,
+            collectionMode: DRY_RUN_COLLECTION_MODE,
+            expiresAtMs: signal.expiresAtMs,
+            duplicate: record.duplicate === true,
+        });
+    } catch (error) {
+        if (error instanceof FreqtradeMarketSnapshotValidationError) {
+            return res.status(503).json({
+                accepted: false,
+                code: error.code,
+                error: error.message,
+            });
+        }
+        if (error instanceof SbkSignalValidationError) {
+            return res.status(422).json({
+                accepted: false,
+                code: error.code,
+                error: error.message,
+            });
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Dry-run collection] Signal was not delivered:', message);
+        return res.status(503).json({
+            accepted: false,
+            code: 'DRY_RUN_COLLECTION_FAILED',
+            error: message,
+        });
+    }
+});
+
 app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdminAuth, async (_req, res) => {
     try {
         const configuredPair = freqtradeBridge.getConfiguredPair();
@@ -1934,6 +2483,21 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             });
         }
 
+        const maxStakeQuoteValue = process.env.SBK1_SIGNAL_MAX_STAKE_QUOTE?.trim();
+        const maxStakeQuote = Number(maxStakeQuoteValue);
+        if (
+            !maxStakeQuoteValue ||
+            !Number.isFinite(maxStakeQuote) ||
+            maxStakeQuote <= 0 ||
+            maxStakeQuote > 100
+        ) {
+            return res.status(409).json({
+                success: false,
+                code: 'DRY_RUN_FIXTURE_NOT_READY',
+                error: 'SBK1_SIGNAL_MAX_STAKE_QUOTE must be a positive amount no greater than 100 quote units.',
+            });
+        }
+
         const signal = createDryRunFixtureSignal({
             nowMs,
             exchange,
@@ -1942,6 +2506,7 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             referencePrice: ticker.last,
             observedAtMs: ticker.retrievedAtMs,
             source: 'freqtrade.dataprovider.ticker',
+            maxStakeQuote,
         });
         const record = await freqtradeSignalAdapter.submit(signal, {
             expectedPair: pair,
@@ -2073,7 +2638,9 @@ app.get('/api/market/freqtrade-snapshot', (_req, res) => {
 });
 
 app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) => {
-    if (process.env.SBK1_DRY_RUN_FIXTURE_ENABLED !== 'true') {
+    const fixtureEnabled = process.env.SBK1_DRY_RUN_FIXTURE_ENABLED === 'true';
+    const collectionEnabled = process.env.SBK1_DRY_RUN_COLLECTION_ENABLED === 'true';
+    if (!fixtureEnabled && !collectionEnabled) {
         const correlationId = crypto.randomUUID();
         try {
             await freqtradeSignalAdapter.cancelPending(
@@ -2117,8 +2684,31 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
             freqtradeBridge.getStatus(),
             freqtradeBridge.getWhitelist(),
         ]);
+        if (
+            collectionEnabled &&
+            (botState.dryRun !== true || botState.demoTrading !== false || botState.forceEntryEnabled !== false)
+        ) {
+            await freqtradeSignalAdapter.cancelPending(
+                'Dry-run collection is blocked because authenticated Freqtrade RPC did not confirm the required dry-run configuration.',
+            );
+            return res.status(503).json({
+                error: 'Signal delivery is disabled until calibrated probability evidence is available or the guarded dry-run fixture is explicitly enabled.',
+                code: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+                stage: 'CALIBRATION',
+                strategyMode: 'CALIBRATION_BLOCKED',
+            });
+        }
+        if (collectionEnabled && botState.maxOpenTrades !== 1) {
+            await freqtradeSignalAdapter.cancelPending(
+                'Dry-run collection is blocked because authenticated Freqtrade RPC did not confirm max_open_trades=1.',
+            );
+            return res.status(409).json({
+                error: 'Dry-run collection requires Freqtrade max_open_trades=1.',
+                code: 'DRY_RUN_COLLECTION_NOT_READY',
+            });
+        }
         const readinessError = getDryRunFixtureReadinessError(botState, {
-            enabled: true,
+            enabled: fixtureEnabled || collectionEnabled,
             killSwitchActive: false,
             configuredPair,
             expectedPair: pair,
@@ -2152,7 +2742,11 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
         return res.json({
             contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
             signals: records.filter((record) =>
-                record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX)
+                (fixtureEnabled &&
+                    record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX)) ||
+                (collectionEnabled &&
+                    botState.openTradesCount === 0 &&
+                    record.signal.collectionMode === DRY_RUN_COLLECTION_MODE)
             ),
         });
     } catch (error) {
@@ -2226,6 +2820,49 @@ app.get('/api/backtest/run', (_req, res) => {
 // Market data is accepted only from the authenticated Freqtrade DataProvider bridge.
 async function initializeServerRuntime() {
     console.log('[MARKET DATA] Waiting for Freqtrade DataProvider snapshots; no direct Bybit feed is started.');
+    try {
+        const result = await retryWithBackoff(
+            syncFreqtradeOutcomes,
+            {
+                attempts: 4,
+                initialDelayMs: 5_000,
+                onRetry: (error, nextAttempt, attempts) => {
+                    console.warn(
+                        `[Prediction archive] Startup outcome sync attempt ${nextAttempt}/${attempts} will retry:`,
+                        error instanceof Error ? error.message : String(error),
+                    );
+                },
+            },
+        );
+        console.info('[Prediction archive] Startup Freqtrade outcome sync completed.', {
+            processedCount: result.processedCount,
+            insertedCount: result.insertedCount,
+            unmatchedCount: result.unmatched.length,
+        });
+        if (result.unmatched.length > 0) {
+            console.warn('[Prediction archive] Closed Freqtrade trades have no exact archived decision link.', result.unmatched);
+        }
+    } catch (error) {
+        console.error(
+            '[Prediction archive] Startup Freqtrade outcome sync failed:',
+            error instanceof Error ? error.message : String(error),
+        );
+    }
+    const outcomeSyncTimer = setInterval(() => {
+        void syncFreqtradeOutcomes().then((result) => {
+            if (result.unmatched.length > 0) {
+                console.warn('[Prediction archive] Closed Freqtrade trades have no exact archived decision link.', result.unmatched);
+            }
+        }).catch((error: unknown) => {
+            console.error(
+                '[Prediction archive] Periodic Freqtrade outcome sync failed:',
+                error instanceof Error ? error.message : String(error),
+            );
+        });
+    }, 60_000);
+    outcomeSyncTimer.unref();
+    process.once('SIGTERM', () => clearInterval(outcomeSyncTimer));
+    process.once('SIGINT', () => clearInterval(outcomeSyncTimer));
 }
 
 // API Live Toggling Routes (Item 2)
@@ -2259,18 +2896,22 @@ async function startServer() {
 
   app.use(viteServer.middlewares);
 
-  // Freqtrade owns exchange connectivity, market feeds, and the trade lifecycle.
-  await initializeServerRuntime();
-  if (shutdownRequested) {
-    await viteServer.close();
-    return;
-  }
-
   const port = Number(process.env.SBK1_PORT || 3000);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
   }
-  httpServer = app.listen(port, '0.0.0.0', () => console.log(`Server running on port ${port}`));
+  const listenHost = process.env.SBK1_LISTEN_HOST?.trim() || '0.0.0.0';
+  httpServer = app.listen(port, listenHost, () => {
+    console.log(`Server running on port ${port}`);
+    if (!shutdownRequested) {
+      void initializeServerRuntime().catch((error: unknown) => {
+        console.error(
+          '[Prediction archive] Runtime initialization failed:',
+          error instanceof Error ? error.message : String(error),
+        );
+      });
+    }
+  });
 }
 
 async function shutdownServer(signal: NodeJS.Signals): Promise<void> {

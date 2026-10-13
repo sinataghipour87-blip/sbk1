@@ -21,6 +21,7 @@ const environment = {
 };
 const config = {
   dry_run: true,
+  max_open_trades: 1,
   strategy: 'SbkSignalStrategy',
   trading_mode: 'futures',
   timeframe: '15m',
@@ -63,6 +64,14 @@ assert.throws(
   () => validateRuntimeSettings({ ...config, force_entry_enable: true }, environment),
   /force_entry_enable must be false/,
 );
+assert.throws(
+  () => validateRuntimeSettings({ ...config, max_open_trades: 2 }, {
+    ...environment,
+    SBK1_DRY_RUN_COLLECTION_ENABLED: 'true',
+  }),
+  /max_open_trades to be exactly 1/,
+);
+assert.doesNotThrow(() => validateRuntimeSettings({ ...config, max_open_trades: 2 }, environment));
 assert.throws(
   () => validateRuntimeSettings({
     ...config,

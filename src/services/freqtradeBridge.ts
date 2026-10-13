@@ -9,6 +9,7 @@ export interface FreqtradeBotState {
   demoTrading?: boolean;
   dryRun: boolean;
   forceEntryEnabled: boolean;
+  maxOpenTrades?: number;
   openTradesCount: number;
   lastChecked: number;
 }
@@ -30,15 +31,27 @@ export interface FreqtradeTrade {
   pair: string;
   is_open: boolean;
   is_short: boolean;
+  enter_tag?: string | null;
   amount: number;
   amount_requested: number | null;
   open_rate: number;
+  open_timestamp?: number;
   stake_amount: number;
   has_open_orders: boolean;
   orders: FreqtradeOrder[];
+  fee_open?: number | null;
   fee_open_cost: number | null;
+  fee_open_currency?: string | null;
+  fee_close?: number | null;
   fee_close_cost: number | null;
+  fee_close_currency?: string | null;
   open_fill_timestamp: number | null;
+  close_rate?: number | null;
+  close_profit?: number | null;
+  close_profit_pct?: number | null;
+  close_profit_abs?: number | null;
+  exit_reason?: string | null;
+  funding_fees?: number | null;
   close_timestamp: number | null;
 }
 
@@ -110,6 +123,7 @@ interface FreqtradeConfig {
   state?: string;
   stake_currency?: string;
   force_entry_enable?: boolean;
+  max_open_trades?: number;
 }
 
 interface FreqtradeWhitelistResponse {
@@ -294,6 +308,7 @@ class FreqtradeBridge {
       demoTrading: config.demo_trading,
       dryRun: config.dry_run,
       forceEntryEnabled: config.force_entry_enable,
+      maxOpenTrades: config.max_open_trades,
       openTradesCount: trades.length,
       lastChecked: Date.now(),
     };
@@ -337,6 +352,51 @@ class FreqtradeBridge {
     return trades;
   }
 
+  async getTrades(limit = 500, offset = 0): Promise<FreqtradeTrade[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500 ||
+      !Number.isSafeInteger(offset) || offset < 0) {
+      throw new FreqtradeRpcError('Freqtrade trade-history limit must be an integer between 1 and 500.');
+    }
+    const history = await this.request<FreqtradeTradesResponse>(
+      `/trades?limit=${limit}&offset=${offset}&order_by_id=true`,
+    );
+    if (!Array.isArray(history.trades)) {
+      throw new FreqtradeRpcError('Freqtrade RPC returned an invalid trade-history response.');
+    }
+    return history.trades.map((trade) => {
+      if (!trade || !Number.isSafeInteger(trade.trade_id) || trade.trade_id <= 0) {
+        throw new FreqtradeRpcError('Freqtrade trade history contains an invalid trade ID.');
+      }
+      return this.validateTrade(trade, trade.trade_id);
+    });
+  }
+
+  async getClosedTrades(limit = 50): Promise<FreqtradeTrade[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new FreqtradeRpcError('Closed-trade history limit must be an integer between 1 and 500.');
+    }
+    const trades = await this.getTrades(500);
+    return trades.filter((trade) => !trade.is_open).slice(-limit).reverse();
+  }
+
+  async getAllClosedTrades(): Promise<FreqtradeTrade[]> {
+    const closedTrades: FreqtradeTrade[] = [];
+    const seenTradeIds = new Set<number>();
+    let offset = 0;
+    while (true) {
+      const page = await this.getTrades(500, offset);
+      for (const trade of page) {
+        if (seenTradeIds.has(trade.trade_id)) {
+          throw new FreqtradeRpcError(`Freqtrade trade history repeated trade ID ${trade.trade_id} across pages.`);
+        }
+        seenTradeIds.add(trade.trade_id);
+        if (!trade.is_open) closedTrades.push(trade);
+      }
+      if (page.length < 500) return closedTrades;
+      offset += page.length;
+    }
+  }
+
   async getTrade(tradeId: string | number): Promise<FreqtradeTrade> {
     const normalizedId = String(tradeId);
     if (!/^\d+$/.test(normalizedId)) {
@@ -359,11 +419,18 @@ class FreqtradeBridge {
   }
 
   private validateTrade(trade: FreqtradeTrade, expectedId: number): FreqtradeTrade {
+    const nullableFinite = (value: unknown): boolean =>
+      value === null || value === undefined || (typeof value === 'number' && Number.isFinite(value));
+    const nullableTimestamp = (value: unknown): boolean =>
+      value === null || value === undefined || (Number.isSafeInteger(value) && Number(value) >= 0);
     if (
       !trade ||
       trade.trade_id !== expectedId ||
+      expectedId <= 0 ||
       typeof trade.is_open !== 'boolean' ||
       typeof trade.is_short !== 'boolean' ||
+      typeof trade.pair !== 'string' ||
+      !trade.pair.trim() ||
       !Array.isArray(trade.orders) ||
       !trade.orders.every((order) =>
         typeof order.ft_order_side === 'string' &&
@@ -374,7 +441,23 @@ class FreqtradeBridge {
         Number.isFinite(order.safe_price)
       ) ||
       !Number.isFinite(trade.amount) ||
-      !Number.isFinite(trade.open_rate)
+      !Number.isFinite(trade.open_rate) ||
+      !nullableFinite(trade.fee_open) ||
+      !nullableFinite(trade.fee_open_cost) ||
+      !nullableFinite(trade.fee_close) ||
+      !nullableFinite(trade.fee_close_cost) ||
+      !nullableFinite(trade.close_rate) ||
+      !nullableFinite(trade.close_profit) ||
+      !nullableFinite(trade.close_profit_pct) ||
+      !nullableFinite(trade.close_profit_abs) ||
+      !nullableFinite(trade.funding_fees) ||
+      !nullableTimestamp(trade.open_timestamp) ||
+      !nullableTimestamp(trade.open_fill_timestamp) ||
+      !nullableTimestamp(trade.close_timestamp) ||
+      (trade.enter_tag !== undefined && trade.enter_tag !== null && typeof trade.enter_tag !== 'string') ||
+      (trade.exit_reason !== undefined && trade.exit_reason !== null && typeof trade.exit_reason !== 'string') ||
+      (trade.fee_open_currency !== undefined && trade.fee_open_currency !== null && typeof trade.fee_open_currency !== 'string') ||
+      (trade.fee_close_currency !== undefined && trade.fee_close_currency !== null && typeof trade.fee_close_currency !== 'string')
     ) {
       throw new FreqtradeRpcError(`Freqtrade returned invalid order state for trade ${expectedId}.`);
     }

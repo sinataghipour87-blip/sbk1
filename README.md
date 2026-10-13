@@ -1,5 +1,103 @@
 # SBK1 + Freqtrade
 
+## Quick start
+
+- Install Node.js dependencies with `npm ci`; set up private Freqtrade config and `.env` as described below.
+- Keep Freqtrade configured with `dry_run: true` and `force_entry_enable: false`.
+- Validate local configuration and strategy discovery with `npm run sbk1:check`.
+- Start the managed SBK1 and Freqtrade dry-run services with `npm run sbk1`.
+- Run the automated checks with `npm test`, `npm run lint`, and `npm run build`.
+
+## Current status
+
+**Dry-run only. Production signals are blocked. This integration is not production-ready.**
+
+## Server-side prediction archive
+
+SBK1 candidate decisions are appended to `data/prediction-archive/archive.sqlite`.
+The directory is git-ignored. The SQLite store rejects row updates and deletes,
+validates feature and data-quality timestamps against the decision timestamp,
+and creates an online SQLite backup at
+`data/prediction-archive/backups/archive-YYYYMMDD.sqlite` on the first new
+record of each UTC day. Copy the database and its backup directory together
+when taking a manual backup; avoid copying the database while SQLite is actively
+writing.
+
+The following admin-authenticated endpoints use the existing `ADMIN_TOKEN`
+(`x-admin-token` header):
+
+- `GET /api/prediction-archive?limit=100&offset=0` lists records as JSON.
+- `GET /api/prediction-archive?limit=500&offset=0&format=csv` exports one
+  page as CSV. Increase `offset` by the page size to export subsequent pages.
+- `POST /api/prediction-archive/records` appends a candidate decision.
+- `POST /api/prediction-archive/import-local` imports an explicitly exported
+  localStorage array in `{ "records": [...] }`. Imported rows are always marked
+  `UNVERIFIED_LOCAL`, their gate is forced ineligible, and prior outcome
+  verification fields are cleared. The server cannot read a browser's
+  localStorage directly, so no local records are migrated unless they are
+  explicitly exported and submitted.
+- `GET /api/prediction-archive/status` reports decision and authenticated
+  Freqtrade outcome counts, calibration minimum gaps, and outcomes without an
+  exact decision link.
+- `POST /api/prediction-archive/sync-freqtrade` triggers an authenticated RPC
+  refresh of closed trades. The same refresh runs at server startup and every
+  60 seconds. Outcomes are joined only by the exact signal tag or an exact
+  Freqtrade trade-ID lifecycle update; unmatched outcomes remain visible and
+  are never attached by pair, time, or price similarity.
+
+Only a positive trade ID from the authenticated Freqtrade RPC history can
+create a `FREQTRADE_CONFIRMED` outcome. The feature snapshot remains immutable;
+outcomes are stored separately and projected onto an exact linked decision when
+the archive is read. Calibration readiness counts only joined outcomes and
+does not change the production signal gate.
+
+Archive errors are surfaced to the caller; failed writes do not change decision
+or production-gate behavior. Archive storage does not authorize signal
+delivery, which remains blocked by the existing calibration and kill-switch
+gates.
+
+## Dry-run collection path
+
+The optional `SBK1_DRY_RUN_COLLECTION_ENABLED` feature flag defaults to
+`false`. When enabled, it exposes a separate, explicitly tagged data-collection
+path; it does not enable or relax the production signal route. Production
+submissions continue to fail closed with `CALIBRATED_CONFIDENCE_UNAVAILABLE`
+while calibrated probability evidence is missing.
+
+Collection delivery is allowed only while authenticated Freqtrade RPC
+confirms **on every signal poll** that `dry_run=true`, `demo_trading=false`,
+and `force_entry_enable=false`. An unavailable or mismatched RPC response
+delivers no collection signals. There must be no open Freqtrade trade, no
+earlier collection signal still active, and the SBK1 kill switch must be
+disarmed. Both the managed launcher and authenticated Freqtrade RPC must
+confirm `max_open_trades=1`, and the strategy rejects collection entries while
+any Freqtrade trade is open. The collection decision must pass the normal fresh-LIVE-data,
+data-quality, order-book-imbalance, funding, ATR, calibrated-regime,
+no-trade-veto, and remaining unified decision/risk gates. Only the calibration-
+dependent probability/expected-value stage is exempted, and only when the
+pipeline's independent historical-expectancy and trade-quality evidence passes.
+This is still a real SBK1 decision, not a fixture.
+
+Every accepted decision is archived with `collectionMode=DRY_RUN_COLLECTION`
+and its deterministic signal ID is reused by the Freqtrade signal contract.
+Freqtrade entry tags carry the `DRY_RUN_COLLECTION:` prefix; exact linked
+outcomes are separately classified as `DRY_RUN_COLLECTION`. The calibration
+status response reports confirmed and matched counts by execution mode. Dry-run
+and collection outcomes do not reduce calibration minimum gaps; only separately
+classified `LIVE` outcomes count toward the existing 40/20/200 minimums, and
+the production signal route remains disabled. Limits are one open trade at a time,
+one active collection signal, at least five minutes between signals, at most
+10 accepted signals per UTC day by default
+(`SBK1_DRY_RUN_COLLECTION_MAX_SIGNALS_PER_DAY`), 1x leverage, a 60-second
+signal expiry, and the required `SBK1_SIGNAL_MAX_STAKE_QUOTE` cap (positive
+and no greater than 100 quote units).
+
+Freqtrade dry-run orders and fills are **simulated**; their fill behavior can
+be materially more optimistic than live execution. Outcomes collected here
+must not be treated as sufficient calibration or as authorization for live
+trading by themselves. Live trading remains disabled and the dry-run,
+authentication, and kill-switch gates must not be weakened.
+
 SBK1 remains the TypeScript/React analysis and monitoring application. Freqtrade is the sole owner of exchange credentials, order placement, fills, open positions, stop-losses, exits, and trade persistence. The Node service validates a narrow, versioned SBK1 signal contract and provides an authenticated pull queue to a Freqtrade strategy. Production SBK1 signals remain blocked pending calibrated-probability evidence; an explicitly enabled, tightly gated dry-run fixture is available only for integration testing. The browser never calls the Freqtrade API.
 
 This integration is **not declared production-ready**. The checked-in Freqtrade configuration is a dry-run template; no live exchange order, fill, restart recovery, or end-to-end deployment was executed in this workspace.
@@ -23,7 +121,7 @@ The requested `sbk1-main.zip` and `freqtrade-develop.zip` were not present in th
 
 - Audit real downloaded Freqtrade Feather OHLCV before backtesting with `.venv/bin/python scripts/audit_freqtrade_market_data.py freqtrade/user_data/data/bybit/futures/BTC_USDT_USDT-15m-futures.feather --timeframe 15m`. It checks timestamp order and cadence, missing intervals, finite values, OHLC geometry, future timestamps, and counts incomplete candles separately. It does not establish that historical order-flow features or SBK1 decisions are available.
 - In the 2026-10-11 workspace audit, Bybit returned 35,109 BTC/USDT:USDT 15m candles from 2025-10-11 through 2026-10-11; the OHLCV audit found no gaps or malformed rows. Freqtrade's SbkSignalStrategy backtest on that history produced zero trades because the live external-signal queue is intentionally not consumed in backtesting. Zero trades is not a performance result.
-- The Freqtrade database had no trade rows in that workspace, and the SBK1 prediction dataset is currently persisted in browser `localStorage`, not a shared server-side historical archive. Browser/local outcomes are marked `UNVERIFIED_LOCAL`; model training, empirical segments, and fill-rate metrics now require `FREQTRADE_CONFIRMED` plus a positive Freqtrade trade ID. No current path writes that verified label, so calibration remains closed until an authenticated Freqtrade outcome archive is implemented. The calibration engine requires labeled feature snapshots: at least 40 training samples, 20 validation samples, and a dynamically sized out-of-sample set (at least 200), including both win and loss outcomes. The current workspace therefore has no basis for a calibrated probability or an eligible production signal.
+- The server-side prediction archive is implemented and periodically synchronizes authenticated Freqtrade closed-trade history. It writes a `FREQTRADE_CONFIRMED` outcome only for a positive Freqtrade trade ID joined to an exact archived decision by signal tag or trade-ID lifecycle update; unmatched outcomes remain unlinked. Browser/local outcomes remain `UNVERIFIED_LOCAL`. Calibration still requires labeled feature snapshots: at least 40 training samples, 20 validation samples, and a dynamically sized out-of-sample set (at least 200), including both win and loss outcomes. The archived decisions and verified outcomes currently do not establish those requirements, so no calibrated probability or eligible production signal is available.
 - Until timestamped historical SBK1 decisions, their contemporaneous features, and authoritative Freqtrade outcomes can be joined and validated, `/api/backtest/run` returns `HISTORICAL_SIGNALS_UNAVAILABLE`, the dashboard does not display synthetic metrics, and production signal delivery remains fail-closed.
 
 ## Signal and state ownership
@@ -46,7 +144,7 @@ The requested `sbk1-main.zip` and `freqtrade-develop.zip` were not present in th
 ## Safety controls and order lifecycle
 
 - SBK1 starts with its server-side kill switch engaged unless a valid persisted state says otherwise. Engaging it blocks new SBK1 signals, stops SBK1 auto-trade, and cancels unclaimed queued signals. It does **not** cancel exchange orders already submitted by Freqtrade or close/modify open positions; the API reports those as unaffected. Reconciliation and position management remain Freqtrade's responsibility. State is persisted in the ignored runtime file `database_kill_switch.json`.
-- SBK1 supports BACKTEST, TESTNET, and PAPER selection only. Its mode endpoint rejects LIVE; the order-flow execution route and production Freqtrade signal delivery fail closed because this heuristic path has no calibrated probability evidence. The optional dry-run fixture is a separate admin-only test path, refuses delivery unless Freqtrade RPC verifies `dry_run=true`, and never turns off Freqtrade's force-entry guard. Freqtrade's example config listens on loopback with authentication enabled and force-entry disabled. Never expose the Freqtrade management API publicly; configure credentials and permissions (withdrawal disabled and IP-restricted keys) only in the private Freqtrade deployment.
+- Execution-mode selection is not an authorization to execute trades. The client recognizes `BACKTEST`, `DRY_RUN`, `TESTNET`, `PAPER`, and `LIVE`; its default is `DRY_RUN`, and previously saved `LIVE`/`TESTNET` values are migrated to `DRY_RUN`. The server's mode endpoint accepts only `BACKTEST`, `TESTNET`, and `PAPER` selections and rejects `LIVE`; its in-memory initial value is `BACKTEST`. Separately, the managed Freqtrade integration and optional admin-only fixture are dry-run-only: the fixture requires authenticated RPC confirmation of `dry_run=true` and never turns off Freqtrade's force-entry guard. The order-flow execution route and production Freqtrade signal delivery fail closed because calibrated probability evidence is unavailable. Freqtrade's example config listens on loopback with authentication enabled and force-entry disabled. Never expose the Freqtrade management API publicly; configure credentials and permissions (withdrawal disabled and IP-restricted keys) only in the private Freqtrade deployment.
 - Cross-origin browser access is denied unless the request is same-origin or its exact origin is listed in `SBK1_ALLOWED_ORIGINS`. Admin and bridge routes require server-side authentication. Keep `.env`, Freqtrade configuration, bridge tokens, and API credentials private.
 - Order states are `CREATED → SUBMITTED → ACKNOWLEDGED → PARTIALLY_FILLED → FILLED`, with explicit `REJECTED`, `CANCELLED`, and `UNKNOWN_IN_FLIGHT` branches. Unknown submissions must be reconciled with Freqtrade/exchange before retry; repeated signal IDs are idempotent. Actual fill prices, fees, protective orders, orders, and positions are only confirmed from Freqtrade/exchange state, never from a local estimate.
 
@@ -98,18 +196,42 @@ The example targets Bybit USDT futures and `BTC/USDT:USDT`, because SBK1's curre
 - Node dependencies are recorded in `package-lock.json`. Freqtrade's Python dependencies are declared in its project metadata, but a clean dependency install and hash-locked Python environment were not verified.
 - No files were removed because no safe deletion was demonstrated. Freqtrade engine/database, strategy, analysis, audit, recovery, tests, and dry-run artifacts have distinct active uses. SBK1 JSON records remain signal/audit records, not authoritative trade state.
 
-## Validation evidence and remaining blockers
+## Validation evidence
 
-- **Successful:** `npm test` passed: 18 fail-closed scenarios, TypeScript/Python signal-contract checks, dry-run fixture gate checks, authenticated local mock RPC checks, runtime configuration tests, and 24 Python unit tests. The mock asserted that no order endpoint was called.
-- **Successful:** `npm run sbk1:check` passed configuration checks and discovered `SbkSignalStrategy` through Freqtrade `list-strategies` with status `OK`.
-- **Successful:** targeted TypeScript checking of `scripts/run_sbk1.ts` and `scripts/verify_sbk1_runtime.ts` passed with ESNext/Bundler module resolution. Python syntax validation and `git diff --check` passed after the changes.
-- **Successful:** `npm run lint` (`tsc --noEmit`) and `npm run build` passed; build reports a large-chunk warning of approximately 1.59 MB.
-- **Successful, read-only managed Dry-run:** Freqtrade RPC confirmed `dry_run=true`, `demo_trading=false`, `force_entry_enable=false`, `SbkSignalStrategy`, Bybit futures, and zero open trades. The DataProvider snapshot contained 500 completed candles, order book, and funding; ticker was unavailable. Production signal polls returned HTTP 503 with `CALIBRATED_CONFIDENCE_UNAVAILABLE` and a correlation ID. No fixture was submitted and no order was sent.
-- **Successful:** after the owner-authorized SIGINT of the stale stack, `npm run sbk1` started both services, `npm run sbk1:status` passed, and `/api/health` returned `200 application/json` with `{"status":"ok","service":"sbk1"}`. A subsequent managed Ctrl+C stopped both children, released the ports, and removed the supervisor lock.
-- **Successful, dry-run only:** an authenticated fixture request returned HTTP 201. Freqtrade created a simulated limit entry, timed it out/cancelled it under the 15-second configuration, and reported no fill or open position. SBK1 initially remained `ORDER_SUBMITTED`; after adding reconciliation against Freqtrade's open trades and restarting the managed stack, the record transitioned to `CANCELLED`. This validates cancellation reconciliation, not fill or active-position recovery.
-- **Not run:** clean `npm ci`/Python install; fill/partial-fill and active-position restart recovery E2E; stop/exit/kill-switch E2E; Freqtrade's full core test suite; fee/slippage backtest, look-ahead audit, and out-of-sample evaluation. No live order was sent.
-- Production signal delivery remains blocked because the current predictor is a heuristic, not calibrated evidence. Fixture tests exercise validation and guards only; they do not prove a real order lifecycle, model performance, or production readiness.
-- The existing browser dashboard's access to protected admin/status endpoints and closed-trade history was not validated end to end.
+- **Validation commands:** `npm test` passed (18 mandatory fail-closed scenarios and 48 Python tests, including authenticated mock-RPC lifecycle tests and the bounded-retry test); `npm run lint`, `npm run build`, and `npm run sbk1:check` passed. The production build emits its existing large-chunk warning. `npm run sbk1:status` passed while the real managed stack was running.
+- **Real managed stack and safety:** Authenticated Freqtrade RPC reported `dry_run=true`, `demo_trading=false`, `force_entry_enable=false`, and `state=running` on Bybit futures with `max_open_trades=1`. SBK1 used the real DataProvider snapshot (HTTP 200; BTC/USDT:USDT, 15m, 500 candles and a ticker). No live mode, force-entry, direct exchange order, or exchange credential was used. The dry-run database backup `backups/tradesv3.dryrun.before-lifecycle-20261013T204243Z.sqlite` is git-ignored and passed `PRAGMA quick_check`.
+- **Real fixture outcomes:** A first request at 20:45:41 UTC was rejected with `FREQTRADE_TICKER_UNAVAILABLE` and created no signal. Four fixtures were subsequently accepted by the authenticated endpoint (HTTP 201), each capped at 10 quote units:
+  - `sbk1_c57bf3672d1ae7cb18d06b25ed10b817`: `ACCEPTED` was observed at 20:46:16.784 and 20:46:31.318 UTC. SBK1 received SIGINT while it was queued; after restart, the same signal ID was still readable and was observed `REJECTED` at 20:47:22.881 with reason `Signal failed Freqtrade freshness or configuration validation.` The unchanged `ACCEPTED` state was not confirmed immediately after restart.
+  - `sbk1_8bfe4babc877d35414a4bbbf1ff790a7`: `ACCEPTED` at 20:48:46.793 and 20:49:05.273 UTC; `REJECTED` at 20:49:46.685 with reason `Signal failed Freqtrade freshness or configuration validation.`
+  - `sbk1_56eeca5e61d4a4aa294ea5a8c38d5100`: `ACCEPTED` at 20:55:49.778 UTC. The authenticated kill-switch endpoint was engaged at 20:55:49.787, reported `cancelledSignals=1`, and the same signal was `CANCELLED` at 20:55:49.816 with reason `SBK1 kill switch cancelled this queued signal.`
+  - `sbk1_57b2750f14d18d1cd256ecc28386fc78`: `ACCEPTED` at 20:56:34.715 and 20:56:53.634 UTC; `REJECTED` at 20:57:34.771 with reason `Signal failed Freqtrade freshness or configuration validation.`
+- **Real trade, order, exit, and recovery evidence:** Freqtrade reported zero open trades and `/api/live/closed-trades` returned zero records. No fixture produced a Freqtrade trade or order; no fill or exit was observed. The queued-signal restart preserved the same signal ID, but unchanged-status recovery was not demonstrated because its terminal rejection occurred before the post-restart observation. `STRATEGY_ACCEPTED`, `ORDER_SUBMITTED`, `PARTIALLY_FILLED`, and `FILLED` were not observed on the real stack, and no real open-position kill-switch case was available. The kill-switch response reported `existingPositionsAffected=false`; the separate open-position case is mock-only.
+- **Real prediction archive and production gate:** Startup outcome sync completed after retry with `processedCount=0`, `insertedCount=0`, and `unmatchedCount=0`. `/api/prediction-archive/status` returned HTTP 200 with zero decisions, confirmed outcomes, and matched outcomes; `unmatchedOutcomes` was empty. With no closed fixture trade, no `FREQTRADE_CONFIRMED` outcome or exact decision link was available to verify. After cleanup, authenticated production polling of `/api/freqtrade/signals` returned HTTP 503, `CALIBRATED_CONFIDENCE_UNAVAILABLE`, stage `CALIBRATION`. Final settings were `SBK1_DRY_RUN_FIXTURE_ENABLED=false` and an empty `SBK1_SIGNAL_MAX_STAKE_QUOTE`; the authenticated admin endpoint re-engaged the kill switch, and final live status showed zero open trades.
+- **Startup-sync fix:** The server now begins listening before the startup archive sync, avoiding a startup-order deadlock with the managed launcher, which starts Freqtrade after the API health check. Startup sync retries four times with exponential delays (5, 10, and 20 seconds), logs retries, and continues if RPC remains unavailable. On the real run it retried while Freqtrade was starting, then completed successfully with zero trades to process. The retry bound and terminal error behavior are covered by `scripts/verify_bounded_retry.ts`.
+- **Mock-only evidence:** Automated tests cover complete/partial fills, rejected orders, expiry, queued kill-switch cancellation, open-position preservation on kill-switch engagement, stop-loss/exit reconciliation, and signal-store/strategy restart recovery for queued, claimed, submitted, partial-fill, and filled cases. These scenarios were not observed against real Freqtrade in this run.
+- **Other not verified:** Clean dependency installation; Freqtrade's full core test suite; fee/slippage backtest, look-ahead audit, and out-of-sample evaluation.
+
+## Remaining blockers
+
+- Build a sufficient, timestamped corpus of SBK1 feature snapshots and exact-linked Freqtrade-confirmed outcomes to meet the training, validation, and out-of-sample minimums, including both wins and losses. Current archive status does not establish calibration readiness.
+- Validate the resulting probability model with leakage/look-ahead review, fee- and slippage-aware backtests, and out-of-sample evaluation. Current heuristic and fixture results do not establish model performance.
+- Exercise the complete lifecycle against a real Freqtrade dry-run instance, including fixture acceptance, fills/exits, timeout/cancellation, and restart recovery. Current lifecycle evidence is from mock RPC tests; the documented fixture attempt was rejected while the kill switch was engaged.
+- Complete a clean dependency installation and run Freqtrade's full core test suite; neither was verified in the recorded integration run.
+- Before any production deployment, review and implement the required durable, transactional shared queue/store and private-network/TLS deployment controls; the current signal store is single-process and the managed launcher is loopback-only.
+
+### Repeatable dry-run lifecycle procedure
+
+Run the following automated procedure from the repository root. It uses loopback-only HTTP servers, temporary signal/kill-switch stores, a local mock Freqtrade RPC, and a test-only admin token; it does not contact an exchange or a live Freqtrade service:
+
+```sh
+npm test
+```
+
+`npm test` includes `verify_freqtrade_order_lifecycle.ts` for fill, partial-fill, rejection, expiry, queued kill-switch, stop/exit reconciliation, and idempotent adapter restart checks; `verify_freqtrade_dashboard_endpoints.ts` starts a local SBK1 server against the mock RPC to verify admin-authenticated status/history reads and that an open position is unaffected by the kill switch. The Python strategy tests use mocked Freqtrade trade records to restart the strategy in queued, claimed, submitted, partial, and filled states. None of these tests sends an RPC order command except the force-exit request to the local mock, and the mock is configured as `dry_run=true`.
+
+For a separate, real Freqtrade **dry-run only** exercise, first provide private configuration and run `npm run sbk1:check`; do not proceed unless it confirms `dry_run=true`, `force_entry_enable=false`, loopback RPC, and the expected strategy/pair. Keep exchange credentials absent for this exercise, confirm the configured Freqtrade trade database is backed up, and begin with no open trades. Enable `SBK1_DRY_RUN_FIXTURE_ENABLED=true` and a deliberately reviewed positive `SBK1_SIGNAL_MAX_STAKE_QUOTE` only for the fixture session. Start with `npm run sbk1`, verify `npm run sbk1:status`, and submit a fixture only through the authenticated `/api/freqtrade/dry-run-test-signal` endpoint. Observe the returned signal ID in `/api/hunter/signals/:signalId` and correlate it with Freqtrade's status/trade history. To test the queued kill switch, engage it before Freqtrade claims the fixture; for the open-position case, wait for an actual Freqtrade dry-run fill and confirm `/api/live/status` still reports the position after engaging the switch. Exercise natural Freqtrade stop-loss/exit behavior and inspect the same trade's persisted orders/history. Never call SBK1 direct exchange routes or use `force-entry`.
+
+For restart recovery, create and observe one fixture at a time in `ACCEPTED` (queued), `STRATEGY_ACCEPTED` (claimed), `ORDER_SUBMITTED`, then `FILLED`. At each observed state, stop the managed stack with Ctrl+C, preserve both stores, restart with `npm run sbk1`, and verify the same signal ID/status and Freqtrade trade/order record through the protected endpoints and authenticated Freqtrade RPC. Do not resubmit a signal in `UNKNOWN_IN_FLIGHT`; investigate the Freqtrade database first. Disable the fixture flag and clear the stake override after the session. Deterministic full/partial fills and rejection are not guaranteed by this fixture mechanism; use the mock suite for repeatable outcome coverage. These real-runtime steps are a procedure, **not evidence that the scenarios have been run**.
 
 ## Clean setup, backup, and upgrade notes
 

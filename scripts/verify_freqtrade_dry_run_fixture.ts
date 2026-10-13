@@ -15,6 +15,7 @@ const botState: FreqtradeBotState = {
   exchange: 'bybit',
   market: 'futures',
   timeframe: '15m',
+  demoTrading: false,
   dryRun: true,
   forceEntryEnabled: false,
   openTradesCount: 0,
@@ -31,6 +32,11 @@ const configuration = {
 };
 
 assert.equal(getDryRunFixtureReadinessError(botState, configuration), undefined);
+assert.equal(
+  getDryRunFixtureReadinessError({ ...botState, demoTrading: true }, configuration),
+  undefined,
+  'the existing fixture readiness behavior remains unchanged when collection mode is not requested',
+);
 assert.match(
   getDryRunFixtureReadinessError({ ...botState, dryRun: false }, configuration) || '',
   /dry_run=true/,
@@ -72,6 +78,7 @@ const signal = createDryRunFixtureSignal({
   referencePrice: 62_000,
   observedAtMs: nowMs,
   source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+  maxStakeQuote: 100,
 });
 assert.equal(signal.market, 'futures');
 assert.equal(signal.direction, 'LONG');
@@ -80,6 +87,18 @@ assert.equal(signal.expiresAtMs - signal.generatedAtMs, 60_000);
 assert.equal(signal.riskLimits.maxStakeQuote, 100);
 assert.equal(signal.riskLimits.riskBudgetPct, 0.1);
 assert.equal(signal.riskLimits.maxLeverage, 1);
+
+const cappedSignal = createDryRunFixtureSignal({
+  nowMs,
+  exchange: 'bybit',
+  pair: 'BTC/USDT:USDT',
+  timeframe: '15m',
+  referencePrice: 62_000,
+  observedAtMs: nowMs,
+  source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+  maxStakeQuote: 10,
+});
+assert.equal(cappedSignal.riskLimits.maxStakeQuote, 10);
 
 assert.throws(
   () => createDryRunFixtureSignal({
@@ -90,6 +109,7 @@ assert.throws(
     referencePrice: 0,
     observedAtMs: nowMs,
     source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+    maxStakeQuote: 100,
   }),
   (error: unknown) => error instanceof SbkSignalValidationError,
 );
@@ -102,6 +122,7 @@ assert.throws(
     referencePrice: 62_000,
     observedAtMs: nowMs - 56_000,
     source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+    maxStakeQuote: 100,
   }),
   (error: unknown) => error instanceof SbkSignalValidationError,
 );
