@@ -1,7 +1,7 @@
 import unittest
 import sys
 import copy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -201,7 +201,10 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         signal["riskLimits"]["maxStakeQuote"] = 10
         self.strategy._signals = {self.signal_id: signal}
 
-        with patch.object(self.strategy, "_post_status", return_value=True) as post_status:
+        with (
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+            self.assertLogs("SbkSignalStrategy", level="INFO") as captured,
+        ):
             stake = self.strategy.custom_stake_amount(
                 "BTC/USDT:USDT",
                 datetime.fromtimestamp(self.now_ms / 1000, UTC),
@@ -215,11 +218,40 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(stake, 0.0)
+        self.assertTrue(any(
+            "decision=stake-zero" in line
+            and "minimum_stake=87.616725000" in line
+            and "selected_stake=10.000000000" in line
+            for line in captured.output
+        ))
         post_status.assert_called_once_with(
             self.signal_id,
             "REJECTED",
             "Freqtrade minimum stake 87.6167 exceeds the risk-bounded signal stake 10.",
         )
+
+    def test_queue_poll_logs_http_status_and_throttles_unchanged_responses(self):
+        self.response.status_code = 200
+        self.response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [],
+        }
+        first_poll = datetime.fromtimestamp(self.now_ms / 1000, UTC)
+
+        with (
+            patch.object(self.strategy, "_publish_market_snapshot", return_value=True),
+            patch("SbkSignalStrategy.requests.get", return_value=self.response),
+            self.assertLogs("SbkSignalStrategy", level="INFO") as captured,
+        ):
+            self.strategy.bot_loop_start(first_poll)
+            self.strategy.bot_loop_start(first_poll + timedelta(seconds=5))
+            self.strategy.bot_loop_start(first_poll + timedelta(seconds=30))
+
+        poll_logs = [line for line in captured.output if "SBK1 queue poll" in line]
+        self.assertEqual(len(poll_logs), 2)
+        self.assertIn("http_status=200", poll_logs[0])
+        self.assertIn("signals_returned=0", poll_logs[0])
+        self.assertIn(first_poll.isoformat(timespec="milliseconds"), poll_logs[0])
 
     def test_collection_contract_enforces_one_x_and_stake_cap(self):
         signal = copy.deepcopy(self.signal)

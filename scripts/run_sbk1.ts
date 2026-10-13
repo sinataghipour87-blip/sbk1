@@ -1,9 +1,11 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
-import { access, open, readFile, unlink } from 'node:fs/promises';
+import { access, appendFile, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import net from 'node:net';
 import path from 'node:path';
+import type { Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
@@ -14,6 +16,11 @@ const STRATEGY_NAME = 'SbkSignalStrategy';
 const FREQTRADE_CONFIG_PATH = path.join(ROOT_DIR, 'freqtrade', 'user_data', 'config.json');
 const STRATEGY_PATH = path.join(ROOT_DIR, 'freqtrade_integration', 'strategies');
 const LOCK_PATH = path.join(ROOT_DIR, '.sbk1-run.lock');
+const SBK1_LOG_PATH = path.join(ROOT_DIR, 'logs', 'sbk1.log');
+const FREQTRADE_LOG_PATH = path.join(ROOT_DIR, 'freqtrade', 'user_data', 'logs', 'freqtrade.log');
+const SBK1_LOG_MAX_BYTES = 5 * 1024 * 1024;
+const SBK1_LOG_BACKUP_COUNT = 3;
+const SENSITIVE_KEY_PATTERN = /(token|password|secret|api[_-]?key|private[_-]?key|credential)/i;
 const STARTUP_TIMEOUT_MS = 90_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 
@@ -60,9 +67,117 @@ let settings: RuntimeSettings | undefined;
 let lockToken: string | undefined;
 let nodeProcess: ChildProcess | undefined;
 let freqtradeProcess: ChildProcess | undefined;
+let sbk1LogWriter: RotatingLogWriter | undefined;
+let sensitiveLogValues: string[] = [];
 let shutdownPromise: Promise<void> | undefined;
 let lifetimeResolve: (() => void) | undefined;
 let exitCode = 0;
+
+function collectSensitiveConfigurationValues(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectSensitiveConfigurationValues(item));
+  }
+  if (!isRecord(value)) return [];
+  return Object.entries(value).flatMap(([key, item]) => {
+    if (SENSITIVE_KEY_PATTERN.test(key) && typeof item === 'string' && item.length > 0) {
+      return [item];
+    }
+    return collectSensitiveConfigurationValues(item);
+  });
+}
+
+function redactLogLine(line: string): string {
+  let redacted = line;
+  for (const secret of sensitiveLogValues) {
+    redacted = redacted.split(secret).join('[REDACTED]');
+  }
+  return redacted.replace(
+    /(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,]+/gi,
+    '$1[REDACTED]',
+  );
+}
+
+class RotatingLogWriter {
+  private currentSize = 0;
+  private initialized = false;
+  private appendQueue: Promise<void> = Promise.resolve();
+  private failure: Error | undefined;
+
+  constructor(private readonly filePath: string) {}
+
+  async initialize(): Promise<void> {
+    await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
+    try {
+      this.currentSize = (await stat(this.filePath)).size;
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+      this.currentSize = 0;
+    }
+    this.initialized = true;
+  }
+
+  attach(stream: Readable, source: string, terminal: NodeJS.WriteStream): void {
+    const decoder = new StringDecoder('utf8');
+    let pending = '';
+    stream.on('data', (chunk: Buffer) => {
+      terminal.write(chunk);
+      const lines = `${pending}${decoder.write(chunk)}`.split(/\r?\n/);
+      pending = lines.pop() ?? '';
+      for (const line of lines) this.enqueue(source, line);
+    });
+    stream.once('end', () => {
+      const finalLine = `${pending}${decoder.end()}`;
+      if (finalLine) this.enqueue(source, finalLine);
+    });
+    stream.once('error', (error) => {
+      console.error(`[sbk1] Could not read ${source} output for logging: ${error.message}`);
+      void requestShutdown(1);
+    });
+  }
+
+  async flush(): Promise<void> {
+    await this.appendQueue;
+  }
+
+  private enqueue(source: string, line: string): void {
+    const prefix = Buffer.from(`${new Date().toISOString()} ${source}: `);
+    const body = Buffer.from(`${redactLogLine(line)}\n`);
+    const marker = Buffer.from('[truncated]\n');
+    const maxBodyBytes = Math.max(0, SBK1_LOG_MAX_BYTES - prefix.length);
+    const boundedBody = body.length > maxBodyBytes
+      ? Buffer.concat([body.subarray(0, Math.max(0, maxBodyBytes - marker.length)), marker])
+      : body;
+    const output = Buffer.concat([prefix, boundedBody]);
+    this.appendQueue = this.appendQueue.then(async () => {
+      if (this.failure) return;
+      if (!this.initialized) throw new Error('SBK1 log writer was not initialized.');
+      if (this.currentSize + output.length > SBK1_LOG_MAX_BYTES) await this.rotate();
+      await appendFile(this.filePath, output, { mode: 0o600 });
+      this.currentSize += output.length;
+    }).catch((error: unknown) => {
+      if (this.failure) return;
+      this.failure = error instanceof Error ? error : new Error(String(error));
+      console.error(`[sbk1] Could not write ${this.filePath}: ${this.failure.message}`);
+      void requestShutdown(1);
+    });
+  }
+
+  private async rotate(): Promise<void> {
+    for (let index = SBK1_LOG_BACKUP_COUNT - 1; index >= 1; index--) {
+      await this.renameIfPresent(`${this.filePath}.${index}`, `${this.filePath}.${index + 1}`);
+    }
+    await this.renameIfPresent(this.filePath, `${this.filePath}.1`);
+    this.currentSize = 0;
+  }
+
+  private async renameIfPresent(source: string, destination: string): Promise<void> {
+    try {
+      await rename(source, destination);
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+    }
+  }
+}
 
 function isLoopbackHostname(hostname: string): boolean {
   const normalized = hostname.replace(/^\[|\]$/g, '').toLowerCase();
@@ -214,6 +329,12 @@ async function loadRuntimeSettings(): Promise<RuntimeSettings> {
       : 'file is not valid JSON';
     throw new Error(`Freqtrade config ${path.relative(ROOT_DIR, FREQTRADE_CONFIG_PATH)} ${reason}.`);
   }
+  const environmentSecrets = Object.entries(process.env).flatMap(([key, value]) =>
+    SENSITIVE_KEY_PATTERN.test(key) && value ? [value] : []);
+  sensitiveLogValues = [
+    ...environmentSecrets,
+    ...collectSensitiveConfigurationValues(config),
+  ].sort((left, right) => right.length - left.length);
   settings = validateRuntimeSettings(config, process.env);
   return settings;
 }
@@ -430,8 +551,21 @@ function verifyStrategyDiscovery(): void {
   console.log(`[sbk1] Freqtrade discovered ${STRATEGY_NAME} successfully.`);
 }
 
-function spawnManaged(command: string, args: string[], label: string): ChildProcess {
-  const child = spawn(command, args, { cwd: ROOT_DIR, env: process.env, stdio: 'inherit' });
+function spawnManaged(
+  command: string,
+  args: string[],
+  label: string,
+  logWriter?: RotatingLogWriter,
+): ChildProcess {
+  const child = spawn(command, args, {
+    cwd: ROOT_DIR,
+    env: process.env,
+    stdio: logWriter ? ['inherit', 'pipe', 'pipe'] : 'inherit',
+  });
+  if (logWriter && child.stdout && child.stderr) {
+    logWriter.attach(child.stdout, 'stdout', process.stdout);
+    logWriter.attach(child.stderr, 'stderr', process.stderr);
+  }
   child.once('error', (error) => {
     console.error(`[sbk1] Could not start ${label}: ${error.message}`);
     void requestShutdown(1);
@@ -464,6 +598,7 @@ function requestShutdown(code = 0): Promise<void> {
     console.log('[sbk1] Stopping managed services...');
     await stopChild(freqtradeProcess);
     await stopChild(nodeProcess);
+    await sbk1LogWriter?.flush();
     await releaseLock();
     lifetimeResolve?.();
   })();
@@ -486,6 +621,25 @@ async function checkSbk1Ready(): Promise<void> {
   }
   if (!isValidSbk1HealthResponse(body)) {
     throw new Error('Health endpoint returned an invalid response.');
+  }
+
+  const dashboardResponse = await fetch(`http://127.0.0.1:${NODE_PORT}/`, {
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!dashboardResponse.ok || !dashboardResponse.headers.get('content-type')?.includes('text/html')) {
+    throw new Error('Dashboard route did not return HTML.');
+  }
+  const dashboardHtml = await dashboardResponse.text();
+  if (!dashboardHtml.includes('id="root"') || !dashboardHtml.includes('/src/main.tsx')) {
+    throw new Error('Dashboard HTML is missing its React root or entry module.');
+  }
+  for (const assetPath of ['/src/main.tsx', '/src/index.css']) {
+    const assetResponse = await fetch(`http://127.0.0.1:${NODE_PORT}${assetPath}`, {
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!assetResponse.ok) {
+      throw new Error(`Dashboard asset ${assetPath} returned HTTP ${assetResponse.status}.`);
+    }
   }
 }
 
@@ -530,10 +684,13 @@ async function runStack(): Promise<void> {
       return;
     }
 
+    sbk1LogWriter = new RotatingLogWriter(SBK1_LOG_PATH);
+    await sbk1LogWriter.initialize();
     nodeProcess = spawnManaged(
       process.execPath,
       ['--import', 'tsx', 'server.ts'],
       'SBK1 server',
+      sbk1LogWriter,
     );
     await waitFor('SBK1 API', checkSbk1Ready, nodeProcess);
 
@@ -545,6 +702,8 @@ async function runStack(): Promise<void> {
         'freqtrade/user_data',
         '--config',
         'freqtrade/user_data/config.json',
+        '--logfile',
+        path.relative(ROOT_DIR, FREQTRADE_LOG_PATH),
         '--strategy-path',
         'freqtrade_integration/strategies',
         '--strategy',
@@ -553,6 +712,7 @@ async function runStack(): Promise<void> {
       'Freqtrade',
     );
     await waitFor('Freqtrade RPC and strategy', checkFreqtradeReady, freqtradeProcess);
+    console.log('Dashboard: http://127.0.0.1:3000  (in Codespaces: open the PORTS tab and click the globe icon next to port 3000)');
     console.log('[sbk1] Both services are healthy. Press Ctrl+C to stop the managed stack.');
   } catch (error) {
     await requestShutdown(1);

@@ -42,6 +42,8 @@ class SbkSignalStrategy(IStrategy):
         self._signals: dict[str, dict[str, Any]] = {}
         self._signal_statuses: dict[str, str] = {}
         self._signals_by_pair: dict[str, dict[str, Any]] = {}
+        self._last_queue_poll_signature: tuple[Any, ...] | None = None
+        self._last_queue_poll_logged_at_ms: int | None = None
         self._market_snapshot_last_publish_ms = 0
         self._pair = os.getenv("SBK1_FREQTRADE_PAIR", "")
         try:
@@ -67,6 +69,32 @@ class SbkSignalStrategy(IStrategy):
             if timeframe != self.timeframe
         ]
 
+    def _log_queue_poll(
+        self,
+        current_time: datetime,
+        http_status: int | str,
+        signals_returned: int,
+        signature: tuple[Any, ...],
+    ) -> bool:
+        timestamp_ms = int(current_time.timestamp() * 1000)
+        previous_signature = getattr(self, "_last_queue_poll_signature", None)
+        previous_log_ms = getattr(self, "_last_queue_poll_logged_at_ms", None)
+        if (
+            signature == previous_signature
+            and previous_log_ms is not None
+            and timestamp_ms - previous_log_ms < 30_000
+        ):
+            return False
+        logger.info(
+            "SBK1 queue poll timestamp=%s http_status=%s signals_returned=%d",
+            current_time.astimezone(UTC).isoformat(timespec="milliseconds"),
+            http_status,
+            signals_returned,
+        )
+        self._last_queue_poll_signature = signature
+        self._last_queue_poll_logged_at_ms = timestamp_ms
+        return True
+
     def bot_loop_start(self, current_time: datetime, **kwargs: Any) -> None:
         self._signals = {}
         self._signal_statuses = {}
@@ -79,8 +107,9 @@ class SbkSignalStrategy(IStrategy):
         if len(self._bridge_token) < 32 or not self._pair or not self._bridge_url:
             return
 
+        response = None
+        poll_logged = False
         try:
-            logger.debug("Polling the SBK1 bridge for dry-run fixtures for pair %s.", self._pair)
             response = requests.get(
                 f"{self._bridge_url}/api/freqtrade/signals",
                 headers={"Authorization": f"Bearer {self._bridge_token}"},
@@ -91,13 +120,43 @@ class SbkSignalStrategy(IStrategy):
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("contractVersion") != "sbk1.freqtrade.signal.v1":
-                logger.error("SBK1 signal bridge returned an unsupported contract response.")
+                response_status = getattr(response, "status_code", "unknown")
+                poll_logged = self._log_queue_poll(
+                    current_time,
+                    response_status if isinstance(response_status, int) else "unknown",
+                    0,
+                    (response_status, "unsupported_contract"),
+                )
+                if poll_logged:
+                    logger.error("SBK1 signal bridge returned an unsupported contract response.")
                 return
             records = payload.get("signals")
             if not isinstance(records, list):
-                logger.error("SBK1 signal bridge returned an invalid signal list.")
+                response_status = getattr(response, "status_code", "unknown")
+                poll_logged = self._log_queue_poll(
+                    current_time,
+                    response_status if isinstance(response_status, int) else "unknown",
+                    0,
+                    (response_status, "invalid_signal_list"),
+                )
+                if poll_logged:
+                    logger.error("SBK1 signal bridge returned an invalid signal list.")
                 return
-            logger.debug("SBK1 bridge returned %d signal record(s).", len(records))
+            response_status = getattr(response, "status_code", "unknown")
+            poll_signature = []
+            for record in records:
+                if not isinstance(record, dict):
+                    poll_signature.append((None, type(record).__name__))
+                    continue
+                signal = record.get("signal")
+                signal_id = signal.get("signalId") if isinstance(signal, dict) else None
+                poll_signature.append((signal_id, record.get("status")))
+            poll_logged = self._log_queue_poll(
+                current_time,
+                response_status if isinstance(response_status, int) else "unknown",
+                len(records),
+                (response_status, tuple(poll_signature)),
+            )
 
             inflight_signal_records = [
                 record for record in records
@@ -119,6 +178,11 @@ class SbkSignalStrategy(IStrategy):
                     )
                 )
                 for signal_id in unresolved_signal_ids:
+                    logger.info(
+                        "SBK1 signal decision=skip signal_id=%s reason=unmatched_inflight persisted_signal_ids=%s",
+                        signal_id,
+                        sorted(trades_by_signal_id),
+                    )
                     self._post_status(
                         signal_id,
                         "UNKNOWN_IN_FLIGHT",
@@ -164,17 +228,53 @@ class SbkSignalStrategy(IStrategy):
             for record in records:
                 signal = record.get("signal") if isinstance(record, dict) else None
                 status = record.get("status") if isinstance(record, dict) else None
+                signal_id = signal.get("signalId") if isinstance(signal, dict) else None
                 if status not in ("ACCEPTED", "STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED", "FILLED"):
+                    logger.info(
+                        "SBK1 signal decision=skip signal_id=%s status=%s accepted_statuses=%s",
+                        signal_id,
+                        status,
+                        "ACCEPTED,STRATEGY_ACCEPTED,ORDER_SUBMITTED,PARTIALLY_FILLED,FILLED",
+                    )
                     continue
-                if isinstance(signal, dict) and signal.get("signalId") in unresolved_signal_ids:
+                if signal_id in unresolved_signal_ids:
+                    logger.info(
+                        "SBK1 signal decision=skip signal_id=%s status=%s unresolved_inflight=true persisted_signal_ids=%s",
+                        signal_id,
+                        status,
+                        sorted(trades_by_signal_id),
+                    )
                     continue
-                if not self._is_valid_signal(
+                signal_valid = self._is_valid_signal(
                     signal,
                     now_ms,
                     configured_exchange,
                     configured_market,
                     require_fresh=status == "ACCEPTED",
-                ):
+                )
+                if not signal_valid:
+                    logger.info(
+                        "SBK1 signal decision=%s signal_id=%s status=%s valid=%s "
+                        "pair=%s expected_pair=%s exchange=%s expected_exchange=%s "
+                        "market=%s expected_market=%s timeframe=%s expected_timeframe=%s "
+                        "now_ms=%s generated_at_ms=%s expires_at_ms=%s require_fresh=%s",
+                        "reject" if status == "ACCEPTED" else "skip",
+                        signal_id,
+                        status,
+                        signal_valid,
+                        signal.get("pair") if isinstance(signal, dict) else None,
+                        self._pair,
+                        signal.get("exchange") if isinstance(signal, dict) else None,
+                        configured_exchange,
+                        signal.get("market") if isinstance(signal, dict) else None,
+                        configured_market,
+                        signal.get("timeframe") if isinstance(signal, dict) else None,
+                        self.timeframe,
+                        now_ms,
+                        signal.get("generatedAtMs") if isinstance(signal, dict) else None,
+                        signal.get("expiresAtMs") if isinstance(signal, dict) else None,
+                        status == "ACCEPTED",
+                    )
                     if status == "ACCEPTED" and isinstance(signal, dict):
                         self._post_status(
                             signal.get("signalId"),
@@ -182,6 +282,27 @@ class SbkSignalStrategy(IStrategy):
                             "Signal failed Freqtrade freshness or configuration validation.",
                         )
                     continue
+                logger.info(
+                    "SBK1 signal decision=%s signal_id=%s status=%s pair=%s expected_pair=%s "
+                    "exchange=%s expected_exchange=%s market=%s expected_market=%s "
+                    "timeframe=%s expected_timeframe=%s now_ms=%s generated_at_ms=%s "
+                    "expires_at_ms=%s require_fresh=%s",
+                    "claim" if status == "ACCEPTED" else "retain",
+                    signal_id,
+                    status,
+                    signal["pair"],
+                    self._pair,
+                    signal["exchange"],
+                    configured_exchange,
+                    signal["market"],
+                    configured_market,
+                    signal["timeframe"],
+                    self.timeframe,
+                    now_ms,
+                    signal["generatedAtMs"],
+                    signal["expiresAtMs"],
+                    status == "ACCEPTED",
+                )
                 active_signals[signal["signalId"]] = signal
                 active_statuses[signal["signalId"]] = status
                 if status == "ACCEPTED":
@@ -196,7 +317,14 @@ class SbkSignalStrategy(IStrategy):
                     payload = response.json()
                 except ValueError:
                     payload = None
-            if isinstance(payload, dict):
+            response_status = response.status_code if response is not None else "unavailable"
+            poll_logged = self._log_queue_poll(
+                current_time,
+                response_status if isinstance(response_status, int) else "unavailable",
+                0,
+                (response_status, "http_error"),
+            )
+            if isinstance(payload, dict) and poll_logged:
                 logger.warning(
                     "SBK1 signal delivery blocked (HTTP %s, stage=%s, code=%s, correlation_id=%s): %s",
                     response.status_code if response is not None else "unknown",
@@ -205,10 +333,19 @@ class SbkSignalStrategy(IStrategy):
                     payload.get("correlationId", "unavailable"),
                     payload.get("error", str(exc)),
                 )
-            else:
+            elif poll_logged:
                 logger.error("SBK1 signal bridge poll failed: %s", exc)
         except (requests.RequestException, ValueError) as exc:
-            logger.error("SBK1 signal bridge poll failed; this loop will not use cached signals: %s", exc)
+            if not poll_logged:
+                response_status = getattr(response, "status_code", "unavailable")
+                poll_logged = self._log_queue_poll(
+                    current_time,
+                    response_status if isinstance(response_status, int) else "unavailable",
+                    0,
+                    (response_status, type(exc).__name__),
+                )
+            if poll_logged:
+                logger.error("SBK1 signal bridge poll failed; this loop will not use cached signals: %s", exc)
 
     def _publish_market_snapshot(self, current_time: datetime) -> bool:
         bridge_token = getattr(self, "_bridge_token", "")
@@ -485,17 +622,42 @@ class SbkSignalStrategy(IStrategy):
 
         pair = metadata.get("pair")
         signal = self._signals_by_pair.get(pair)
-        if not signal or signal["timeframe"] != self.timeframe:
+        if not signal:
+            return dataframe
+        if signal["timeframe"] != self.timeframe:
+            logger.info(
+                "SBK1 signal decision=skip signal_id=%s timeframe=%s expected_timeframe=%s",
+                signal.get("signalId"),
+                signal["timeframe"],
+                self.timeframe,
+            )
             return dataframe
         if not is_dry_run_fixture_runtime(
             self.config,
             getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
         ):
+            logger.info(
+                "SBK1 signal decision=skip signal_id=%s reason=runtime_not_dry_run dry_run=%s "
+                "demo_trading=%s force_entry_enable=%s runmode=%s",
+                signal["signalId"],
+                self.config.get("dry_run"),
+                self.config.get("demo_trading"),
+                self.config.get("force_entry_enable"),
+                getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
+            )
             return dataframe
         if signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE and not is_dry_run_collection_runtime(
             self.config,
             getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
         ):
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=unsafe_collection_runtime "
+                "dry_run=%s demo_trading=%s force_entry_enable=%s",
+                signal["signalId"],
+                self.config.get("dry_run"),
+                self.config.get("demo_trading"),
+                self.config.get("force_entry_enable"),
+            )
             self._post_status(
                 signal["signalId"],
                 "REJECTED",
@@ -505,19 +667,61 @@ class SbkSignalStrategy(IStrategy):
         latest = dataframe.iloc[-1]
         price = float(latest["close"])
         if not math.isfinite(price) or price <= 0:
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=invalid_candle_price price=%s finite=%s positive=%s",
+                signal["signalId"],
+                price,
+                math.isfinite(price),
+                price > 0,
+            )
             self._post_status(signal["signalId"], "REJECTED", "Freqtrade candle close is invalid.")
             return dataframe
         candle_time = latest["date"]
         if isinstance(candle_time, datetime):
             candle_ms = int(candle_time.timestamp() * 1000)
-            if int(datetime.now(UTC).timestamp() * 1000) - candle_ms > self._timeframe_seconds() * 2_000:
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
+            candle_age_ms = now_ms - candle_ms
+            max_candle_age_ms = self._timeframe_seconds() * 2_000
+            if candle_age_ms > max_candle_age_ms:
+                logger.info(
+                    "SBK1 signal decision=reject signal_id=%s reason=stale_candle now_ms=%s "
+                    "candle_ms=%s candle_age_ms=%s max_candle_age_ms=%s",
+                    signal["signalId"],
+                    now_ms,
+                    candle_ms,
+                    candle_age_ms,
+                    max_candle_age_ms,
+                )
                 self._post_status(signal["signalId"], "REJECTED", "Freqtrade latest candle is stale.")
                 return dataframe
         drift_bps = abs(price - signal["referencePrice"]) / signal["referencePrice"] * 10_000
-        if drift_bps > signal["entryConditions"]["maxPriceDeviationBps"]:
+        max_deviation_bps = signal["entryConditions"]["maxPriceDeviationBps"]
+        if drift_bps > max_deviation_bps:
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=candle_price_deviation "
+                "price=%s reference_price=%s drift_bps=%.6f max_deviation_bps=%s",
+                signal["signalId"],
+                price,
+                signal["referencePrice"],
+                drift_bps,
+                max_deviation_bps,
+            )
             self._post_status(signal["signalId"], "REJECTED", "Freqtrade candle price exceeded the fixture deviation limit.")
             return dataframe
 
+        logger.info(
+            "SBK1 signal decision=claim signal_id=%s pair=%s expected_pair=%s timeframe=%s "
+            "expected_timeframe=%s price=%s reference_price=%s drift_bps=%.6f max_deviation_bps=%s",
+            signal["signalId"],
+            pair,
+            signal["pair"],
+            self.timeframe,
+            signal["timeframe"],
+            price,
+            signal["referencePrice"],
+            drift_bps,
+            max_deviation_bps,
+        )
         last_index = dataframe.index[-1]
         if signal["direction"] == "LONG":
             dataframe.loc[last_index, "enter_long"] = 1
@@ -569,30 +773,95 @@ class SbkSignalStrategy(IStrategy):
                 str(self.config.get("trading_mode", "spot")).lower(),
             )
         ):
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=entry_validation "
+                "dry_run=%s demo_trading=%s force_entry_enable=%s runmode=%s "
+                "signal_found=%s status=%s expected_status=ACCEPTED pair=%s expected_pair=%s "
+                "exchange=%s market=%s timeframe=%s current_time=%s generated_at_ms=%s expires_at_ms=%s",
+                signal_id,
+                self.config.get("dry_run"),
+                self.config.get("demo_trading"),
+                self.config.get("force_entry_enable"),
+                getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
+                bool(signal),
+                self._signal_statuses.get(signal_id or ""),
+                pair,
+                signal.get("pair") if signal else None,
+                signal.get("exchange") if signal else None,
+                signal.get("market") if signal else None,
+                signal.get("timeframe") if signal else None,
+                current_time.astimezone(UTC).isoformat(timespec="milliseconds"),
+                signal.get("generatedAtMs") if signal else None,
+                signal.get("expiresAtMs") if signal else None,
+            )
             self._post_status(signal_id, "REJECTED", "Signal missing, stale, or incompatible at entry confirmation.")
             return False
         if pair != signal["pair"] or side.lower() != signal["direction"].lower():
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=pair_or_side_mismatch "
+                "pair=%s expected_pair=%s side=%s expected_side=%s",
+                signal_id,
+                pair,
+                signal["pair"],
+                side.lower(),
+                signal["direction"].lower(),
+            )
             self._post_status(signal_id, "REJECTED", "Pair or side changed between signal validation and entry.")
             return False
         if not math.isfinite(rate) or rate <= 0:
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=invalid_entry_rate rate=%s finite=%s positive=%s",
+                signal_id,
+                rate,
+                math.isfinite(rate),
+                rate > 0,
+            )
             self._post_status(signal_id, "REJECTED", "Freqtrade supplied an invalid entry rate.")
             return False
         drift_bps = abs(rate - signal["referencePrice"]) / signal["referencePrice"] * 10_000
         if drift_bps > signal["entryConditions"]["maxPriceDeviationBps"]:
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=entry_price_deviation "
+                "rate=%s reference_price=%s drift_bps=%.6f max_deviation_bps=%s",
+                signal_id,
+                rate,
+                signal["referencePrice"],
+                drift_bps,
+                signal["entryConditions"]["maxPriceDeviationBps"],
+            )
             self._post_status(signal_id, "REJECTED", "Entry price exceeded the signal price-deviation limit.")
             return False
-        if (
-            signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE
-            and Trade.get_open_trade_count() != 0
-        ):
-            self._post_status(
+        if signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE:
+            open_trade_count = Trade.get_open_trade_count()
+            if open_trade_count != 0:
+                logger.info(
+                    "SBK1 signal decision=reject signal_id=%s reason=open_trade_limit "
+                    "open_trade_count=%s max_open_trades=1 expected_open_trade_count=0",
+                    signal_id,
+                    open_trade_count,
+                )
+                self._post_status(
+                    signal_id,
+                    "REJECTED",
+                    "Dry-run collection permits at most one open Freqtrade trade.",
+                )
+                return False
+        if not self._post_status(signal_id, "STRATEGY_ACCEPTED", "Validated by SbkSignalStrategy before order submission."):
+            logger.info(
+                "SBK1 signal decision=reject signal_id=%s reason=status_persist_failed requested_status=STRATEGY_ACCEPTED",
                 signal_id,
-                "REJECTED",
-                "Dry-run collection permits at most one open Freqtrade trade.",
             )
             return False
-        if not self._post_status(signal_id, "STRATEGY_ACCEPTED", "Validated by SbkSignalStrategy before order submission."):
-            return False
+        logger.info(
+            "SBK1 signal decision=claim signal_id=%s status=STRATEGY_ACCEPTED order_type=%s "
+            "amount=%s rate=%s side=%s time_in_force=%s",
+            signal_id,
+            order_type,
+            amount,
+            rate,
+            side,
+            time_in_force,
+        )
         self._signal_statuses[signal_id or ""] = "STRATEGY_ACCEPTED"
         return True
 
@@ -666,11 +935,39 @@ class SbkSignalStrategy(IStrategy):
         side: str,
         **kwargs: Any,
     ) -> float:
-        signal = self._signals.get(signal_id_from_entry_tag(entry_tag) or "")
+        signal_id = signal_id_from_entry_tag(entry_tag)
+        signal = self._signals.get(signal_id or "")
         if not signal or current_rate <= 0 or max_stake <= 0:
+            logger.info(
+                "SBK1 signal decision=stake-zero signal_id=%s reason=missing_signal_or_nonpositive_input "
+                "signal_found=%s pair=%s current_rate=%s current_rate_positive=%s "
+                "max_stake=%s max_stake_positive=%s min_stake=%s proposed_stake=%s",
+                signal_id,
+                bool(signal),
+                pair,
+                current_rate,
+                current_rate > 0,
+                max_stake,
+                max_stake > 0,
+                min_stake,
+                proposed_stake,
+            )
             return 0.0
         stop_fraction = abs(current_rate - signal["entryConditions"]["stopLoss"]) / current_rate
         if not math.isfinite(stop_fraction) or stop_fraction <= 0 or leverage <= 0:
+            logger.info(
+                "SBK1 signal decision=stake-zero signal_id=%s reason=invalid_risk_inputs "
+                "current_rate=%s stop_loss=%s stop_fraction=%.9f finite=%s positive=%s "
+                "leverage=%s leverage_positive=%s",
+                signal_id,
+                current_rate,
+                signal["entryConditions"]["stopLoss"],
+                stop_fraction,
+                math.isfinite(stop_fraction),
+                stop_fraction > 0,
+                leverage,
+                leverage > 0,
+            )
             return 0.0
         risk_budget = max_stake * signal["riskLimits"]["riskBudgetPct"] / 100
         risk_limited_stake = risk_budget / stop_fraction / leverage
@@ -681,12 +978,58 @@ class SbkSignalStrategy(IStrategy):
             proposed_stake,
         )
         if min_stake is not None and selected_stake < min_stake:
+            logger.info(
+                "SBK1 signal decision=stake-zero signal_id=%s reason=minimum_stake_exceeds_selected "
+                "minimum_stake=%.9f selected_stake=%.9f proposed_stake=%.9f max_stake=%.9f "
+                "signal_stake_cap=%.9f risk_budget=%.9f risk_limited_stake=%.9f "
+                "stop_fraction=%.9f leverage=%.9f",
+                signal_id,
+                min_stake,
+                selected_stake,
+                proposed_stake,
+                max_stake,
+                signal["riskLimits"]["maxStakeQuote"],
+                risk_budget,
+                risk_limited_stake,
+                stop_fraction,
+                leverage,
+            )
             self._post_status(
                 signal["signalId"],
                 "REJECTED",
                 f"Freqtrade minimum stake {min_stake:g} exceeds the risk-bounded signal stake {selected_stake:g}.",
             )
             return 0.0
+        if selected_stake <= 0:
+            logger.info(
+                "SBK1 signal decision=stake-zero signal_id=%s reason=nonpositive_selected_stake "
+                "selected_stake=%s min_stake=%s proposed_stake=%s max_stake=%s "
+                "signal_stake_cap=%s risk_budget=%s risk_limited_stake=%s",
+                signal_id,
+                selected_stake,
+                min_stake,
+                proposed_stake,
+                max_stake,
+                signal["riskLimits"]["maxStakeQuote"],
+                risk_budget,
+                risk_limited_stake,
+            )
+            return max(0.0, selected_stake)
+        logger.info(
+            "SBK1 signal decision=stake signal_id=%s selected_stake=%.9f min_stake=%s "
+            "proposed_stake=%.9f max_stake=%.9f signal_stake_cap=%.9f "
+            "risk_budget=%.9f risk_limited_stake=%.9f stop_fraction=%.9f leverage=%.9f",
+            signal_id,
+            selected_stake,
+            min_stake,
+            proposed_stake,
+            max_stake,
+            signal["riskLimits"]["maxStakeQuote"],
+            risk_budget,
+            risk_limited_stake,
+            stop_fraction,
+            leverage,
+        )
         return max(0.0, selected_stake)
 
     def order_filled(self, pair: str, trade: Any, order: Any, current_time: datetime, **kwargs: Any) -> None:
