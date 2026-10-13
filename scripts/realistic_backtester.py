@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-📊 REALISTIC QUANTITATIVE BACKTESTER (INSTITUTIONAL GRADE) - SECTION 7
+RESEARCH-ONLY OHLCV BACKTESTER — NOT LIVE-READINESS EVIDENCE
 ------------------------------------------------------------------------
 Standards Implemented:
 1. True Historical Data Traceability (Source, Timeframe, Symbol, Range).
