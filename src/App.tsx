@@ -22,7 +22,6 @@ import { VolatilitySpikePredictorWidget } from './components/VolatilitySpikePred
 import { FundingPriceCorrelationWidget } from './components/FundingPriceCorrelationWidget';
 import { RealtimeSynchronizerWidget } from './components/RealtimeSynchronizerWidget';
 import { IndexedDbBrainMemoryWidget } from './components/IndexedDbBrainMemoryWidget';
-import { DistributedMemoryCacheWidget } from './components/DistributedMemoryCacheWidget';
 import { DynamicEntryWidget } from './components/DynamicEntryWidget';
 
 import { EarlyWarningProtocolWidget } from './components/EarlyWarningProtocolWidget';
@@ -62,7 +61,6 @@ import { hunterOsEngine } from './services/hunterOsEngine';
 
 import { AIRiskGovernor, RiskGovernorState } from './components/AIRiskGovernor';
 import ExecutionGovernorDashboard from './components/ExecutionGovernorDashboard';
-import { WinRateOptimizerComponent, WinRateOptimizerConfig } from './components/WinRateOptimizer';
 import { runUnifiedDecisionPipeline } from './services/decisionPipeline';
 import { SbFiveModelsPanel } from './components/SbFiveModelsPanel';
 import { sbFiveModelsEngine, analyzeMultiTimeframeSbObiCorrelation } from './services/sbFiveModelsEngine';
@@ -92,7 +90,6 @@ import { setupFreqtradeMarketFeed } from './services/websocket';
 import { validatePrecisionEntry, generateClientSidePredictionFallback, updatePredictiveModelFeedbackLoop, evaluate15mTimingAndLifecycle, runDistributedMultiTimeframeBrains, calculateAiMtfConsensusCorrelation, evaluateFuturePredictability } from './services/predictiveEngine';
 import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTargets } from './services/signalToExecution';
 import { verifyAutoTradePrerequisites } from './services/autoTradeGuard';
-import { getExecutionMode } from './services/executionMode';
 import type { FreqtradeTrade } from './services/freqtradeBridge';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
 import { tradeThesisAndSmartExitEngine } from './services/tradeThesisAndSmartExitEngine';
@@ -254,8 +251,7 @@ export default function App() {
   const [notification, setNotification] = useState<string | null>(null);
   const [isCalibratingEngines, setIsCalibratingEngines] = useState<boolean>(false);
 
-  // WinRate-Optimizer State
-  const [winRateConfig, setWinRateConfig] = useState<WinRateOptimizerConfig>(() => {
+  const [winRateConfig] = useState(() => {
     const saved = localStorage.getItem('quantum_winrate_config');
     if (saved) {
       try {
@@ -1969,7 +1965,6 @@ export default function App() {
                     activePositions={activePositions}
                     recentHistory={getTradeHistory()}
                   />
-                  <DistributedMemoryCacheWidget />
                   <BrainStatisticalEdgeVerifierWidget analysis={analysis} />
                   <ModelChampionChallengerWidget />
                   <AntiSelfDeceptionOnlineLearningWidget />
