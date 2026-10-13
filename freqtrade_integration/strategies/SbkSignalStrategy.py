@@ -11,6 +11,7 @@ from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
 from sbk_signal_contract import (
     DRY_RUN_COLLECTION_MODE,
+    is_dry_run_collection_runtime,
     is_dry_run_fixture_runtime,
     is_valid_sbk_signal,
     format_entry_tag,
@@ -491,6 +492,16 @@ class SbkSignalStrategy(IStrategy):
             getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
         ):
             return dataframe
+        if signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE and not is_dry_run_collection_runtime(
+            self.config,
+            getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
+        ):
+            self._post_status(
+                signal["signalId"],
+                "REJECTED",
+                "Dry-run collection requires dry_run=true, demo_trading=false, and force_entry_enable=false.",
+            )
+            return dataframe
         latest = dataframe.iloc[-1]
         price = float(latest["close"])
         if not math.isfinite(price) or price <= 0:
@@ -539,6 +550,14 @@ class SbkSignalStrategy(IStrategy):
             not is_dry_run_fixture_runtime(
                 self.config,
                 getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
+            )
+            or (
+                signal
+                and signal.get("collectionMode") == DRY_RUN_COLLECTION_MODE
+                and not is_dry_run_collection_runtime(
+                    self.config,
+                    getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
+                )
             )
             or
             not signal
@@ -662,6 +681,11 @@ class SbkSignalStrategy(IStrategy):
             proposed_stake,
         )
         if min_stake is not None and selected_stake < min_stake:
+            self._post_status(
+                signal["signalId"],
+                "REJECTED",
+                f"Freqtrade minimum stake {min_stake:g} exceeds the risk-bounded signal stake {selected_stake:g}.",
+            )
             return 0.0
         return max(0.0, selected_stake)
 

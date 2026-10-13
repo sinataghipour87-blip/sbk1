@@ -237,6 +237,25 @@ try {
   const unauthenticatedArchiveStatus = await fetch(`${baseUrl}/api/prediction-archive/status`);
   assert.equal(unauthenticatedArchiveStatus.status, 403);
 
+  const backtestResponse = await fetch(`${baseUrl}/api/backtest/run`, { cache: 'no-store' });
+  assert.equal(backtestResponse.status, 409, serverLogs);
+  const backtest = await backtestResponse.json() as {
+    code: string;
+    label: string;
+    counts: {
+      archivedDecisions: number;
+      replayableDecisions: number;
+      requiredReplayableDecisions: number;
+      additionalReplayableDecisionsNeeded: number;
+    };
+  };
+  assert.equal(backtest.code, 'HISTORICAL_SIGNALS_UNAVAILABLE');
+  assert.equal(backtest.label, 'REPLAY_SIMULATED');
+  assert.equal(backtest.counts.archivedDecisions, 0);
+  assert.equal(backtest.counts.replayableDecisions, 0);
+  assert.equal(backtest.counts.requiredReplayableDecisions, 30);
+  assert.equal(backtest.counts.additionalReplayableDecisionsNeeded, 30);
+
   const headers = { 'x-admin-token': adminToken };
   const statusResponse = await fetch(`${baseUrl}/api/live/status`, { headers, cache: 'no-store' });
   assert.equal(statusResponse.status, 200);

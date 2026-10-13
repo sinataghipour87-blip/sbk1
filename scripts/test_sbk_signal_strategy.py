@@ -47,6 +47,8 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.strategy._bridge_token = "a" * 64
         self.strategy.config = {
             "dry_run": True,
+            "demo_trading": False,
+            "force_entry_enable": False,
             "runmode": SimpleNamespace(value="dry_run"),
             "exchange": {"name": "bybit"},
             "trading_mode": "futures",
@@ -140,6 +142,83 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             self.signal_id,
             "REJECTED",
             "Dry-run collection permits at most one open Freqtrade trade.",
+        )
+
+    def test_collection_entry_is_blocked_if_dry_run_config_changes(self):
+        signal = copy.deepcopy(self.signal)
+        signal["collectionMode"] = "DRY_RUN_COLLECTION"
+        signal["generatedAtMs"] = self.now_ms
+        signal["dataQuality"]["observedAtMs"] = self.now_ms
+        signal["dataQuality"]["maxAgeMs"] = 5_000
+        signal["entryConditions"]["setupType"] = "LIVE_SBK1_SETUP"
+        self.strategy._signals = {self.signal_id: signal}
+        self.strategy._signals_by_pair = {"BTC/USDT:USDT": signal}
+        self.strategy.config["demo_trading"] = True
+        dataframe = pd.DataFrame([{
+            "date": datetime.fromtimestamp(self.now_ms / 1000, UTC),
+            "close": signal["referencePrice"],
+        }])
+
+        with patch.object(self.strategy, "_post_status", return_value=True) as post_status:
+            result = self.strategy.populate_entry_trend(dataframe, {"pair": "BTC/USDT:USDT"})
+
+        self.assertEqual(result.iloc[-1]["enter_long"], 0)
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "REJECTED",
+            "Dry-run collection requires dry_run=true, demo_trading=false, and force_entry_enable=false.",
+        )
+
+    def test_collection_confirmation_rechecks_demo_and_force_entry_settings(self):
+        signal = copy.deepcopy(self.signal)
+        signal["collectionMode"] = "DRY_RUN_COLLECTION"
+        signal["generatedAtMs"] = self.now_ms
+        signal["dataQuality"]["observedAtMs"] = self.now_ms
+        signal["dataQuality"]["maxAgeMs"] = 5_000
+        signal["entryConditions"]["setupType"] = "LIVE_SBK1_SETUP"
+        self.strategy._signals = {self.signal_id: signal}
+        self.strategy._signal_statuses = {self.signal_id: "ACCEPTED"}
+
+        for setting in ("demo_trading", "force_entry_enable"):
+            with self.subTest(setting=setting):
+                self.strategy.config[setting] = True
+                with patch.object(self.strategy, "_post_status", return_value=True):
+                    accepted = self.strategy.confirm_trade_entry(
+                        "BTC/USDT:USDT",
+                        "limit",
+                        0.001,
+                        signal["referencePrice"],
+                        "GTC",
+                        datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                        f"DRY_RUN_COLLECTION:{self.signal_id}",
+                        "long",
+                    )
+                self.assertFalse(accepted)
+                self.strategy.config[setting] = False
+
+    def test_custom_stake_rejects_signal_below_freqtrade_minimum_stake(self):
+        signal = copy.deepcopy(self.signal)
+        signal["riskLimits"]["maxStakeQuote"] = 10
+        self.strategy._signals = {self.signal_id: signal}
+
+        with patch.object(self.strategy, "_post_status", return_value=True) as post_status:
+            stake = self.strategy.custom_stake_amount(
+                "BTC/USDT:USDT",
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                signal["referencePrice"],
+                100,
+                87.616725,
+                100,
+                1,
+                self.signal_id,
+                "long",
+            )
+
+        self.assertEqual(stake, 0.0)
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "REJECTED",
+            "Freqtrade minimum stake 87.6167 exceeds the risk-bounded signal stake 10.",
         )
 
     def test_collection_contract_enforces_one_x_and_stake_cap(self):

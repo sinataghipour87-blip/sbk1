@@ -59,6 +59,14 @@ def is_dry_run_fixture_runtime(config: dict[str, Any], runmode: str) -> bool:
     return config.get("dry_run") is True and runmode == "dry_run"
 
 
+def is_dry_run_collection_runtime(config: dict[str, Any], runmode: str) -> bool:
+    return (
+        is_dry_run_fixture_runtime(config, runmode)
+        and config.get("demo_trading") is False
+        and config.get("force_entry_enable") is False
+    )
+
+
 def signal_id_from_entry_tag(entry_tag: Any) -> str | None:
     if not isinstance(entry_tag, str):
         return None

@@ -1,6 +1,7 @@
 import unittest
 
 from freqtrade_integration.strategies.sbk_signal_contract import (
+    is_dry_run_collection_runtime,
     is_dry_run_fixture_runtime,
     is_valid_sbk_signal,
     validate_bridge_url,
@@ -53,6 +54,19 @@ class MarketModelFailClosedTests(unittest.TestCase):
         self.assertFalse(is_dry_run_fixture_runtime({"dry_run": True}, "live"))
         self.assertFalse(is_dry_run_fixture_runtime({"dry_run": 1}, "dry_run"))
         self.assertFalse(is_dry_run_fixture_runtime({}, "dry_run"))
+
+    def test_collection_requires_all_three_explicit_dry_run_config_values(self):
+        safe_config = {
+            "dry_run": True,
+            "demo_trading": False,
+            "force_entry_enable": False,
+        }
+        self.assertTrue(is_dry_run_collection_runtime(safe_config, "dry_run"))
+        self.assertFalse(is_dry_run_collection_runtime({**safe_config, "dry_run": False}, "dry_run"))
+        self.assertFalse(is_dry_run_collection_runtime({**safe_config, "demo_trading": True}, "dry_run"))
+        self.assertFalse(is_dry_run_collection_runtime({**safe_config, "force_entry_enable": True}, "dry_run"))
+        self.assertFalse(is_dry_run_collection_runtime({**safe_config, "demo_trading": None}, "dry_run"))
+        self.assertFalse(is_dry_run_collection_runtime(safe_config, "live"))
 
     def test_dry_run_fixture_allows_bounded_strategy_poll_latency(self):
         now_ms = 1_800_000_000_000

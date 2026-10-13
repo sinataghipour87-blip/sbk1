@@ -4,6 +4,7 @@ import { GoogleGenAI, Type, GenerateVideosOperation } from "@google/genai";
 import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import fs from 'fs';
+import path from 'path';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
@@ -183,7 +184,13 @@ let lastPredictCache: { key: string; data: any; time: number } | null = null;
 let activePythonProcesses = 0;
 const MAX_CONCURRENT_PYTHON_PROCESSES = 5;
 
-function runPythonScript(scriptPath: string, args: string[] = [], inputData?: any, timeoutMs: number = 10000): Promise<any> {
+function runPythonScript(
+    scriptPath: string,
+    args: string[] = [],
+    inputData?: any,
+    timeoutMs: number = 10000,
+    pythonExecutable = 'python3',
+): Promise<any> {
     return new Promise((resolve, reject) => {
         if (activePythonProcesses >= MAX_CONCURRENT_PYTHON_PROCESSES) {
             return reject(new Error('SERVER_BUSY: حداکثر تعداد پردازش‌های همزمان پایتون پر شده است. لطفا لحظاتی دیگر تلاش کنید.'));
@@ -192,7 +199,7 @@ function runPythonScript(scriptPath: string, args: string[] = [], inputData?: an
         activePythonProcesses++;
         let completed = false;
 
-        const pythonProcess = spawn('python3', [scriptPath, ...args]);
+        const pythonProcess = spawn(pythonExecutable, [scriptPath, ...args]);
         let result = '';
         let error = '';
 
@@ -2810,11 +2817,38 @@ app.post('/api/hunter/exit', liveOperationLimiter, requireAdminAuth, async (req,
     }
 });
 
-app.get('/api/backtest/run', (_req, res) => {
-    res.status(409).json({
-        error: 'Historical SBK1 signal and feature records are unavailable; synthetic backtest output is disabled.',
-        code: 'HISTORICAL_SIGNALS_UNAVAILABLE',
-    });
+app.get('/api/backtest/run', async (_req, res) => {
+    try {
+        const configuredPython = process.env.SBK1_PYTHON?.trim();
+        const venvPython = process.platform === 'win32'
+            ? path.resolve('.venv', 'Scripts', 'python.exe')
+            : path.resolve('.venv', 'bin', 'python');
+        const replayPython = configuredPython || (fs.existsSync(venvPython) ? venvPython : 'python3');
+        const result = await runPythonScript(
+            'scripts/historical_decision_replay.py',
+            [],
+            { action: 'run' },
+            120_000,
+            replayPython,
+        );
+        const replay = JSON.parse(result);
+        res.setHeader('Cache-Control', 'no-store');
+        if (replay.status === 'HISTORICAL_SIGNALS_UNAVAILABLE') {
+            return res.status(409).json(replay);
+        }
+        if (replay.status !== 'SUCCESS' || replay.label !== 'REPLAY_SIMULATED') {
+            throw new Error('Historical replay returned an invalid response.');
+        }
+        return res.json(replay);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[Historical replay] Failed:', message);
+        return res.status(503).json({
+            error: 'Historical replay is unavailable because its archive or market data could not be read.',
+            code: 'HISTORICAL_REPLAY_FAILED',
+            label: 'REPLAY_SIMULATED',
+        });
+    }
 });
 
 // Market data is accepted only from the authenticated Freqtrade DataProvider bridge.
