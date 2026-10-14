@@ -92,7 +92,6 @@ import { setupFreqtradeMarketFeed } from './services/websocket';
 import { validatePrecisionEntry, generateClientSidePredictionFallback, updatePredictiveModelFeedbackLoop, evaluate15mTimingAndLifecycle, runDistributedMultiTimeframeBrains, calculateAiMtfConsensusCorrelation, evaluateFuturePredictability } from './services/predictiveEngine';
 import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTargets } from './services/signalToExecution';
 import { verifyAutoTradePrerequisites } from './services/autoTradeGuard';
-import { getExecutionMode } from './services/executionMode';
 import type { FreqtradeTrade } from './services/freqtradeBridge';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
 import { tradeThesisAndSmartExitEngine } from './services/tradeThesisAndSmartExitEngine';
@@ -232,7 +231,7 @@ export function calculateHedgeBreakEvenPrice(
 export default function App() {
   const [settings, setSettings] = useState<UserSettings>(() => loadSettings());
   const [showSidebar, setShowSidebar] = useState(false);
-  const executionModeRef = useRef<ExecutionMode | null>(null);
+  const executionModeRef = useRef<ExecutionMode | null>('DRY_RUN');
   const [freqtradeDashboard, setFreqtradeDashboard] = useState<{
     status: 'CHECKING' | 'CONNECTED' | 'UNAVAILABLE' | 'SIMULATION';
     openTrades: FreqtradeTrade[];
@@ -280,6 +279,7 @@ export default function App() {
   const [activePositions, setActivePositions] = useState<TradePosition[]>([]);
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [lastAnalysisAtMs, setLastAnalysisAtMs] = useState<number | null>(null);
   const [aiPrediction, setAiPrediction] = useState<any | null>(null);
   const [source, setSource] = useState<string>('Bybit 15m');
   const [isFetching, setIsFetching] = useState<boolean>(false);
@@ -1587,6 +1587,7 @@ export default function App() {
       }
 
       setAnalysis(res);
+      setLastAnalysisAtMs(Date.now());
       setSource(candleData.source);
       setMarketDataError(sentimentError);
 
@@ -1710,7 +1711,11 @@ export default function App() {
         <div className="flex flex-col gap-1.5 flex-shrink-0">
           <ChartTopBar
             source={source}
-            isLive={true}
+            isLive={Boolean(
+              analysis &&
+              (analysis.dataStatus === 'LIVE' || analysis.dataStatus === 'VERIFIED_REALTIME') &&
+              analysis.dataQualityReport?.isTradeAllowed,
+            )}
             isFetching={isFetching}
             onRefresh={loadMarketData}
             isDeepBlack={isDeepBlack}
@@ -2144,7 +2149,16 @@ export default function App() {
       </div>
 
       <div id="execution-governor">
-        <ExecutionGovernorDashboard onModeSelected={handleExecutionModeSelected} />
+        <ExecutionGovernorDashboard
+          onModeSelected={handleExecutionModeSelected}
+          analysisStatus={
+            analysis && analysis.dataQualityReport?.isTradeAllowed &&
+            (analysis.dataStatus === 'LIVE' || analysis.dataStatus === 'VERIFIED_REALTIME')
+              ? 'داده معتبر؛ تحلیل heuristic و غیرمجاز برای سیگنال تولیدی'
+              : 'داده/کیفیت نامعتبر یا نامشخص؛ NO TRADE'
+          }
+          lastAnalysisAtMs={lastAnalysisAtMs}
+        />
       </div>
 
 

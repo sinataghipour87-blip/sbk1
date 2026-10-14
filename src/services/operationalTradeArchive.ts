@@ -16,11 +16,16 @@ export interface OperationalTradeArchiveRecord {
   lifecycleEvents: Array<{
     status: SbkFreqtradeSignalRecord['status'];
     observedAtMs: number;
-    source: 'SBK1_SIGNAL_LIFECYCLE';
+    source: SbkFreqtradeSignalRecord['lifecycleEvents'][number]['source'];
+    reason?: string;
+    tradeId?: number;
+    filledAmount?: number;
+    averageFillPrice?: number;
   }>;
   freqtradeTrades: Array<{
     observedAtMs: number;
     source: 'FREQTRADE_RPC';
+    executionMode?: 'DRY_RUN' | 'LIVE';
     trade: FreqtradeTrade;
   }>;
 }
@@ -134,20 +139,42 @@ export class OperationalTradeArchive {
         lifecycleEvents: [],
         freqtradeTrades: [],
       };
-      const latestEvent = record.lifecycleEvents[record.lifecycleEvents.length - 1];
-      if (latestEvent?.status !== signalRecord.status) {
-        record.lifecycleEvents.push({
-          status: signalRecord.status,
-          observedAtMs: signalRecord.updatedAtMs,
-          source: 'SBK1_SIGNAL_LIFECYCLE',
-        });
+      const lifecycleEvents = signalRecord.lifecycleEvents.length > 0
+        ? signalRecord.lifecycleEvents
+        : [{
+            status: signalRecord.status,
+            observedAtMs: signalRecord.updatedAtMs,
+            source: 'SBK1' as const,
+            reason: signalRecord.reason,
+            tradeId: signalRecord.tradeId,
+            filledAmount: signalRecord.filledAmount,
+            averageFillPrice: signalRecord.averageFillPrice,
+          }];
+      for (const event of lifecycleEvents) {
+        const archivedEvent = {
+          status: event.status,
+          observedAtMs: event.observedAtMs,
+          source: event.source,
+          ...(event.reason === undefined ? {} : { reason: event.reason }),
+          ...(event.tradeId === undefined ? {} : { tradeId: event.tradeId }),
+          ...(event.filledAmount === undefined ? {} : { filledAmount: event.filledAmount }),
+          ...(event.averageFillPrice === undefined ? {} : { averageFillPrice: event.averageFillPrice }),
+        };
+        if (!record.lifecycleEvents.some((existing) => isDeepStrictEqual(existing, archivedEvent))) {
+          record.lifecycleEvents.push(archivedEvent);
+        }
       }
       this.recordsBySignalId.set(record.signalId, record);
       await this.persist();
     });
   }
 
-  async recordFreqtradeTrade(signalId: string, trade: FreqtradeTrade, observedAtMs = Date.now()): Promise<void> {
+  async recordFreqtradeTrade(
+    signalId: string,
+    trade: FreqtradeTrade,
+    executionMode: 'DRY_RUN' | 'LIVE',
+    observedAtMs = Date.now(),
+  ): Promise<void> {
     await this.withExclusiveAccess(async () => {
       await this.load();
       const record = this.recordsBySignalId.get(signalId);
@@ -168,14 +195,19 @@ export class OperationalTradeArchive {
       if (alreadyLinked) {
         throw new Error(`Freqtrade trade ${trade.trade_id} is already linked to signal ${alreadyLinked.signalId}.`);
       }
-      const fingerprint = createHash('sha256').update(JSON.stringify(trade)).digest('hex');
+      const fingerprint = createHash('sha256')
+        .update(JSON.stringify({ executionMode, trade }))
+        .digest('hex');
       const existingFingerprints = new Set(record.freqtradeTrades.map((snapshot) =>
-        createHash('sha256').update(JSON.stringify(snapshot.trade)).digest('hex')
+        createHash('sha256')
+          .update(JSON.stringify({ executionMode: snapshot.executionMode ?? 'LIVE', trade: snapshot.trade }))
+          .digest('hex')
       ));
       if (!existingFingerprints.has(fingerprint)) {
         record.freqtradeTrades.push({
           observedAtMs,
           source: 'FREQTRADE_RPC',
+          executionMode,
           trade,
         });
         await this.persist();

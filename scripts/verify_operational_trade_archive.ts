@@ -58,8 +58,30 @@ function makeRecord(nowMs: number, status: SbkFreqtradeSignalRecord['status']): 
   return {
     signal,
     status,
+    receivedAtMs: nowMs,
     createdAtMs: nowMs,
     updatedAtMs: nowMs,
+    lifecycleEvents: [{ status, observedAtMs: nowMs, source: 'SBK1' }],
+  };
+}
+
+function makeStatusUpdate(
+  record: SbkFreqtradeSignalRecord,
+  status: SbkFreqtradeSignalRecord['status'],
+  updatedAtMs: number,
+  details: Partial<Pick<SbkFreqtradeSignalRecord, 'reason' | 'tradeId' | 'filledAmount' | 'averageFillPrice'>> = {},
+): SbkFreqtradeSignalRecord {
+  return {
+    ...record,
+    status,
+    updatedAtMs,
+    ...details,
+    lifecycleEvents: [{
+      status,
+      observedAtMs: updatedAtMs,
+      source: 'FREQTRADE',
+      ...details,
+    }],
   };
 }
 
@@ -100,29 +122,52 @@ try {
   const archive = new OperationalTradeArchive(storePath);
   const initialRecord = makeRecord(1_800_000_000_000, 'ACCEPTED');
   await archive.recordSignalLifecycle(initialRecord);
-  await archive.recordSignalLifecycle({ ...initialRecord, status: 'ORDER_SUBMITTED', updatedAtMs: initialRecord.updatedAtMs + 1 });
-  await archive.recordSignalLifecycle({
-    ...initialRecord,
-    status: 'FILLED',
+  await archive.recordSignalLifecycle(makeStatusUpdate(
+    initialRecord,
+    'ORDER_SUBMITTED',
+    initialRecord.updatedAtMs + 1,
+  ));
+  await archive.recordSignalLifecycle(makeStatusUpdate(initialRecord, 'PARTIALLY_FILLED', initialRecord.updatedAtMs + 2, {
+    tradeId: 73,
+    filledAmount: 0.0004,
+    averageFillPrice: 59_900,
+  }));
+  await archive.recordSignalLifecycle(makeStatusUpdate(initialRecord, 'PARTIALLY_FILLED', initialRecord.updatedAtMs + 3, {
+    tradeId: 73,
+    filledAmount: 0.00075,
+    averageFillPrice: 60_000,
+  }));
+  const filledRecord = makeStatusUpdate(initialRecord, 'FILLED', initialRecord.updatedAtMs + 4, {
     tradeId: 73,
     filledAmount: 0.001,
     averageFillPrice: 60_000,
-    updatedAtMs: initialRecord.updatedAtMs + 2,
   });
-  await archive.recordFreqtradeTrade(initialRecord.signal.signalId, trade, 1_800_000_602_000);
-  await archive.recordFreqtradeTrade(initialRecord.signal.signalId, trade, 1_800_000_603_000);
+  await archive.recordSignalLifecycle(filledRecord);
+  await archive.recordFreqtradeTrade(initialRecord.signal.signalId, trade, 'DRY_RUN', 1_800_000_602_000);
+  await archive.recordFreqtradeTrade(initialRecord.signal.signalId, trade, 'DRY_RUN', 1_800_000_603_000);
 
   const recovered = await new OperationalTradeArchive(storePath).getBySignalId(initialRecord.signal.signalId);
   assert.ok(recovered, 'record survives service restart');
   assert.equal(recovered.decisionId, initialRecord.signal.decisionId);
   assert.equal(recovered.featureSnapshot, null);
   assert.equal(recovered.modelVersion, null);
-  assert.equal(recovered.lifecycleEvents.length, 3, 'distinct lifecycle states are retained');
+  assert.equal(recovered.lifecycleEvents.length, 5, 'partial-fill updates with the same status are retained');
+  assert.equal(recovered.lifecycleEvents[2]?.source, 'FREQTRADE');
+  assert.equal(recovered.lifecycleEvents[2]?.tradeId, 73);
+  assert.equal(recovered.lifecycleEvents[2]?.filledAmount, 0.0004);
+  assert.equal(recovered.lifecycleEvents[3]?.filledAmount, 0.00075);
+  assert.equal(recovered.lifecycleEvents[4]?.averageFillPrice, 60_000);
   assert.equal(recovered.freqtradeTrades.length, 1, 'identical authoritative trade snapshot is idempotent');
   assert.equal(recovered.freqtradeTrades[0]?.source, 'FREQTRADE_RPC');
+  assert.equal(recovered.freqtradeTrades[0]?.executionMode, 'DRY_RUN');
   assert.equal(recovered.freqtradeTrades[0]?.trade.orders[0]?.order_id, 'entry-73');
   assert.equal(recovered.freqtradeTrades[0]?.trade.fee_close_cost, 0.03);
   assert.equal(recovered.freqtradeTrades[0]?.trade.close_profit_abs, 0.94);
+
+  const restartedArchive = new OperationalTradeArchive(storePath);
+  await restartedArchive.recordSignalLifecycle(filledRecord);
+  const afterDuplicateReplay = await restartedArchive.getBySignalId(initialRecord.signal.signalId);
+  assert.equal(afterDuplicateReplay?.lifecycleEvents.length, 5, 'lifecycle replay after restart is idempotent');
 
   const fixtureSignal = makeSignal(1_800_000_000_000, `${DRY_RUN_FIXTURE_SETUP_PREFIX}archive-test`);
   await archive.recordSignalLifecycle({
@@ -137,11 +182,11 @@ try {
     signal: secondSignal,
   });
   await assert.rejects(
-    archive.recordFreqtradeTrade(secondSignal.signalId, trade),
+    archive.recordFreqtradeTrade(secondSignal.signalId, trade, 'DRY_RUN'),
     /already linked to signal/,
   );
   await assert.rejects(
-    archive.recordFreqtradeTrade(initialRecord.signal.signalId, { ...trade, pair: 'ETH/USDT:USDT' }),
+    archive.recordFreqtradeTrade(initialRecord.signal.signalId, { ...trade, pair: 'ETH/USDT:USDT' }, 'DRY_RUN'),
     /does not match signal/,
   );
   console.log('Operational trade archive persistence, idempotency, source separation, and linkage checks passed.');

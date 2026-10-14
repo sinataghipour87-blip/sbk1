@@ -103,7 +103,6 @@ export type ExecutionMode = 'BACKTEST' | 'DRY_RUN' | 'TESTNET' | 'PAPER' | 'LIVE
 
 export interface ExecutionSettings {
   mode: ExecutionMode;
-  liveCapitalCeilingPct: number;
   lastChangedAt: number;
 }
 

@@ -8,6 +8,10 @@ export interface FreqtradeBotState {
   timeframe?: string;
   demoTrading?: boolean;
   dryRun: boolean;
+  dryRunWallet?: number;
+  stakeAmount?: number | string;
+  maxOpenTrades?: number;
+  marginMode?: string;
   forceEntryEnabled: boolean;
   openTradesCount: number;
   lastChecked: number;
@@ -119,6 +123,10 @@ interface FreqtradeConfig {
   demo_trading?: boolean;
   state?: string;
   stake_currency?: string;
+  stake_amount?: number | string;
+  dry_run_wallet?: number;
+  max_open_trades?: number;
+  margin_mode?: string;
   force_entry_enable?: boolean;
 }
 
@@ -303,6 +311,10 @@ class FreqtradeBridge {
       timeframe: config.timeframe,
       demoTrading: config.demo_trading,
       dryRun: config.dry_run,
+      dryRunWallet: config.dry_run_wallet,
+      stakeAmount: config.stake_amount,
+      maxOpenTrades: config.max_open_trades,
+      marginMode: config.margin_mode,
       forceEntryEnabled: config.force_entry_enable,
       openTradesCount: trades.length,
       lastChecked: Date.now(),

@@ -17,7 +17,7 @@ export const ChartTopBar: React.FC<ChartTopBarProps> = ({
   onRefresh,
   isFetching,
   source,
-  isLive = true,
+  isLive = false,
   isDeepBlack = false,
   onToggleTheme,
   onOpenSidebar,
@@ -80,10 +80,14 @@ export const ChartTopBar: React.FC<ChartTopBarProps> = ({
 
       {/* Status & Action Buttons */}
       <div className="flex items-center gap-2.5 w-full sm:w-auto justify-between sm:justify-end relative">
-        <div className="flex items-center gap-2 text-emerald-400 bg-emerald-950/80 border border-emerald-500/40 px-2.5 py-1 rounded-xl text-xs font-mono shadow-[0_0_12px_rgba(16,185,129,0.25)]">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-          <span className="font-bold text-[11px]">زنده (LIVE)</span>
-          <span className="text-emerald-300/70 text-[10px]">({source})</span>
+        <div className={`flex items-center gap-2 px-2.5 py-1 rounded-xl text-xs font-mono ${
+          isLive
+            ? 'text-emerald-400 bg-emerald-950/80 border border-emerald-500/40 shadow-[0_0_12px_rgba(16,185,129,0.25)]'
+            : 'text-amber-300 bg-amber-950/50 border border-amber-700/50'
+        }`}>
+          <span className={`w-2 h-2 rounded-full ${isLive ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
+          <span className="font-bold text-[11px]">{isLive ? 'دادهٔ زندهٔ معتبر' : 'داده تأییدنشده'}</span>
+          {isLive && <span className="text-emerald-300/70 text-[10px]">({source})</span>}
         </div>
 
         {/* Wallet Dropdown Button */}

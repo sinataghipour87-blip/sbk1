@@ -1,14 +1,10 @@
-import { ExecutionMode } from '../types/trading';
-
-const EXECUTION_MODE_STORAGE_KEY = 'quantum_execution_mode';
-const EXECUTION_MODE_CACHE_TTL_MS = 45_000;
+import type { ExecutionMode } from '../types/trading';
 
 export interface ExecutionSettings {
   mode: ExecutionMode;
-  liveCapitalCeilingPct?: number;
+  selectedProfile?: 'DEMO' | 'LIVE';
 }
 
-let cachedExecutionSettings: { value: ExecutionSettings; expiresAt: number } | null = null;
 let executionSettingsRequest: Promise<ExecutionSettings> | null = null;
 
 function isExecutionMode(value: unknown): value is ExecutionMode {
@@ -16,32 +12,16 @@ function isExecutionMode(value: unknown): value is ExecutionMode {
 }
 
 export function getSelectedExecutionMode(): ExecutionMode {
-  const savedMode = localStorage.getItem(EXECUTION_MODE_STORAGE_KEY);
-  if (savedMode === 'LIVE' || savedMode === 'TESTNET') {
-    localStorage.setItem(EXECUTION_MODE_STORAGE_KEY, 'DRY_RUN');
-    cachedExecutionSettings = null;
-    return 'DRY_RUN';
-  }
-  return isExecutionMode(savedMode) ? savedMode : 'DRY_RUN';
+  return 'DRY_RUN';
 }
 
 export function saveSelectedExecutionMode(mode: ExecutionMode): void {
-  if (getSelectedExecutionMode() !== mode) {
-    cachedExecutionSettings = null;
+  if (mode !== 'DRY_RUN') {
+    throw new Error('Execution profiles are controlled by the SBK1 server, not browser storage.');
   }
-  localStorage.setItem(EXECUTION_MODE_STORAGE_KEY, mode);
 }
 
 export async function getExecutionSettings(): Promise<ExecutionSettings> {
-  const selectedMode = getSelectedExecutionMode();
-  if (selectedMode !== 'LIVE') {
-    return { mode: selectedMode };
-  }
-
-  if (cachedExecutionSettings && Date.now() < cachedExecutionSettings.expiresAt) {
-    return cachedExecutionSettings.value;
-  }
-
   if (executionSettingsRequest) {
     return executionSettingsRequest;
   }
@@ -49,9 +29,6 @@ export async function getExecutionSettings(): Promise<ExecutionSettings> {
   const request = (async (): Promise<ExecutionSettings> => {
     const response = await fetch('/api/execution/settings');
     if (!response.ok) {
-      if (response.status === 429 && cachedExecutionSettings && cachedExecutionSettings.value.mode !== 'LIVE') {
-        return cachedExecutionSettings.value;
-      }
       throw new Error(`HTTP ${response.status}`);
     }
 
@@ -65,16 +42,11 @@ export async function getExecutionSettings(): Promise<ExecutionSettings> {
       throw new Error('حالت اجرای پشتیبانی‌نشده از سرور دریافت شد.');
     }
 
-    const settings: ExecutionSettings = { mode };
-    if ('liveCapitalCeilingPct' in data && typeof data.liveCapitalCeilingPct === 'number') {
-      settings.liveCapitalCeilingPct = data.liveCapitalCeilingPct;
+    if (mode !== 'DRY_RUN' || ('selectedProfile' in data && data.selectedProfile !== 'DEMO')) {
+      throw new Error('سرور پروفایل DEMO مورد انتظار را تأیید نکرد.');
     }
 
-    cachedExecutionSettings = {
-      value: settings,
-      expiresAt: Date.now() + EXECUTION_MODE_CACHE_TTL_MS,
-    };
-    return settings;
+    return { mode, selectedProfile: 'DEMO' };
   })();
 
   const trackedRequest = request.finally(() => {

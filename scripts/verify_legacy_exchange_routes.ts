@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { resolve } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 const adminToken = 'legacy-route-test-admin-token-long-enough';
 
@@ -38,6 +40,8 @@ async function waitForServer(baseUrl: string, child: ReturnType<typeof spawn>): 
 
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
+const auditDirectory = await mkdtemp(join(tmpdir(), 'sbk1-execution-audit-'));
+const auditPath = join(auditDirectory, 'audit.jsonl');
 const child = spawn(
   process.execPath,
   [
@@ -56,6 +60,7 @@ const child = spawn(
       FREQTRADE_BASE_URL: 'http://127.0.0.1:1',
       FREQTRADE_USERNAME: 'legacy-route-test-user',
       FREQTRADE_PASSWORD: 'legacy-route-test-password',
+      SBK1_EXECUTION_AUDIT_PATH: auditPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   },
@@ -67,6 +72,12 @@ child.stderr.setEncoding('utf8').on('data', (chunk: string) => { output += chunk
 
 try {
   await waitForServer(baseUrl, child);
+  const unknownApiResponse = await fetch(`${baseUrl}/api/v1/ping`);
+  assert.equal(unknownApiResponse.status, 404);
+  assert.match(unknownApiResponse.headers.get('content-type') || '', /application\/json/);
+  const unknownApiBody = await unknownApiResponse.json() as { code?: string };
+  assert.equal(unknownApiBody.code, 'API_ROUTE_NOT_FOUND');
+
   const blockedRequests: Array<{ method: string; path: string; body?: object }> = [
     { method: 'POST', path: '/api/exchange/credentials', body: { apiKey: 'test', apiSecret: 'test' } },
     { method: 'DELETE', path: '/api/exchange/credentials' },
@@ -110,6 +121,69 @@ try {
   const statusBody = await statusResponse.json() as { executionAuthority?: string };
   assert.equal(statusBody.executionAuthority, 'freqtrade');
 
+  const profileResponse = await fetch(`${baseUrl}/api/execution/settings`, { cache: 'no-store' });
+  const profileBody = await profileResponse.json() as { mode?: string; selectedProfile?: string };
+  assert.equal(profileBody.mode, 'DRY_RUN');
+  assert.equal(profileBody.selectedProfile, 'DEMO');
+
+  const liveSelectionResponse = await fetch(`${baseUrl}/api/execution/mode`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${adminToken}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ mode: 'LIVE' }),
+  });
+  assert.equal(liveSelectionResponse.status, 409, 'browser/server mode selection cannot switch the Freqtrade profile to LIVE');
+
+  const protectedDashboardResponse = await fetch(`${baseUrl}/api/execution/dashboard`, {
+    headers: { authorization: `Bearer ${adminToken}` },
+    cache: 'no-store',
+  });
+  assert.equal(protectedDashboardResponse.status, 503, 'missing RPC must not produce a fabricated wallet or connected state');
+  const protectedDashboard = await protectedDashboardResponse.json() as {
+    freqtradeMode?: string;
+    balance?: { kind?: string; equity?: number | null };
+    modeMatchesSelection?: boolean;
+  };
+  assert.equal(protectedDashboard.freqtradeMode, 'UNKNOWN');
+  assert.equal(protectedDashboard.modeMatchesSelection, false);
+  assert.equal(protectedDashboard.balance?.kind, 'UNAVAILABLE');
+  assert.equal(protectedDashboard.balance?.equity, null);
+
+  const unauthorizedActivationResponse = await fetch(`${baseUrl}/api/execution/live/activate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmation: 'ACTIVATE_LIVE' }),
+  });
+  assert.equal(unauthorizedActivationResponse.status, 403);
+
+  const activationResponse = await fetch(`${baseUrl}/api/execution/live/activate`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${adminToken}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ confirmation: 'ACTIVATE_LIVE' }),
+  });
+  assert.equal(activationResponse.status, 409, 'server-side LIVE gate must remain blocked');
+  const activationBody = await activationResponse.json() as {
+    activated?: boolean;
+    status?: string;
+    ordersPlaced?: number;
+    blockers?: string[];
+    auditLogged?: boolean;
+  };
+  assert.equal(activationBody.activated, false);
+  assert.equal(activationBody.status, 'BLOCKED');
+  assert.equal(activationBody.ordersPlaced, 0);
+  assert.equal(activationBody.auditLogged, true);
+  assert.ok((activationBody.blockers?.length ?? 0) > 0);
+  const auditContents = await readFile(auditPath, 'utf8');
+  assert.match(auditContents, /"outcome":"BLOCKED"/);
+  assert.doesNotMatch(auditContents, new RegExp(adminToken));
+  assert.doesNotMatch(auditContents, /legacy-route-test-password/);
+
   const toggleResponse = await fetch(`${baseUrl}/api/live/toggle-auto-trade`, {
     method: 'POST',
     headers: {
@@ -122,7 +196,7 @@ try {
   assert.equal(toggleResponse.status, 409);
   assert.equal(toggleBody.liveAutoTradeEnabled, false);
 
-  console.log(`${blockedRequests.length} legacy exchange routes and live auto-trading activation fail closed; external fetches were blocked.`);
+  console.log(`${blockedRequests.length} legacy exchange routes, server-side LIVE activation, and live auto-trading fail closed; external fetches were blocked.`);
 } catch (error) {
   throw new Error(`${error instanceof Error ? error.message : String(error)}\nServer output:\n${output}`);
 } finally {
@@ -139,4 +213,5 @@ try {
       });
     });
   }
+  await rm(auditDirectory, { recursive: true, force: true });
 }

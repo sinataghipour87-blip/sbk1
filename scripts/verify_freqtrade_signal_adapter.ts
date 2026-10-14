@@ -110,6 +110,10 @@ try {
   assert.equal(concurrentSubmissions.filter((record) => !record.duplicate).length, 1);
   assert.equal(concurrentSubmissions.filter((record) => record.duplicate).length, 3);
   assert.equal(concurrentSubmissions[0].status, 'ACCEPTED');
+  assert.equal(concurrentSubmissions[0].lifecycleEvents.length, 1);
+  assert.equal(concurrentSubmissions[0].lifecycleEvents[0]?.status, 'ACCEPTED');
+  assert.equal(concurrentSubmissions[0].lifecycleEvents[0]?.source, 'SBK1');
+  assert.equal(concurrentSubmissions[0].receivedAtMs, concurrentSubmissions[0].createdAtMs);
   await assert.rejects(
     adapter.submit({
       ...signal,
@@ -140,6 +144,12 @@ try {
     averageFillPrice: 62_106,
   });
   assert.equal(filled.status, 'FILLED');
+  assert.deepEqual(
+    filled.lifecycleEvents.map((event) => event.status),
+    ['ACCEPTED', 'STRATEGY_ACCEPTED', 'ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'FILLED'],
+  );
+  assert.equal(filled.lifecycleEvents.at(-1)?.tradeId, 42);
+  assert.equal(filled.lifecycleEvents.at(-1)?.source, 'FREQTRADE');
   await assert.rejects(
     adapter.updateStatus(signal.signalId, { status: 'FILLED', tradeId: 43 }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'TRADE_ID_CONFLICT',
@@ -223,6 +233,7 @@ try {
     record.signal.signalId === signal.signalId).tradeId, 42);
   const restored = await new FreqtradeSignalAdapter().get(signal.signalId);
   assert.equal(restored?.status, 'FILLED');
+  assert.equal(restored?.lifecycleEvents.length, 5, 'signal history survives process restart');
   assert.equal((await new FreqtradeSignalAdapter().get(uncertain.signal.signalId))?.status, 'ORDER_SUBMITTED');
 
   const pythonContractCheck = spawnSync('python3', ['-c', `

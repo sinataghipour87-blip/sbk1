@@ -4,6 +4,7 @@ import { GoogleGenAI, Type, GenerateVideosOperation } from "@google/genai";
 import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import fs from 'fs';
+import path from 'path';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
@@ -346,8 +347,7 @@ app.post('/api/monte-carlo', async (req, res) => {
 
 // --- Execution Mode Engine ---
 let executionSettings: ExecutionSettings = {
-    mode: 'BACKTEST',
-    liveCapitalCeilingPct: 5,
+    mode: 'DRY_RUN',
     lastChangedAt: Date.now()
 };
 
@@ -359,32 +359,21 @@ const executionModeLimiter: express.RequestHandler = (req, res, next) => {
 };
 
 app.get('/api/execution/settings', (req, res) => {
-    res.json(executionSettings);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ...executionSettings, selectedProfile: 'DEMO' });
 });
 
 app.post('/api/execution/mode', executionModeLimiter, requireAdminAuth, (req, res) => {
-    const { mode, liveCapitalCeilingPct } = req.body || {};
-    const supportedModes = ['BACKTEST', 'TESTNET', 'PAPER'] as const;
-    if (mode !== undefined && !supportedModes.includes(mode)) {
+    const { mode } = req.body || {};
+    if (mode !== 'DRY_RUN') {
         return res.status(409).json({
             success: false,
-            error: 'SBK1 cannot enable LIVE mode. Live execution is exclusively controlled and audited by the Freqtrade deployment.',
+            selectedProfile: 'DEMO',
+            liveActivationAllowed: false,
+            error: 'SBK1 selects only the Freqtrade DEMO profile. LIVE requires the separate server-side activation gate.',
         });
     }
-    if (
-        liveCapitalCeilingPct !== undefined &&
-        (typeof liveCapitalCeilingPct !== 'number' ||
-            !Number.isFinite(liveCapitalCeilingPct) ||
-            liveCapitalCeilingPct < 1 ||
-            liveCapitalCeilingPct > 5)
-    ) {
-        return res.status(400).json({
-            success: false,
-            error: 'liveCapitalCeilingPct must be a finite percentage between 1 and 5.',
-        });
-    }
-    if (mode !== undefined) executionSettings.mode = mode;
-    if (liveCapitalCeilingPct !== undefined) executionSettings.liveCapitalCeilingPct = liveCapitalCeilingPct;
+    executionSettings.mode = 'DRY_RUN';
     executionSettings.lastChangedAt = Date.now();
     res.json({ success: true, settings: executionSettings });
 });
@@ -1561,6 +1550,246 @@ let liveTradingState = {
     liveAutoTradeEnabled: false
 };
 
+const liveActivationBlockers = [
+    'A separate LIVE Freqtrade profile is not provisioned; SBK1 startup enforces dry_run=true.',
+    'Private exchange API credentials have not been validated by the server; no key or secret is read into the dashboard.',
+    'Read-only account connectivity and the required non-withdrawal trade permissions have not been verified.',
+    'Read-only-first verification and Testnet connectivity/order submit/cancel/fill tests have not been evidenced.',
+    'Exchange, pair, market type, timeframe, margin mode, and leverage have not been checked against an approved LIVE policy.',
+    'The LIVE gate does not yet bind authorization to a fresh, valid market-data snapshot with a measured age check.',
+    'The production signal path is blocked because calibrated probability evidence is unavailable.',
+    'A reviewed LIVE capital ceiling, bounded order sizing, max-open-trades, and daily-loss policy is not provisioned.',
+    'LIVE stoploss placement, emergency exit, timeout behavior, and exchange-side kill-switch behavior have not been tested.',
+    'Existing LIVE positions and open orders have not been reconciled.',
+    'Restart recovery and unknown-order reconciliation have not been verified against a LIVE or Testnet account.',
+    'The SBK1 emergency stop and kill-switch recovery have not been exercised end-to-end.',
+];
+
+function writeExecutionAudit(entry: Record<string, unknown>): void {
+    const auditPath = path.resolve(process.env.SBK1_EXECUTION_AUDIT_PATH || 'data/sbk1-execution-audit.jsonl');
+    fs.mkdirSync(path.dirname(auditPath), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(auditPath, `${JSON.stringify(entry)}\n`, { encoding: 'utf-8', mode: 0o600 });
+    if (process.platform !== 'win32') fs.chmodSync(auditPath, 0o600);
+}
+
+app.get('/api/execution/dashboard', requireAdminAuth, async (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const expectedPair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+    const expectedExchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+    const expectedTimeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+    try {
+        const [freqtrade, balance, openTrades] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getBalance(),
+            freqtradeBridge.getOpenTrades(),
+        ]);
+        let market: Record<string, unknown>;
+        try {
+            if (!expectedPair || !expectedExchange || !expectedTimeframe) {
+                throw new Error('The expected exchange, pair, or timeframe is not configured.');
+            }
+            const snapshot = freqtradeMarketDataBridge.getLatestConfigured({
+                exchange: expectedExchange,
+                pair: expectedPair,
+                timeframe: expectedTimeframe,
+            });
+            if (
+                !snapshot.ticker ||
+                Date.now() < snapshot.ticker.retrievedAtMs ||
+                Date.now() - snapshot.ticker.retrievedAtMs > FREQTRADE_TICKER_MAX_AGE_MS
+            ) {
+                throw new Error('A fresh Freqtrade ticker is unavailable.');
+            }
+            market = {
+                status: 'FRESH',
+                source: snapshot.source,
+                pair: snapshot.pair,
+                timeframe: snapshot.timeframe,
+                lastPrice: snapshot.ticker?.last ?? null,
+                observedAtMs: snapshot.ticker?.retrievedAtMs ?? null,
+                snapshotAtMs: snapshot.generatedAtMs,
+                ageMs: Math.max(0, Date.now() - snapshot.generatedAtMs),
+            };
+        } catch (error) {
+            market = {
+                status: 'UNAVAILABLE',
+                error: error instanceof Error ? error.message : 'Market data is unavailable.',
+            };
+        }
+
+        let signals: Record<string, unknown>;
+        try {
+            if (!expectedPair || !expectedTimeframe) {
+                throw new Error('The expected pair or timeframe is not configured.');
+            }
+            const records = await freqtradeSignalAdapter.getDashboardRecords(expectedPair, expectedTimeframe);
+            signals = {
+                status: 'AVAILABLE',
+                queuedCount: records.filter((record) => record.status === 'ACCEPTED').length,
+                rejectedCount: records.filter((record) => record.status === 'REJECTED').length,
+                records: records.map((record) => ({
+                    signalId: record.signal.signalId,
+                    status: record.status,
+                    updatedAtMs: record.updatedAtMs,
+                    reason: record.reason,
+                    tradeId: record.tradeId,
+                    filledAmount: record.filledAmount,
+                    averageFillPrice: record.averageFillPrice,
+                    testOnlyFixture: record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX),
+                    lifecycle: record.lifecycleEvents.map((event) => ({
+                        status: event.status,
+                        observedAtMs: event.observedAtMs,
+                        source: event.source,
+                        reason: event.reason,
+                        tradeId: event.tradeId,
+                        filledAmount: event.filledAmount,
+                        averageFillPrice: event.averageFillPrice,
+                    })),
+                })),
+            };
+        } catch (error) {
+            signals = {
+                status: 'UNAVAILABLE',
+                queuedCount: null,
+                rejectedCount: null,
+                records: [],
+                error: error instanceof Error ? error.message : 'Signal lifecycle is unavailable.',
+            };
+        }
+
+        return res.json({
+            selectedProfile: 'DEMO',
+            selectedFreqtradeMode: executionSettings.mode,
+            freqtradeMode: freqtrade.dryRun ? 'DEMO' : freqtrade.demoTrading ? 'TESTNET' : 'LIVE',
+            modeMatchesSelection: freqtrade.status === 'running' &&
+                freqtrade.dryRun === true &&
+                freqtrade.demoTrading === false &&
+                freqtrade.forceEntryEnabled === false &&
+                executionSettings.mode === 'DRY_RUN',
+            rpc: { status: 'CONNECTED', lastCheckedAtMs: freqtrade.lastChecked },
+            exchange: {
+                status: freqtrade.status === 'running' ? 'CONNECTED' : 'STOPPED',
+                name: freqtrade.exchange ?? null,
+                market: freqtrade.market ?? null,
+                pair: expectedPair || null,
+                timeframe: freqtrade.timeframe ?? null,
+            },
+            freqtrade: {
+                status: freqtrade.status,
+                dryRun: freqtrade.dryRun,
+                demoTrading: freqtrade.demoTrading,
+                forceEntryEnabled: freqtrade.forceEntryEnabled,
+                strategy: freqtrade.strategy ?? null,
+                openTradesCount: freqtrade.openTradesCount,
+                stakeAmount: freqtrade.stakeAmount ?? null,
+                dryRunWallet: freqtrade.dryRunWallet ?? null,
+                maxOpenTrades: freqtrade.maxOpenTrades ?? null,
+                marginMode: freqtrade.marginMode ?? null,
+            },
+            balance: {
+                kind: freqtrade.dryRun ? 'VIRTUAL' : freqtrade.demoTrading ? 'TESTNET' : 'EXCHANGE',
+                equity: balance.equity,
+                available: balance.available,
+                currency: balance.currency,
+            },
+            openTrades,
+            orderCount: openTrades.reduce((count, trade) => count + trade.orders.length, 0),
+            filledOrderCount: openTrades.reduce(
+                (count, trade) => count + trade.orders.filter((order) => (order.filled ?? 0) > 0).length,
+                0,
+            ),
+            market,
+            analysis: {
+                status: 'NOT_REPORTED',
+                lastDecisionAtMs: null,
+                reason: 'Analysis runs in the browser and is not independently reported to the execution server.',
+            },
+            signals,
+            killSwitchActive: liveTradingState.killSwitchActive,
+            services: {
+                sbk1: 'RUNNING',
+                freqtrade: freqtrade.status === 'running' ? 'RUNNING' : 'STOPPED',
+            },
+            live: {
+                status: 'BLOCKED',
+                activationAllowed: false,
+                blockers: liveActivationBlockers,
+            },
+        });
+    } catch (error) {
+        return res.status(503).json({
+            selectedProfile: 'DEMO',
+            freqtradeMode: 'UNKNOWN',
+            modeMatchesSelection: false,
+            rpc: { status: 'UNAVAILABLE' },
+            exchange: { status: 'UNAVAILABLE' },
+            balance: { kind: 'UNAVAILABLE', equity: null, available: null, currency: null },
+            openTrades: [],
+            market: { status: 'UNAVAILABLE' },
+            analysis: {
+                status: 'NOT_REPORTED',
+                lastDecisionAtMs: null,
+                reason: 'Analysis runs in the browser and is not independently reported to the execution server.',
+            },
+            signals: { status: 'UNAVAILABLE', queuedCount: null, rejectedCount: null, records: [] },
+            killSwitchActive: liveTradingState.killSwitchActive,
+            services: { sbk1: 'RUNNING', freqtrade: 'UNAVAILABLE' },
+            live: { status: 'BLOCKED', activationAllowed: false, blockers: liveActivationBlockers },
+            error: error instanceof Error ? error.message : 'Freqtrade state is unavailable.',
+        });
+    }
+});
+
+app.post('/api/execution/live/activate', requireAdminAuth, async (req, res) => {
+    if (req.body?.confirmation !== 'ACTIVATE_LIVE') {
+        return res.status(400).json({
+            activated: false,
+            status: 'BLOCKED',
+            error: 'Explicit confirmation ACTIVATE_LIVE is required to record an activation attempt.',
+        });
+    }
+
+    const blockers = [...liveActivationBlockers];
+    try {
+        const freqtrade = await freqtradeBridge.getStatus();
+        if (freqtrade.dryRun) {
+            blockers.unshift('Freqtrade RPC confirms dry_run=true; this runtime is DEMO, not LIVE.');
+        }
+        if (freqtrade.status !== 'running') {
+            blockers.unshift('Freqtrade is not running.');
+        }
+    } catch (error) {
+        blockers.unshift(`Freqtrade RPC could not verify execution mode: ${error instanceof Error ? error.message : 'unavailable'}`);
+    }
+
+    const auditEntry = {
+        timestamp: new Date().toISOString(),
+        action: 'LIVE_ACTIVATION_REQUEST',
+        outcome: 'BLOCKED',
+        actor: 'authenticated-admin',
+        blockers,
+        ordersPlaced: 0,
+    };
+    try {
+        writeExecutionAudit(auditEntry);
+    } catch (error) {
+        return res.status(503).json({
+            activated: false,
+            status: 'BLOCKED',
+            blockers,
+            error: `LIVE activation attempt could not be written to the audit log: ${error instanceof Error ? error.message : 'unknown error'}`,
+            ordersPlaced: 0,
+        });
+    }
+    return res.status(409).json({
+        activated: false,
+        status: 'BLOCKED',
+        blockers,
+        ordersPlaced: 0,
+        auditLogged: true,
+    });
+});
+
 app.get('/api/live/status', async (req, res) => {
     try {
         const [botState, openTrades] = await Promise.all([
@@ -1959,6 +2188,8 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             success: true,
             dryRun: true,
             testOnly: true,
+            queued: true,
+            executionStage: 'QUEUED',
             signalId: record.signal.signalId,
             status: record.status,
             expiresAtMs: record.signal.expiresAtMs,
@@ -2158,6 +2389,7 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
         const records = await freqtradeSignalAdapter.getForStrategy(pair, timeframe);
         return res.json({
             contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
+            deliveryStage: 'QUEUE_POLL',
             signals: records.filter((record) =>
                 record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX)
             ),
@@ -2174,13 +2406,17 @@ app.post('/api/freqtrade/signals/:signalId/status', requireFreqtradeBridgeAuth, 
     try {
         const record = await freqtradeSignalAdapter.updateStatus(req.params.signalId, req.body || {});
         if (!record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX)) {
-            const botState = await freqtradeBridge.getStatus();
-            if (!botState.dryRun) {
-                await operationalTradeArchive.recordSignalLifecycle(record);
-                if (record.tradeId !== undefined) {
-                    const freqtradeTrade = await freqtradeBridge.getTrade(record.tradeId);
-                    await operationalTradeArchive.recordFreqtradeTrade(record.signal.signalId, freqtradeTrade);
-                }
+            await operationalTradeArchive.recordSignalLifecycle(record);
+            if (record.tradeId !== undefined) {
+                const [botState, freqtradeTrade] = await Promise.all([
+                    freqtradeBridge.getStatus(),
+                    freqtradeBridge.getTrade(record.tradeId),
+                ]);
+                await operationalTradeArchive.recordFreqtradeTrade(
+                    record.signal.signalId,
+                    freqtradeTrade,
+                    botState.dryRun ? 'DRY_RUN' : 'LIVE',
+                );
             }
         }
         res.json({
@@ -2217,14 +2453,17 @@ app.get('/api/hunter/trade-archive/:signalId', requireAdminAuth, async (req, res
         const latestTrade = record.freqtradeTrades[record.freqtradeTrades.length - 1]?.trade;
         if (latestTrade) {
             const botState = await freqtradeBridge.getStatus();
-            if (botState.dryRun) {
+            const executionMode = botState.dryRun ? 'DRY_RUN' : 'LIVE';
+            const archivedExecutionMode =
+                record.freqtradeTrades[record.freqtradeTrades.length - 1]?.executionMode ?? 'LIVE';
+            if (executionMode !== archivedExecutionMode) {
                 return res.status(409).json({
-                    error: 'Trade archive refresh requires Freqtrade dry_run=false; simulated state is not archived.',
-                    code: 'SIMULATED_TRADE_ARCHIVE_REFRESH_BLOCKED',
+                    error: 'Trade archive refresh is blocked because the Freqtrade execution mode changed.',
+                    code: 'TRADE_ARCHIVE_EXECUTION_MODE_MISMATCH',
                 });
             }
             const currentTrade = await freqtradeBridge.getTrade(latestTrade.trade_id);
-            await operationalTradeArchive.recordFreqtradeTrade(record.signalId, currentTrade);
+            await operationalTradeArchive.recordFreqtradeTrade(record.signalId, currentTrade, executionMode);
             record = await operationalTradeArchive.getBySignalId(record.signalId);
             if (!record) throw new Error('Operational trade archive record disappeared during refresh.');
         }
@@ -2300,6 +2539,12 @@ async function startServer() {
     return;
   }
 
+  app.use('/api', (_req, res) => {
+    res.status(404).json({
+      error: 'API endpoint not found.',
+      code: 'API_ROUTE_NOT_FOUND',
+    });
+  });
   app.use(viteServer.middlewares);
 
   // Freqtrade owns exchange connectivity, market feeds, and the trade lifecycle.
@@ -2313,7 +2558,7 @@ async function startServer() {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
   }
-  httpServer = app.listen(port, '0.0.0.0', () => console.log(`Server running on port ${port}`));
+  httpServer = app.listen(port, '127.0.0.1', () => console.log(`Server running on http://127.0.0.1:${port}`));
 }
 
 async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
