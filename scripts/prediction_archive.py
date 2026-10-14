@@ -698,12 +698,12 @@ def archive_freqtrade_closed_trades(trades: Any, path: Path | None = None) -> di
                             "SELECT collection_mode FROM prediction_signals WHERE signal_id = ?",
                             (signal_id,),
                         ).fetchone()
-                        if (
-                            decision
-                            and decision["collection_mode"] == "DRY_RUN_COLLECTION"
-                            and execution_mode == "DRY_RUN"
-                        ):
-                            execution_mode = "DRY_RUN_COLLECTION"
+                        if decision and decision["collection_mode"] == "DRY_RUN_COLLECTION":
+                            execution_mode = (
+                                "DRY_RUN_COLLECTION"
+                                if execution_mode == "DRY_RUN"
+                                else "UNAVAILABLE"
+                            )
                 fees_json = _canonical_json(trade["fees"])
                 cursor = connection.execute(
                     """

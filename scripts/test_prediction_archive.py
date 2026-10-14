@@ -278,7 +278,7 @@ class PredictionArchiveTests(unittest.TestCase):
         self.assertEqual(status["calibrationEligibleMatchedOutcomes"], 1)
         self.assertEqual(status["remaining"]["training"], 39)
 
-    def test_live_outcome_is_not_mislabeled_as_collection(self):
+    def test_live_rpc_mode_cannot_authorize_collection_decision_for_calibration(self):
         signal_id = "sbk1_" + "d" * 32
         decision = candidate_record()
         decision.update({
@@ -291,10 +291,13 @@ class PredictionArchiveTests(unittest.TestCase):
         ], self.database)
 
         stored = list_records(path=self.database)["records"][0]
-        self.assertEqual(stored["outcome"]["executionMode"], "LIVE")
+        self.assertEqual(stored["outcome"]["executionMode"], "UNAVAILABLE")
         status = calibration_status(self.database)
-        self.assertEqual(status["confirmedOutcomesByExecutionMode"]["LIVE"], 1)
+        self.assertEqual(status["confirmedOutcomesByExecutionMode"]["LIVE"], 0)
         self.assertEqual(status["confirmedOutcomesByExecutionMode"]["DRY_RUN_COLLECTION"], 0)
+        self.assertEqual(status["confirmedOutcomesByExecutionMode"]["UNAVAILABLE"], 1)
+        self.assertEqual(status["calibrationEligibleMatchedOutcomes"], 0)
+        self.assertEqual(status["remaining"]["training"], 40)
 
     def test_unmatched_outcomes_are_reported_without_guessing_and_can_be_linked_later(self):
         decision = candidate_record()
