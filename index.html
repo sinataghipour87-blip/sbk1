@@ -13,10 +13,43 @@
   <body>
     <div id="root">
       <main dir="rtl" style="min-height:100vh;display:grid;place-content:center;gap:12px;padding:24px;background:#020617;color:#e2e8f0;font-family:system-ui,sans-serif;text-align:center">
-        <strong style="font-size:1.2rem">در حال راه‌اندازی سامانه تحلیل و معامله</strong>
-        <span style="color:#94a3b8">لطفاً تا بارگذاری کامل رابط کاربری منتظر بمانید.</span>
+        <strong data-sbk1-startup-title style="font-size:1.2rem">در حال راه‌اندازی رابط کاربری</strong>
+        <span style="color:#94a3b8">لطفاً تا بارگذاری کامل داشبورد منتظر بمانید.</span>
+        <p data-sbk1-startup-error role="alert" hidden style="max-width:42rem;margin:12px auto 0;color:#fda4af"></p>
       </main>
     </div>
+    <script>
+      (() => {
+        const startupScreen = document.querySelector('[data-sbk1-startup-title]')?.parentElement;
+        const showStartupError = (details) => {
+          if (!startupScreen?.isConnected) return;
+          const title = startupScreen.querySelector('[data-sbk1-startup-title]');
+          const message = startupScreen.querySelector('[data-sbk1-startup-error]');
+          if (title) title.textContent = 'رابط کاربری بارگذاری نشد';
+          if (message) {
+            message.hidden = false;
+            message.textContent = `${details} صفحه را تازه‌سازی کنید؛ اگر مشکل ماند، Console مرورگر را بررسی کنید و مطمئن شوید برنامه با «npm run sbk1» اجرا شده است.`;
+          }
+        };
+
+        window.addEventListener('error', (event) => {
+          if (event instanceof ErrorEvent && event.message) {
+            showStartupError(`خطای اجرا: ${event.message}`);
+          } else if (event.target instanceof HTMLScriptElement) {
+            showStartupError('فایل اصلی رابط کاربری از سرور بارگذاری نشد.');
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', (event) => {
+          const reason = event.reason instanceof Error ? event.reason.message : String(event.reason);
+          showStartupError(`خطای راه‌اندازی: ${reason}`);
+        });
+
+        window.setTimeout(() => {
+          showStartupError('بارگذاری بیش از ۳۰ ثانیه طول کشید.');
+        }, 30_000);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
