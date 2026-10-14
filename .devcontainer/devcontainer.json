@@ -1,0 +1,21 @@
+{
+  "name": "SBK1 dry-run dashboard",
+  "image": "ghcr.io/freqtrade/freqtrade-devcontainer:latest",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "forwardPorts": [
+    3000
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "SBK1 dashboard",
+      "visibility": "private"
+    },
+    "8080": {
+      "onAutoForward": "ignore"
+    }
+  }
+}

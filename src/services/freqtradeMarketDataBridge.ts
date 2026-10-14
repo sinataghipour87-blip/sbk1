@@ -345,6 +345,18 @@ export class FreqtradeMarketDataBridge {
     return matching[0];
   }
 
+  getLatestConfiguredTimestampMs(
+    configuration: { exchange: string; pair: string; timeframe: string },
+  ): number | null {
+    const matching = [...this.latestByMarket.values()].filter((snapshot) =>
+      snapshot.exchange.toLowerCase() === configuration.exchange.toLowerCase() &&
+      snapshot.pair === configuration.pair &&
+      snapshot.timeframe === configuration.timeframe
+    );
+    if (matching.length !== 1) return null;
+    return matching[0].generatedAtMs;
+  }
+
   private key(expected: FreqtradeMarketSnapshotExpectation): string {
     return [expected.exchange.toLowerCase(), expected.market, expected.pair, expected.timeframe].join('|');
   }

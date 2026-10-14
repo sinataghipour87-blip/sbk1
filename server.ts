@@ -1772,6 +1772,22 @@ let liveTradingState = {
 };
 
 app.get('/api/live/status', async (req, res) => {
+    const configuredMarket = {
+        exchange: process.env.SBK1_SIGNAL_EXCHANGE?.trim() || '',
+        pair: process.env.SBK1_FREQTRADE_PAIR?.trim() || '',
+        timeframe: process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '',
+    };
+    const marketSnapshotTimestamp = configuredMarket.exchange && configuredMarket.pair && configuredMarket.timeframe
+        ? freqtradeMarketDataBridge.getLatestConfiguredTimestampMs(configuredMarket)
+        : null;
+    const marketDataAgeMs = marketSnapshotTimestamp === null
+        ? null
+        : Date.now() - marketSnapshotTimestamp;
+    const productionSignalStatus = {
+        blocked: true,
+        reason: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+    } as const;
+
     try {
         const [botState, openTrades] = await Promise.all([
             freqtradeBridge.getStatus(),
@@ -1780,6 +1796,8 @@ app.get('/api/live/status', async (req, res) => {
         res.json({
             killSwitchActive: liveTradingState.killSwitchActive,
             liveAutoTradeEnabled: false,
+            marketDataAgeMs: marketDataAgeMs !== null && marketDataAgeMs >= 0 ? marketDataAgeMs : null,
+            productionSignalStatus,
             positionAuthority: 'freqtrade',
             executionAuthority: 'freqtrade',
             freqtrade: botState,
@@ -1801,6 +1819,8 @@ app.get('/api/live/status', async (req, res) => {
         res.status(503).json({
             killSwitchActive: liveTradingState.killSwitchActive,
             liveAutoTradeEnabled: false,
+            marketDataAgeMs: marketDataAgeMs !== null && marketDataAgeMs >= 0 ? marketDataAgeMs : null,
+            productionSignalStatus,
             positionAuthority: 'freqtrade',
             executionAuthority: 'freqtrade',
             activePositions: [],
@@ -2934,9 +2954,9 @@ async function startServer() {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
   }
-  const listenHost = process.env.SBK1_LISTEN_HOST?.trim() || '0.0.0.0';
+  const listenHost = '127.0.0.1';
   httpServer = app.listen(port, listenHost, () => {
-    console.log(`Server running on port ${port}`);
+    console.log(`Server running at http://${listenHost}:${port}`);
     if (!shutdownRequested) {
       void initializeServerRuntime().catch((error: unknown) => {
         console.error(

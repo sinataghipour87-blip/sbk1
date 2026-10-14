@@ -261,10 +261,17 @@ try {
   assert.equal(statusResponse.status, 200);
   const status = await statusResponse.json() as {
     killSwitchActive: boolean;
+    marketDataAgeMs: number | null;
+    productionSignalStatus: { blocked: boolean; reason: string };
     activePositions: Array<{ tradeId: number }>;
   };
   assert.equal(status.activePositions.length, 1);
   assert.equal(status.activePositions[0]?.tradeId, openTrade.trade_id);
+  assert.equal(status.marketDataAgeMs, null, 'market data age must remain unavailable without an accepted snapshot');
+  assert.deepEqual(status.productionSignalStatus, {
+    blocked: true,
+    reason: 'CALIBRATED_CONFIDENCE_UNAVAILABLE',
+  });
 
   const historyResponse = await fetch(`${baseUrl}/api/live/closed-trades`, { headers, cache: 'no-store' });
   assert.equal(historyResponse.status, 200);
