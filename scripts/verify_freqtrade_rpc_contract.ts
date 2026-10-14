@@ -98,6 +98,50 @@ const mockFreqtrade = createServer(async (request, response) => {
     }]);
     return;
   }
+  if (url.pathname === '/api/v1/trade/700') {
+    respond(response, 404, { detail: 'closed trades are available from trade history' });
+    return;
+  }
+  if (url.pathname === '/api/v1/trades') {
+    const offset = Number(url.searchParams.get('offset') || 0);
+    const page = offset === 0
+      ? Array.from({ length: 500 }, (_, index) => ({
+          trade_id: index + 1,
+          pair: 'BTC/USDT:USDT',
+          is_open: false,
+          is_short: false,
+          amount: 0.001,
+          amount_requested: 0.001,
+          open_rate: 60_000,
+          stake_amount: 60,
+          has_open_orders: false,
+          orders: [],
+          fee_open_cost: 0.03,
+          fee_close_cost: 0.03,
+          open_fill_timestamp: 1_800_000_001_000,
+          close_timestamp: 1_800_000_601_000,
+        }))
+      : [{
+          trade_id: 700,
+          pair: 'BTC/USDT:USDT',
+          is_open: false,
+          is_short: false,
+          amount: 0.001,
+          amount_requested: 0.001,
+          open_rate: 60_000,
+          stake_amount: 60,
+          has_open_orders: false,
+          orders: [],
+          fee_open_cost: 0.03,
+          fee_close_cost: 0.03,
+          open_fill_timestamp: 1_800_000_001_000,
+          close_timestamp: 1_800_000_601_000,
+          close_rate: 61_000,
+          close_profit_abs: 0.94,
+        }];
+    respond(response, 200, { trades: page });
+    return;
+  }
   if (url.pathname === '/api/v1/balance') {
     respond(response, 200, {
       total: 125,
@@ -141,6 +185,9 @@ try {
   const trades = await freqtradeBridge.getOpenTrades();
   assert.equal(trades[0]?.trade_id, 7);
   assert.equal(trades[0]?.orders[0]?.filled, 0.001);
+  const closedTrade = await freqtradeBridge.getTrade(700);
+  assert.equal(closedTrade.trade_id, 700, 'closed trades beyond the first page are recoverable');
+  assert.equal(closedTrade.close_profit_abs, 0.94);
   const balance = await freqtradeBridge.getBalance();
   assert.deepEqual(balance, { equity: 125, available: 100, currency: 'USDT' });
   assert.deepEqual(await freqtradeBridge.getWhitelist(), ['BTC/USDT:USDT']);

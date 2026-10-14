@@ -21,8 +21,12 @@ export interface FreqtradeOrder {
   safe_price: number;
   cost: number;
   ft_order_side: string;
+  order_type?: string;
   is_open: boolean;
+  order_timestamp?: number | null;
   order_filled_timestamp: number | null;
+  ft_fee_base?: number | null;
+  ft_order_tag?: string | null;
 }
 
 export interface FreqtradeTrade {
@@ -40,6 +44,12 @@ export interface FreqtradeTrade {
   fee_close_cost: number | null;
   open_fill_timestamp: number | null;
   close_timestamp: number | null;
+  close_rate?: number | null;
+  close_profit_abs?: number | null;
+  close_profit?: number | null;
+  realized_profit?: number;
+  exit_reason?: string | null;
+  strategy?: string;
 }
 
 export interface FreqtradeBalance {
@@ -351,30 +361,62 @@ class FreqtradeBridge {
       if (!(error instanceof FreqtradeRpcError) || error.statusCode !== 404) {
         throw error;
       }
-      const history = await this.request<FreqtradeTradesResponse>('/trades?limit=500&order_by_id=true');
-      const trade = history.trades?.find((item) => item.trade_id === Number(normalizedId));
-      if (!trade) throw error;
-      return this.validateTrade(trade, Number(normalizedId));
+      const pageSize = 500;
+      for (let offset = 0; ; offset += pageSize) {
+        const history = await this.request<FreqtradeTradesResponse>(
+          `/trades?limit=${pageSize}&offset=${offset}&order_by_id=true`,
+        );
+        if (!Array.isArray(history.trades)) {
+          throw new FreqtradeRpcError('Freqtrade RPC returned an invalid trade-history response.');
+        }
+        const trade = history.trades.find((item) => item.trade_id === Number(normalizedId));
+        if (trade) return this.validateTrade(trade, Number(normalizedId));
+        if (history.trades.length < pageSize) throw error;
+      }
     }
   }
 
   private validateTrade(trade: FreqtradeTrade, expectedId: number): FreqtradeTrade {
+    const finiteOrNull = (value: unknown): boolean =>
+      value === null || value === undefined || (typeof value === 'number' && Number.isFinite(value));
+    const timestampOrNull = (value: unknown): boolean =>
+      value === null || value === undefined || (Number.isSafeInteger(value) && Number(value) >= 0);
     if (
       !trade ||
+      !Number.isSafeInteger(trade.trade_id) ||
       trade.trade_id !== expectedId ||
+      typeof trade.pair !== 'string' ||
+      !trade.pair ||
       typeof trade.is_open !== 'boolean' ||
       typeof trade.is_short !== 'boolean' ||
+      typeof trade.has_open_orders !== 'boolean' ||
       !Array.isArray(trade.orders) ||
       !trade.orders.every((order) =>
+        typeof order.order_id === 'string' &&
         typeof order.ft_order_side === 'string' &&
         typeof order.status === 'string' &&
         typeof order.is_open === 'boolean' &&
         Number.isFinite(order.amount) &&
-        (order.filled === null || Number.isFinite(order.filled)) &&
-        Number.isFinite(order.safe_price)
+        finiteOrNull(order.filled) &&
+        Number.isFinite(order.safe_price) &&
+        Number.isFinite(order.cost) &&
+        timestampOrNull(order.order_filled_timestamp) &&
+        timestampOrNull(order.order_timestamp) &&
+        finiteOrNull(order.ft_fee_base)
       ) ||
       !Number.isFinite(trade.amount) ||
-      !Number.isFinite(trade.open_rate)
+      !Number.isFinite(trade.amount_requested ?? 0) ||
+      !Number.isFinite(trade.open_rate) ||
+      !Number.isFinite(trade.stake_amount) ||
+      !finiteOrNull(trade.fee_open_cost) ||
+      !finiteOrNull(trade.fee_close_cost) ||
+      !timestampOrNull(trade.open_fill_timestamp) ||
+      !timestampOrNull(trade.close_timestamp) ||
+      !finiteOrNull(trade.close_rate) ||
+      !finiteOrNull(trade.close_profit_abs) ||
+      !finiteOrNull(trade.close_profit) ||
+      !finiteOrNull(trade.realized_profit) ||
+      (trade.exit_reason !== undefined && trade.exit_reason !== null && typeof trade.exit_reason !== 'string')
     ) {
       throw new FreqtradeRpcError(`Freqtrade returned invalid order state for trade ${expectedId}.`);
     }

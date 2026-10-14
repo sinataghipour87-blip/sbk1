@@ -15,7 +15,7 @@
     "lint": "tsc --noEmit",
     "verify:freqtrade": "tsx scripts/verify_freqtrade_rpc_connection.ts",
     "verify:freqtrade:dry-run": "tsx scripts/verify_freqtrade_dry_run.ts",
-    "test": "tsx scripts/verify_fail_closed_system.ts && tsx scripts/verify_execution_mode.ts && tsx scripts/verify_freqtrade_signal_adapter.ts && tsx scripts/verify_freqtrade_dry_run_fixture.ts && tsx scripts/verify_freqtrade_rpc_contract.ts && tsx scripts/verify_freqtrade_market_snapshot.ts && tsx scripts/verify_freqtrade_market_data_adapters.ts && tsx scripts/verify_legacy_exchange_routes.ts && tsx scripts/verify_sbk1_runtime.ts && tsx scripts/run_python_tests.ts",
+    "test": "tsx scripts/verify_fail_closed_system.ts && tsx scripts/verify_execution_mode.ts && tsx scripts/verify_freqtrade_signal_adapter.ts && tsx scripts/verify_operational_trade_archive.ts && tsx scripts/verify_freqtrade_dry_run_fixture.ts && tsx scripts/verify_freqtrade_rpc_contract.ts && tsx scripts/verify_freqtrade_market_snapshot.ts && tsx scripts/verify_freqtrade_market_data_adapters.ts && tsx scripts/verify_legacy_exchange_routes.ts && tsx scripts/verify_sbk1_runtime.ts && tsx scripts/run_python_tests.ts",
     "verify:freqtrade:contract": "tsx scripts/verify_freqtrade_rpc_contract.ts"
   },
   "dependencies": {

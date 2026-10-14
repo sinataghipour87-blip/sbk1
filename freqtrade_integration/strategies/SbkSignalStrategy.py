@@ -98,7 +98,12 @@ class SbkSignalStrategy(IStrategy):
             inflight_signal_records = [
                 record for record in records
                 if isinstance(record, dict)
-                and record.get("status") in ("STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED")
+                and record.get("status") in (
+                    "STRATEGY_ACCEPTED",
+                    "ORDER_SUBMITTED",
+                    "PARTIALLY_FILLED",
+                    "UNKNOWN_IN_FLIGHT",
+                )
             ]
             unresolved_signal_ids: set[str] = set()
             trades_by_signal_id: dict[str, Any] = {}
@@ -115,16 +120,42 @@ class SbkSignalStrategy(IStrategy):
                     )
                 )
                 for signal_id in unresolved_signal_ids:
-                    self._post_status(
-                        signal_id,
-                        "UNKNOWN_IN_FLIGHT",
-                        "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
+                    record = next(
+                        (
+                            candidate for candidate in inflight_signal_records
+                            if isinstance(candidate.get("signal"), dict)
+                            and candidate["signal"].get("signalId") == signal_id
+                        ),
+                        None,
                     )
+                    if record and record.get("status") != "UNKNOWN_IN_FLIGHT":
+                        self._post_status(
+                            signal_id,
+                            "UNKNOWN_IN_FLIGHT",
+                            "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
+                        )
                 for record in inflight_signal_records:
                     signal = record.get("signal")
                     signal_id = signal.get("signalId") if isinstance(signal, dict) else None
                     trade = trades_by_signal_id.get(signal_id)
                     if not isinstance(signal_id, str) or not trade:
+                        continue
+                    if (
+                        trade.pair != signal["pair"]
+                        or bool(trade.is_short) != (signal["direction"] == "SHORT")
+                    ):
+                        unresolved_signal_ids.add(signal_id)
+                        if record.get("status") != "UNKNOWN_IN_FLIGHT":
+                            self._post_status(
+                                signal_id,
+                                "UNKNOWN_IN_FLIGHT",
+                                "A Freqtrade trade with this signal tag has a different pair or direction; the signal remains quarantined.",
+                            )
+                        logger.error(
+                            "Freqtrade trade %s does not match signal %s pair/direction; keeping signal quarantined.",
+                            getattr(trade, "id", "unknown"),
+                            signal_id,
+                        )
                         continue
                     open_entry_orders = [
                         order for order in trade.open_orders
@@ -158,7 +189,14 @@ class SbkSignalStrategy(IStrategy):
             for record in records:
                 signal = record.get("signal") if isinstance(record, dict) else None
                 status = record.get("status") if isinstance(record, dict) else None
-                if status not in ("ACCEPTED", "STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED", "FILLED"):
+                if status not in (
+                    "ACCEPTED",
+                    "STRATEGY_ACCEPTED",
+                    "ORDER_SUBMITTED",
+                    "PARTIALLY_FILLED",
+                    "FILLED",
+                    "UNKNOWN_IN_FLIGHT",
+                ):
                     continue
                 if isinstance(signal, dict) and signal.get("signalId") in unresolved_signal_ids:
                     continue

@@ -67,6 +67,7 @@ def unresolved_inflight_signal_ids(
             "STRATEGY_ACCEPTED",
             "ORDER_SUBMITTED",
             "PARTIALLY_FILLED",
+            "UNKNOWN_IN_FLIGHT",
         ):
             continue
         signal = record.get("signal")

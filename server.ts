@@ -25,6 +25,7 @@ import {
     freqtradeMarketDataBridge,
     FreqtradeMarketSnapshotValidationError,
 } from './src/services/freqtradeMarketDataBridge';
+import { operationalTradeArchive } from './src/services/operationalTradeArchive';
 
 dotenv.config();
 
@@ -1942,12 +1943,18 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             referencePrice: ticker.last,
             observedAtMs: ticker.retrievedAtMs,
             source: 'freqtrade.dataprovider.ticker',
+            riskLimits: {
+                riskBudgetPct: Number(process.env.SBK1_SIGNAL_RISK_PCT),
+                maxStakeQuote: Number(process.env.SBK1_SIGNAL_MAX_STAKE_QUOTE),
+                maxLeverage: Number(process.env.SBK1_SIGNAL_MAX_LEVERAGE),
+            },
         });
         const record = await freqtradeSignalAdapter.submit(signal, {
             expectedPair: pair,
             expectedExchange: exchange,
             expectedTimeframe: timeframe,
         });
+        await operationalTradeArchive.recordSignalLifecycle(record);
         res.status(record.duplicate ? 200 : 201).json({
             success: true,
             dryRun: true,
@@ -2166,6 +2173,16 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
 app.post('/api/freqtrade/signals/:signalId/status', requireFreqtradeBridgeAuth, async (req, res) => {
     try {
         const record = await freqtradeSignalAdapter.updateStatus(req.params.signalId, req.body || {});
+        if (!record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX)) {
+            const botState = await freqtradeBridge.getStatus();
+            if (!botState.dryRun) {
+                await operationalTradeArchive.recordSignalLifecycle(record);
+                if (record.tradeId !== undefined) {
+                    const freqtradeTrade = await freqtradeBridge.getTrade(record.tradeId);
+                    await operationalTradeArchive.recordFreqtradeTrade(record.signal.signalId, freqtradeTrade);
+                }
+            }
+        }
         res.json({
             signalId: record.signal.signalId,
             status: record.status,
@@ -2190,6 +2207,32 @@ app.get('/api/hunter/signals/:signalId', requireAdminAuth, async (req, res) => {
         res.json(record);
     } catch (error) {
         res.status(503).json({ error: `Could not read signal lifecycle: ${error instanceof Error ? error.message : String(error)}` });
+    }
+});
+
+app.get('/api/hunter/trade-archive/:signalId', requireAdminAuth, async (req, res) => {
+    try {
+        let record = await operationalTradeArchive.getBySignalId(req.params.signalId);
+        if (!record) return res.status(404).json({ error: 'Operational trade archive record was not found.' });
+        const latestTrade = record.freqtradeTrades[record.freqtradeTrades.length - 1]?.trade;
+        if (latestTrade) {
+            const botState = await freqtradeBridge.getStatus();
+            if (botState.dryRun) {
+                return res.status(409).json({
+                    error: 'Trade archive refresh requires Freqtrade dry_run=false; simulated state is not archived.',
+                    code: 'SIMULATED_TRADE_ARCHIVE_REFRESH_BLOCKED',
+                });
+            }
+            const currentTrade = await freqtradeBridge.getTrade(latestTrade.trade_id);
+            await operationalTradeArchive.recordFreqtradeTrade(record.signalId, currentTrade);
+            record = await operationalTradeArchive.getBySignalId(record.signalId);
+            if (!record) throw new Error('Operational trade archive record disappeared during refresh.');
+        }
+        res.json(record);
+    } catch (error) {
+        res.status(503).json({
+            error: `Could not read operational trade archive: ${error instanceof Error ? error.message : String(error)}`,
+        });
     }
 });
 

@@ -1,6 +1,5 @@
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
 import {createRoot} from 'react-dom/client';
-import App from './App.tsx';
 import './index.css';
 
 class RootErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -112,10 +111,55 @@ if (typeof window !== 'undefined') {
   });
 }
 
-createRoot(document.getElementById('root')!).render(
+const root = createRoot(document.getElementById('root')!);
+const startupFallback = (
   <StrictMode>
-    <RootErrorBoundary>
-      <App />
-    </RootErrorBoundary>
-  </StrictMode>,
+    <main dir="rtl" role="status" className="grid min-h-screen place-content-center gap-3 bg-slate-950 p-6 text-center text-slate-100">
+      <strong className="text-xl">در حال راه‌اندازی سامانه تحلیل و معامله</strong>
+      <span className="text-slate-400">لطفاً تا بارگذاری کامل رابط کاربری منتظر بمانید.</span>
+    </main>
+  </StrictMode>
 );
+
+root.render(startupFallback);
+
+const startupTimeout = window.setTimeout(() => {
+  root.render(
+    <main dir="rtl" role="alert" className="grid min-h-screen place-content-center gap-3 bg-slate-950 p-6 text-center text-slate-100">
+      <strong className="text-xl text-amber-300">بارگذاری رابط کاربری بیش از حد معمول طول کشیده است</strong>
+      <span className="text-slate-300">اتصال سرور و بارگذاری فایل‌های برنامه را بررسی کنید؛ در صورت تکرار، صفحه را دوباره بارگذاری کنید.</span>
+      <button type="button" onClick={() => window.location.reload()} className="mx-auto mt-2 rounded-lg bg-emerald-700 px-4 py-2 font-bold hover:bg-emerald-600">
+        بارگذاری دوباره
+      </button>
+    </main>,
+  );
+}, 20_000);
+
+void import('./App.tsx')
+  .then(({ default: App }) => {
+    window.clearTimeout(startupTimeout);
+    root.render(
+      <StrictMode>
+        <RootErrorBoundary>
+          <App />
+        </RootErrorBoundary>
+      </StrictMode>,
+    );
+  })
+  .catch((error: unknown) => {
+    window.clearTimeout(startupTimeout);
+    console.error('[UI] Application startup failed:', error);
+    const message = error instanceof Error ? error.message : String(error);
+    root.render(
+      <main dir="rtl" role="alert" className="min-h-screen bg-slate-950 p-6 text-slate-100">
+        <section className="mx-auto mt-16 max-w-2xl rounded-2xl border border-rose-800/60 bg-slate-900 p-6">
+          <h1 className="text-xl font-bold text-rose-300">رابط کاربری بارگذاری نشد</h1>
+          <p className="mt-3 text-sm text-slate-300">اتصال سرور را بررسی کنید. اگر خطا تکرار شد، متن زیر را برای بررسی نگه دارید.</p>
+          <pre dir="ltr" className="mt-4 overflow-auto whitespace-pre-wrap rounded-lg bg-black/40 p-3 text-xs text-rose-200">{message}</pre>
+          <button type="button" onClick={() => window.location.reload()} className="mt-5 rounded-lg bg-rose-700 px-4 py-2 text-sm font-bold hover:bg-rose-600">
+            بارگذاری دوباره
+          </button>
+        </section>
+      </main>,
+    );
+  });

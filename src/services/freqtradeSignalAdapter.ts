@@ -92,7 +92,7 @@ const allowedTransitions: Record<SbkSignalStatus, ReadonlySet<SbkSignalStatus>> 
   EXPIRED: new Set(),
   CANCELLED: new Set(),
   ERROR: new Set(),
-  UNKNOWN_IN_FLIGHT: new Set(),
+  UNKNOWN_IN_FLIGHT: new Set(['ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'FILLED']),
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -380,6 +380,7 @@ export class FreqtradeSignalAdapter {
         'ORDER_SUBMITTED',
         'PARTIALLY_FILLED',
         'FILLED',
+        'UNKNOWN_IN_FLIGHT',
       ]);
       return [...this.recordsById.values()]
         .filter((record) =>
@@ -387,7 +388,6 @@ export class FreqtradeSignalAdapter {
           record.signal.pair === pair &&
           record.signal.timeframe === timeframe
         )
-        .slice(-100)
         .map((record) => ({ ...record }));
     });
   }
@@ -399,15 +399,17 @@ export class FreqtradeSignalAdapter {
       if (!record) {
         throw new SbkSignalValidationError('Signal ID was not found.', 'SIGNAL_NOT_FOUND');
       }
-      if (!allowedTransitions[record.status].has(update.status)) {
-        if (record.status === update.status) return { ...record };
+      if (update.tradeId !== undefined && (!Number.isSafeInteger(update.tradeId) || update.tradeId <= 0)) {
+        throw new SbkSignalValidationError('Freqtrade trade ID must be a positive integer.', 'INVALID_TRADE_ID');
+      }
+      if (record.tradeId !== undefined && update.tradeId !== undefined && record.tradeId !== update.tradeId) {
+        throw new SbkSignalValidationError('A signal cannot be linked to more than one Freqtrade trade.', 'TRADE_ID_CONFLICT');
+      }
+      if (record.status !== update.status && !allowedTransitions[record.status].has(update.status)) {
         throw new SbkSignalValidationError(
           `Lifecycle transition ${record.status} -> ${update.status} is not allowed.`,
           'INVALID_STATUS_TRANSITION',
         );
-      }
-      if (update.tradeId !== undefined && (!Number.isSafeInteger(update.tradeId) || update.tradeId <= 0)) {
-        throw new SbkSignalValidationError('Freqtrade trade ID must be a positive integer.', 'INVALID_TRADE_ID');
       }
       if (update.filledAmount !== undefined && (!Number.isFinite(update.filledAmount) || update.filledAmount < 0)) {
         throw new SbkSignalValidationError('Filled amount must be a finite non-negative number.', 'INVALID_FILL_AMOUNT');
@@ -415,11 +417,24 @@ export class FreqtradeSignalAdapter {
       if (update.averageFillPrice !== undefined && (!finitePositive(update.averageFillPrice))) {
         throw new SbkSignalValidationError('Average fill price must be finite and positive.', 'INVALID_FILL_PRICE');
       }
+      const reason = update.reason?.slice(0, 500) ?? record.reason;
+      const tradeId = update.tradeId ?? record.tradeId;
+      const filledAmount = update.filledAmount ?? record.filledAmount;
+      const averageFillPrice = update.averageFillPrice ?? record.averageFillPrice;
+      if (
+        record.status === update.status &&
+        record.reason === reason &&
+        record.tradeId === tradeId &&
+        record.filledAmount === filledAmount &&
+        record.averageFillPrice === averageFillPrice
+      ) {
+        return { ...record };
+      }
       record.status = update.status;
-      record.reason = update.reason?.slice(0, 500);
-      record.tradeId = update.tradeId ?? record.tradeId;
-      record.filledAmount = update.filledAmount ?? record.filledAmount;
-      record.averageFillPrice = update.averageFillPrice ?? record.averageFillPrice;
+      record.reason = reason;
+      record.tradeId = tradeId;
+      record.filledAmount = filledAmount;
+      record.averageFillPrice = averageFillPrice;
       record.updatedAtMs = Date.now();
       await this.persist();
       return { ...record };

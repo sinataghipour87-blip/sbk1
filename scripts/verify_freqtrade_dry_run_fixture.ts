@@ -72,6 +72,7 @@ const signal = createDryRunFixtureSignal({
   referencePrice: 62_000,
   observedAtMs: nowMs,
   source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+  riskLimits: { riskBudgetPct: 0.1, maxStakeQuote: 100, maxLeverage: 1 },
 });
 assert.equal(signal.market, 'futures');
 assert.equal(signal.direction, 'LONG');
@@ -90,6 +91,7 @@ assert.throws(
     referencePrice: 0,
     observedAtMs: nowMs,
     source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+    riskLimits: { riskBudgetPct: 0.1, maxStakeQuote: 100, maxLeverage: 1 },
   }),
   (error: unknown) => error instanceof SbkSignalValidationError,
 );
@@ -102,8 +104,22 @@ assert.throws(
     referencePrice: 62_000,
     observedAtMs: nowMs - 56_000,
     source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+    riskLimits: { riskBudgetPct: 0.1, maxStakeQuote: 100, maxLeverage: 1 },
   }),
   (error: unknown) => error instanceof SbkSignalValidationError,
+);
+assert.throws(
+  () => createDryRunFixtureSignal({
+    nowMs,
+    exchange: 'bybit',
+    pair: 'BTC/USDT:USDT',
+    timeframe: '15m',
+    referencePrice: 62_000,
+    observedAtMs: nowMs,
+    source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+    riskLimits: { riskBudgetPct: 0, maxStakeQuote: 100, maxLeverage: 1 },
+  }),
+  (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_RISK_LIMITS',
 );
 
 console.log('Dry-run fixture gates and signal contract checks passed.');

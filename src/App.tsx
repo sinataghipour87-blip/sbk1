@@ -114,6 +114,38 @@ export interface DerivFeeData {
   networkMakerFeeRate?: number;
 }
 
+interface ExchangeStatusResponse {
+  connected?: boolean;
+  dryRun?: boolean;
+  demoTrading?: boolean;
+  forceEntryEnabled?: boolean;
+  openTrades?: FreqtradeTrade[];
+  walletBalanceUsdt?: number;
+  error?: string;
+}
+
+async function fetchJsonWithTimeout<T>(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<{ response: Response; data: T }> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    const data = (await response.json()) as T;
+    return { response, data };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const requestName = typeof input === 'string' ? input : 'API request';
+      throw new Error(`${requestName} timed out after ${timeoutMs} ms.`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 /**
  * Calculates the exact Break-Even Price for a hedged position taking into account
  * real-time exchange network trading fees and cumulative funding interest rate from Deriv API.
@@ -251,6 +283,7 @@ export default function App() {
   const [aiPrediction, setAiPrediction] = useState<any | null>(null);
   const [source, setSource] = useState<string>('Bybit 15m');
   const [isFetching, setIsFetching] = useState<boolean>(false);
+  const [marketDataError, setMarketDataError] = useState<string | null>(null);
   const [notification, setNotification] = useState<string | null>(null);
   const [isCalibratingEngines, setIsCalibratingEngines] = useState<boolean>(false);
 
@@ -1323,6 +1356,7 @@ export default function App() {
     if (isFetchingRef.current) return;
     isFetchingRef.current = true;
     setIsFetching(true);
+    let sentimentError: string | null = null;
     try {
       try {
         const selectedMode = executionModeRef.current;
@@ -1340,11 +1374,15 @@ export default function App() {
           balanceRef.current = 0;
         } else {
           const adminToken = localStorage.getItem('admin_token');
-          const exchangeStatusRes = await fetch('/api/exchange/status', {
-            headers: adminToken ? { 'x-admin-token': adminToken } : undefined,
-            cache: 'no-store',
-          });
-          const exchangeStatusData = await exchangeStatusRes.json();
+          const { response: exchangeStatusRes, data: exchangeStatusData } =
+            await fetchJsonWithTimeout<ExchangeStatusResponse>(
+              '/api/exchange/status',
+              {
+                headers: adminToken ? { 'x-admin-token': adminToken } : undefined,
+                cache: 'no-store',
+              },
+              15_000,
+            );
           if (
             exchangeStatusRes.ok &&
             exchangeStatusData.connected === true &&
@@ -1407,12 +1445,19 @@ export default function App() {
       };
 
       try {
-        const sentimentResponse = await fetch('/api/sentiment', { method: 'POST' });
-        if (sentimentResponse.ok) {
-          sentiment = await sentimentResponse.json();
+        const { response: sentimentResponse, data: sentimentData } =
+          await fetchJsonWithTimeout<typeof sentiment>(
+            '/api/sentiment',
+            { method: 'POST' },
+            15_000,
+          );
+        if (!sentimentResponse.ok) {
+          throw new Error(`/api/sentiment failed with HTTP ${sentimentResponse.status}.`);
         }
+        sentiment = sentimentData;
       } catch (err) {
-        // fallback to default
+        sentimentError = err instanceof Error ? err.message : String(err);
+        console.error('[MarketData] Could not refresh sentiment:', err);
       }
 
       const [candleData, fng, deriv, realObiData, orderFlowFeatures, htf, futuresPrices, canonicalSnapshot] = await Promise.all([
@@ -1543,12 +1588,15 @@ export default function App() {
 
       setAnalysis(res);
       setSource(candleData.source);
+      setMarketDataError(sentimentError);
 
       if (settingsRef.current.notificationsEnabled && res.signalOk && res.confScore >= 5) {
         sendNotification('سیگنال قدرتمند جدید', `سیگنال ${res.direction === 'LONG' ? 'خرید' : 'فروش'} با امتیاز ۵/۵ تایید شد.`);
       }
     } catch (err) {
-      // Market fetch handled silently
+      const message = err instanceof Error ? err.message : String(err);
+      setMarketDataError(message);
+      console.error('[MarketData] Could not refresh market data:', err);
     } finally {
       setIsFetching(false);
       isFetchingRef.current = false;
@@ -1684,6 +1732,15 @@ export default function App() {
           />
            <TickerBar btcPrice={liveEffectivePrice} />
           </div>
+
+          {marketDataError && (
+            <section
+              role="alert"
+              className="rounded-xl border border-rose-700/60 bg-rose-950/30 px-4 py-3 text-sm text-rose-100"
+            >
+              به‌روزرسانی داده‌ها با خطا مواجه شد: {marketDataError}
+            </section>
+          )}
 
           {freqtradeDashboard.status !== 'SIMULATION' && (
             <section

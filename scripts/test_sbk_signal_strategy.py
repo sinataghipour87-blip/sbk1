@@ -22,6 +22,7 @@ class InflightSignalReconciliationTests(unittest.TestCase):
             {"status": "STRATEGY_ACCEPTED", "signal": {"signalId": "accepted"}},
             {"status": "ORDER_SUBMITTED", "signal": {"signalId": "missing-order"}},
             {"status": "PARTIALLY_FILLED", "signal": {"signalId": "missing-partial"}},
+            {"status": "UNKNOWN_IN_FLIGHT", "signal": {"signalId": "missing-unknown"}},
             {"status": "ORDER_SUBMITTED", "signal": {"signalId": "open"}},
             {"status": "ACCEPTED", "signal": {"signalId": "not-submitted"}},
             {"status": "FILLED", "signal": {"signalId": "filled"}},
@@ -31,7 +32,7 @@ class InflightSignalReconciliationTests(unittest.TestCase):
 
         self.assertEqual(
             unresolved_inflight_signal_ids(records, {"open", "filled"}),
-            ["accepted", "missing-order", "missing-partial"],
+            ["accepted", "missing-order", "missing-partial", "missing-unknown"],
         )
 
 
@@ -218,10 +219,92 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
         )
 
+    def test_unknown_signal_remains_quarantined_until_trade_reconciliation(self):
+        unknown_response = Mock()
+        unknown_response.raise_for_status.return_value = None
+        unknown_response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [{"signal": self.signal, "status": "UNKNOWN_IN_FLIGHT"}],
+        }
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=unknown_response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        self.assertEqual(self.strategy._signals, {})
+        post_status.assert_not_called()
+
+    def test_unknown_signal_is_reconciled_from_matching_persisted_trade(self):
+        unknown_response = Mock()
+        unknown_response.raise_for_status.return_value = None
+        unknown_response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [{"signal": self.signal, "status": "UNKNOWN_IN_FLIGHT"}],
+        }
+        order = SimpleNamespace(ft_order_side="buy", safe_filled=0)
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            pair=self.signal["pair"],
+            is_short=False,
+            open_orders=[order],
+            entry_side="buy",
+            select_filled_orders=lambda _side: [],
+            amount=0,
+            open_rate=62_100,
+            id=42,
+        )
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=unknown_response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[trade]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "ORDER_SUBMITTED",
+            "Reconciled signal lifecycle from the persisted Freqtrade trade and order records.",
+            trade_id=42,
+            filled_amount=0.0,
+            average_fill_price=62_100.0,
+        )
+        self.assertIn(self.signal_id, self.strategy._signals)
+        self.assertNotIn("BTC/USDT:USDT", self.strategy._signals_by_pair)
+
+    def test_unknown_signal_with_mismatched_trade_remains_quarantined(self):
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            pair="ETH/USDT:USDT",
+            is_short=False,
+            open_orders=[],
+            entry_side="buy",
+            select_filled_orders=lambda _side: [],
+            amount=0,
+            open_rate=62_100,
+            id=42,
+        )
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=self.response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[trade]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        self.assertEqual(self.strategy._signals, {})
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "UNKNOWN_IN_FLIGHT",
+            "A Freqtrade trade with this signal tag has a different pair or direction; the signal remains quarantined.",
+        )
+
     def test_persisted_open_entry_order_is_reconciled_without_reentry(self):
         order = SimpleNamespace(ft_order_side="buy", safe_filled=0)
         trade = SimpleNamespace(
             enter_tag=self.signal_id,
+            pair=self.signal["pair"],
+            is_short=False,
             open_orders=[order],
             entry_side="buy",
             select_filled_orders=lambda _side: [],

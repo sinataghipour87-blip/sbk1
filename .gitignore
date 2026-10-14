@@ -7,6 +7,8 @@ __pycache__/
 /.sbk1-run.lock
 /data/freqtrade-signals.json
 /data/freqtrade-signals.json.*.tmp
+/data/sbk1-operational-trade-archive.json
+/data/sbk1-operational-trade-archive.json.*.tmp
 /tradesv3.dryrun.sqlite*
 database_kill_switch.json
 database_kill_switch.json.tmp
