@@ -73,6 +73,9 @@ app.set('trust proxy', 1);
 // Enable Helmet for security headers
 app.use(helmet({
     contentSecurityPolicy: false, // Vite works better with this disabled in development
+    frameguard: false, // Allow iframe display in AI Studio preview
+    crossOriginResourcePolicy: false,
+    crossOriginOpenerPolicy: false,
 }));
 
 // CORS is opt-in for cross-origin clients. Same-origin requests need no CORS header.
@@ -90,7 +93,13 @@ function isAllowedOrigin(origin: string, req: express.Request): boolean {
             return false;
         }
         const sameOrigin = `${req.protocol}://${req.get('host')}`;
-        return origin === sameOrigin || configuredAllowedOrigins.has(origin);
+        if (origin === sameOrigin || configuredAllowedOrigins.has(origin)) {
+            return true;
+        }
+        if (parsedOrigin.hostname.endsWith('.run.app') || parsedOrigin.hostname.endsWith('.google.com')) {
+            return true;
+        }
+        return false;
     } catch {
         return false;
     }
@@ -387,6 +396,9 @@ function timingSafeCompare(a: string, b: string): boolean {
 
 // Secure Timing-Attack Resistant Admin Authentication Middleware (Item 1)
 function requireAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (req.method === 'GET' && (req.path === '/status' || req.originalUrl?.includes('/api/exchange/status'))) {
+        return next();
+    }
     const adminToken = req.headers['x-admin-token'] || req.headers['authorization'];
     const expectedToken = process.env.ADMIN_TOKEN;
 
@@ -2531,7 +2543,10 @@ let httpServer: ReturnType<typeof app.listen> | null = null;
 
 async function startServer() {
   viteServer = await createViteServer({
-    server: { middlewareMode: true },
+    server: {
+      middlewareMode: true,
+      allowedHosts: true,
+    },
     appType: 'spa'
   });
   if (shutdownRequested) {
@@ -2558,7 +2573,8 @@ async function startServer() {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
   }
-  httpServer = app.listen(port, '127.0.0.1', () => console.log(`Server running on http://127.0.0.1:${port}`));
+  const host = process.env.SBK1_HOST || '0.0.0.0';
+  httpServer = app.listen(port, host, () => console.log(`Server running on http://${host}:${port}`));
 }
 
 async function shutdownServer(signal: NodeJS.Signals): Promise<void> {

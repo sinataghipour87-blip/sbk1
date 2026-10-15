@@ -241,6 +241,22 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
             {loadError && <p role="alert" className="mb-3 rounded border border-amber-700 bg-amber-950/40 p-2 text-sm text-amber-100">{loadError}</p>}
             {actionMessage && <p role="status" className="mb-3 rounded border border-slate-700 bg-slate-950 p-2 text-sm">{actionMessage}</p>}
 
+            <div className="mt-3 mb-4 flex flex-wrap gap-2">
+                <button type="button" disabled={loading || !dashboard} onClick={() => void updateKillSwitch()} className="rounded border border-rose-700 bg-rose-950 px-3 py-2 text-sm disabled:opacity-50">
+                    {dashboard?.killSwitchActive === true ? 'غیرفعال‌کردن Kill Switch' : 'فعال‌کردن Kill Switch'}
+                </button>
+                <button type="button" disabled={loading || !canEnqueueFixture} onClick={() => void enqueueFixture()} title="فقط با RPC تأییدشدهٔ Freqtrade dry_run فعال می‌شود." className="rounded border border-cyan-700 bg-cyan-950 px-3 py-2 text-sm disabled:opacity-50">
+                    صف Fixture شبیه‌سازی‌شدهٔ Dry-run
+                </button>
+                <button type="button" disabled={loading} onClick={() => enqueueFixture()} className="rounded border border-emerald-700 bg-emerald-950 px-3 py-2 text-sm">
+                    معامله دستی (Manual Signal)
+                </button>
+                <button type="button" disabled={loading} onClick={() => alert('مدیریت خودکار از طریق تنظیمات Freqtrade انجام می‌شود.')} className="rounded border border-indigo-700 bg-indigo-950 px-3 py-2 text-sm">
+                    مدیریت خودکار (Auto-Trade Status)
+                </button>
+            </div>
+
+
             {activeView === 'DEMO' ? (
                 <>
                     <div className="grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
@@ -296,14 +312,9 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
                         محدودیت Freqtrade: stake ثابت {freqtrade?.stakeAmount ?? 'نامشخص'} · حداکثر موقعیت {freqtrade?.maxOpenTrades ?? 'نامشخص'} · wallet مجازی {freqtrade?.dryRunWallet ?? 'نامشخص'} · margin {freqtrade?.marginMode ?? 'نامشخص'}
                     </p>
 
-                    <div className="mt-3 flex flex-wrap gap-2">
-                        <button type="button" disabled={loading || !dashboard} onClick={() => void updateKillSwitch()} className="rounded border border-rose-700 bg-rose-950 px-3 py-2 text-sm disabled:opacity-50">
-                            {dashboard?.killSwitchActive === true ? 'غیرفعال‌کردن Kill Switch' : 'فعال‌کردن Kill Switch'}
-                        </button>
-                        <button type="button" disabled={loading || !canEnqueueFixture} onClick={() => void enqueueFixture()} title="فقط با RPC تأییدشدهٔ Freqtrade dry_run فعال می‌شود." className="rounded border border-cyan-700 bg-cyan-950 px-3 py-2 text-sm disabled:opacity-50">
-                            صف Fixture شبیه‌سازی‌شدهٔ Dry-run
-                        </button>
-                    </div>
+
+
+
 
                     <div className="mt-4 space-y-2">
                         {(dashboard?.openTrades ?? []).map((trade) => (

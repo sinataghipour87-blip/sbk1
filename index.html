@@ -17,44 +17,6 @@
         <span style="color:#94a3b8">لطفاً تا بارگذاری کامل رابط کاربری منتظر بمانید.</span>
       </main>
     </div>
-    <script>
-      (() => {
-        const root = document.getElementById('root');
-        const entry = document.querySelector('[data-sbk1-entry]');
-        const showFailure = (detail) => {
-          if (!root || root.dataset.sbk1EntryLoaded === 'true') return;
-          const main = document.createElement('main');
-          main.dir = 'rtl';
-          main.setAttribute('role', 'alert');
-          main.style.cssText = 'min-height:100vh;display:grid;place-content:center;gap:12px;padding:24px;background:#020617;color:#e2e8f0;font-family:system-ui,sans-serif;text-align:center';
-          const title = document.createElement('strong');
-          title.style.color = '#fda4af';
-          title.textContent = 'رابط کاربری بارگذاری نشد';
-          const message = document.createElement('span');
-          message.textContent = detail;
-          const button = document.createElement('button');
-          button.textContent = 'بارگذاری دوباره';
-          button.style.cssText = 'margin:8px auto 0;padding:8px 16px;border:0;border-radius:8px;background:#047857;color:white;font-weight:bold;cursor:pointer';
-          button.addEventListener('click', () => window.location.reload());
-          main.append(title, message, button);
-          root.replaceChildren(main);
-        };
-        const timeout = window.setTimeout(
-          () => showFailure('ماژول شروع رابط کاربری بارگذاری نشد؛ اتصال سرور و خطاهای Network/Console را بررسی کنید.'),
-          20_000,
-        );
-        if (entry) {
-          entry.addEventListener('load', () => {
-            window.clearTimeout(timeout);
-            if (root) root.dataset.sbk1EntryLoaded = 'true';
-          }, { once: true });
-          entry.addEventListener('error', () => {
-            window.clearTimeout(timeout);
-            showFailure('بارگذاری فایل اصلی رابط کاربری یا یکی از وابستگی‌های آن ناموفق بود؛ خطای دقیق در Console مرورگر ثبت می‌شود.');
-          }, { once: true });
-        }
-      })();
-    </script>
-    <script type="module" data-sbk1-entry src="/src/main.tsx"></script>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

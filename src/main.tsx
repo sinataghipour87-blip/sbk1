@@ -1,5 +1,7 @@
+import './services/storagePolyfill.ts';
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
-import {createRoot} from 'react-dom/client';
+import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
 import './index.css';
 
 class RootErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -111,33 +113,14 @@ if (typeof window !== 'undefined') {
   });
 }
 
-const root = createRoot(document.getElementById('root')!);
-const startupFallback = (
-  <StrictMode>
-    <main dir="rtl" role="status" className="grid min-h-screen place-content-center gap-3 bg-slate-950 p-6 text-center text-slate-100">
-      <strong className="text-xl">در حال راه‌اندازی سامانه تحلیل و معامله</strong>
-      <span className="text-slate-400">لطفاً تا بارگذاری کامل رابط کاربری منتظر بمانید.</span>
-    </main>
-  </StrictMode>
-);
+const rootElement = document.getElementById('root');
+if (rootElement) {
+  rootElement.dataset.sbk1EntryLoaded = 'true';
+}
 
-root.render(startupFallback);
-
-const startupTimeout = window.setTimeout(() => {
-  root.render(
-    <main dir="rtl" role="alert" className="grid min-h-screen place-content-center gap-3 bg-slate-950 p-6 text-center text-slate-100">
-      <strong className="text-xl text-amber-300">بارگذاری رابط کاربری بیش از حد معمول طول کشیده است</strong>
-      <span className="text-slate-300">اتصال سرور و بارگذاری فایل‌های برنامه را بررسی کنید؛ در صورت تکرار، صفحه را دوباره بارگذاری کنید.</span>
-      <button type="button" onClick={() => window.location.reload()} className="mx-auto mt-2 rounded-lg bg-emerald-700 px-4 py-2 font-bold hover:bg-emerald-600">
-        بارگذاری دوباره
-      </button>
-    </main>,
-  );
-}, 20_000);
-
-void import('./App.tsx')
-  .then(({ default: App }) => {
-    window.clearTimeout(startupTimeout);
+if (rootElement) {
+  try {
+    const root = createRoot(rootElement);
     root.render(
       <StrictMode>
         <RootErrorBoundary>
@@ -145,11 +128,10 @@ void import('./App.tsx')
         </RootErrorBoundary>
       </StrictMode>,
     );
-  })
-  .catch((error: unknown) => {
-    window.clearTimeout(startupTimeout);
+  } catch (error: unknown) {
     console.error('[UI] Application startup failed:', error);
     const message = error instanceof Error ? error.message : String(error);
+    const root = createRoot(rootElement);
     root.render(
       <main dir="rtl" role="alert" className="min-h-screen bg-slate-950 p-6 text-slate-100">
         <section className="mx-auto mt-16 max-w-2xl rounded-2xl border border-rose-800/60 bg-slate-900 p-6">
@@ -162,4 +144,5 @@ void import('./App.tsx')
         </section>
       </main>,
     );
-  });
+  }
+}

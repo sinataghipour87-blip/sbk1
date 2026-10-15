@@ -131,8 +131,32 @@ async function fetchJsonWithTimeout<T>(
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(input, { ...init, signal: controller.signal });
-    const data = (await response.json()) as T;
+    const headers = new Headers(init?.headers);
+    if (!headers.has('Accept')) {
+      headers.set('Accept', 'application/json');
+    }
+    const response = await fetch(input, { ...init, headers, signal: controller.signal });
+    const text = await response.text();
+    let data: T;
+    if (text.trim().startsWith('<')) {
+      data = {
+        connected: false,
+        error: !response.ok
+          ? `HTTP ${response.status}: سرویس در دسترس نیست.`
+          : 'سرویس بازار در حال راه‌اندازی است.',
+      } as T;
+      return { response, data };
+    }
+    try {
+      data = JSON.parse(text) as T;
+    } catch {
+      data = {
+        connected: false,
+        error: !response.ok
+          ? `HTTP ${response.status}: سرویس در دسترس نیست.`
+          : 'پاسخ سرور در حال آماده‌سازی است.',
+      } as T;
+    }
     return { response, data };
   } catch (error) {
     if (controller.signal.aborted) {
@@ -1434,7 +1458,7 @@ export default function App() {
           setBalance(0);
           balanceRef.current = 0;
         }
-        console.error('[Freqtrade] Could not refresh authoritative trading state:', err);
+        console.warn('[Freqtrade] Authoritative trading state temporarily unavailable:', err instanceof Error ? err.message : String(err));
       }
 
       let sentiment = {
@@ -1607,7 +1631,7 @@ export default function App() {
   // Ultra-high-performance 3-sec auto refresh for instant real-time sync
   useEffect(() => {
     loadMarketData();
-    const interval = setInterval(loadMarketData, 3000);
+    const interval = setInterval(loadMarketData, 15000);
     return () => clearInterval(interval);
   }, [loadMarketData]);
 
