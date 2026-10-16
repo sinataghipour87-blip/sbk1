@@ -1,5 +1,5 @@
 import { CalibratedProbabilityMetadata, Candle, TradeQualityScore } from '../types/trading';
-import { CentralTradeDatasetService, PredictionDatasetRecord } from './centralTradeDataset';
+import { CentralTradeDatasetService, hasFreqtradeVerifiedOutcome, PredictionDatasetRecord } from './centralTradeDataset';
 import { learnedRegimeWeightsService, FeatureClusterId, ClusterFeatureVote } from './learnedRegimeWeights';
 
 /**
@@ -385,6 +385,7 @@ export function evaluateRealLearnedSegmentMetrics(
   const sampleSize = segmentRecords.length;
   const featureRecords = segmentRecords.flatMap(record => {
     if (
+      !hasFreqtradeVerifiedOutcome(record) ||
       (record.outcome !== 'WIN' && record.outcome !== 'LOSS') ||
       (record.direction !== 'LONG' && record.direction !== 'SHORT')
     ) return [];
@@ -546,7 +547,8 @@ export function evaluateRealLearnedSegmentMetrics(
     ? applyPlattCalibration(plattModel, rawProbability)
     : null;
   const filledCount = segmentRecords.filter(record =>
-    record.executionStatus === 'EXECUTED_FILLED' || record.executionStatus === 'CLOSED_COMPLETED'
+    hasFreqtradeVerifiedOutcome(record) &&
+    (record.executionStatus === 'EXECUTED_FILLED' || record.executionStatus === 'CLOSED_COMPLETED')
   ).length;
   const fillRate = sampleSize > 0 ? filledCount / sampleSize : null;
 

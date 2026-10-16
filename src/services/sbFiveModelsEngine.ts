@@ -139,15 +139,14 @@ export class SbFiveModelsEngine {
     });
 
     // استخراج آمار واقعی از دیتابیس مرکزی و سابقه معاملات جهت حذف کامل ضرایب ساختگی
-    const allPredictions = CentralTradeDatasetService.getInstance().getAllPredictions();
-    const resolvedPredictions = allPredictions.filter(p => p.outcome === 'WIN' || p.outcome === 'LOSS');
-    const validHistoryTrades = (tradeHistory || []).filter(t => typeof t.pnlUsd === 'number');
-    const totalEmpiricalResolved = resolvedPredictions.length + validHistoryTrades.length;
+    const resolvedPredictions = CentralTradeDatasetService.getInstance().getFreqtradeVerifiedPredictions()
+      .filter(p => p.outcome === 'WIN' || p.outcome === 'LOSS');
+    const totalEmpiricalResolved = resolvedPredictions.length;
     const hasEmpiricalEdge = totalEmpiricalResolved >= 20;
 
     let empiricalWinRatePct: number | null = null;
     if (hasEmpiricalEdge) {
-      const wins = resolvedPredictions.filter(p => p.outcome === 'WIN').length + validHistoryTrades.filter(t => (t.pnlUsd || 0) > 0).length;
+      const wins = resolvedPredictions.filter(p => p.outcome === 'WIN').length;
       empiricalWinRatePct = Math.round((wins / totalEmpiricalResolved) * 100);
     }
 

@@ -18,9 +18,24 @@ const environment = {
   SBK1_FREQTRADE_TIMEFRAME: '15m',
   SBK1_FREQTRADE_BRIDGE_TOKEN: 'runtime-test-bridge-token-that-is-long-enough',
   SBK1_BRIDGE_URL: 'http://127.0.0.1:3000',
+  SBK1_SIGNAL_RISK_PCT: '1',
+  SBK1_SIGNAL_MAX_LEVERAGE: '1',
+  SBK1_SIGNAL_MAX_STAKE_QUOTE: '100',
 };
 const config = {
   dry_run: true,
+  dry_run_wallet: 1000,
+  stake_amount: 100,
+  max_open_trades: 1,
+  tradable_balance_ratio: 0.9,
+  margin_mode: 'isolated',
+  unfilledtimeout: { entry: 15, exit: 15, unit: 'seconds' },
+  order_types: {
+    emergency_exit: 'market',
+    force_exit: 'market',
+    stoploss: 'market',
+    stoploss_on_exchange: false,
+  },
   strategy: 'SbkSignalStrategy',
   trading_mode: 'futures',
   timeframe: '15m',
@@ -58,6 +73,44 @@ assert.equal(
 assert.throws(
   () => validateRuntimeSettings({ ...config, dry_run: false }, environment),
   /restricted to dry-run/,
+);
+assert.throws(
+  () => validateRuntimeSettings({ ...config, stake_amount: 'unlimited' }, environment),
+  /fixed amount between 0 and 100/,
+);
+assert.throws(
+  () => validateRuntimeSettings({ ...config, max_open_trades: 2 }, environment),
+  /max_open_trades must be exactly 1/,
+);
+assert.throws(
+  () => validateRuntimeSettings({ ...config, tradable_balance_ratio: 0.91 }, environment),
+  /no greater than 0.9/,
+);
+assert.throws(
+  () => validateRuntimeSettings({ ...config, margin_mode: 'cross' }, environment),
+  /margin_mode must be isolated/,
+);
+assert.throws(
+  () => validateRuntimeSettings({
+    ...config,
+    order_types: { ...config.order_types, emergency_exit: 'limit' },
+  }, environment),
+  /market stoploss and emergency\/force exits/,
+);
+assert.throws(
+  () => validateRuntimeSettings(config, {
+    ...environment,
+    SBK1_SIGNAL_MAX_STAKE_QUOTE: '101',
+  }),
+  /risk limits must be finite, bounded/,
+);
+assert.throws(
+  () => validateRuntimeSettings(config, {
+    ...environment,
+    SBK1_DRY_RUN_FIXTURE_ENABLED: 'true',
+    SBK1_SIGNAL_MAX_LEVERAGE: '',
+  }),
+  /risk limits must be finite, bounded/,
 );
 assert.throws(
   () => validateRuntimeSettings({ ...config, force_entry_enable: true }, environment),

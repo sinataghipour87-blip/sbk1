@@ -9,7 +9,6 @@
  */
 
 import { AnalysisResult, Candle } from '../types/trading';
-import { centralTradeDatasetService } from './centralTradeDataset';
 
 export type WhaleSignalType =
   | 'MASSIVE_EXCHANGE_OUTFLOW'
@@ -100,75 +99,29 @@ export class WhaleStatisticalProofEngine {
       };
     }
 
-    // Rule 46: Calculate statistical returns across 1m, 5m, 15m, 1h from historical dataset
-    const tradeRecords = centralTradeDatasetService.getAllTradeRecords();
-    const candles = analysis?.candles || [];
-
-    // Filter trades/records matching this whale signal in dataset
-    const relevantTrades = tradeRecords.filter(
-      (t: any) => t.setupType?.includes('WHALE') || t.setupType?.includes('LIQUIDITY') || t.setupType?.includes('SMC')
-    );
-
-    const baseCount = Math.max(relevantTrades.length, 42); // minimum sample size from historical database
-
-    // Calculate dynamic returns based on candles or historical trades
-    const tf1m = this.calculateHorizStats('1m', baseCount, 0.58, 0.18, 0.12);
-    const tf5m = this.calculateHorizStats('5m', baseCount, 0.62, 0.35, 0.22);
-    const tf15m = this.calculateHorizStats('15m', baseCount, 0.66, 0.68, 0.38);
-    const tf1h = this.calculateHorizStats('1h', baseCount, 0.61, 0.85, 0.31);
-
-    // Criteria for statistical proof (Sample size >= 30, Win Rate >= 55%, Expectancy > 0, 15m Edge = true)
-    const isProven =
-      baseCount >= 30 &&
-      tf15m.winRatePct >= 55.0 &&
-      tf15m.avgReturnPct > 0 &&
-      tf15m.expectancyR > 0;
-
-    const assignedWeightMultiplier = isProven ? 1.0 : 0.0;
-
-    let rationaleFa = '';
-    if (isProven) {
-      rationaleFa = `✅ اثر آماری سیگنال ${signalNameFa} در ${baseCount} نمونه تاریخی اثبات شد: وین‌ریت 15m برابر با ${tf15m.winRatePct}% و میانگین بازدهی +${tf15m.avgReturnPct}% (وزن سیگنال = ۱.۰).`;
-    } else {
-      rationaleFa = `🛑 برتری آماری سیگنال ${signalNameFa} اثبات نشد (وین‌ریت 15m زیر ۵۵٪ یا عدم سودآوری). بر اساس قانون ۴۶، وزن سیگنال صفر گردید (وزن = ۰).`;
-    }
+    const emptyTf = (tfLabel: TimeframeReturnStats['tfLabel']): TimeframeReturnStats => ({
+      tfLabel,
+      sampleCount: 0,
+      winCount: 0,
+      winRatePct: 0,
+      avgReturnPct: 0,
+      expectancyR: 0,
+      pValue: 1,
+      isPositiveEdge: false,
+    });
 
     return {
       signalType,
       signalNameFa,
       dataStatus: 'LIVE',
-      sampleCount: baseCount,
-      tf1m,
-      tf5m,
-      tf15m,
-      tf1h,
-      isStatisticallyProven: isProven,
-      assignedWeightMultiplier,
-      rationaleFa,
-    };
-  }
-
-  private calculateHorizStats(
-    tf: '1m' | '5m' | '15m' | '1h',
-    baseCount: number,
-    baseWinRate: number,
-    baseAvgReturn: number,
-    baseExpectancy: number
-  ): TimeframeReturnStats {
-    const winRatePct = Math.round(baseWinRate * 1000) / 10;
-    const winCount = Math.round(baseCount * baseWinRate);
-    const isPositiveEdge = winRatePct >= 55.0 && baseAvgReturn > 0;
-    const pValue = isPositiveEdge ? 0.012 : 0.28;
-
-    return {
-      tfLabel: tf,
-      sampleCount: baseCount,
-      winCount,
-      winRatePct,
-      avgReturnPct: baseAvgReturn,
-      expectancyR: baseExpectancy,
-      pValue,
-      isPositiveEdge,
+      sampleCount: 0,
+      tf1m: emptyTf('1m'),
+      tf5m: emptyTf('5m'),
+      tf15m: emptyTf('15m'),
+      tf1h: emptyTf('1h'),
+      isStatisticallyProven: false,
+      assignedWeightMultiplier: 0,
+      rationaleFa: `🛑 داده زنده موجود است، اما outcome تاریخیِ تأییدشده‌ی Freqtrade برای ${signalNameFa} وجود ندارد؛ وزن صفر است.`,
     };
   }
 

@@ -110,6 +110,10 @@ try {
   assert.equal(concurrentSubmissions.filter((record) => !record.duplicate).length, 1);
   assert.equal(concurrentSubmissions.filter((record) => record.duplicate).length, 3);
   assert.equal(concurrentSubmissions[0].status, 'ACCEPTED');
+  assert.equal(concurrentSubmissions[0].lifecycleEvents.length, 1);
+  assert.equal(concurrentSubmissions[0].lifecycleEvents[0]?.status, 'ACCEPTED');
+  assert.equal(concurrentSubmissions[0].lifecycleEvents[0]?.source, 'SBK1');
+  assert.equal(concurrentSubmissions[0].receivedAtMs, concurrentSubmissions[0].createdAtMs);
   await assert.rejects(
     adapter.submit({
       ...signal,
@@ -140,6 +144,36 @@ try {
     averageFillPrice: 62_106,
   });
   assert.equal(filled.status, 'FILLED');
+  assert.deepEqual(
+    filled.lifecycleEvents.map((event) => event.status),
+    ['ACCEPTED', 'STRATEGY_ACCEPTED', 'ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'FILLED'],
+  );
+  assert.equal(filled.lifecycleEvents.at(-1)?.tradeId, 42);
+  assert.equal(filled.lifecycleEvents.at(-1)?.source, 'FREQTRADE');
+  await assert.rejects(
+    adapter.updateStatus(signal.signalId, { status: 'FILLED', tradeId: 43 }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'TRADE_ID_CONFLICT',
+  );
+
+  const lateLinkIds = deriveSbkSignalIds({
+    pair: signal.pair,
+    direction: signal.direction,
+    setupType: signal.entryConditions.setupType,
+    generatedAtMs: nowMs,
+    sweptLevelPrice: 62_400,
+    referencePrice: signal.referencePrice,
+    stopLoss: signal.entryConditions.stopLoss,
+    takeProfit: signal.entryConditions.takeProfit,
+  });
+  const lateLink = await adapter.submit({ ...signal, ...lateLinkIds }, { nowMs, expectedPair: signal.pair });
+  await adapter.updateStatus(lateLink.signal.signalId, { status: 'STRATEGY_ACCEPTED' });
+  await adapter.updateStatus(lateLink.signal.signalId, { status: 'ORDER_SUBMITTED' });
+  await adapter.updateStatus(lateLink.signal.signalId, { status: 'FILLED' });
+  const linkedAfterFill = await adapter.updateStatus(lateLink.signal.signalId, {
+    status: 'FILLED',
+    tradeId: 44,
+  });
+  assert.equal(linkedAfterFill.tradeId, 44, 'same-state callback can add a late authoritative trade link');
 
   const uncertainIds = deriveSbkSignalIds({
     pair: signal.pair,
@@ -163,11 +197,17 @@ try {
   });
   assert.equal(quarantined.status, 'UNKNOWN_IN_FLIGHT');
   assert.equal((await adapter.getForStrategy(signal.pair, signal.timeframe)).some((record) =>
-    record.signal.signalId === uncertain.signal.signalId), false);
+    record.signal.signalId === uncertain.signal.signalId), true, 'unknown signals remain visible for Freqtrade reconciliation');
   await assert.rejects(
     adapter.updateStatus(uncertain.signal.signalId, { status: 'ACCEPTED' }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_STATUS_TRANSITION',
   );
+  const reconciledUnknown = await adapter.updateStatus(uncertain.signal.signalId, {
+    status: 'ORDER_SUBMITTED',
+    tradeId: 45,
+  });
+  assert.equal(reconciledUnknown.status, 'ORDER_SUBMITTED');
+  assert.equal(reconciledUnknown.tradeId, 45);
 
   const cancelledIds = deriveSbkSignalIds({
     pair: signal.pair,
@@ -193,7 +233,8 @@ try {
     record.signal.signalId === signal.signalId).tradeId, 42);
   const restored = await new FreqtradeSignalAdapter().get(signal.signalId);
   assert.equal(restored?.status, 'FILLED');
-  assert.equal((await new FreqtradeSignalAdapter().get(uncertain.signal.signalId))?.status, 'UNKNOWN_IN_FLIGHT');
+  assert.equal(restored?.lifecycleEvents.length, 5, 'signal history survives process restart');
+  assert.equal((await new FreqtradeSignalAdapter().get(uncertain.signal.signalId))?.status, 'ORDER_SUBMITTED');
 
   const pythonContractCheck = spawnSync('python3', ['-c', `
 import json

@@ -17,85 +17,83 @@ Standards Implemented:
 11. Statistical Rigor: 95% Confidence Interval for Win Rate, Annualized Sharpe & Sortino.
 """
 
-import sys
+import argparse
 import json
 import math
 import random
-import urllib.request
-import urllib.error
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 
-def fetch_real_btc_ohlcv(symbol="BTCUSDT", interval="15m", limit=1000):
-    """
-    Fetches real institutional historical OHLCV candles from exchange REST API with true pagination.
-    Uses Bybit V5 Linear API (paginated via 'end' timestamp) with automatic fallback to Binance.
-    """
-    # 1. Primary: Bybit V5 Linear API with True Pagination
-    bybit_interval = interval.replace("m", "")
+
+def load_freqtrade_feather(data_path, timeframe="15m", limit=1000):
+    """Load and validate completed OHLCV candles from local Freqtrade data."""
     try:
-        candles_dict = {}
-        current_end = None
-        pages_needed = max(1, math.ceil(limit / 200))
+        import pandas as pd
+    except ImportError as error:
+        raise RuntimeError("Reading Freqtrade Feather data requires pandas and pyarrow from the Freqtrade environment.") from error
 
-        for page in range(pages_needed):
-            url_bybit = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={bybit_interval}&limit=200"
-            if current_end is not None:
-                url_bybit += f"&end={current_end}"
+    path = Path(data_path)
+    if not path.is_file() or path.suffix.lower() != ".feather":
+        raise ValueError(f"Expected an existing Freqtrade .feather file: {path}")
+    interval = re.fullmatch(r"([1-9][0-9]*)([mhd])", timeframe)
+    if not interval:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+    multiplier = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[interval.group(2)]
+    interval_ms = int(interval.group(1)) * multiplier
 
-            req = urllib.request.Request(
-                url_bybit,
-                headers={"User-Agent": "InstitutionalBacktester/2.0 (RealMarketAnalysis)"}
-            )
-            with urllib.request.urlopen(req, timeout=10) as response:
-                raw_data = json.loads(response.read().decode('utf-8'))
-                if raw_data.get("retCode") == 0 and "result" in raw_data and "list" in raw_data["result"]:
-                    kline_list = raw_data["result"]["list"]
-                    if not kline_list:
-                        break
-                    for item in kline_list:
-                        ts = int(item[0])
-                        if ts not in candles_dict:
-                            candles_dict[ts] = {
-                                "timestamp": ts,
-                                "open": float(item[1]),
-                                "high": float(item[2]),
-                                "low": float(item[3]),
-                                "close": float(item[4]),
-                                "volume": float(item[5])
-                            }
-                    oldest_ts = min(int(item[0]) for item in kline_list)
-                    current_end = oldest_ts - 1
-                    if len(candles_dict) >= limit:
-                        break
-                else:
-                    break
+    frame = pd.read_feather(path)
+    required = {"date", "open", "high", "low", "close", "volume"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"Freqtrade Feather is missing columns: {', '.join(missing)}")
+    if frame.empty:
+        raise ValueError("Freqtrade Feather contains no candles.")
 
-        sorted_candles = [candles_dict[ts] for ts in sorted(candles_dict.keys())]
-        if len(sorted_candles) >= min(200, limit):
-            return sorted_candles[-limit:] if len(sorted_candles) > limit else sorted_candles
-    except Exception as e:
-        sys.stderr.write(f"[DEBUG] Bybit paginated kline fetch attempt failed: {e}, trying Binance...\n")
+    date_values = frame["date"]
+    if pd.api.types.is_numeric_dtype(date_values):
+        timestamps = pd.to_datetime(date_values, unit="ms", utc=True, errors="coerce")
+    else:
+        timestamps = pd.to_datetime(date_values, utc=True, errors="coerce")
+    if timestamps.isna().any() or timestamps.duplicated().any():
+        raise ValueError("Freqtrade Feather timestamps are invalid or duplicated.")
+    if not timestamps.is_monotonic_increasing:
+        raise ValueError("Freqtrade Feather timestamps must be strictly increasing.")
 
-    # 2. Secondary: Binance
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "InstitutionalBacktester/2.0 (RealMarketAnalysis)"}
-    )
-    with urllib.request.urlopen(req, timeout=12) as response:
-        raw_klines = json.loads(response.read().decode('utf-8'))
-        
-    candles = []
-    for k in raw_klines:
-        candles.append({
-            "timestamp": int(k[0]),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5])
-        })
-    return candles
+    numeric = frame[["open", "high", "low", "close", "volume"]].apply(pd.to_numeric, errors="coerce")
+    values = numeric.to_numpy(dtype=float)
+    if not all(math.isfinite(value) for row in values for value in row):
+        raise ValueError("Freqtrade Feather contains non-finite OHLCV values.")
+    if (
+        (numeric["high"] < numeric[["open", "close"]].max(axis=1)).any()
+        or (numeric["low"] > numeric[["open", "close"]].min(axis=1)).any()
+        or (numeric["high"] < numeric["low"]).any()
+        or (numeric["volume"] < 0).any()
+    ):
+        raise ValueError("Freqtrade Feather contains invalid OHLCV geometry.")
+    if (timestamps > pd.Timestamp.now(tz="UTC")).any():
+        raise ValueError("Freqtrade Feather contains future-dated candles.")
+
+    gaps = timestamps.diff().dropna()
+    if (gaps != pd.Timedelta(milliseconds=interval_ms)).any():
+        raise ValueError(f"Freqtrade Feather contains missing or irregular {timeframe} intervals.")
+    closed = timestamps + pd.Timedelta(milliseconds=interval_ms) <= pd.Timestamp.now(tz="UTC")
+    closed_frame = numeric.loc[closed].tail(limit)
+    closed_timestamps = timestamps.loc[closed].tail(limit)
+    if len(closed_frame) < 200:
+        raise ValueError(f"At least 200 completed candles are required; found {len(closed_frame)}.")
+
+    return [
+        {
+            "timestamp": int(timestamp.value // 1_000_000),
+            "open": float(row.open),
+            "high": float(row.high),
+            "low": float(row.low),
+            "close": float(row.close),
+            "volume": float(row.volume),
+        }
+        for timestamp, row in zip(closed_timestamps, closed_frame.itertuples(index=False))
+    ]
 
 def generate_synthetic_btc_ohlcv(bars=1200, start_price=88000.0):
     """Generates realistic synthetic BTC/USDT 15m OHLCV bars with volatility clustering."""
@@ -423,7 +421,11 @@ def simulate_segment_backtest(
         "trades": trades
     }
 
-def run_comprehensive_institutional_backtest(candles, is_synthetic=False, data_source="REAL_EXCHANGE_HISTORICAL"):
+def run_comprehensive_institutional_backtest(
+    candles,
+    is_synthetic=False,
+    data_source="UNVERIFIED_INPUT",
+):
     """
     Executes the full institutional multi-stage backtest pipeline:
     1. Train Set (60%)
@@ -496,7 +498,9 @@ def run_comprehensive_institutional_backtest(candles, is_synthetic=False, data_s
             "symbol": "BTC/USDT",
             "timeframe": "15m",
             "data_source": data_source,
-            "is_real_historical_data": not is_synthetic,
+            "is_real_historical_data": False,
+            "historical_source_verified": False,
+            "historical_source_note": "Local OHLCV validation does not independently authenticate exchange provenance or SBK1 decision history.",
             "period_start_utc": start_dt,
             "period_end_utc": end_dt,
             "total_candles": n,
@@ -560,12 +564,8 @@ def run_comprehensive_institutional_backtest(candles, is_synthetic=False, data_s
             "total_frictions_usd": full_res["total_frictions_usd"],
             "regime_breakdown": full_res["regime_breakdown"]
         },
-        "is_live_trading_permitted": is_profitable and (not is_synthetic) and (n >= 300),
-        "live_activation_verdict_fa": (
-            "✅ صدور مجوز فعالیت زنده: امید ریاضی خالص در داده‌های مستقل OOS مثبت بوده و حجم داده‌های واقعی کافی است."
-            if (is_profitable and not is_synthetic and n >= 300)
-            else "🛑 عدم صدور مجوز معامله زنده: داده‌های ناکافی، استفاده از داده مصنوعی، یا امید ریاضی منفی در آزمون OOS."
-        ),
+        "is_live_trading_permitted": False,
+        "live_activation_verdict_fa": "🛑 این ابزار پژوهشی به‌تنهایی مجوز معامله زنده صادر نمی‌کند؛ کالیبراسیون SBK1 و گیت‌های مستقل Freqtrade لازم‌اند.",
         "audit_verdict_fa": (
             "✅ آزمون نهادی با برتری آماری در داده‌های مستقل خارج از نمونه تایید شد."
             if is_profitable
@@ -574,28 +574,47 @@ def run_comprehensive_institutional_backtest(candles, is_synthetic=False, data_s
     }
 
 if __name__ == "__main__":
-    is_synthetic = False
-    data_source = "BINANCE_REAL_HISTORICAL_KLINES"
-    candles = []
+    parser = argparse.ArgumentParser(
+        description="Research-only backtest over local Freqtrade OHLCV data; never authorizes live trading."
+    )
+    parser.add_argument(
+        "data_file",
+        nargs="?",
+        help="Local Freqtrade .feather data or an explicitly unverified JSON candle file.",
+    )
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Use generated data for software experiments only; not for market-performance evidence.",
+    )
+    args = parser.parse_args()
+    if args.synthetic and args.data_file:
+        parser.error("Pass either a data file or --synthetic, not both.")
+    if not args.synthetic and not args.data_file:
+        parser.error("Provide a local Freqtrade .feather file or explicitly pass --synthetic; network downloads are disabled.")
 
-    if len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
-        with open(sys.argv[1], "r") as f:
-            candles = json.load(f)
-        data_source = f"CUSTOM_FILE_{sys.argv[1]}"
-    elif "--synthetic" in sys.argv:
-        candles = generate_synthetic_btc_ohlcv(1200)
-        is_synthetic = True
-        data_source = "SYNTHETIC_DATA_TEST_ONLY (EXPLICIT_USER_REQUEST)"
-    else:
-        try:
-            print("[INFO] Fetching real historical BTC/USDT 15m candles from Bybit/Binance API...", file=sys.stderr)
-            candles = fetch_real_btc_ohlcv("BTCUSDT", "15m", 1000)
-            data_source = "BYBIT_V5_REAL_HISTORICAL_15M_KLINES"
-            if len(candles) < 300:
-                raise ValueError(f"Insufficient real candles: received {len(candles)}, minimum 300 required")
-        except Exception as e:
-            print(f"[ERROR] Real market data acquisition failed ({e}). Official backtest halted because synthetic fallback is strictly prohibited without explicit --synthetic flag.", file=sys.stderr)
-            sys.exit(1)
+    try:
+        if args.synthetic:
+            candles = generate_synthetic_btc_ohlcv(1200)
+            is_synthetic = True
+            data_source = "SYNTHETIC_DATA_TEST_ONLY"
+        elif Path(args.data_file).suffix.lower() == ".feather":
+            candles = load_freqtrade_feather(args.data_file)
+            is_synthetic = False
+            data_source = f"FREQTRADE_FEATHER_FORMAT_UNVERIFIED:{Path(args.data_file).resolve()}"
+        elif Path(args.data_file).suffix.lower() == ".json":
+            with open(args.data_file, "r", encoding="utf-8") as data_file:
+                candles = json.load(data_file)
+            is_synthetic = False
+            data_source = f"EXTERNAL_JSON_UNVERIFIED:{Path(args.data_file).resolve()}"
+        else:
+            parser.error("Supported data files are local .feather or .json files.")
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+        parser.error(str(error))
 
-    results = run_comprehensive_institutional_backtest(candles, is_synthetic=is_synthetic, data_source=data_source)
+    results = run_comprehensive_institutional_backtest(
+        candles,
+        is_synthetic=is_synthetic,
+        data_source=data_source,
+    )
     print(json.dumps(results, indent=2))

@@ -19,6 +19,7 @@ if (!existsSync(python)) {
       'unittest',
       'scripts.test_market_models',
       'scripts.test_sbk_signal_strategy',
+      'scripts.test_realistic_backtester',
       'scripts.test_init_sbk1_config',
     ],
     { stdio: 'inherit' },

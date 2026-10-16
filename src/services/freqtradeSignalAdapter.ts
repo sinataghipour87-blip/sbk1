@@ -53,8 +53,18 @@ export interface SbkFreqtradeSignal {
 export interface SbkFreqtradeSignalRecord {
   signal: SbkFreqtradeSignal;
   status: SbkSignalStatus;
+  receivedAtMs: number;
   createdAtMs: number;
   updatedAtMs: number;
+  lifecycleEvents: Array<{
+    status: SbkSignalStatus;
+    observedAtMs: number;
+    source: 'SBK1' | 'FREQTRADE';
+    reason?: string;
+    tradeId?: number;
+    filledAmount?: number;
+    averageFillPrice?: number;
+  }>;
   reason?: string;
   tradeId?: number;
   filledAmount?: number;
@@ -92,7 +102,7 @@ const allowedTransitions: Record<SbkSignalStatus, ReadonlySet<SbkSignalStatus>> 
   EXPIRED: new Set(),
   CANCELLED: new Set(),
   ERROR: new Set(),
-  UNKNOWN_IN_FLIGHT: new Set(),
+  UNKNOWN_IN_FLIGHT: new Set(['ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'FILLED']),
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -302,6 +312,32 @@ export class FreqtradeSignalAdapter {
         ) {
           throw new Error('Signal store contains an invalid lifecycle record.');
         }
+        record.receivedAtMs = Number.isSafeInteger(record.receivedAtMs)
+          ? record.receivedAtMs
+          : record.createdAtMs;
+        if (!Array.isArray(record.lifecycleEvents)) {
+          record.lifecycleEvents = [{
+            status: record.status,
+            observedAtMs: record.updatedAtMs,
+            source: record.status === 'ACCEPTED' ? 'SBK1' : 'FREQTRADE',
+            reason: record.reason,
+            tradeId: record.tradeId,
+            filledAmount: record.filledAmount,
+            averageFillPrice: record.averageFillPrice,
+          }];
+        }
+        if (
+          record.lifecycleEvents.length === 0 ||
+          !record.lifecycleEvents.every((event) =>
+            isRecord(event) &&
+            allowedTransitions[event.status as SbkSignalStatus] !== undefined &&
+            Number.isSafeInteger(event.observedAtMs) &&
+            (event.source === 'SBK1' || event.source === 'FREQTRADE')
+          ) ||
+          record.lifecycleEvents[record.lifecycleEvents.length - 1]?.status !== record.status
+        ) {
+          throw new Error('Signal store contains an invalid lifecycle history.');
+        }
         record.signal = validated;
         this.recordsById.set(validated.signalId, record);
       }
@@ -317,7 +353,18 @@ export class FreqtradeSignalAdapter {
     const filePath = this.storePath;
     await mkdir(path.dirname(filePath), { recursive: true });
     const temporaryPath = `${filePath}.${process.pid}.tmp`;
-    const records = [...this.recordsById.values()].slice(-5_000);
+    const allRecords = [...this.recordsById.values()];
+    const activeRecords = allRecords.filter((record) =>
+      record.signal.expiresAtMs > Date.now() ||
+      ['STRATEGY_ACCEPTED', 'ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'UNKNOWN_IN_FLIGHT'].includes(record.status)
+    );
+    const recentRecords = allRecords
+      .filter((record) => record.signal.expiresAtMs <= Date.now())
+      .slice(-5_000);
+    const records = [...new Map([...recentRecords, ...activeRecords].map((record) => [
+      record.signal.signalId,
+      record,
+    ])).values()];
     await writeFile(temporaryPath, JSON.stringify({ version: 1, records } satisfies SignalStore), { mode: 0o600 });
     await rename(temporaryPath, filePath);
   }
@@ -331,18 +378,20 @@ export class FreqtradeSignalAdapter {
         if (!isDeepStrictEqual(existing.signal, signal)) {
           throw new SbkSignalValidationError('Signal ID was already used for a different decision.', 'IDEMPOTENCY_CONFLICT');
         }
-        return { ...existing, duplicate: true };
+        return { ...structuredClone(existing), duplicate: true };
       }
       const nowMs = Date.now();
       const record: SbkFreqtradeSignalRecord = {
         signal,
         status: 'ACCEPTED',
+        receivedAtMs: nowMs,
         createdAtMs: nowMs,
         updatedAtMs: nowMs,
+        lifecycleEvents: [{ status: 'ACCEPTED', observedAtMs: nowMs, source: 'SBK1' }],
       };
       this.recordsById.set(signal.signalId, record);
       await this.persist();
-      return { ...record };
+      return structuredClone(record);
     });
   }
 
@@ -356,6 +405,12 @@ export class FreqtradeSignalAdapter {
           record.status = 'EXPIRED';
           record.reason = 'Signal expired before the Freqtrade strategy accepted it.';
           record.updatedAtMs = nowMs;
+          record.lifecycleEvents.push({
+            status: 'EXPIRED',
+            observedAtMs: nowMs,
+            source: 'SBK1',
+            reason: record.reason,
+          });
           changed = true;
         }
       }
@@ -366,7 +421,7 @@ export class FreqtradeSignalAdapter {
           record.signal.pair === pair &&
           record.signal.timeframe === timeframe
         )
-        .map((record) => ({ ...record }));
+        .map((record) => structuredClone(record));
     });
   }
 
@@ -380,6 +435,7 @@ export class FreqtradeSignalAdapter {
         'ORDER_SUBMITTED',
         'PARTIALLY_FILLED',
         'FILLED',
+        'UNKNOWN_IN_FLIGHT',
       ]);
       return [...this.recordsById.values()]
         .filter((record) =>
@@ -387,8 +443,19 @@ export class FreqtradeSignalAdapter {
           record.signal.pair === pair &&
           record.signal.timeframe === timeframe
         )
-        .slice(-100)
-        .map((record) => ({ ...record }));
+        .map((record) => structuredClone(record));
+    });
+  }
+
+  async getDashboardRecords(pair: string, timeframe: string): Promise<SbkFreqtradeSignalRecord[]> {
+    await this.getPending(pair, timeframe);
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      return [...this.recordsById.values()]
+        .filter((record) => record.signal.pair === pair && record.signal.timeframe === timeframe)
+        .sort((left, right) => right.updatedAtMs - left.updatedAtMs)
+        .slice(0, 50)
+        .map((record) => structuredClone(record));
     });
   }
 
@@ -399,15 +466,17 @@ export class FreqtradeSignalAdapter {
       if (!record) {
         throw new SbkSignalValidationError('Signal ID was not found.', 'SIGNAL_NOT_FOUND');
       }
-      if (!allowedTransitions[record.status].has(update.status)) {
-        if (record.status === update.status) return { ...record };
+      if (update.tradeId !== undefined && (!Number.isSafeInteger(update.tradeId) || update.tradeId <= 0)) {
+        throw new SbkSignalValidationError('Freqtrade trade ID must be a positive integer.', 'INVALID_TRADE_ID');
+      }
+      if (record.tradeId !== undefined && update.tradeId !== undefined && record.tradeId !== update.tradeId) {
+        throw new SbkSignalValidationError('A signal cannot be linked to more than one Freqtrade trade.', 'TRADE_ID_CONFLICT');
+      }
+      if (record.status !== update.status && !allowedTransitions[record.status].has(update.status)) {
         throw new SbkSignalValidationError(
           `Lifecycle transition ${record.status} -> ${update.status} is not allowed.`,
           'INVALID_STATUS_TRANSITION',
         );
-      }
-      if (update.tradeId !== undefined && (!Number.isSafeInteger(update.tradeId) || update.tradeId <= 0)) {
-        throw new SbkSignalValidationError('Freqtrade trade ID must be a positive integer.', 'INVALID_TRADE_ID');
       }
       if (update.filledAmount !== undefined && (!Number.isFinite(update.filledAmount) || update.filledAmount < 0)) {
         throw new SbkSignalValidationError('Filled amount must be a finite non-negative number.', 'INVALID_FILL_AMOUNT');
@@ -415,14 +484,45 @@ export class FreqtradeSignalAdapter {
       if (update.averageFillPrice !== undefined && (!finitePositive(update.averageFillPrice))) {
         throw new SbkSignalValidationError('Average fill price must be finite and positive.', 'INVALID_FILL_PRICE');
       }
+      const reason = update.reason?.slice(0, 500) ?? record.reason;
+      const tradeId = update.tradeId ?? record.tradeId;
+      const filledAmount = update.filledAmount ?? record.filledAmount;
+      const averageFillPrice = update.averageFillPrice ?? record.averageFillPrice;
+      const statusChanged = record.status !== update.status;
+      const lifecycleChanged = statusChanged ||
+        record.reason !== reason ||
+        record.tradeId !== tradeId ||
+        record.filledAmount !== filledAmount ||
+        record.averageFillPrice !== averageFillPrice;
+      if (
+        record.status === update.status &&
+        record.reason === reason &&
+        record.tradeId === tradeId &&
+        record.filledAmount === filledAmount &&
+        record.averageFillPrice === averageFillPrice
+      ) {
+        return { ...record };
+      }
       record.status = update.status;
-      record.reason = update.reason?.slice(0, 500);
-      record.tradeId = update.tradeId ?? record.tradeId;
-      record.filledAmount = update.filledAmount ?? record.filledAmount;
-      record.averageFillPrice = update.averageFillPrice ?? record.averageFillPrice;
-      record.updatedAtMs = Date.now();
+      record.reason = reason;
+      record.tradeId = tradeId;
+      record.filledAmount = filledAmount;
+      record.averageFillPrice = averageFillPrice;
+      const updatedAtMs = Date.now();
+      if (lifecycleChanged) {
+        record.lifecycleEvents.push({
+          status: update.status,
+          observedAtMs: updatedAtMs,
+          source: 'FREQTRADE',
+          reason,
+          tradeId,
+          filledAmount,
+          averageFillPrice,
+        });
+      }
+      record.updatedAtMs = updatedAtMs;
       await this.persist();
-      return { ...record };
+      return structuredClone(record);
     });
   }
 
@@ -430,7 +530,7 @@ export class FreqtradeSignalAdapter {
     return this.withExclusiveAccess(async () => {
       await this.load();
       const record = this.recordsById.get(signalId);
-      return record ? { ...record } : null;
+      return record ? structuredClone(record) : null;
     });
   }
 
@@ -444,6 +544,12 @@ export class FreqtradeSignalAdapter {
           record.status = 'CANCELLED';
           record.reason = reason.slice(0, 500);
           record.updatedAtMs = nowMs;
+          record.lifecycleEvents.push({
+            status: 'CANCELLED',
+            observedAtMs: nowMs,
+            source: 'SBK1',
+            reason: record.reason,
+          });
           cancelled++;
         }
       }

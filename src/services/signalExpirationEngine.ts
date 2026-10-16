@@ -190,10 +190,11 @@ export class SignalExpirationEngineService {
     const isEntryPassed = isWithinEntryZone && priceDriftPct <= this.MAX_PRICE_DRIFT_PCT;
 
     // ۵. Spread
-    const freshSpread = freshMarketSnapshot.realObiData?.spreadUsd
+    const freshSpread = freshMarketSnapshot.realObiData?.spreadUsd !== null &&
+      freshMarketSnapshot.realObiData?.spreadUsd !== undefined
       ? (freshMarketSnapshot.realObiData.spreadUsd / freshPrice) * 10000
-      : (freshMarketSnapshot.canonicalSnapshot?.basisSpreadBps ?? (freshMarketSnapshot as any).spreadBps ?? 1.4);
-    const isSpreadPassed = freshSpread <= this.MAX_SPREAD_WIDENING_BPS;
+      : freshMarketSnapshot.canonicalSnapshot?.basisSpreadBps ?? Number.POSITIVE_INFINITY;
+    const isSpreadPassed = Number.isFinite(freshSpread) && freshSpread <= this.MAX_SPREAD_WIDENING_BPS;
 
     // ۶. OBI (Order Book Imbalance)
     const freshObi = freshMarketSnapshot.realObiData?.obi ?? freshMarketSnapshot.obi ?? 0;

@@ -1,4 +1,4 @@
-import { AnalysisResult, AutoTradePrerequisitesCheck, ExchangeOrderReconciliation, ExecutionMode, TradeHistory, TradePosition, PreTradeRiskGateCheck, PositionReconciliationReport, OpportunityClusteringCheck, RealisticFillSimulationResult } from '../types/trading';
+import { AnalysisResult, AutoTradePrerequisitesCheck, ExecutionMode, TradeHistory, TradePosition, PreTradeRiskGateCheck, PositionReconciliationReport, OpportunityClusteringCheck, RealisticFillSimulationResult } from '../types/trading';
 import { getAntiTiltStatus, evaluateAccountLevelRisk } from './kellyRisk';
 import { calculateRealisticOrderFill, evaluateOpportunityClusteringGuard } from './sharedStrategyCore';
 import { newsShockFirewallService } from './newsShockFirewall';
@@ -11,6 +11,9 @@ interface ExchangeSecurityStatus {
   apiPermissionValid: boolean;
   clockSynchronized: boolean;
   clockDriftMs: number;
+  dryRun: boolean;
+  demoTrading: boolean;
+  forceEntryEnabled: boolean;
   exchangePositions: any[];
   walletBalanceUsdt: number | null;
   availableBalanceUsdt: number | null;
@@ -31,9 +34,13 @@ function getCachedExchangeSecurityStatus(): Promise<ExchangeSecurityStatus> {
 
   const request = (async (): Promise<ExchangeSecurityStatus> => {
     try {
+      const adminToken = localStorage.getItem('admin_token');
       const res = await fetch('/api/exchange/status', {
         method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(adminToken ? { 'x-admin-token': adminToken } : {}),
+        },
       });
       if (!res.ok) {
         return {
@@ -41,6 +48,9 @@ function getCachedExchangeSecurityStatus(): Promise<ExchangeSecurityStatus> {
           apiPermissionValid: false,
           clockSynchronized: false,
           clockDriftMs: 0,
+          dryRun: false,
+          demoTrading: false,
+          forceEntryEnabled: true,
           exchangePositions: [],
           walletBalanceUsdt: null,
           availableBalanceUsdt: null,
@@ -55,9 +65,15 @@ function getCachedExchangeSecurityStatus(): Promise<ExchangeSecurityStatus> {
 
       return {
         exchangeConnected: !!data.connected,
-        apiPermissionValid: !!data.hasTradePermissions,
+        apiPermissionValid: data.executionAuthority === 'freqtrade' &&
+          data.dryRun === true &&
+          data.demoTrading !== true &&
+          data.forceEntryEnabled === false,
         clockSynchronized: clockDriftMs < 1500,
         clockDriftMs,
+        dryRun: data.dryRun === true,
+        demoTrading: data.demoTrading === true,
+        forceEntryEnabled: data.forceEntryEnabled !== false,
         exchangePositions: data.activePositions || [],
         walletBalanceUsdt: typeof data.walletBalanceUsdt === 'number' ? data.walletBalanceUsdt : null,
         availableBalanceUsdt: typeof data.availableBalanceUsdt === 'number' ? data.availableBalanceUsdt : null,
@@ -69,6 +85,9 @@ function getCachedExchangeSecurityStatus(): Promise<ExchangeSecurityStatus> {
         apiPermissionValid: false,
         clockSynchronized: false,
         clockDriftMs: 0,
+        dryRun: false,
+        demoTrading: false,
+        forceEntryEnabled: true,
         exchangePositions: [],
         walletBalanceUsdt: null,
         availableBalanceUsdt: null,
@@ -127,6 +146,58 @@ export async function verifyAutoTradePrerequisites(
   tradeHistory: TradeHistory[],
   executionMode: ExecutionMode
 ): Promise<AutoTradePrerequisitesCheck> {
+  if (executionMode === 'DRY_RUN') {
+    const status = await getCachedExchangeSecurityStatus();
+    const safeFreqtradeRuntime = status.exchangeConnected &&
+      status.apiPermissionValid &&
+      status.dryRun &&
+      !status.demoTrading &&
+      !status.forceEntryEnabled;
+    const marketDataLive = analysis?.dataStatus === 'LIVE' &&
+      analysis.price > 0 &&
+      analysis.dataQualityReport?.isTradeAllowed === true;
+    const antiTilt = getAntiTiltStatus(tradeHistory);
+    let maxEquity = 1_000;
+    let currentEquity = 1_000;
+    let maxDrawdownPct = 0;
+    for (const trade of tradeHistory) {
+      currentEquity += typeof trade.pnlUsd === 'number' ? trade.pnlUsd : (trade.realizedPnlUsd || 0);
+      maxEquity = Math.max(maxEquity, currentEquity);
+      maxDrawdownPct = Math.max(maxDrawdownPct, ((maxEquity - currentEquity) / maxEquity) * 100);
+    }
+    const riskEngineHealthy = !antiTilt.isLocked &&
+      maxDrawdownPct < 15 &&
+      !globalKillSwitchEngine.isBlocked();
+    return {
+      isEligible: false,
+      exchangeConnected: status.exchangeConnected,
+      apiPermissionValid: safeFreqtradeRuntime,
+      marketDataLive,
+      riskEngineHealthy,
+      executionEngineHealthy: safeFreqtradeRuntime,
+      clockSynchronized: status.clockSynchronized,
+      positionStateSynchronized: true,
+      emergencyStopAvailable: typeof window !== 'undefined',
+      realEquityAvailable: false,
+      walletBalanceUsdt: status.walletBalanceUsdt,
+      detailsFa: [
+        ...(status.requestFailure
+          ? ['❌ وضعیت RPC احراز‌شدهٔ Freqtrade در دسترس نیست.']
+          : [safeFreqtradeRuntime
+            ? '✅ کیف پول مجازی Freqtrade در dry_run تایید شد؛ force-entry خاموش است.'
+            : '❌ پیکربندی امن Freqtrade dry_run تایید نشد.']),
+        ...(marketDataLive
+          ? []
+          : ['❌ دادهٔ زنده/مجاز برای معامله موجود نیست یا یکی از feedهای لازم نامعتبر است.']),
+        ...(!riskEngineHealthy
+          ? ['❌ قفل ریسک، افت سرمایه یا kill switch مانع تصمیم است.']
+          : []),
+        '🛑 NO TRADE — CALIBRATED_CONFIDENCE_UNAVAILABLE: آرشیو و شواهد کالیبراسیون خارج از نمونه موجود نیست؛ هیچ سیگنال production ارسال نمی‌شود.',
+      ],
+      checkedAt: Date.now(),
+    };
+  }
+
   if (executionMode !== 'LIVE') {
     return {
       isEligible: true,
@@ -494,77 +565,6 @@ export function reconcilePositionsLocalVsExchange(
     discrepancies,
     checkedAt: now,
   };
-}
-
-/**
- * Reconciles local trade order and position state with actual exchange records (Issue 29)
- */
-export async function reconcileOrderWithExchange(
-  orderId: string,
-  clientOrderId: string,
-  requestedPrice: number,
-  symbol: string = 'BTCUSDT'
-): Promise<ExchangeOrderReconciliation> {
-  const now = Date.now();
-  try {
-    const res = await fetch(`/api/exchange/order-status?orderId=${encodeURIComponent(orderId)}&clientOrderId=${encodeURIComponent(clientOrderId)}&symbol=${symbol}`);
-    if (!res.ok) {
-      throw new Error(`Reconciliation HTTP ${res.status}`);
-    }
-    const data = await res.json();
-    if (!data.success) {
-      throw new Error(data.error || 'خطا در واکشی وضعیت سفارش از صرافی');
-    }
-
-    const order = data.order || {};
-    const filledQty = parseFloat(order.cumExecQty || order.filledQty || '0');
-    const remainingQty = parseFloat(order.leavesQty || '0');
-    const avgFillPrice = parseFloat(order.avgPrice || order.cumExecValue ? (parseFloat(order.cumExecValue) / (filledQty || 1)).toString() : requestedPrice.toString());
-    const actualFeeUsd = parseFloat(order.cumExecFee || '0');
-    const actualSlippageUsd = Math.abs(avgFillPrice - requestedPrice);
-    const orderStatus = order.orderStatus || 'FILLED';
-
-    return {
-      orderId,
-      clientOrderId,
-      signalId: data.signalId || `SIG_${now}`,
-      decisionId: data.decisionId || `DEC_${now}`,
-      executionAttemptId: data.executionAttemptId || `ATT_${now}`,
-      orderStatus,
-      filledQty,
-      remainingQty,
-      avgFillPrice: avgFillPrice > 0 ? avgFillPrice : requestedPrice,
-      requestedPrice,
-      actualFeeUsd,
-      actualSlippageUsd,
-      positionSizeBtc: data.position?.size ? parseFloat(data.position.size) : filledQty,
-      positionSide: data.position?.side || (order.side === 'Buy' ? 'Buy' : 'Sell'),
-      exchangePositionState: 'ACTIVE',
-      isReconciled: true,
-      lastReconciledTime: now,
-    };
-  } catch (err: any) {
-    return {
-      orderId,
-      clientOrderId,
-      signalId: `SIG_${now}`,
-      decisionId: `DEC_${now}`,
-      executionAttemptId: `ATT_${now}`,
-      orderStatus: 'NEW',
-      filledQty: 0,
-      remainingQty: 0,
-      avgFillPrice: requestedPrice,
-      requestedPrice,
-      actualFeeUsd: 0,
-      actualSlippageUsd: 0,
-      positionSizeBtc: 0,
-      positionSide: 'None',
-      exchangePositionState: 'MISMATCH_HALTED',
-      isReconciled: false,
-      discrepancyFa: `عدم تطابق با صرافی: ${err.message || 'پاسخ نامعتبر'}`,
-      lastReconciledTime: now,
-    };
-  }
 }
 
 /**

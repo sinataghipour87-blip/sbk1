@@ -85,7 +85,7 @@ export class CrossBrainPredictiveEngineService {
 
     // Query real historical resolved dataset
     const dataset = centralTradeDatasetService;
-    const allRecords = dataset.getAllPredictions();
+    const allRecords = dataset.getFreqtradeVerifiedPredictions();
     const resolvedRecords = allRecords.filter(r => r.outcome === 'WIN' || r.outcome === 'LOSS');
     const totalResolvedCount = resolvedRecords.length;
 

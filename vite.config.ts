@@ -12,9 +12,9 @@ export default defineConfig(() => {
       },
     },
     server: {
+      allowedHosts: true as const,
       host: '0.0.0.0',
       port: 3000,
-      allowedHosts: true as const,
       // Disable HMR WebSocket to avoid iframe preview connection drops
       hmr: false,
       watch: null,

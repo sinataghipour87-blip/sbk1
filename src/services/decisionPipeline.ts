@@ -317,8 +317,8 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   // STAGE 6: LIQUIDITY ANALYSIS & SPREAD
   // =========================================================================
   const obi = analysis?.obi ?? 0;
-  const spreadBps = analysis?.canonicalSnapshot?.basisSpreadBps ?? 1.2;
-  const isSpreadAcceptable = spreadBps <= 8.0; // Avoid abnormal spread slippage
+  const spreadBps = analysis?.canonicalSnapshot?.basisSpreadBps;
+  const isSpreadAcceptable = typeof spreadBps === 'number' && spreadBps <= 8.0; // Avoid abnormal spread slippage
   const isObiFavorable = isLong ? obi >= -0.30 : obi <= 0.30;
   const stage6Passed = !pipelineHalted && isSpreadAcceptable && isObiFavorable;
 
@@ -669,8 +669,8 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   ) {
     throw new Error('Meta-model requires live setup, timeframe, order-flow, volatility, RSI, and candle inputs.');
   }
-  const allDatasetPreds = centralTradeDatasetService.getAllPredictions();
-  const resolvedPreds = allDatasetPreds.filter(p => p.outcome === 'WIN' || p.outcome === 'LOSS');
+  const resolvedPreds = centralTradeDatasetService.getFreqtradeVerifiedPredictions()
+    .filter(p => p.outcome === 'WIN' || p.outcome === 'LOSS');
   const totalResolved = resolvedPreds.length;
 
   // Real Bayesian Inference
@@ -1041,8 +1041,8 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
       cvdDelta,
       takerRatio,
       fngVal: typeof analysis?.fngVal === 'number' ? analysis.fngVal : null,
-      spreadUsd: analysis?.canonicalSnapshot?.basisSpreadUsd || 1.5,
-      spreadBps,
+      spreadUsd: analysis?.canonicalSnapshot?.basisSpreadUsd ?? Number.MAX_SAFE_INTEGER,
+      spreadBps: spreadBps ?? Number.MAX_SAFE_INTEGER,
       bidDepthUsd: analysis?.realObiData?.bidDepthUsd,
       askDepthUsd: analysis?.realObiData?.askDepthUsd,
       orderBookLevels: analysis?.realObiData?.levelsCount,
@@ -1112,7 +1112,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     { ...analysis, modelAgreementPct: 100 - disagreementReport.disagreementIndex },
     resolvedDir,
     traceableIds,
-    stage14Passed ? 'EXECUTED_FILLED' : 'DECISION_REJECTED',
+    stage14Passed ? 'PREDICTED_ONLY' : 'DECISION_REJECTED',
     stage14Passed ? undefined : defaultWaitReason
   );
 
@@ -1125,7 +1125,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     riskVersion: 'v3.0-failclosed',
     executionVersion: 'v2.5-bybit',
     marketSnapshotTimestamp: timestampMs,
-    exchangeTimestamp: analysis?.canonicalSnapshot?.timestampUtc || timestampMs,
+    exchangeTimestamp: analysis?.canonicalSnapshot?.feeds[0]?.exchangeTimestampUtc ?? null,
   };
 
   const selectedEntrySurfacePoint = opportunitySurface.points.find(point => point.entryPrice === entryTargetPrice);

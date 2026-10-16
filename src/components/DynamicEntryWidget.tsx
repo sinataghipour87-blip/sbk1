@@ -25,7 +25,8 @@ export const DynamicEntryWidget: React.FC<DynamicEntryWidgetProps> = ({ analysis
   const zone = useMemo(() => {
     if (!analysis) return null;
     
-    const spread = analysis.canonicalSnapshot?.basisSpreadBps ?? 0.5;
+    const spread = analysis.canonicalSnapshot?.basisSpreadBps;
+    if (typeof spread !== 'number' || !Number.isFinite(spread)) return null;
     const setupType = analysis.setupContext?.setupType ?? 'VWAP_MSS_CONTINUATION';
     const regime = analysis.regimeClassification?.activeRegime ?? 'TREND';
     const timeframe = (analysis.timeframe as string) || '15m';

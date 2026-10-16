@@ -18,6 +18,7 @@ from sbk_signal_contract import (
 
 
 logger = logging.getLogger(__name__)
+INFORMATIVE_TIMEFRAMES = ("1m", "5m", "1h", "4h")
 
 
 class SbkSignalStrategy(IStrategy):
@@ -37,6 +38,7 @@ class SbkSignalStrategy(IStrategy):
         self._signals: dict[str, dict[str, Any]] = {}
         self._signal_statuses: dict[str, str] = {}
         self._signals_by_pair: dict[str, dict[str, Any]] = {}
+        self._market_snapshot_last_publish_ms = 0
         self._pair = os.getenv("SBK1_FREQTRADE_PAIR", "")
         try:
             self._bridge_url = validate_bridge_url(
@@ -51,11 +53,23 @@ class SbkSignalStrategy(IStrategy):
         if not self._pair:
             logger.error("SBK1 signal bridge is disabled: SBK1_FREQTRADE_PAIR must match FREQTRADE_PAIR on the SBK1 server.")
 
+    def informative_pairs(self) -> list[tuple[str, str]]:
+        pair = os.getenv("SBK1_FREQTRADE_PAIR", "").strip()
+        if not pair:
+            return []
+        return [
+            (pair, timeframe)
+            for timeframe in INFORMATIVE_TIMEFRAMES
+            if timeframe != self.timeframe
+        ]
+
     def bot_loop_start(self, current_time: datetime, **kwargs: Any) -> None:
         self._signals = {}
         self._signal_statuses = {}
         self._signals_by_pair = {}
         runmode = getattr(self.config.get("runmode"), "value", self.config.get("runmode"))
+        if runmode in ("dry_run", "live"):
+            self._publish_market_snapshot(current_time)
         if not is_dry_run_fixture_runtime(self.config, runmode):
             return
         if len(self._bridge_token) < 32 or not self._pair or not self._bridge_url:
@@ -84,7 +98,12 @@ class SbkSignalStrategy(IStrategy):
             inflight_signal_records = [
                 record for record in records
                 if isinstance(record, dict)
-                and record.get("status") in ("STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED")
+                and record.get("status") in (
+                    "STRATEGY_ACCEPTED",
+                    "ORDER_SUBMITTED",
+                    "PARTIALLY_FILLED",
+                    "UNKNOWN_IN_FLIGHT",
+                )
             ]
             unresolved_signal_ids: set[str] = set()
             trades_by_signal_id: dict[str, Any] = {}
@@ -101,16 +120,42 @@ class SbkSignalStrategy(IStrategy):
                     )
                 )
                 for signal_id in unresolved_signal_ids:
-                    self._post_status(
-                        signal_id,
-                        "UNKNOWN_IN_FLIGHT",
-                        "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
+                    record = next(
+                        (
+                            candidate for candidate in inflight_signal_records
+                            if isinstance(candidate.get("signal"), dict)
+                            and candidate["signal"].get("signalId") == signal_id
+                        ),
+                        None,
                     )
+                    if record and record.get("status") != "UNKNOWN_IN_FLIGHT":
+                        self._post_status(
+                            signal_id,
+                            "UNKNOWN_IN_FLIGHT",
+                            "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
+                        )
                 for record in inflight_signal_records:
                     signal = record.get("signal")
                     signal_id = signal.get("signalId") if isinstance(signal, dict) else None
                     trade = trades_by_signal_id.get(signal_id)
                     if not isinstance(signal_id, str) or not trade:
+                        continue
+                    if (
+                        trade.pair != signal["pair"]
+                        or bool(trade.is_short) != (signal["direction"] == "SHORT")
+                    ):
+                        unresolved_signal_ids.add(signal_id)
+                        if record.get("status") != "UNKNOWN_IN_FLIGHT":
+                            self._post_status(
+                                signal_id,
+                                "UNKNOWN_IN_FLIGHT",
+                                "A Freqtrade trade with this signal tag has a different pair or direction; the signal remains quarantined.",
+                            )
+                        logger.error(
+                            "Freqtrade trade %s does not match signal %s pair/direction; keeping signal quarantined.",
+                            getattr(trade, "id", "unknown"),
+                            signal_id,
+                        )
                         continue
                     open_entry_orders = [
                         order for order in trade.open_orders
@@ -144,7 +189,14 @@ class SbkSignalStrategy(IStrategy):
             for record in records:
                 signal = record.get("signal") if isinstance(record, dict) else None
                 status = record.get("status") if isinstance(record, dict) else None
-                if status not in ("ACCEPTED", "STRATEGY_ACCEPTED", "ORDER_SUBMITTED", "PARTIALLY_FILLED", "FILLED"):
+                if status not in (
+                    "ACCEPTED",
+                    "STRATEGY_ACCEPTED",
+                    "ORDER_SUBMITTED",
+                    "PARTIALLY_FILLED",
+                    "FILLED",
+                    "UNKNOWN_IN_FLIGHT",
+                ):
                     continue
                 if isinstance(signal, dict) and signal.get("signalId") in unresolved_signal_ids:
                     continue
@@ -168,8 +220,290 @@ class SbkSignalStrategy(IStrategy):
                     self._signals_by_pair[signal["pair"]] = signal
             self._signals = active_signals
             self._signal_statuses = active_statuses
+        except requests.HTTPError as exc:
+            response = exc.response
+            payload = None
+            if response is not None:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+            if isinstance(payload, dict):
+                logger.warning(
+                    "SBK1 signal delivery blocked (HTTP %s, stage=%s, code=%s, correlation_id=%s): %s",
+                    response.status_code if response is not None else "unknown",
+                    payload.get("stage", "unknown"),
+                    payload.get("code", "unknown"),
+                    payload.get("correlationId", "unavailable"),
+                    payload.get("error", str(exc)),
+                )
+            else:
+                logger.error("SBK1 signal bridge poll failed: %s", exc)
         except (requests.RequestException, ValueError) as exc:
             logger.error("SBK1 signal bridge poll failed; this loop will not use cached signals: %s", exc)
+
+    def _publish_market_snapshot(self, current_time: datetime) -> bool:
+        bridge_token = getattr(self, "_bridge_token", "")
+        bridge_url = getattr(self, "_bridge_url", "")
+        pair = getattr(self, "_pair", "")
+        data_provider = getattr(self, "dp", None)
+        now_ms = int(current_time.timestamp() * 1000)
+        if (
+            len(bridge_token) < 32 or not bridge_url or not pair or data_provider is None
+            or now_ms - getattr(self, "_market_snapshot_last_publish_ms", 0) < 10_000
+        ):
+            return False
+
+        configured_exchange = str(self.config.get("exchange", {}).get("name", "")).lower()
+        market = str(self.config.get("trading_mode", "spot")).lower()
+        if not configured_exchange or market not in ("spot", "futures"):
+            logger.error("Freqtrade market snapshot was not published: exchange or market configuration is invalid.")
+            return False
+
+        try:
+            candles = self._snapshot_candles(data_provider, pair, self.timeframe, now_ms)
+            if not candles:
+                raise ValueError("DataProvider returned no completed candles for the configured pair and timeframe.")
+            additional_candles = {
+                timeframe: self._snapshot_candles(data_provider, pair, timeframe, now_ms)
+                for timeframe in INFORMATIVE_TIMEFRAMES
+                if timeframe != self.timeframe
+            }
+            ticker = self._snapshot_ticker(data_provider, pair)
+            order_book = self._snapshot_order_book(data_provider, pair, now_ms)
+            funding_rate = self._snapshot_funding_rate(data_provider, pair, market, now_ms)
+            generated_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+            payload = {
+                "contractVersion": "sbk1.freqtrade.market-snapshot.v3",
+                "source": "freqtrade.dataprovider",
+                "exchange": configured_exchange,
+                "market": market,
+                "pair": pair,
+                "timeframe": self.timeframe,
+                "generatedAtMs": generated_at_ms,
+                "candles": candles,
+                "additionalCandles": additional_candles,
+                "ticker": ticker,
+                "orderBook": order_book,
+                "fundingRate": funding_rate,
+            }
+            response = requests.post(
+                f"{bridge_url}/api/freqtrade/market-snapshot",
+                headers={"Authorization": f"Bearer {bridge_token}"},
+                json=payload,
+                timeout=(1.0, 2.0),
+                allow_redirects=False,
+            )
+            response.raise_for_status()
+            self._market_snapshot_last_publish_ms = generated_at_ms
+            return True
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            logger.error("Freqtrade market snapshot push failed; no market data was cached by this strategy: %s", exc)
+            return False
+        except Exception:
+            logger.exception("Unexpected failure while building the Freqtrade market snapshot.")
+            return False
+
+    def _snapshot_candles(
+        self,
+        data_provider: Any,
+        pair: str,
+        timeframe: str,
+        now_ms: int,
+    ) -> list[dict[str, Any]] | None:
+        try:
+            dataframe = data_provider.get_pair_dataframe(pair, timeframe)
+        except Exception as exc:
+            logger.warning("Freqtrade DataProvider candles are unavailable for %s/%s: %s", pair, timeframe, exc)
+            return None
+        if dataframe is None or dataframe.empty:
+            logger.warning("Freqtrade DataProvider returned no candles for %s/%s.", pair, timeframe)
+            return None
+
+        timeframe_ms = self._timeframe_seconds_for(timeframe) * 1000
+        candles = []
+        for row in dataframe.tail(500).itertuples(index=False):
+            candle_time = getattr(row, "date", None)
+            if not isinstance(candle_time, datetime):
+                logger.warning("Freqtrade DataProvider returned a candle without a datetime for %s/%s.", pair, timeframe)
+                return None
+            timestamp_ms = int(candle_time.timestamp() * 1000)
+            if timestamp_ms + timeframe_ms > now_ms:
+                continue
+            candle = {
+                "timestampMs": timestamp_ms,
+                "open": float(row.open),
+                "high": float(row.high),
+                "low": float(row.low),
+                "close": float(row.close),
+                "volume": float(row.volume),
+            }
+            if (
+                not all(math.isfinite(candle[key]) for key in ("open", "high", "low", "close", "volume"))
+                or min(candle["open"], candle["high"], candle["low"], candle["close"]) <= 0
+                or candle["volume"] < 0
+                or candle["high"] < max(candle["open"], candle["close"], candle["low"])
+                or candle["low"] > min(candle["open"], candle["close"], candle["high"])
+            ):
+                logger.warning("Freqtrade DataProvider returned invalid OHLCV for %s/%s.", pair, timeframe)
+                return None
+            candles.append(candle)
+        if not candles:
+            logger.warning("Freqtrade DataProvider has no completed candles for %s/%s.", pair, timeframe)
+            return None
+        return candles
+
+    def _snapshot_ticker(self, data_provider: Any, pair: str) -> dict[str, Any] | None:
+        try:
+            ticker = data_provider.ticker(pair)
+        except Exception as exc:
+            logger.warning("Freqtrade DataProvider ticker is unavailable for %s: %s", pair, exc)
+            return None
+        if not isinstance(ticker, dict):
+            logger.warning("Freqtrade DataProvider returned an invalid ticker for %s.", pair)
+            return None
+        exchange_timestamp_ms = ticker.get("timestamp")
+        if (
+            not isinstance(exchange_timestamp_ms, (int, float))
+            or isinstance(exchange_timestamp_ms, bool)
+            or not math.isfinite(exchange_timestamp_ms)
+        ):
+            raw_datetime = ticker.get("datetime")
+            if isinstance(raw_datetime, str):
+                try:
+                    parsed_datetime = datetime.fromisoformat(raw_datetime.replace("Z", "+00:00"))
+                    if parsed_datetime.tzinfo is not None:
+                        exchange_timestamp_ms = int(parsed_datetime.timestamp() * 1000)
+                except ValueError:
+                    pass
+        last = ticker.get("last")
+        valid_last = (
+            isinstance(last, (int, float))
+            and not isinstance(last, bool)
+            and math.isfinite(last)
+            and last > 0
+        )
+        if not valid_last:
+            logger.warning(
+                "Freqtrade DataProvider ticker has no valid last price for %s; ticker remains unavailable.",
+                pair,
+            )
+            return None
+        if (
+            not isinstance(exchange_timestamp_ms, (int, float))
+            or isinstance(exchange_timestamp_ms, bool)
+            or not math.isfinite(exchange_timestamp_ms)
+        ):
+            exchange_timestamp_ms = None
+            logger.warning(
+                "Freqtrade DataProvider ticker has no exchange timestamp for %s; "
+                "freshness is based on local retrieval time only.",
+                pair,
+            )
+        else:
+            exchange_timestamp_ms = int(exchange_timestamp_ms)
+        retrieved_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+        if (
+            exchange_timestamp_ms is not None
+            and (
+                exchange_timestamp_ms > retrieved_at_ms + 1_000
+                or retrieved_at_ms - exchange_timestamp_ms > 5_000
+            )
+        ):
+            logger.warning("Freqtrade DataProvider ticker is stale for %s.", pair)
+            return None
+        bid = ticker.get("bid")
+        ask = ticker.get("ask")
+        return {
+            "exchangeTimestampMs": exchange_timestamp_ms,
+            "retrievedAtMs": retrieved_at_ms,
+            "last": float(last),
+            "bid": float(bid) if isinstance(bid, (int, float)) and not isinstance(bid, bool) and math.isfinite(bid) and bid > 0 else None,
+            "ask": float(ask) if isinstance(ask, (int, float)) and not isinstance(ask, bool) and math.isfinite(ask) and ask > 0 else None,
+            "markPrice": self._first_positive(ticker, ("mark", "markPrice")),
+            "indexPrice": self._first_positive(ticker, ("indexPrice", "index")),
+        }
+
+    def _snapshot_funding_rate(
+        self,
+        data_provider: Any,
+        pair: str,
+        market: str,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        if market != "futures":
+            return None
+        try:
+            funding = data_provider.funding_rate(pair)
+        except Exception as exc:
+            logger.warning("Freqtrade DataProvider funding rate is unavailable for %s: %s", pair, exc)
+            return None
+        if not isinstance(funding, dict):
+            logger.warning("Freqtrade DataProvider returned an invalid funding rate for %s.", pair)
+            return None
+        rate = funding.get("fundingRate")
+        if not isinstance(rate, (int, float)) or isinstance(rate, bool) or not math.isfinite(rate):
+            logger.warning("Freqtrade DataProvider funding rate has no finite value for %s.", pair)
+            return None
+        next_funding_at = funding.get("fundingTimestamp")
+        return {
+            "retrievedAtMs": now_ms,
+            "rate": float(rate),
+            "nextFundingAtMs": int(next_funding_at)
+            if isinstance(next_funding_at, (int, float)) and not isinstance(next_funding_at, bool)
+            and math.isfinite(next_funding_at) and next_funding_at > 0
+            else None,
+        }
+
+    def _snapshot_order_book(self, data_provider: Any, pair: str, now_ms: int) -> dict[str, Any] | None:
+        try:
+            order_book = data_provider.orderbook(pair, 20)
+        except Exception as exc:
+            logger.warning("Freqtrade DataProvider order book is unavailable for %s: %s", pair, exc)
+            return None
+        if not isinstance(order_book, dict):
+            logger.warning("Freqtrade DataProvider returned an invalid order book for %s.", pair)
+            return None
+        timestamp_ms = order_book.get("timestamp")
+        bids = order_book.get("bids")
+        asks = order_book.get("asks")
+        if (
+            not isinstance(timestamp_ms, (int, float)) or isinstance(timestamp_ms, bool)
+            or not math.isfinite(timestamp_ms) or not isinstance(bids, list) or not isinstance(asks, list)
+        ):
+            logger.warning("Freqtrade DataProvider order book has no valid timestamp or levels for %s.", pair)
+            return None
+        timestamp_ms = int(timestamp_ms)
+        if timestamp_ms > now_ms + 1_000 or now_ms - timestamp_ms > 15_000:
+            logger.warning("Freqtrade DataProvider order book is stale for %s.", pair)
+            return None
+
+        def levels(values: list[Any]) -> list[dict[str, float]]:
+            result = []
+            for value in values[:20]:
+                if not isinstance(value, (list, tuple)) or len(value) < 2:
+                    raise ValueError("DataProvider returned an invalid order book level.")
+                price, amount = value[0], value[1]
+                if (
+                    not isinstance(price, (int, float)) or isinstance(price, bool)
+                    or not math.isfinite(price) or price <= 0
+                    or not isinstance(amount, (int, float)) or isinstance(amount, bool)
+                    or not math.isfinite(amount) or amount <= 0
+                ):
+                    raise ValueError("DataProvider returned a non-positive or non-finite order book level.")
+                result.append({"price": float(price), "amount": float(amount)})
+            return result
+
+        try:
+            bid_levels = levels(bids)
+            ask_levels = levels(asks)
+        except ValueError as exc:
+            logger.warning("Freqtrade DataProvider order book is invalid for %s: %s", pair, exc)
+            return None
+        if not bid_levels or not ask_levels or bid_levels[0]["price"] >= ask_levels[0]["price"]:
+            logger.warning("Freqtrade DataProvider order book is empty or crossed for %s.", pair)
+            return None
+        return {"timestampMs": timestamp_ms, "bids": bid_levels, "asks": ask_levels}
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
@@ -460,6 +794,27 @@ class SbkSignalStrategy(IStrategy):
             return False
 
     def _timeframe_seconds(self) -> int:
-        unit = self.timeframe[-1]
-        quantity = int(self.timeframe[:-1])
+        return self._timeframe_seconds_for(self.timeframe)
+
+    def _timeframe_seconds_for(self, timeframe: str) -> int:
+        unit = timeframe[-1]
+        quantity = int(timeframe[:-1])
         return quantity * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+
+    @staticmethod
+    def _first_positive(values: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+        info = values.get("info")
+        for key in keys:
+            value = values.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+                return float(value)
+            if isinstance(info, dict):
+                raw_value = info.get(key)
+                if isinstance(raw_value, (int, float, str)) and not isinstance(raw_value, bool):
+                    try:
+                        number = float(raw_value)
+                    except ValueError:
+                        continue
+                    if math.isfinite(number) and number > 0:
+                        return number
+        return None

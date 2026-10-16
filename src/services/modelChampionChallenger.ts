@@ -23,7 +23,7 @@
  * =============================================================================
  */
 
-import { centralTradeDatasetService, PredictionDatasetRecord } from './centralTradeDataset';
+import { centralTradeDatasetService, hasFreqtradeVerifiedOutcome, PredictionDatasetRecord } from './centralTradeDataset';
 import { MarketRegimeType } from './antiSelfDeceptionOnlineLearning';
 
 export type TimeframeHorizon = '5m' | '15m' | '1h';
@@ -212,6 +212,16 @@ export class ModelChampionChallengerService {
    * جلوگیری از ثبت نمونه‌های ناقص، برچسب‌های بدون تأییدیه صرافی، پاداش‌های متناقض و نشت داده‌های آینده
    */
   public sanitizeDatasetRecord(record: PredictionDatasetRecord): DataSanitizationResult {
+    if (!hasFreqtradeVerifiedOutcome(record)) {
+      return {
+        isValidForTraining: false,
+        rejectionReasonFa: 'نتیجه به معامله‌ی بسته‌شده‌ی تأییدشده‌ی Freqtrade متصل نیست.',
+        hasLeakageRisk: false,
+        isOutcomeVerified: false,
+        isExchangeConfirmed: false,
+      };
+    }
+
     // ۱. بررسی قطعی بودن نتیجه
     if (!record.outcome || (record.outcome !== 'WIN' && record.outcome !== 'LOSS')) {
       return {
@@ -298,7 +308,9 @@ export class ModelChampionChallengerService {
    */
   public calculateNineCriteria(records: PredictionDatasetRecord[]): PerformanceStats {
     const closed = records.filter(
-      (r) => r.outcome === 'WIN' || r.outcome === 'LOSS' || (r.PnL !== undefined && r.PnL !== null)
+      (r) => hasFreqtradeVerifiedOutcome(r) &&
+        (r.outcome === 'WIN' || r.outcome === 'LOSS') &&
+        typeof r.PnL === 'number' && Number.isFinite(r.PnL)
     );
 
     const sampleSize = closed.length;
@@ -406,10 +418,7 @@ export class ModelChampionChallengerService {
    * ۴۹ & ۵۰. همگام‌سازی و بازمحاسبه زنده وضعیت مدل‌ها از روی Central Dataset
    */
   public syncWithRealDataset(): void {
-    const allPredictions = centralTradeDatasetService.getAllPredictions();
-    const evaluatedRecords = allPredictions.filter(
-      (p) => p.outcome !== undefined || p.PnL !== undefined
-    );
+    const evaluatedRecords = centralTradeDatasetService.getFreqtradeVerifiedPredictions();
 
     if (evaluatedRecords.length >= 5) {
       // تفکیک رکوردهای آموزش و تست مستقل برون‌نمونه (۷۰٪ آموزش / ۳۰٪ OOS)

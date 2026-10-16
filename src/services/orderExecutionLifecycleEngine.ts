@@ -579,9 +579,14 @@ export class OrderExecutionLifecycleService {
     let exitRequestStarted = false;
     try {
       const botState = await freqtradeBridge.getStatus();
-      if (!botState.ping || botState.status !== 'running' || botState.dryRun) {
+      if (
+        !botState.ping ||
+        botState.status !== 'running' ||
+        botState.dryRun !== true ||
+        botState.demoTrading !== false
+      ) {
         throw new FreqtradeRpcError(
-          `Freqtrade is not ready for live exits (state: ${botState.status}, dry-run: ${botState.dryRun}).`,
+          `Freqtrade exits are restricted to a running local dry-run instance (state: ${botState.status}, dry-run: ${botState.dryRun}, demo-trading: ${botState.demoTrading}).`,
         );
       }
       const existingTrade = await freqtradeBridge.getTrade(normalizedTradeId);

@@ -353,7 +353,7 @@ export function evaluateRegimeSetupEdge(
   ];
 
   const matrixRecords: SetupRegimeEdgeRecord[] = [];
-  const allPredictions = centralTradeDatasetService.getAllPredictions();
+  const allPredictions = centralTradeDatasetService.getFreqtradeVerifiedPredictions();
 
   for (const sType of allSetupTypes) {
     const resolved = allPredictions.filter(record =>

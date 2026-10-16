@@ -49,6 +49,8 @@ export interface PredictionDatasetRecord {
 
   // Outcome Feedback Written Back After Completion (Item 19)
   outcome?: 'WIN' | 'LOSS' | 'BREAKEVEN' | 'SKIPPED_EXECUTED_NO_FILL' | 'REJECTED_WAIT';
+  outcomeSource?: 'FREQTRADE_CONFIRMED' | 'UNVERIFIED_LOCAL';
+  freqtradeTradeId?: number;
   PnL?: number;
   R?: number;
   MAE?: number;
@@ -84,6 +86,8 @@ export interface TradeDatasetRecord {
   notionalUsd: number;
   
   isClosed: boolean;
+  outcomeSource?: 'FREQTRADE_CONFIRMED' | 'UNVERIFIED_LOCAL';
+  freqtradeTradeId?: number;
   closedAtMs?: number;
   closedAtIso?: string;
   exitPrice?: number;
@@ -96,6 +100,22 @@ export interface TradeDatasetRecord {
   actualSlippageUsd?: number;
   actualFeesUsd?: number;
   exitReason?: string;
+}
+
+export function hasFreqtradeVerifiedOutcome(record: PredictionDatasetRecord): boolean {
+  return record.outcomeSource === 'FREQTRADE_CONFIRMED' &&
+    record.executionStatus === 'CLOSED_COMPLETED' &&
+    (record.outcome === 'WIN' || record.outcome === 'LOSS' || record.outcome === 'BREAKEVEN') &&
+    Number.isSafeInteger(record.freqtradeTradeId) &&
+    (record.freqtradeTradeId ?? 0) > 0;
+}
+
+export function hasFreqtradeVerifiedTradeOutcome(record: TradeDatasetRecord): boolean {
+  return record.outcomeSource === 'FREQTRADE_CONFIRMED' &&
+    record.isClosed &&
+    (record.outcome === 'WIN' || record.outcome === 'LOSS' || record.outcome === 'BREAKEVEN') &&
+    Number.isSafeInteger(record.freqtradeTradeId) &&
+    (record.freqtradeTradeId ?? 0) > 0;
 }
 
 export interface PerformanceSegmentMetrics {
@@ -135,7 +155,7 @@ export interface TraceableIdsPack {
 
 const PREDICTIONS_DATASET_KEY = 'quantum_central_predictions_dataset';
 const TRADES_DATASET_KEY = 'quantum_central_trades_dataset';
-const PERFORMANCE_MATRIX_KEY = 'quantum_performance_matrix';
+const PERFORMANCE_MATRIX_KEY = 'quantum_performance_matrix_freqtrade_v1';
 
 export class CentralTradeDatasetService {
   private static instance: CentralTradeDatasetService;
@@ -291,6 +311,7 @@ export class CentralTradeDatasetService {
       marginUsd: trade.margin,
       notionalUsd: trade.margin * trade.lev,
       isClosed: false,
+      outcomeSource: 'UNVERIFIED_LOCAL',
     };
 
     const trades = this.getAllTradeRecords();
@@ -321,6 +342,7 @@ export class CentralTradeDatasetService {
 
     if (predIndex !== -1) {
       predictions[predIndex].outcome = outcome;
+      predictions[predIndex].outcomeSource = 'UNVERIFIED_LOCAL';
       predictions[predIndex].PnL = pnlUsd;
       predictions[predIndex].R = rMultiple;
       predictions[predIndex].MAE = maeUsd;
@@ -346,7 +368,7 @@ export class CentralTradeDatasetService {
    * ITEM 19: Batch model evaluation cycle (Overfitting Guard)
    */
   public checkAndTriggerBatchModelEvaluation(): void {
-    const predictions = this.getAllPredictions();
+    const predictions = this.getFreqtradeVerifiedPredictions();
     const completedFeedbackCount = predictions.filter(p => p.feedbackProcessedAtMs).length;
 
     if (completedFeedbackCount > 0 && completedFeedbackCount % 5 === 0) {
@@ -360,7 +382,9 @@ export class CentralTradeDatasetService {
    */
   public recalculatePerformanceMatrix(): MultiDimensionalPerformanceMatrix {
     const predictions = this.getAllPredictions();
-    const completed = predictions.filter(p => p.outcome !== undefined);
+    const completed = predictions.filter(
+      (record) => hasFreqtradeVerifiedOutcome(record) && record.outcome !== undefined
+    );
 
     const buildSegment = (
       key: string,
@@ -494,6 +518,12 @@ export class CentralTradeDatasetService {
     }
   }
 
+  public getFreqtradeVerifiedPredictions(): PredictionDatasetRecord[] {
+    return this.getAllPredictions().filter(
+      (record) => hasFreqtradeVerifiedOutcome(record) && record.outcome !== undefined
+    );
+  }
+
   public getAllTradeRecords(): TradeDatasetRecord[] {
     if (typeof window === 'undefined' || typeof localStorage === 'undefined') return [];
     const saved = localStorage.getItem(TRADES_DATASET_KEY);
@@ -503,6 +533,12 @@ export class CentralTradeDatasetService {
     } catch {
       return [];
     }
+  }
+
+  public getFreqtradeVerifiedTradeRecords(): TradeDatasetRecord[] {
+    return this.getAllTradeRecords().filter(
+      (record) => hasFreqtradeVerifiedTradeOutcome(record) && record.isClosed
+    );
   }
 
   public getPerformanceMatrix(): MultiDimensionalPerformanceMatrix {

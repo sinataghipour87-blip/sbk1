@@ -64,6 +64,7 @@ export function createDryRunFixtureSignal(input: {
   referencePrice: number;
   observedAtMs: number;
   source: string;
+  riskLimits: SbkFreqtradeSignal['riskLimits'];
 }): SbkFreqtradeSignal {
   const stopLoss = input.referencePrice * 0.99;
   const takeProfit = input.referencePrice * 1.02;
@@ -103,11 +104,7 @@ export function createDryRunFixtureSignal(input: {
         takeProfit,
         maxPriceDeviationBps: 100,
       },
-      riskLimits: {
-        riskBudgetPct: 0.1,
-        maxStakeQuote: 100,
-        maxLeverage: 1,
-      },
+      riskLimits: input.riskLimits,
     },
     {
       nowMs: input.nowMs,

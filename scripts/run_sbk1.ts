@@ -21,6 +21,22 @@ dotenv.config({ path: path.join(ROOT_DIR, '.env') });
 
 interface FreqtradeConfig {
   dry_run?: boolean;
+  dry_run_wallet?: number;
+  stake_amount?: number | string;
+  max_open_trades?: number;
+  tradable_balance_ratio?: number;
+  margin_mode?: string;
+  unfilledtimeout?: {
+    entry?: number;
+    exit?: number;
+    unit?: string;
+  };
+  order_types?: {
+    emergency_exit?: string;
+    force_exit?: string;
+    stoploss?: string;
+    stoploss_on_exchange?: boolean;
+  };
   strategy?: string;
   trading_mode?: string;
   timeframe?: string;
@@ -135,6 +151,65 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   }
   if (config.trading_mode !== 'spot' && config.trading_mode !== 'futures') {
     throw new Error('Freqtrade trading_mode must be spot or futures.');
+  }
+  if (config.trading_mode === 'futures' && config.margin_mode !== 'isolated') {
+    throw new Error('Freqtrade futures margin_mode must be isolated for the reviewed DEMO risk profile.');
+  }
+  if (
+    typeof config.stake_amount !== 'number' ||
+    !Number.isFinite(config.stake_amount) ||
+    config.stake_amount <= 0 ||
+    config.stake_amount > 100
+  ) {
+    throw new Error('Freqtrade stake_amount must be a finite fixed amount between 0 and 100 USDT; unlimited sizing is prohibited.');
+  }
+  if (config.max_open_trades !== 1) {
+    throw new Error('Freqtrade max_open_trades must be exactly 1 for the reviewed DEMO risk profile.');
+  }
+  if (!Number.isFinite(config.dry_run_wallet) || (config.dry_run_wallet ?? 0) <= 0) {
+    throw new Error('Freqtrade dry_run_wallet must be a finite positive virtual balance.');
+  }
+  if (
+    !Number.isFinite(config.tradable_balance_ratio) ||
+    (config.tradable_balance_ratio ?? 0) <= 0 ||
+    (config.tradable_balance_ratio ?? 1) > 0.9
+  ) {
+    throw new Error('Freqtrade tradable_balance_ratio must be positive and no greater than 0.9.');
+  }
+  const unfilledTimeout = config.unfilledtimeout;
+  if (
+    !unfilledTimeout ||
+    unfilledTimeout.entry !== 15 ||
+    unfilledTimeout.exit !== 15 ||
+    unfilledTimeout.unit !== 'seconds'
+  ) {
+    throw new Error('Freqtrade entry and exit unfilled timeouts must both be 15 seconds.');
+  }
+  const orderTypes = config.order_types;
+  if (
+    !orderTypes ||
+    orderTypes.emergency_exit !== 'market' ||
+    orderTypes.force_exit !== 'market' ||
+    orderTypes.stoploss !== 'market' ||
+    orderTypes.stoploss_on_exchange !== false
+  ) {
+    throw new Error('Freqtrade must use market stoploss and emergency/force exits with stoploss_on_exchange explicitly disabled.');
+  }
+  const riskPctRaw = env.SBK1_SIGNAL_RISK_PCT?.trim();
+  const maxStakeRaw = env.SBK1_SIGNAL_MAX_STAKE_QUOTE?.trim();
+  const maxLeverageRaw = env.SBK1_SIGNAL_MAX_LEVERAGE?.trim();
+  const riskPct = riskPctRaw ? Number(riskPctRaw) : undefined;
+  const maxStake = maxStakeRaw ? Number(maxStakeRaw) : undefined;
+  const maxLeverage = maxLeverageRaw ? Number(maxLeverageRaw) : undefined;
+  const fixtureEnabled = env.SBK1_DRY_RUN_FIXTURE_ENABLED === 'true';
+  if (
+    (fixtureEnabled && (riskPct === undefined || maxStake === undefined || maxLeverage === undefined)) ||
+    (riskPct !== undefined && (!Number.isFinite(riskPct) || riskPct <= 0 || riskPct > 1)) ||
+    (maxStake !== undefined &&
+      (!Number.isFinite(maxStake) || maxStake <= 0 || maxStake > config.stake_amount)) ||
+    (maxLeverage !== undefined && (!Number.isFinite(maxLeverage) || maxLeverage <= 0 || maxLeverage > 1))
+  ) {
+    throw new Error('Fixture risk limits must be finite, bounded (risk <= 1%, leverage <= 1x), and max stake must not exceed Freqtrade stake_amount.');
   }
 
   const api = config.api_server;
@@ -307,15 +382,58 @@ function isPortOpen(port: number, host = '127.0.0.1'): Promise<boolean> {
   });
 }
 
-async function ensurePortsAvailable(): Promise<void> {
+interface PortListener {
+  pid: number;
+  owner: string;
+  command: string;
+}
+
+function findPortListeners(port: number): PortListener[] {
+  if (process.platform !== 'linux') return [];
+  const sockets = spawnSync('ss', ['-ltnp'], { encoding: 'utf8', timeout: 2_000 });
+  if (sockets.error || sockets.status !== 0) return [];
+
+  const pids = new Set<number>();
+  for (const line of sockets.stdout.split('\n')) {
+    const columns = line.trim().split(/\s+/);
+    if (!columns.includes('LISTEN') || !columns[3]?.endsWith(`:${port}`)) continue;
+    for (const match of line.matchAll(/pid=(\d+)/g)) pids.add(Number(match[1]));
+  }
+
+  return [...pids].map((pid) => {
+    const processInfo = spawnSync('ps', ['-o', 'user=', '-o', 'args=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 2_000,
+    });
+    const [owner = 'unknown', ...commandParts] = (processInfo.stdout || '').trim().split(/\s+/);
+    return {
+      pid,
+      owner: owner || 'unknown',
+      command: commandParts.join(' ') || 'unavailable',
+    };
+  });
+}
+
+function describePortListeners(port: number): string {
+  const listeners = findPortListeners(port);
+  if (listeners.length === 0) {
+    return `port ${port} has a listener, but its PID, owner, and command could not be read`;
+  }
+  return listeners
+    .map(({ pid, owner, command }) => `port ${port}: PID ${pid}, owner ${owner}, command "${command}"`)
+    .join('; ');
+}
+
+async function ensurePortsAvailable(healthDiagnostics: string[]): Promise<void> {
   const nodeBusy = await isPortOpen(NODE_PORT);
   const freqtradeBusy = await isPortOpen(settings!.apiPort, settings!.apiHost);
   if (nodeBusy || freqtradeBusy) {
-    const services = [
-      ...(nodeBusy ? [`SBK1 port ${NODE_PORT}`] : []),
-      ...(freqtradeBusy ? [`Freqtrade RPC port ${settings!.apiPort}`] : []),
+    const listeners = [
+      ...(nodeBusy ? [describePortListeners(NODE_PORT)] : []),
+      ...(freqtradeBusy ? [describePortListeners(settings!.apiPort)] : []),
     ];
-    throw new Error(`${services.join(' and ')} already have a listener; refusing to start duplicate services.`);
+    const health = healthDiagnostics.length > 0 ? `Health checks: ${healthDiagnostics.join('; ')}. ` : '';
+    throw new Error(`${health}Existing services occupy the required ports (${listeners.join('; ')}); refusing to stop or replace them.`);
   }
 }
 
@@ -506,6 +624,34 @@ async function statusCommand(): Promise<void> {
   if (!nodeReady || !freqtradeReady) process.exitCode = 1;
 }
 
+async function checkExistingStack(): Promise<{ ready: boolean; details: string[] }> {
+  const checks = await Promise.all([
+    checkSbk1Ready().then(
+      () => ({ service: 'SBK1 API', ready: true as const }),
+      (error: unknown) => ({
+        service: 'SBK1 API',
+        ready: false as const,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    ),
+    checkFreqtradeReady().then(
+      () => ({ service: 'Freqtrade RPC', ready: true as const }),
+      (error: unknown) => ({
+        service: 'Freqtrade RPC',
+        ready: false as const,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    ),
+  ]);
+  return {
+    ready: checks.every((check) => check.ready),
+    details: checks.flatMap((check) => {
+      if (!('error' in check)) return [];
+      return [`${check.service}: ${check.error}`];
+    }),
+  };
+}
+
 async function runStack(): Promise<void> {
   process.once('SIGINT', () => void requestShutdown(130));
   process.once('SIGTERM', () => void requestShutdown(143));
@@ -515,9 +661,14 @@ async function runStack(): Promise<void> {
   try {
     settings = await loadRuntimeSettings();
     if (shutdownPromise) return;
+    const existingStack = await checkExistingStack();
+    if (existingStack.ready) {
+      console.log('[sbk1] SBK1 API and authenticated Freqtrade RPC are already healthy; no duplicate services were started.');
+      return;
+    }
     await validatePrerequisites();
     if (shutdownPromise) return;
-    await ensurePortsAvailable();
+    await ensurePortsAvailable(existingStack.details);
     verifyStrategyDiscovery();
     if (shutdownPromise) return;
     await acquireLock();

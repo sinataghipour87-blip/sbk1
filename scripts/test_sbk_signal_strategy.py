@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "freqtrade"))
 sys.path.insert(0, str(ROOT / "freqtrade_integration" / "strategies"))
@@ -20,6 +22,7 @@ class InflightSignalReconciliationTests(unittest.TestCase):
             {"status": "STRATEGY_ACCEPTED", "signal": {"signalId": "accepted"}},
             {"status": "ORDER_SUBMITTED", "signal": {"signalId": "missing-order"}},
             {"status": "PARTIALLY_FILLED", "signal": {"signalId": "missing-partial"}},
+            {"status": "UNKNOWN_IN_FLIGHT", "signal": {"signalId": "missing-unknown"}},
             {"status": "ORDER_SUBMITTED", "signal": {"signalId": "open"}},
             {"status": "ACCEPTED", "signal": {"signalId": "not-submitted"}},
             {"status": "FILLED", "signal": {"signalId": "filled"}},
@@ -29,7 +32,7 @@ class InflightSignalReconciliationTests(unittest.TestCase):
 
         self.assertEqual(
             unresolved_inflight_signal_ids(records, {"open", "filled"}),
-            ["accepted", "missing-order", "missing-partial"],
+            ["accepted", "missing-order", "missing-partial", "missing-unknown"],
         )
 
 
@@ -87,6 +90,120 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "signals": [{"signal": self.signal, "status": "STRATEGY_ACCEPTED"}],
         }
 
+    def test_market_snapshot_uses_only_completed_dataprovider_candles(self):
+        now = datetime.now(UTC)
+        now_ms = int(now.timestamp() * 1000)
+        timeframe_ms = 15 * 60 * 1000
+        current_candle_start = now_ms // timeframe_ms * timeframe_ms
+        timestamps = [
+            current_candle_start - 2 * timeframe_ms,
+            current_candle_start - timeframe_ms,
+            current_candle_start,
+        ]
+        dataframe = pd.DataFrame({
+            "date": pd.to_datetime(timestamps, unit="ms", utc=True),
+            "open": [60_000, 60_050, 60_100],
+            "high": [60_100, 60_150, 60_200],
+            "low": [59_900, 60_000, 60_050],
+            "close": [60_050, 60_100, 60_150],
+            "volume": [1.0, 2.0, 3.0],
+        })
+        self.strategy.config["dry_run"] = False
+        self.strategy.config["runmode"] = SimpleNamespace(value="live")
+        self.strategy.dp = SimpleNamespace(
+            get_pair_dataframe=Mock(return_value=dataframe),
+            ticker=Mock(return_value={
+                "timestamp": now_ms - 100,
+                "last": 60_150,
+                "bid": 60_149,
+                "ask": 60_151,
+                "mark": 60_152,
+                "indexPrice": 60_153,
+            }),
+            orderbook=Mock(return_value={
+                "timestamp": now_ms - 100,
+                "bids": [[60_149, 1.0]],
+                "asks": [[60_151, 1.0]],
+            }),
+            funding_rate=Mock(return_value={
+                "fundingRate": -0.0001,
+                "fundingTimestamp": now_ms + 3_600_000,
+            }),
+        )
+        response = Mock()
+        response.raise_for_status.return_value = None
+
+        with patch("SbkSignalStrategy.requests.post", return_value=response) as post:
+            self.strategy.bot_loop_start(now)
+
+        self.assertEqual(self.strategy.dp.get_pair_dataframe.call_count, 5)
+        self.strategy.dp.get_pair_dataframe.assert_any_call("BTC/USDT:USDT", "15m")
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], "http://127.0.0.1:3000/api/freqtrade/market-snapshot")
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], f"Bearer {'a' * 64}")
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["source"], "freqtrade.dataprovider")
+        self.assertEqual(len(payload["candles"]), 2)
+        self.assertEqual(payload["candles"][-1]["timestampMs"], timestamps[1])
+        self.assertEqual(payload["ticker"]["last"], 60_150)
+        self.assertEqual(payload["ticker"]["exchangeTimestampMs"], now_ms - 100)
+        self.assertGreaterEqual(payload["ticker"]["retrievedAtMs"], now_ms)
+        self.assertEqual(payload["ticker"]["markPrice"], 60_152)
+        self.assertEqual(payload["ticker"]["indexPrice"], 60_153)
+        self.assertEqual(payload["orderBook"]["bids"][0]["price"], 60_149)
+        self.assertEqual(payload["fundingRate"]["rate"], -0.0001)
+        self.assertEqual(set(payload["additionalCandles"]), {"1m", "5m", "1h", "4h"})
+
+    def test_market_snapshot_is_not_published_in_backtest(self):
+        self.strategy.config["runmode"] = SimpleNamespace(value="backtest")
+        self.strategy.dp = SimpleNamespace(get_pair_dataframe=Mock())
+
+        with patch("SbkSignalStrategy.requests.post") as post:
+            self.strategy.bot_loop_start(datetime.now(UTC))
+
+        self.strategy.dp.get_pair_dataframe.assert_not_called()
+        post.assert_not_called()
+
+    def test_market_snapshot_rejects_ticker_without_exchange_timestamp(self):
+        self.strategy.dp = SimpleNamespace(ticker=Mock(return_value={
+            "timestamp": None,
+            "datetime": None,
+            "last": 60_150,
+            "info": {"lastPrice": "60150"},
+        }))
+
+        with self.assertLogs("SbkSignalStrategy", level="WARNING") as captured:
+            ticker = self.strategy._snapshot_ticker(self.strategy.dp, self.strategy._pair)
+
+        self.assertIsNotNone(ticker)
+        self.assertIn("no exchange timestamp", captured.output[0])
+        self.assertEqual(ticker["exchangeTimestampMs"], None)
+        self.assertGreaterEqual(ticker["retrievedAtMs"], self.now_ms)
+        self.assertEqual(ticker["last"], 60_150)
+
+    def test_production_signal_gate_reason_and_correlation_are_logged(self):
+        self.response.status_code = 503
+        self.response.json.return_value = {
+            "code": "CALIBRATED_CONFIDENCE_UNAVAILABLE",
+            "stage": "CALIBRATION",
+            "correlationId": "trace-123",
+            "error": "Production signal delivery is disabled pending calibration evidence.",
+        }
+        self.response.raise_for_status.side_effect = requests.HTTPError(
+            "503 Server Error",
+            response=self.response,
+        )
+
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=self.response),
+            self.assertLogs("SbkSignalStrategy", level="WARNING") as captured,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        self.assertIn("CALIBRATED_CONFIDENCE_UNAVAILABLE", captured.output[0])
+        self.assertIn("trace-123", captured.output[0])
+        self.assertEqual(self.strategy._signals, {})
+
     def test_restart_without_a_persisted_freqtrade_trade_quarantines_signal(self):
         with (
             patch("SbkSignalStrategy.requests.get", return_value=self.response),
@@ -102,10 +219,92 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "The signal was accepted for order submission but no matching Freqtrade trade is persisted. It is quarantined and will not be submitted again.",
         )
 
+    def test_unknown_signal_remains_quarantined_until_trade_reconciliation(self):
+        unknown_response = Mock()
+        unknown_response.raise_for_status.return_value = None
+        unknown_response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [{"signal": self.signal, "status": "UNKNOWN_IN_FLIGHT"}],
+        }
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=unknown_response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        self.assertEqual(self.strategy._signals, {})
+        post_status.assert_not_called()
+
+    def test_unknown_signal_is_reconciled_from_matching_persisted_trade(self):
+        unknown_response = Mock()
+        unknown_response.raise_for_status.return_value = None
+        unknown_response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [{"signal": self.signal, "status": "UNKNOWN_IN_FLIGHT"}],
+        }
+        order = SimpleNamespace(ft_order_side="buy", safe_filled=0)
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            pair=self.signal["pair"],
+            is_short=False,
+            open_orders=[order],
+            entry_side="buy",
+            select_filled_orders=lambda _side: [],
+            amount=0,
+            open_rate=62_100,
+            id=42,
+        )
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=unknown_response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[trade]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "ORDER_SUBMITTED",
+            "Reconciled signal lifecycle from the persisted Freqtrade trade and order records.",
+            trade_id=42,
+            filled_amount=0.0,
+            average_fill_price=62_100.0,
+        )
+        self.assertIn(self.signal_id, self.strategy._signals)
+        self.assertNotIn("BTC/USDT:USDT", self.strategy._signals_by_pair)
+
+    def test_unknown_signal_with_mismatched_trade_remains_quarantined(self):
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            pair="ETH/USDT:USDT",
+            is_short=False,
+            open_orders=[],
+            entry_side="buy",
+            select_filled_orders=lambda _side: [],
+            amount=0,
+            open_rate=62_100,
+            id=42,
+        )
+        with (
+            patch("SbkSignalStrategy.requests.get", return_value=self.response),
+            patch("SbkSignalStrategy.Trade.get_trades_proxy", return_value=[trade]),
+            patch.object(self.strategy, "_post_status", return_value=True) as post_status,
+        ):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        self.assertEqual(self.strategy._signals, {})
+        post_status.assert_called_once_with(
+            self.signal_id,
+            "UNKNOWN_IN_FLIGHT",
+            "A Freqtrade trade with this signal tag has a different pair or direction; the signal remains quarantined.",
+        )
+
     def test_persisted_open_entry_order_is_reconciled_without_reentry(self):
         order = SimpleNamespace(ft_order_side="buy", safe_filled=0)
         trade = SimpleNamespace(
             enter_tag=self.signal_id,
+            pair=self.signal["pair"],
+            is_short=False,
             open_orders=[order],
             entry_side="buy",
             select_filled_orders=lambda _side: [],

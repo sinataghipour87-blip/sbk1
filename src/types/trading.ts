@@ -30,7 +30,7 @@ export interface VersionMetadata {
   riskVersion: string;
   executionVersion: string;
   marketSnapshotTimestamp: number;
-  exchangeTimestamp: number;
+  exchangeTimestamp: number | null;
 }
 
 export type EntryCandidateType =
@@ -99,11 +99,10 @@ export interface TradeDecision {
   masterDecision?: MasterDecisionObject;
   evaluatedAtIso: string;
 }
-export type ExecutionMode = 'BACKTEST' | 'TESTNET' | 'PAPER' | 'LIVE';
+export type ExecutionMode = 'BACKTEST' | 'DRY_RUN' | 'TESTNET' | 'PAPER' | 'LIVE';
 
 export interface ExecutionSettings {
   mode: ExecutionMode;
-  liveCapitalCeilingPct: number;
   lastChangedAt: number;
 }
 
@@ -186,7 +185,9 @@ export interface CanonicalExchangeFeed {
   marketType: 'SPOT' | 'PERPETUAL_FUTURES' | 'PERPETUAL' | 'DELIVERY_FUTURES';
   symbol: string;
   contract?: string;
-  timestampUtc: number; // Unix timestamp in ms UTC
+  timestampUtc: number; // Exchange event time when available, otherwise Freqtrade retrieval time
+  exchangeTimestampUtc: number | null;
+  timestampSource: 'EXCHANGE' | 'FREQTRADE_RECEIVED' | 'UNAVAILABLE';
   isoTimeUtc: string; // ISO 8601 UTC
   lastPrice: number;
   bestBid?: number;
@@ -206,11 +207,11 @@ export interface CanonicalMarketSnapshot {
   timestampUtc: number;
   isoTimeUtc: string;
   symbol: 'BTC/USDT';
-  primaryIndexPrice: number; // Normalized benchmark price
-  basisSpreadUsd: number; // Spot vs Perpetual spread
-  basisSpreadBps: number;
-  crossExchangeSpreadUsd: number;
-  crossExchangeLatencyMs: number;
+  primaryIndexPrice: number | null; // Normalized benchmark price
+  basisSpreadUsd: number | null; // Spot vs Perpetual spread
+  basisSpreadBps: number | null;
+  crossExchangeSpreadUsd: number | null;
+  crossExchangeLatencyMs: number | null;
   overallQualityScore: number; // 0 - 100
   feedStatuses: Record<string, FeedStatus>;
   feeds: CanonicalExchangeFeed[];
@@ -233,7 +234,9 @@ export interface FuturesPrices {
   lastPrice: number;    // Used for Entry Execution & Slippage
   markPrice: number;    // Used for Stop Loss & Liquidation Engine
   indexPrice: number;   // Spot Underlying Index Benchmark
-  timestampUtc: number; // Exchange event timestamp
+  timestampUtc: number; // Exchange event time when available, otherwise Freqtrade retrieval time
+  exchangeTimestampUtc: number | null;
+  timestampSource: 'EXCHANGE' | 'FREQTRADE_RECEIVED' | 'UNAVAILABLE';
   receivedTimestampMs: number;
   isoTimeUtc: string;
   ageMs: number;

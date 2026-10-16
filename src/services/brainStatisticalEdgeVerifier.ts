@@ -78,8 +78,8 @@ export class BrainStatisticalEdgeVerifierService {
     const activeRegime = this.detectActiveRegime(analysis);
 
     // Fetch historical records from Central Trade Dataset
-    const datasetTrades = centralTradeDatasetService.getAllTradeRecords();
-    const predictions = centralTradeDatasetService.getAllPredictions();
+    const datasetTrades = centralTradeDatasetService.getFreqtradeVerifiedTradeRecords();
+    const predictions = centralTradeDatasetService.getFreqtradeVerifiedPredictions();
 
     const brainDefinitions: Array<{
       id: string;
