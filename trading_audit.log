@@ -1,0 +1,23 @@
+[2026-10-16T09:08:01.252Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T09:08:02.129Z] WS_OPEN: Bybit WebSocket linear stream connected.
+[2026-10-16T09:11:37.147Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T09:11:38.011Z] WS_OPEN: Bybit WebSocket linear stream connected.
+[2026-10-16T09:37:42.072Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T09:37:43.255Z] WS_OPEN: Bybit WebSocket linear stream connected.
+[2026-10-16T09:43:29.324Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T09:43:30.505Z] WS_OPEN: Bybit WebSocket linear stream connected.
+[2026-10-16T10:16:58.410Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T10:16:58.760Z] WS_ERROR: WebSocket error occurred: WebSocket was closed before the connection was established
+[2026-10-16T10:26:30.539Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T10:26:31.062Z] WS_ERROR: WebSocket error occurred: WebSocket was closed before the connection was established
+[2026-10-16T10:41:45.324Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T10:41:46.182Z] WS_ERROR: WebSocket error occurred: WebSocket was closed before the connection was established
+[2026-10-16T10:44:34.438Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T10:44:35.163Z] WS_ERROR: WebSocket error occurred: WebSocket was closed before the connection was established
+[2026-10-16T10:47:07.663Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T10:47:08.219Z] WS_ERROR: WebSocket error occurred: WebSocket was closed before the connection was established
+[2026-10-16T10:53:01.352Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T10:53:01.926Z] WS_ERROR: WebSocket error occurred: WebSocket was closed before the connection was established
+[2026-10-16T11:56:02.176Z] WS_CLOSE: WebSocket connection closed. Retrying in 5 seconds.
+[2026-10-16T11:56:07.184Z] WS_CONNECT: Connecting to Bybit WebSocket: wss://stream-testnet.bybit.com/v5/public/linear
+[2026-10-16T11:56:07.945Z] WS_OPEN: Bybit WebSocket linear stream connected.
