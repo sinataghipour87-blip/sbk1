@@ -94,8 +94,8 @@ function isAllowedOrigin(origin: string, req: express.Request): boolean {
         if (!['http:', 'https:'].includes(parsedOrigin.protocol) || parsedOrigin.origin !== origin) {
             return false;
         }
-        const sameOrigin = `${req.protocol}://${req.get('host')}`;
-        return origin === sameOrigin || configuredAllowedOrigins.has(origin);
+        const sameHost = parsedOrigin.host === req.get('host');
+        return sameHost || configuredAllowedOrigins.has(origin);
     } catch {
         return false;
     }
@@ -3861,6 +3861,23 @@ app.post('/api/live/toggle-auto-trade', (req, res) => {
 let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
 let httpServer: ReturnType<typeof app.listen> | null = null;
 
+function listenOnAvailablePort(port: number, allowFallback: boolean): Promise<ReturnType<typeof app.listen>> {
+    return new Promise((resolve, reject) => {
+        const server = app.listen(port, '0.0.0.0');
+        server.once('listening', () => resolve(server));
+        server.once('error', (error: NodeJS.ErrnoException) => {
+            server.close(() => {
+                if (error.code === 'EADDRINUSE' && allowFallback && port < 65535) {
+                    console.warn(`Port ${port} is occupied; trying port ${port + 1}.`);
+                    resolve(listenOnAvailablePort(port + 1, true));
+                    return;
+                }
+                reject(error);
+            });
+        });
+    });
+}
+
 async function startServer() {
   viteServer = await createViteServer({
     server: { middlewareMode: true },
@@ -3881,7 +3898,14 @@ async function startServer() {
     return;
   }
 
-  httpServer = app.listen(3000, '0.0.0.0', () => console.log('Server running on port 3000'));
+    const configuredPort = Number(process.env.SBK1_PORT || 3000);
+    if (!Number.isInteger(configuredPort) || configuredPort < 1 || configuredPort > 65535) {
+        throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
+    }
+    httpServer = await listenOnAvailablePort(configuredPort, process.env.SBK1_PORT === undefined);
+    const address = httpServer.address();
+    const listeningPort = typeof address === 'object' && address ? address.port : configuredPort;
+    console.log(`Server running on port ${listeningPort}`);
 }
 
 async function shutdownServer(signal: NodeJS.Signals): Promise<void> {

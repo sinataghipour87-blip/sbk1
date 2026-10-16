@@ -6,7 +6,7 @@ import { StrategyAndIndicators } from './components/StrategyAndIndicators';
 import { HistoryDashboard } from './components/HistoryDashboard';
 import { DcaCalculator } from './components/DcaCalculator';
 import { LiquidityRiskPanel } from './components/LiquidityRiskPanel';
-import { DemoTestingSandbox } from './components/DemoTestingSandbox';
+import { OrderExecutionPanel } from './components/OrderExecutionPanel';
 import { CollapsibleCard } from './components/CollapsibleCard';
 import { PillarsStatusWidget } from './components/PillarsStatusWidget';
 import { LiquidityHeatmapWidget } from './components/LiquidityHeatmapWidget';
@@ -92,7 +92,7 @@ import { setupBybitWebSocket } from './services/websocket';
 import { validatePrecisionEntry, generateClientSidePredictionFallback, updatePredictiveModelFeedbackLoop, evaluate15mTimingAndLifecycle, runDistributedMultiTimeframeBrains, calculateAiMtfConsensusCorrelation, evaluateFuturePredictability } from './services/predictiveEngine';
 import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTargets } from './services/signalToExecution';
 import { verifyAutoTradePrerequisites, reconcileOrderWithExchange } from './services/autoTradeGuard';
-import { getExecutionMode } from './services/executionMode';
+import { getExecutionMode, getSelectedExecutionMode } from './services/executionMode';
 import type { FreqtradeTrade } from './services/freqtradeBridge';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
 import { tradeThesisAndSmartExitEngine } from './services/tradeThesisAndSmartExitEngine';
@@ -305,6 +305,7 @@ export default function App() {
 
   const lastCloseTimeRef = useRef<number>(0);
   const fastReloadReadyRef = useRef<boolean>(false);
+  const lastAutoTradeSignalRef = useRef<string | null>(null);
   const lastClosedTradePnlRef = useRef<number>(0);
   const wsRef = useRef<any>(null);
   const isFetchingRef = useRef<boolean>(false);
@@ -1539,6 +1540,127 @@ export default function App() {
     showNotification(`اهرم معاملاتی کاربر روی ${newLev}x تنظیم گردید.`);
   };
 
+  const handleUpdatePaperBalance = (newBalance: number) => {
+    const mode = executionModeRef.current ?? getSelectedExecutionMode();
+    if (mode !== 'PAPER' && mode !== 'BACKTEST') {
+      showNotification('تغییر موجودی فقط برای شبیه‌سازی محلی مجاز است.');
+      return;
+    }
+    balanceRef.current = newBalance;
+    setBalance(newBalance);
+    localStorage.setItem('quantum_balance', String(newBalance));
+  };
+
+  const handlePaperTrade = useCallback((direction: 'LONG' | 'SHORT', isAuto: boolean) => {
+    const mode = executionModeRef.current ?? getSelectedExecutionMode();
+    if (mode !== 'PAPER' && mode !== 'BACKTEST') {
+      showNotification('ثبت سفارش مستقیم غیرفعال است؛ Freqtrade تنها مالک اجرای سفارش است.');
+      return;
+    }
+
+    const snapshot = latestAnalysisSnapshotRef.current ?? analysis;
+    const currentBalance = balanceRef.current;
+    if (!snapshot || currentBalance < 5) {
+      showNotification('برای شبیه‌سازی، ابتدا دادهٔ بازار و موجودی آزمایشی معتبر وارد کنید.');
+      return;
+    }
+
+    const positions = activePositionsRef.current;
+    if (positions.length >= (isAuto ? 3 : 6)) {
+      showNotification('ظرفیت پوزیشن‌های شبیه‌سازی‌شده پر است.');
+      return;
+    }
+
+    const position = buildExecutionPosition(
+      snapshot,
+      direction,
+      currentBalance,
+      getTradeHistory(),
+      userLeverageRef.current ?? snapshot.leverage,
+      false,
+      aiPredictionRef.current
+    );
+    if (!position) {
+      showNotification('گیت داده یا ریسک معامله را تأیید نکرد؛ شبیه‌سازی ثبت نشد.');
+      return;
+    }
+
+    position.name = isAuto ? 'AUTO PAPER' : 'MANUAL PAPER';
+    position.isAuto = isAuto;
+    position.isExchangeConfirmed = false;
+    const updatedPositions = [...positions, position];
+    activePositionsRef.current = updatedPositions;
+    setActivePositions(updatedPositions);
+    localStorage.setItem('quantum_positions', JSON.stringify(updatedPositions));
+    showNotification(`${isAuto ? 'ورود خودکار' : 'ورود دستی'} ${direction} فقط در ${mode} ثبت شد؛ سفارشی به صرافی ارسال نشد.`);
+  }, [analysis, showNotification]);
+
+  const handleClosePaperTrade = useCallback((positionId: string) => {
+    const mode = executionModeRef.current ?? getSelectedExecutionMode();
+    if (mode !== 'PAPER' && mode !== 'BACKTEST') {
+      showNotification('بستن معاملهٔ صرافی از این پنل مجاز نیست؛ Freqtrade مالک چرخهٔ معامله است.');
+      return;
+    }
+
+    const position = activePositionsRef.current.find((item) => item.id === positionId);
+    if (!position) return;
+    const price = latestAnalysisSnapshotRef.current?.price ?? analysis?.price ?? position.entry;
+    const directionFactor = position.dir === 'LONG' ? 1 : -1;
+    const pnlUsd = (position.realizedPnlUsd || 0) +
+      (position.margin * (position.lev || 1) * ((price - position.entry) / position.entry) * directionFactor);
+    const pnlPct = position.margin > 0 ? (pnlUsd / position.margin) * 100 : 0;
+    const closedAt = new Date().toLocaleTimeString();
+    const historyEntry: TradeHistory = {
+      ...position,
+      exitPrice: price,
+      pnlUsd,
+      pnlPct,
+      closedAt,
+      closeReason: 'بستن دستی پوزیشن شبیه‌سازی‌شده',
+    };
+    const updatedPositions = activePositionsRef.current.filter((item) => item.id !== positionId);
+    activePositionsRef.current = updatedPositions;
+    setActivePositions(updatedPositions);
+    localStorage.setItem('quantum_positions', JSON.stringify(updatedPositions));
+    const updatedBalance = Math.max(0, balanceRef.current + pnlUsd);
+    balanceRef.current = updatedBalance;
+    setBalance(updatedBalance);
+    localStorage.setItem('quantum_balance', String(updatedBalance));
+    commitTradeClosureAndContinuousLearning(historyEntry);
+    showNotification(`پوزیشن شبیه‌سازی‌شده بسته شد: ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)}.`);
+  }, [analysis, commitTradeClosureAndContinuousLearning, showNotification]);
+
+  const handleToggleAutoTrade = useCallback(async () => {
+    const enabled = settingsRef.current.autoTradeEnabled;
+    if (enabled) {
+      const updated = { ...settingsRef.current, autoTradeEnabled: false };
+      settingsRef.current = updated;
+      setSettings(updated);
+      saveSettings(updated);
+      showNotification('Auto-Pilot شبیه‌سازی متوقف شد.');
+      return;
+    }
+
+    const mode = executionModeRef.current ?? getSelectedExecutionMode();
+    if (mode !== 'PAPER') {
+      showNotification('Auto-Pilot فقط در حالت PAPER قابل فعال‌سازی است.');
+      return;
+    }
+    const snapshot = latestAnalysisSnapshotRef.current ?? analysis;
+    const prerequisites = await verifyAutoTradePrerequisites(snapshot, activePositionsRef.current, getTradeHistory(), mode);
+    if (!prerequisites.isEligible) {
+      const blocker = prerequisites.detailsFa.find((detail) => detail.startsWith('❌'));
+      showNotification(`Auto-Pilot فعال نشد: ${blocker || 'پیش‌نیازهای ایمنی تأیید نشد.'}`);
+      return;
+    }
+
+    const updated = { ...settingsRef.current, autoTradeEnabled: true };
+    settingsRef.current = updated;
+    setSettings(updated);
+    saveSettings(updated);
+    showNotification('Auto-Pilot در حالت PAPER فعال شد؛ اجرای زنده در دسترس نیست.');
+  }, [analysis, showNotification]);
+
   const fullSystemEval = useMemo(() => {
     if (!analysis) return null;
     const historyData = getTradeHistory();
@@ -1558,6 +1680,19 @@ export default function App() {
   }, [analysis, aiPrediction, winRateConfig.minWinProbability]);
 
   const liveEffectivePrice = analysis?.price || (analysis?.candles && analysis.candles.length > 0 ? ((analysis.candles[analysis.candles.length - 1] as any).close ?? (Array.isArray(analysis.candles[analysis.candles.length - 1]) ? analysis.candles[analysis.candles.length - 1][3] : 0)) : 0);
+
+  useEffect(() => {
+    const mode = executionModeRef.current ?? getSelectedExecutionMode();
+    if (mode !== 'PAPER' || !settings.autoTradeEnabled || !fullSystemEval?.canExecute) return;
+    if (fullSystemEval.direction !== 'LONG' && fullSystemEval.direction !== 'SHORT') return;
+    if (activePositionsRef.current.length > 0) return;
+    const signalKey = `${Math.floor(Date.now() / 900_000)}:${fullSystemEval.direction}`;
+    if (lastAutoTradeSignalRef.current === signalKey) return;
+    lastAutoTradeSignalRef.current = signalKey;
+    handlePaperTrade(fullSystemEval.direction, true);
+  }, [analysis, fullSystemEval, handlePaperTrade, settings.autoTradeEnabled]);
+
+  const selectedExecutionMode = executionModeRef.current ?? getSelectedExecutionMode();
 
   return (
     <div className={`min-h-screen overflow-y-auto overflow-x-hidden flex flex-col ${isDeepBlack ? 'bg-[#000000]' : 'bg-titanium-obsidian'} text-slate-100 font-sans antialiased selection:bg-emerald-500 selection:text-black transition-colors duration-300 relative gpu-accelerated`}>
@@ -1700,7 +1835,7 @@ export default function App() {
 
           {/* Analysis and read-only monitoring; all order controls are owned by Freqtrade. */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[600px]">
-            <div className="lg:col-span-12 flex flex-col min-h-[500px]">
+            <div className="lg:col-span-6 flex flex-col min-h-[500px]">
               <CollapsibleCard
                 title="نمودار تحلیل کوانتومی (BTC/USDT)"
                 badge="TradingView Pro"
@@ -1717,6 +1852,50 @@ export default function App() {
                 )}
               </CollapsibleCard>
               <DynamicEntryWidget analysis={analysis} history={getTradeHistory()} />
+            </div>
+
+            <div className="lg:col-span-3 flex flex-col min-h-[500px]">
+              {analysis && (
+                <CollapsibleCard title="میز معاملات دستی" badge="معامله دستی" badgeColor="text-cyan-300 bg-cyan-950/80 border-cyan-500/40" defaultOpen={true} className="flex-1">
+                  <OrderExecutionPanel
+                    balance={balance}
+                    onUpdateBalance={handleUpdatePaperBalance}
+                    onSelectLeverage={handleLeverageChange}
+                    userLeverage={userLeverage ?? analysis.leverage}
+                    analysis={analysis}
+                    activePositions={activePositions}
+                    onOpenTrade={(direction) => handlePaperTrade(direction, false)}
+                    onClosePosition={handleClosePaperTrade}
+                    onAutoTrade={(direction) => handlePaperTrade(direction, true)}
+                    prediction={aiPrediction}
+                    autoTradeActive={settings.autoTradeEnabled}
+                    onToggleAutoTrade={handleToggleAutoTrade}
+                    mode="manual"
+                  />
+                </CollapsibleCard>
+              )}
+            </div>
+
+            <div className="lg:col-span-3 flex flex-col min-h-[500px]">
+              {analysis && (
+                <CollapsibleCard title="موتور هوشمند ربات (Auto-Pilot)" badge="ترید خودکار" badgeColor="text-emerald-300 bg-emerald-950/80 border-emerald-500/40" defaultOpen={true} className="flex-1">
+                  <OrderExecutionPanel
+                    balance={balance}
+                    onUpdateBalance={handleUpdatePaperBalance}
+                    onSelectLeverage={handleLeverageChange}
+                    userLeverage={userLeverage ?? analysis.leverage}
+                    analysis={analysis}
+                    activePositions={activePositions}
+                    onOpenTrade={(direction) => handlePaperTrade(direction, false)}
+                    onClosePosition={handleClosePaperTrade}
+                    onAutoTrade={(direction) => handlePaperTrade(direction, true)}
+                    prediction={aiPrediction}
+                    autoTradeActive={settings.autoTradeEnabled}
+                    onToggleAutoTrade={handleToggleAutoTrade}
+                    mode="auto"
+                  />
+                </CollapsibleCard>
+              )}
             </div>
 
           </div>
