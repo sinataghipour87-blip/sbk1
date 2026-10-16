@@ -7,7 +7,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { TradePosition, TradeHistory, ExecutionSettings } from './src/types/trading';
 import { freqtradeBridge } from './src/services/freqtradeBridge';
 import {
@@ -21,6 +21,10 @@ import {
     DRY_RUN_FIXTURE_SETUP_PREFIX,
     getDryRunFixtureReadinessError,
 } from './src/services/freqtradeDryRunFixture';
+import {
+    FreqtradeMarketSnapshotValidationError,
+    freqtradeMarketDataBridge,
+} from './src/services/freqtradeMarketDataBridge';
 
 dotenv.config();
 
@@ -356,7 +360,8 @@ app.post('/api/monte-carlo', async (req, res) => {
 // -------------------------------------------------------------
 // --- Execution Mode Engine ---
 let executionSettings: ExecutionSettings = {
-    mode: 'BACKTEST',
+    mode: 'DRY_RUN',
+    selectedProfile: 'DEMO',
     liveCapitalCeilingPct: 5,
     lastChangedAt: Date.now()
 };
@@ -372,9 +377,130 @@ app.get('/api/execution/settings', (req, res) => {
     res.json(executionSettings);
 });
 
+app.get('/api/execution/dashboard', requireAdminAuth, async (_req, res) => {
+    const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || process.env.FREQTRADE_PAIR?.trim() || '';
+    const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+    const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+    const expectedMarket = { exchange, pair, timeframe };
+    const [botResult, balanceResult, tradesResult, snapshotResult, signalResult] = await Promise.allSettled([
+        freqtradeBridge.getStatus(),
+        freqtradeBridge.getBalance(),
+        freqtradeBridge.getOpenTrades(),
+        Promise.resolve().then(() => freqtradeMarketDataBridge.getLatestConfigured(expectedMarket)),
+        pair && timeframe
+            ? freqtradeSignalAdapter.getDashboardRecords(pair, timeframe)
+            : Promise.reject(new Error('Freqtrade pair/timeframe configuration is missing.')),
+    ]);
+
+    const bot = botResult.status === 'fulfilled' ? botResult.value : null;
+    const balance = balanceResult.status === 'fulfilled' ? balanceResult.value : null;
+    const openTrades = tradesResult.status === 'fulfilled' ? tradesResult.value : [];
+    const snapshot = snapshotResult.status === 'fulfilled' ? snapshotResult.value : null;
+    const signalRecords = signalResult.status === 'fulfilled' ? signalResult.value : [];
+    const rpcError = botResult.status === 'rejected'
+        ? botResult.reason instanceof Error ? botResult.reason.message : String(botResult.reason)
+        : undefined;
+    const records = signalRecords.map((record) => ({
+        signalId: record.signal.signalId,
+        status: record.status,
+        updatedAtMs: record.updatedAtMs,
+        reason: record.reason,
+        tradeId: record.tradeId,
+        filledAmount: record.filledAmount,
+        averageFillPrice: record.averageFillPrice,
+        testOnlyFixture: record.signal.entryConditions.setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX),
+        lifecycle: record.lifecycleEvents,
+    }));
+    const rpcConnected = bot?.ping === true && bot.status === 'running';
+    const marketStatus = snapshot?.ticker ? 'LIVE' : 'UNAVAILABLE';
+    const liveBlockers = [
+        'اجرای زنده از SBK1 غیرفعال است.',
+        'مدل‌های فعلی شواهد احتمال کالیبره‌شدهٔ خارج از نمونه ندارند.',
+        ...(!rpcConnected ? ['اتصال احراز‌شده و فعال Freqtrade در دسترس نیست.'] : []),
+        ...(bot?.dryRun !== true ? ['Freqtrade باید با dry_run=true اجرا شود.'] : []),
+    ];
+
+    res.json({
+        selectedProfile: 'DEMO',
+        selectedFreqtradeMode: 'DRY_RUN',
+        freqtradeMode: bot ? bot.dryRun && !bot.demoTrading ? 'DEMO' : bot.demoTrading ? 'TESTNET' : 'LIVE' : 'UNKNOWN',
+        modeMatchesSelection: bot?.dryRun === true && bot.demoTrading === false,
+        rpc: {
+            status: rpcConnected ? 'CONNECTED' : 'UNAVAILABLE',
+            lastCheckedAtMs: bot?.lastChecked ?? Date.now(),
+        },
+        exchange: {
+            status: bot ? 'CONNECTED' : 'UNAVAILABLE',
+            name: bot?.exchange ?? null,
+            market: bot?.market ?? null,
+            pair: pair || null,
+            timeframe: bot?.timeframe ?? (timeframe || null),
+        },
+        freqtrade: {
+            status: bot?.status ?? 'unavailable',
+            dryRun: bot?.dryRun ?? false,
+            demoTrading: bot?.demoTrading ?? false,
+            forceEntryEnabled: bot?.forceEntryEnabled ?? true,
+            strategy: bot?.strategy ?? null,
+            openTradesCount: bot?.openTradesCount ?? openTrades.length,
+            stakeAmount: bot?.stakeAmount ?? null,
+            dryRunWallet: bot?.dryRunWallet ?? null,
+            maxOpenTrades: bot?.maxOpenTrades ?? null,
+            marginMode: bot?.marginMode ?? null,
+        },
+        balance: balance
+            ? { kind: bot?.dryRun ? 'VIRTUAL' : 'EXCHANGE', ...balance }
+            : { kind: 'UNAVAILABLE', equity: null, available: null, currency: null },
+        openTrades,
+        orderCount: openTrades.reduce((count, trade) => count + trade.orders.length, 0),
+        filledOrderCount: openTrades.reduce(
+            (count, trade) => count + trade.orders.filter((order) => order.filled !== null && order.filled > 0).length,
+            0,
+        ),
+        market: {
+            status: marketStatus,
+            source: snapshot?.source,
+            pair: snapshot?.pair ?? pair,
+            timeframe: snapshot?.timeframe ?? timeframe,
+            lastPrice: snapshot?.ticker?.last ?? null,
+            observedAtMs: snapshot?.ticker?.exchangeTimestampMs ?? snapshot?.ticker?.retrievedAtMs ?? null,
+            snapshotAtMs: snapshot?.generatedAtMs,
+            ageMs: snapshot?.ticker ? Date.now() - snapshot.ticker.retrievedAtMs : undefined,
+            error: snapshot ? undefined : snapshotResult.status === 'rejected'
+                ? snapshotResult.reason instanceof Error ? snapshotResult.reason.message : String(snapshotResult.reason)
+                : undefined,
+        },
+        analysis: {
+            status: marketStatus,
+            lastDecisionAtMs: null,
+            reason: snapshot ? 'تحلیل رابط کاربری مجوز اجرای معامله نیست.' : 'در انتظار snapshot تازهٔ Freqtrade.',
+        },
+        signals: {
+            status: signalResult.status === 'fulfilled' ? 'CONNECTED' : 'UNAVAILABLE',
+            queuedCount: signalRecords.filter((record) => ['ACCEPTED', 'STRATEGY_ACCEPTED', 'ORDER_SUBMITTED', 'PARTIALLY_FILLED'].includes(record.status)).length,
+            rejectedCount: signalRecords.filter((record) => record.status === 'REJECTED').length,
+            records,
+            error: signalResult.status === 'rejected'
+                ? signalResult.reason instanceof Error ? signalResult.reason.message : String(signalResult.reason)
+                : undefined,
+        },
+        killSwitchActive: liveTradingState.killSwitchActive,
+        services: {
+            sbk1: 'CONNECTED',
+            freqtrade: rpcConnected ? 'CONNECTED' : 'UNAVAILABLE',
+        },
+        live: {
+            status: 'BLOCKED',
+            activationAllowed: false,
+            blockers: liveBlockers,
+        },
+        error: rpcError,
+    });
+});
+
 app.post('/api/execution/mode', executionModeLimiter, requireAdminAuth, (req, res) => {
     const { mode, liveCapitalCeilingPct } = req.body || {};
-    const supportedModes = ['BACKTEST', 'TESTNET', 'PAPER'] as const;
+    const supportedModes = ['BACKTEST', 'DRY_RUN', 'TESTNET', 'PAPER'] as const;
     if (mode !== undefined && !supportedModes.includes(mode)) {
         return res.status(409).json({
             success: false,
@@ -631,6 +757,143 @@ function requireFreqtradeBridgeAuth(req: express.Request, res: express.Response,
     }
     next();
 }
+
+app.post('/api/freqtrade/market-snapshot', requireFreqtradeBridgeAuth, async (req, res) => {
+    try {
+        const [botState, whitelist] = await Promise.all([
+            freqtradeBridge.getStatus(),
+            freqtradeBridge.getWhitelist(),
+        ]);
+        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+        if (!pair || !exchange || !timeframe) {
+            return res.status(503).json({
+                accepted: false,
+                code: 'MARKET_SNAPSHOT_NOT_CONFIGURED',
+                error: 'SBK1 Freqtrade exchange, pair, and timeframe are required before accepting market snapshots.',
+            });
+        }
+        if (
+            botState.status !== 'running' ||
+            !botState.dryRun ||
+            botState.demoTrading ||
+            botState.forceEntryEnabled ||
+            botState.exchange?.toLowerCase() !== exchange ||
+            botState.timeframe !== timeframe ||
+            freqtradeBridge.getConfiguredPair() !== pair ||
+            !whitelist.includes(pair)
+        ) {
+            return res.status(409).json({
+                accepted: false,
+                code: 'FREQTRADE_MARKET_CONFIGURATION_MISMATCH',
+                error: 'Snapshot publisher must match a running, guarded Freqtrade dry-run configuration and whitelisted pair.',
+            });
+        }
+
+        const snapshot = freqtradeMarketDataBridge.accept(req.body, {
+            exchange,
+            market: botState.market ?? 'spot',
+            pair,
+            timeframe,
+        });
+        return res.status(202).json({
+            accepted: true,
+            generatedAtMs: snapshot.generatedAtMs,
+        });
+    } catch (error) {
+        const validationError = error instanceof FreqtradeMarketSnapshotValidationError;
+        return res.status(validationError ? 422 : 503).json({
+            accepted: false,
+            code: validationError ? error.code : 'MARKET_SNAPSHOT_REJECTED',
+            error: error instanceof Error ? error.message : String(error),
+        });
+    }
+});
+
+app.get('/api/market/freqtrade-snapshot', (req, res) => {
+    try {
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+        if (!exchange || !pair || !timeframe) {
+            return res.status(503).json({
+                error: 'Freqtrade market snapshot is not configured; start the managed Freqtrade integration.',
+                code: 'MARKET_SNAPSHOT_NOT_CONFIGURED',
+            });
+        }
+        const snapshot = freqtradeMarketDataBridge.getLatestConfigured({ exchange, pair, timeframe });
+        res.setHeader('X-SBK1-Server-Time', String(Date.now()));
+        return res.json(snapshot);
+    } catch (error) {
+        return res.status(503).json({
+            error: error instanceof Error ? error.message : 'No fresh Freqtrade market snapshot is available.',
+            code: error instanceof FreqtradeMarketSnapshotValidationError
+                ? error.code
+                : 'MARKET_SNAPSHOT_UNAVAILABLE',
+        });
+    }
+});
+
+app.get('/api/market/bybit/v5/market/:resource', async (req, res) => {
+    const resource = req.params.resource;
+    if (!['kline', 'tickers', 'orderbook', 'recent-trade'].includes(resource)) {
+        return res.status(404).json({ error: 'Unsupported public market data resource.' });
+    }
+
+    const params = new URLSearchParams({ category: 'linear', symbol: 'BTCUSDT' });
+    if (resource === 'kline') {
+        const interval = typeof req.query.interval === 'string' ? req.query.interval : '';
+        const limit = Number(req.query.limit);
+        if (!['1', '3', '5', '15', '30', '60', '120', '240', '360', '720'].includes(interval) ||
+            !Number.isInteger(limit) || limit < 20 || limit > 1000) {
+            return res.status(400).json({ error: 'Invalid Bybit candle interval or limit.' });
+        }
+        params.set('interval', interval);
+        params.set('limit', String(limit));
+    } else if (resource === 'orderbook') {
+        const limit = Number(req.query.limit);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+            return res.status(400).json({ error: 'Invalid Bybit order book limit.' });
+        }
+        params.set('limit', String(limit));
+    } else if (resource === 'recent-trade') {
+        params.set('limit', '1000');
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    try {
+        const upstream = await fetch(
+            `https://api.bybit.com/v5/market/${resource}?${params.toString()}`,
+            { signal: controller.signal, headers: { Accept: 'application/json' } },
+        );
+        if (!upstream.ok) {
+            return res.status(502).json({ error: `Bybit public market request failed (HTTP ${upstream.status}).` });
+        }
+        const payload: unknown = await upstream.json();
+        if (
+            typeof payload !== 'object' ||
+            payload === null ||
+            !('retCode' in payload) ||
+            payload.retCode !== 0
+        ) {
+            const message = typeof payload === 'object' && payload !== null && 'retMsg' in payload
+                ? String(payload.retMsg)
+                : 'Bybit returned a malformed market response.';
+            return res.status(502).json({ error: message });
+        }
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json(payload);
+    } catch (error) {
+        console.warn(`[MARKET DATA] Bybit ${resource} request failed: ${error instanceof Error ? error.message : String(error)}`);
+        return res.status(502).json({
+            error: error instanceof Error ? error.message : 'Bybit public market request failed.',
+        });
+    } finally {
+        clearTimeout(timeout);
+    }
+});
 
 // -------------------------------------------------------------
 // IDEMPOTENCY & DUPLICATE ORDER PROTECTION ENGINE (Issue 30)
@@ -2100,14 +2363,19 @@ app.get('/api/crypto-macro-calendar', (req, res) => {
 let cachedSentiment: any = null;
 let lastCacheTime = 0;
 const CACHE_DURATION = 2 * 60 * 1000; // 2 minutes real-time cache for breaking news
+const SENTIMENT_FAILURE_CACHE_DURATION = 15_000;
 
 // Real-Time Live Bitcoin News Sentiment with Google Search Grounding
 app.post('/api/sentiment', async (req, res) => {
     const now = Date.now();
-    if (cachedSentiment && (now - lastCacheTime) < CACHE_DURATION) {
+    if (
+        cachedSentiment &&
+        now - lastCacheTime < (cachedSentiment.status === 'LIVE' ? CACHE_DURATION : SENTIMENT_FAILURE_CACHE_DURATION)
+    ) {
         return res.json(cachedSentiment);
     }
 
+    let failureReason = 'Live sentiment service returned no analysis.';
     try {
         const prompt = `Search live for the latest breaking Bitcoin (BTC) news and crypto market headlines in the past 1 hour.
 Analyze current sentiment and output ONLY a JSON object:
@@ -2131,27 +2399,50 @@ Analyze current sentiment and output ONLY a JSON object:
             const jsonStart = cleanText.indexOf('{');
             const jsonEnd = cleanText.lastIndexOf('}');
             if (jsonStart !== -1 && jsonEnd !== -1) {
-              const parsed = JSON.parse(cleanText.substring(jsonStart, jsonEnd + 1));
-              parsed.status = parsed.status || 'LIVE';
-              parsed.score = typeof parsed.score === 'number' ? parsed.score : 0.15;
-              parsed.label = parsed.label || 'NEUTRAL';
-              parsed.trend = parsed.trend || 'STABLE';
-              parsed.drivers = Array.isArray(parsed.drivers) && parsed.drivers.length > 0 ? parsed.drivers : ['تثبیت تکنیکال بازار'];
-              cachedSentiment = parsed;
+              const parsed: unknown = JSON.parse(cleanText.substring(jsonStart, jsonEnd + 1));
+              if (
+                typeof parsed !== 'object' ||
+                parsed === null ||
+                !('score' in parsed) ||
+                typeof parsed.score !== 'number' ||
+                !Number.isFinite(parsed.score) ||
+                parsed.score < -1 ||
+                parsed.score > 1 ||
+                !('label' in parsed) ||
+                !['POSITIVE', 'NEGATIVE', 'NEUTRAL'].includes(String(parsed.label)) ||
+                !('trend' in parsed) ||
+                !['UP', 'DOWN', 'STABLE'].includes(String(parsed.trend)) ||
+                !('drivers' in parsed) ||
+                !Array.isArray(parsed.drivers) ||
+                parsed.drivers.length === 0 ||
+                !parsed.drivers.every((driver) => typeof driver === 'string' && driver.trim().length > 0)
+              ) {
+                throw new Error('Live sentiment response did not match the required data contract.');
+              }
+              const validSentiment = {
+                score: parsed.score,
+                label: parsed.label,
+                trend: parsed.trend,
+                drivers: parsed.drivers,
+                status: 'LIVE',
+              };
+              cachedSentiment = validSentiment;
               lastCacheTime = now;
-              return res.json(parsed);
+              return res.json(validSentiment);
             }
         }
-    } catch (error: any) {
-        // Fallback must NEVER use hardcoded static mock values as live data
+    } catch (error) {
+        failureReason = error instanceof Error ? error.message : String(error);
+        console.warn(`[MarketData] Live sentiment unavailable: ${failureReason}`);
     }
 
     const fallbackSentiment = {
-        status: 'PROTECTED',
-        score: 0.15,
+        status: 'UNAVAILABLE',
+        score: 0,
         label: 'NEUTRAL',
         trend: 'STABLE',
-        drivers: ['تثبیت قیمت در کانال معاملاتی', 'حالت حفاظتی فعال است']
+        drivers: [],
+        error: failureReason,
     };
 
     cachedSentiment = fallbackSentiment;
@@ -2766,7 +3057,7 @@ app.post('/api/live/run-readiness-tests', async (_req, res) => {
 
     const creds = loadServerCredentials();
     const isWsConnected = wsClient !== null && wsClient.readyState === WebSocket.OPEN;
-    const isTestnet = creds ? creds.isTestnet : true;
+    const isTestnet = creds?.isTestnet ?? false;
     const baseUrl = isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
     const pingStart = Date.now();
 
@@ -3058,6 +3349,29 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             });
         }
 
+        const riskLimits = {
+            riskBudgetPct: Number(process.env.SBK1_SIGNAL_RISK_PCT),
+            maxStakeQuote: Number(process.env.SBK1_SIGNAL_MAX_STAKE_QUOTE),
+            maxLeverage: Number(process.env.SBK1_SIGNAL_MAX_LEVERAGE),
+        };
+        if (
+            !Number.isFinite(riskLimits.riskBudgetPct) ||
+            riskLimits.riskBudgetPct <= 0 ||
+            riskLimits.riskBudgetPct > 1 ||
+            !Number.isFinite(riskLimits.maxStakeQuote) ||
+            riskLimits.maxStakeQuote <= 0 ||
+            riskLimits.maxStakeQuote > 100 ||
+            !Number.isFinite(riskLimits.maxLeverage) ||
+            riskLimits.maxLeverage <= 0 ||
+            riskLimits.maxLeverage > 1
+        ) {
+            return res.status(503).json({
+                success: false,
+                code: 'FIXTURE_RISK_LIMITS_INVALID',
+                error: 'Valid fixture risk limits are required: risk <= 1%, stake <= 100 USDT, and leverage <= 1x.',
+            });
+        }
+
         const signal = createDryRunFixtureSignal({
             nowMs: Date.now(),
             exchange,
@@ -3066,6 +3380,7 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             referencePrice: prices.lastPrice,
             observedAtMs: prices.timestampUtc,
             source: prices.source,
+            riskLimits,
         });
         const record = await freqtradeSignalAdapter.submit(signal, {
             expectedPair: pair,
@@ -3337,10 +3652,34 @@ async function setupSymbolPositionParameters(creds: any, symbol: string, leverag
 // Bybit WebSocket Price Connection Client (Item 1)
 let wsClient: WebSocket | null = null;
 let wsReconnectTimer: NodeJS.Timeout | null = null;
+let wsHeartbeatTimer: NodeJS.Timeout | null = null;
 let lastBtcPrice = 0;
+let lastMarketTicker: {
+    lastPrice: number;
+    bid: number | null;
+    ask: number | null;
+    markPrice: number | null;
+    exchangeTimestamp: number | null;
+    receivedTimestamp: number;
+    source: 'bybit';
+} | null = null;
+const marketStreamClients = new Set<WebSocket>();
+const marketStreamServer = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+marketStreamServer.on('error', (error) => {
+    console.error(`[MARKET DATA] Browser websocket server error: ${error.message}`);
+});
+
+function broadcastMarketStream(message: Record<string, unknown>) {
+    const payload = JSON.stringify(message);
+    for (const client of marketStreamClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(payload);
+        else marketStreamClients.delete(client);
+    }
+}
 
 function connectBybitWs() {
     if (shutdownRequested) return;
+    if (wsClient && (wsClient.readyState === WebSocket.CONNECTING || wsClient.readyState === WebSocket.OPEN)) return;
     const creds = loadServerCredentials();
     const isTestnet = creds ? creds.isTestnet : true;
     const wsUrl = isTestnet 
@@ -3348,45 +3687,72 @@ function connectBybitWs() {
         : 'wss://stream.bybit.com/v5/public/linear';
 
     logTradingEvent('WS_CONNECT', `Connecting to Bybit WebSocket: ${wsUrl}`);
-    wsClient = new WebSocket(wsUrl);
+    const socket = new WebSocket(wsUrl);
+    wsClient = socket;
 
-    wsClient.on('open', () => {
+    socket.on('open', () => {
         logTradingEvent('WS_OPEN', 'Bybit WebSocket linear stream connected.');
-        wsClient?.send(JSON.stringify({
+        broadcastMarketStream({ type: 'status', state: 'DEGRADED', source: 'bybit' });
+        socket.send(JSON.stringify({
             op: 'subscribe',
             args: ['tickers.BTCUSDT']
         }));
+        if (wsHeartbeatTimer) clearInterval(wsHeartbeatTimer);
+        wsHeartbeatTimer = setInterval(() => {
+            if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ op: 'ping' }));
+        }, 20_000);
     });
 
-    wsClient.on('message', (data: any) => {
+    socket.on('message', (data: WebSocket.RawData) => {
         try {
-            const parsed = JSON.parse(data.toString());
-            if (parsed.topic === 'tickers.BTCUSDT' && parsed.data) {
-                const tick = parsed.data;
-                const priceStr = tick.lastPrice || tick.markPrice || tick.indexPrice;
-                if (priceStr) {
-                    const price = parseFloat(priceStr);
-                    if (price > 0) {
-                        lastBtcPrice = price;
-                        // Trigger fast server-side ticks (e.g. hedging on 2% drop)
-                        runServerSidePositionTicks(price);
-                    }
-                }
-            }
-        } catch (e) {
-            // suppress parse errors
+            const parsed: unknown = JSON.parse(data.toString());
+            if (typeof parsed !== 'object' || parsed === null || !('topic' in parsed) || parsed.topic !== 'tickers.BTCUSDT' || !('data' in parsed)) return;
+            const tick = parsed.data;
+            if (typeof tick !== 'object' || tick === null) return;
+            const lastPrice = Number('lastPrice' in tick ? tick.lastPrice : NaN);
+            const markPriceValue = Number('markPrice' in tick ? tick.markPrice : NaN);
+            const bidValue = Number('bid1Price' in tick ? tick.bid1Price : NaN);
+            const askValue = Number('ask1Price' in tick ? tick.ask1Price : NaN);
+            if (!Number.isFinite(lastPrice) || lastPrice <= 0) return;
+            const receivedTimestamp = Date.now();
+            const exchangeTimestamp = typeof parsed === 'object' && 'ts' in parsed && Number.isSafeInteger(Number(parsed.ts))
+                ? Number(parsed.ts)
+                : null;
+            lastBtcPrice = lastPrice;
+            lastMarketTicker = {
+                lastPrice,
+                bid: Number.isFinite(bidValue) && bidValue > 0 ? bidValue : null,
+                ask: Number.isFinite(askValue) && askValue > 0 ? askValue : null,
+                markPrice: Number.isFinite(markPriceValue) && markPriceValue > 0 ? markPriceValue : null,
+                exchangeTimestamp,
+                receivedTimestamp,
+                source: 'bybit',
+            };
+            broadcastMarketStream({ type: 'ticker', ...lastMarketTicker, state: 'LIVE' });
+            void runServerSidePositionTicks(lastPrice);
+        } catch (error) {
+            console.warn(`[MARKET DATA] Ignored an invalid Bybit websocket message: ${error instanceof Error ? error.message : String(error)}`);
         }
     });
 
-    wsClient.on('close', () => {
+    socket.on('close', () => {
+        if (wsHeartbeatTimer) clearInterval(wsHeartbeatTimer);
+        wsHeartbeatTimer = null;
+        if (wsClient === socket) wsClient = null;
+        broadcastMarketStream({ type: 'status', state: 'DISCONNECTED', source: 'bybit' });
         if (shutdownRequested) return;
         logTradingEvent('WS_CLOSE', 'WebSocket connection closed. Retrying in 5 seconds.');
-        wsReconnectTimer = setTimeout(connectBybitWs, 5000);
+        if (!wsReconnectTimer) {
+            wsReconnectTimer = setTimeout(() => {
+                wsReconnectTimer = null;
+                connectBybitWs();
+            }, 5000);
+        }
     });
 
-    wsClient.on('error', (err) => {
+    socket.on('error', (err) => {
         logTradingEvent('WS_ERROR', `WebSocket error occurred: ${err.message}`);
-        wsClient?.close();
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
     });
 }
 
@@ -3880,7 +4246,7 @@ function listenOnAvailablePort(port: number, allowFallback: boolean): Promise<Re
 
 async function startServer() {
   viteServer = await createViteServer({
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false, ws: false },
     appType: 'spa'
   });
   if (shutdownRequested) {
@@ -3903,6 +4269,35 @@ async function startServer() {
         throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
     }
     httpServer = await listenOnAvailablePort(configuredPort, process.env.SBK1_PORT === undefined);
+    httpServer.on('upgrade', (request, socket, head) => {
+      let pathname: string;
+      try {
+        pathname = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`).pathname;
+      } catch {
+        socket.destroy();
+        return;
+      }
+      if (pathname !== '/api/market-stream') {
+        socket.destroy();
+        return;
+      }
+      if (marketStreamClients.size >= 50) {
+        socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      marketStreamServer.handleUpgrade(request, socket, head, (client) => {
+        marketStreamClients.add(client);
+        client.on('close', () => marketStreamClients.delete(client));
+        client.on('error', () => marketStreamClients.delete(client));
+        client.send(JSON.stringify({
+          type: 'status',
+          state: lastMarketTicker && Date.now() - lastMarketTicker.receivedTimestamp <= 5_000 ? 'LIVE' : 'DEGRADED',
+          source: 'bybit',
+        }));
+        if (lastMarketTicker) client.send(JSON.stringify({ type: 'ticker', ...lastMarketTicker, state: 'LIVE' }));
+      });
+    });
     const address = httpServer.address();
     const listeningPort = typeof address === 'object' && address ? address.port : configuredPort;
     console.log(`Server running on port ${listeningPort}`);
@@ -3914,7 +4309,11 @@ async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
   console.log(`[SBK1] Received ${signal}; shutting down server and market feed.`);
   clearInterval(idempotencyCleanupTimer);
   if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+  if (wsHeartbeatTimer) clearInterval(wsHeartbeatTimer);
   wsClient?.close();
+  for (const client of marketStreamClients) client.close(1001, 'SBK1 server shutting down');
+  marketStreamClients.clear();
+  marketStreamServer.close();
 
   const forceCloseTimer = setTimeout(() => {
     httpServer?.closeAllConnections();

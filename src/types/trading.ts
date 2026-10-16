@@ -104,6 +104,8 @@ export type ExecutionMode = 'BACKTEST' | 'DRY_RUN' | 'TESTNET' | 'PAPER' | 'LIVE
 export interface ExecutionSettings {
   mode: ExecutionMode;
   lastChangedAt: number;
+  liveCapitalCeilingPct?: number;
+  selectedProfile?: 'DEMO' | 'LIVE';
 }
 
 export interface MarketFeedQuality {
@@ -128,6 +130,7 @@ export interface DataQualityReport {
     derivatives: MarketFeedQuality;
     futuresPrices: MarketFeedQuality;
     sentiment: MarketFeedQuality;
+    orderFlow: MarketFeedQuality;
   };
 }
 
@@ -172,12 +175,15 @@ export interface OrderFlowFeatures {
   takerDelta: number | null; // takerBuy - takerSell
   tradePriceChangePct?: number | null;
   delta?: number | null; // Current period net delta (Item 11)
-  cumulativeDelta?: number | null; // Multi-period cumulative delta (Item 11)
+  cumulativeDelta?: number | null; // Cumulative signed delta over the supplied recent-trade window
   deltaVelocity?: number | null; // Delta velocity (volume/sec) (Item 11)
   isRealTradeFlow?: boolean; // True if from live trade feed, false if unavailable (Item 11)
   status?: FeedStatus; // LIVE / UNAVAILABLE (Item 11)
   timestampUtc?: number;
   ageMs?: number;
+  latencyMs?: number;
+  source?: string;
+  error?: string;
 }
 
 export interface CanonicalExchangeFeed {
@@ -221,6 +227,10 @@ export interface FearAndGreed {
   value: number | null;
   sent: string;
   status?: 'LIVE' | 'STALE' | 'UNAVAILABLE';
+  timestampUtc?: number;
+  ageMs?: number;
+  latencyMs?: number;
+  source?: string;
 }
 
 export interface SentimentData {
@@ -228,6 +238,7 @@ export interface SentimentData {
   label: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL';
   trend: 'UP' | 'DOWN' | 'STABLE';
   drivers: string[];
+  status?: 'LIVE' | 'PROTECTED' | 'UNAVAILABLE';
 }
 
 export interface FuturesPrices {
@@ -243,6 +254,10 @@ export interface FuturesPrices {
   latencyMs: number;
   source: string;
   status: FeedStatus;
+  systemLastPrice?: number | null;
+  systemOpenInterest?: number | null;
+  systemPriceStatus?: FeedStatus;
+  error?: string;
 }
 
 export interface DerivativesData {

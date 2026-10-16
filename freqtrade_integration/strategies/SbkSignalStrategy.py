@@ -42,7 +42,7 @@ class SbkSignalStrategy(IStrategy):
         self._pair = os.getenv("SBK1_FREQTRADE_PAIR", "")
         try:
             self._bridge_url = validate_bridge_url(
-                os.getenv("SBK1_BRIDGE_URL", "http://127.0.0.1:3000")
+                os.getenv("SBK1_BRIDGE_URL") or "http://127.0.0.1:3000"
             )
         except ValueError as exc:
             self._bridge_url = ""

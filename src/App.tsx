@@ -88,10 +88,10 @@ import { loadSettings, saveSettings } from './services/settings';
 import { saveTradeToHistory, getTradeHistory } from './services/history';
 import { calculateKellyRisk, getAntiTiltStatus, calculateDynamicKellyMargin, evaluateCognitiveConviction } from './services/kellyRisk';
 import { requestNotificationPermission, sendNotification } from './services/notifications';
-import { setupBybitWebSocket } from './services/websocket';
+import { setupFreqtradeMarketFeed, type WebSocketConnectionState } from './services/websocket';
 import { validatePrecisionEntry, generateClientSidePredictionFallback, updatePredictiveModelFeedbackLoop, evaluate15mTimingAndLifecycle, runDistributedMultiTimeframeBrains, calculateAiMtfConsensusCorrelation, evaluateFuturePredictability } from './services/predictiveEngine';
 import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTargets } from './services/signalToExecution';
-import { verifyAutoTradePrerequisites, reconcileOrderWithExchange } from './services/autoTradeGuard';
+import { verifyAutoTradePrerequisites } from './services/autoTradeGuard';
 import { getExecutionMode, getSelectedExecutionMode } from './services/executionMode';
 import type { FreqtradeTrade } from './services/freqtradeBridge';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
@@ -197,6 +197,31 @@ export function calculateHedgeBreakEvenPrice(
   };
 }
 
+function isLatestMarketDataVerified(
+  analysis: AnalysisResult | null,
+  lastAnalysisAtMs: number | null,
+  nowMs = Date.now(),
+): boolean {
+  if (
+    !analysis ||
+    analysis.dataStatus !== 'LIVE' ||
+    lastAnalysisAtMs === null ||
+    nowMs - lastAnalysisAtMs < 0 ||
+    nowMs - lastAnalysisAtMs > 15_000 ||
+    analysis.candles.length < 300
+  ) return false;
+
+  const quality = analysis.dataQualityReport;
+  const candleAgeMs = quality?.feeds.candles.ageMs;
+  return quality?.status === 'LIVE' &&
+    quality.isTradeAllowed &&
+    quality.feeds.candles.status === 'LIVE' &&
+    typeof candleAgeMs === 'number' &&
+    Number.isFinite(candleAgeMs) &&
+    candleAgeMs >= -1_000 &&
+    candleAgeMs <= 15_000;
+}
+
 export default function App() {
   const [settings, setSettings] = useState<UserSettings>(() => loadSettings());
   const [showSidebar, setShowSidebar] = useState(false);
@@ -227,7 +252,10 @@ export default function App() {
     const saved = localStorage.getItem('quantum_theme_deep_black');
     return saved !== null ? saved === 'true' : true;
   });
-  const [balance, setBalance] = useState<number>(0);
+  const [balance, setBalance] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('quantum_balance'));
+    return Number.isFinite(saved) && saved >= 0 ? saved : 1_000;
+  });
 
   const [userLeverage, setUserLeverage] = useState<number | null>(() => {
     const saved = localStorage.getItem('quantum_user_leverage');
@@ -242,9 +270,13 @@ export default function App() {
   const [activePositions, setActivePositions] = useState<TradePosition[]>([]);
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [lastAnalysisAtMs, setLastAnalysisAtMs] = useState<number | null>(null);
   const [aiPrediction, setAiPrediction] = useState<any | null>(null);
   const [source, setSource] = useState<string>('Bybit 15m');
   const [isFetching, setIsFetching] = useState<boolean>(false);
+  const [marketDataError, setMarketDataError] = useState<string | null>(null);
+  const [marketStreamState, setMarketStreamState] = useState<WebSocketConnectionState>('DISCONNECTED');
+  const [walletAdjustmentAmount, setWalletAdjustmentAmount] = useState('100');
   const [notification, setNotification] = useState<string | null>(null);
   const [isCalibratingEngines, setIsCalibratingEngines] = useState<boolean>(false);
 
@@ -1270,7 +1302,7 @@ export default function App() {
     }
 
     requestNotificationPermission();
-    wsRef.current = setupBybitWebSocket((rawPrice) => {
+    wsRef.current = setupFreqtradeMarketFeed((rawPrice) => {
       if (!rawPrice || rawPrice <= 0) return;
       const price = rawPrice;
       smoothedPriceRef.current = rawPrice;
@@ -1290,7 +1322,7 @@ export default function App() {
         lastPriceUpdateRef.current = now;
         setAnalysis((prev) => (prev ? { ...prev, price } : null));
       }
-    });
+    }, setMarketStreamState);
     return () => wsRef.current?.close();
   }, [runRealtimePositionTicks]);
 
@@ -1369,20 +1401,42 @@ export default function App() {
         console.error('[Freqtrade] Could not refresh authoritative trading state:', err);
       }
 
-      let sentiment = {
-        score: 0.45,
-        label: 'POSITIVE',
-        trend: 'UP',
-        drivers: ['شکست مقاومت کلیدی و اوردر بلاک صعودی', 'انباشت نهنگ‌ها و خروج از صرافی'],
+      let sentiment: SentimentData = {
+        score: 0,
+        label: 'NEUTRAL' as const,
+        trend: 'STABLE' as const,
+        drivers: [],
+        status: 'UNAVAILABLE' as const,
       };
 
       try {
         const sentimentResponse = await fetch('/api/sentiment', { method: 'POST' });
         if (sentimentResponse.ok) {
-          sentiment = await sentimentResponse.json();
+          const responseSentiment = await sentimentResponse.json() as Partial<SentimentData>;
+          if (
+            typeof responseSentiment.score === 'number' &&
+            Number.isFinite(responseSentiment.score) &&
+            responseSentiment.score >= -1 &&
+            responseSentiment.score <= 1 &&
+            ['POSITIVE', 'NEGATIVE', 'NEUTRAL'].includes(responseSentiment.label ?? '') &&
+            ['UP', 'DOWN', 'STABLE'].includes(responseSentiment.trend ?? '') &&
+            Array.isArray(responseSentiment.drivers) &&
+            responseSentiment.drivers.every((driver) => typeof driver === 'string') &&
+            responseSentiment.status === 'LIVE'
+          ) {
+            sentiment = {
+              score: responseSentiment.score,
+              label: responseSentiment.label as SentimentData['label'],
+              trend: responseSentiment.trend as SentimentData['trend'],
+              drivers: responseSentiment.drivers,
+              status: 'LIVE',
+            };
+          } else {
+            throw new Error('Sentiment service returned an invalid data contract.');
+          }
         }
       } catch (err) {
-        // fallback to default
+        console.warn('[MarketData] Live sentiment is unavailable; neutral weighting is used.', err);
       }
 
       const [candleData, fng, deriv, realObiData, orderFlowFeatures, htf, futuresPrices, canonicalSnapshot] = await Promise.all([
@@ -1395,8 +1449,18 @@ export default function App() {
         fetchFuturesPrices(),
         getCanonicalMarketSnapshot().catch(() => undefined),
       ]);
+      if (candleData.status !== 'LIVE' || candleData.candles.length < 300) {
+        throw new Error(candleData.error || 'کمتر از ۳۰۰ کندل واقعی و تازه برای تحلیل معتبر دریافت شد.');
+      }
 
-      const dataQualityReport = evaluateMarketDataQuality(candleData, realObiData, deriv, fng, futuresPrices);
+      const dataQualityReport = evaluateMarketDataQuality(
+        candleData,
+        realObiData,
+        deriv,
+        fng,
+        futuresPrices,
+        orderFlowFeatures,
+      );
       const effectiveObi = realObiData.obi !== null ? realObiData.obi : 0.0;
 
       const currentBalance = balanceRef.current;
@@ -1513,13 +1577,18 @@ export default function App() {
       }
 
       setAnalysis(res);
+      setLastAnalysisAtMs(Date.now());
+      setMarketDataError(null);
       setSource(candleData.source);
 
       if (settingsRef.current.notificationsEnabled && res.signalOk && res.confScore >= 5) {
         sendNotification('سیگنال قدرتمند جدید', `سیگنال ${res.direction === 'LONG' ? 'خرید' : 'فروش'} با امتیاز ۵/۵ تایید شد.`);
       }
     } catch (err) {
-      // Market fetch handled silently
+      const message = err instanceof Error ? err.message : String(err);
+      setMarketDataError(message);
+      setSource('Freqtrade DataProvider unavailable');
+      console.error('[MarketData] Analysis refresh failed:', err);
     } finally {
       setIsFetching(false);
       isFetchingRef.current = false;
@@ -1693,6 +1762,22 @@ export default function App() {
   }, [analysis, fullSystemEval, handlePaperTrade, settings.autoTradeEnabled]);
 
   const selectedExecutionMode = executionModeRef.current ?? getSelectedExecutionMode();
+  const adjustSandboxWallet = (direction: 'add' | 'subtract') => {
+    const amount = Number(walletAdjustmentAmount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
+      showNotification('مبلغ باید عددی مثبت و حداکثر ۱٬۰۰۰٬۰۰۰ USDT باشد.');
+      return;
+    }
+    const nextBalance = balanceRef.current + (direction === 'add' ? amount : -amount);
+    const reservedMargin = activePositions.reduce((total, position) => total + Math.max(0, position.margin), 0);
+    if (nextBalance < reservedMargin || nextBalance < 0) {
+      showNotification('کاهش موجودی از مارجین رزروشدهٔ موقعیت‌های باز بیشتر است.');
+      return;
+    }
+    balanceRef.current = nextBalance;
+    setBalance(nextBalance);
+    localStorage.setItem('quantum_balance', String(nextBalance));
+  };
 
   return (
     <div className={`min-h-screen overflow-y-auto overflow-x-hidden flex flex-col ${isDeepBlack ? 'bg-[#000000]' : 'bg-titanium-obsidian'} text-slate-100 font-sans antialiased selection:bg-emerald-500 selection:text-black transition-colors duration-300 relative gpu-accelerated`}>
@@ -1767,7 +1852,7 @@ export default function App() {
         <div className="flex flex-col gap-1.5 flex-shrink-0">
           <ChartTopBar
             source={source}
-            isLive={true}
+            isLive={isLatestMarketDataVerified(analysis, lastAnalysisAtMs)}
             isFetching={isFetching}
             onRefresh={loadMarketData}
             isDeepBlack={isDeepBlack}
@@ -1787,6 +1872,22 @@ export default function App() {
               setIsWalletPopupOpen(!isWalletPopupOpen);
             }}
           />
+          {marketDataError && (
+            <p role="alert" className="rounded-lg border border-rose-700 bg-rose-950/60 px-3 py-2 text-xs text-rose-200">
+              دریافت یا تحلیل دادهٔ بازار ناموفق بود: {marketDataError}
+            </p>
+          )}
+          <p role="status" aria-live="polite" className="px-2 text-[11px] text-slate-400">
+            WebSocket بازار: {
+              marketStreamState === 'LIVE' ? 'زنده' :
+              marketStreamState === 'DEGRADED' ? 'در حال اتصال مجدد؛ تحلیل دوره‌ای ادامه دارد' :
+              marketStreamState === 'STALE' ? 'دادهٔ WebSocket کهنه است؛ تحلیل دوره‌ای ادامه دارد' :
+              'قطع؛ تحلیل دوره‌ای از API ادامه دارد'
+            }
+            {' · '}
+            تحلیل: {lastAnalysisAtMs ? `آخرین اجرا ${new Date(lastAnalysisAtMs).toLocaleTimeString('fa-IR')}` : 'در انتظار دادهٔ معتبر'}
+            {analysis?.dataStatus ? ` · کیفیت داده: ${analysis.dataStatus}` : ''}
+          </p>
            <TickerBar btcPrice={liveEffectivePrice} />
           </div>
 
@@ -2231,7 +2332,11 @@ export default function App() {
       </div>
 
       <div id="execution-governor">
-        <ExecutionGovernorDashboard onModeSelected={handleExecutionModeSelected} />
+        <ExecutionGovernorDashboard
+          onModeSelected={handleExecutionModeSelected}
+          analysisStatus={analysis?.dataStatus ?? 'DATA_UNAVAILABLE'}
+          lastAnalysisAtMs={lastAnalysisAtMs}
+        />
       </div>
 
 
@@ -2246,7 +2351,7 @@ export default function App() {
           }}
         >
           <div className="flex items-center justify-between pb-3 border-b border-emerald-950/80 mb-3">
-            <span className="text-xs font-bold text-emerald-300 font-sans">کیف پول و دارایی حساب</span>
+            <span className="text-xs font-bold text-emerald-300 font-sans">کیف پول شبیه‌سازی SBK1</span>
             <button
               onClick={() => setIsWalletPopupOpen(false)}
               className="text-slate-400 hover:text-white text-xs cursor-pointer"
@@ -2256,11 +2361,41 @@ export default function App() {
           </div>
 
           <div className="space-y-3">
+            <p className="text-[10px] leading-5 text-amber-200">
+              موجودی محلی دمو است و موجودی مجازی Freqtrade یا صرافی را تغییر نمی‌دهد.
+            </p>
             <div>
-              <div className="text-[10px] text-slate-400 font-sans">موجودی کل (USDT)</div>
+              <div className="text-[10px] text-slate-400 font-sans">موجودی محلی (USDT)</div>
               <div className="text-xl font-mono font-extrabold text-white">
                 ${balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
+            </div>
+
+            <div className="grid grid-cols-[1fr_auto_auto] gap-2">
+              <input
+                aria-label="مبلغ تغییر موجودی دمو"
+                type="number"
+                min="0.01"
+                max="1000000"
+                step="0.01"
+                value={walletAdjustmentAmount}
+                onChange={(event) => setWalletAdjustmentAmount(event.target.value)}
+                className="min-w-0 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-white"
+              />
+              <button
+                type="button"
+                onClick={() => adjustSandboxWallet('add')}
+                className="rounded bg-emerald-800 px-2 py-1 text-xs font-bold"
+              >
+                افزودن
+              </button>
+              <button
+                type="button"
+                onClick={() => adjustSandboxWallet('subtract')}
+                className="rounded bg-rose-900 px-2 py-1 text-xs font-bold"
+              >
+                کسر
+              </button>
             </div>
 
             <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-300 py-2 border-y border-emerald-950/60 font-sans">

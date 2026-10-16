@@ -21,7 +21,7 @@ const marketSnapshot = {
   pair: 'BTC/USDT:USDT',
   timeframe: '15m',
   generatedAtMs: nowMs,
-  candles: makeCandles(15 * 60_000, 30),
+  candles: makeCandles(15 * 60_000, 500),
   additionalCandles: {
     '1m': makeCandles(60_000, 30),
     '5m': makeCandles(5 * 60_000, 30),
@@ -54,20 +54,38 @@ const marketSnapshot = {
 Object.defineProperty(globalThis, 'window', { value: {}, configurable: true });
 let requestCount = 0;
 const originalFetch = globalThis.fetch;
-globalThis.fetch = async () => {
+globalThis.fetch = async (input) => {
+  if (
+    String(input).startsWith('https://api.bybit.com/') ||
+    String(input).startsWith('/api/market/bybit/')
+  ) {
+    throw new Error('Public Bybit network access is disabled in this focused adapter check.');
+  }
   requestCount += 1;
   return new Response(JSON.stringify(marketSnapshot), {
     status: 200,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Date: new Date(nowMs).toUTCString(),
+    },
   });
 };
 
 try {
-  const marketData = await import('../src/services/marketData');
-  const candles = await marketData.fetchCandles(true);
-  assert.equal(candles.candles.length, 30);
+const marketData = await import('../src/services/marketData');
+const originalDateNow = Date.now;
+try {
+  Date.now = () => nowMs + 60_000;
+  await marketData.getFreqtradeMarketSnapshot();
+} finally {
+  Date.now = originalDateNow;
+}
+const candles = await marketData.fetchCandles();
+  assert.equal(candles.candles.length, 500);
   assert.equal(candles.status, 'LIVE');
   assert.match(candles.source, /freqtrade\.dataprovider/);
+  assert.equal(marketData.validateMarketDataLiveSafety(candles.candles, candles.status).isLiveSafe, true);
+  assert.equal(marketData.validateMarketDataLiveSafety(candles.candles.slice(-299), candles.status).isLiveSafe, false);
 
   const htf = await marketData.fetchHtf();
   assert.equal(htf['Freqtrade 1h']?.length, 10);
@@ -90,7 +108,7 @@ try {
   const derivatives = await marketData.fetchDerivatives();
   assert.equal(derivatives.status, 'UNAVAILABLE', 'funding/OI feature stays unavailable without OI');
   assert.equal(derivatives.oi, null);
-  assert.equal(derivatives.funding, null);
+  assert.equal(derivatives.funding, -0.0001, 'verified funding is retained even when open interest is unavailable');
 
   const tradeFlow = await marketData.fetchRealTradeFlowCvd();
   assert.equal(tradeFlow.status, 'UNAVAILABLE');
@@ -111,13 +129,13 @@ try {
 
   await assert.rejects(
     () => marketData.fetchBybit('7', 30),
-    /does not contain 7m data/,
+    /Unsupported Bybit candle request/,
   );
   await assert.rejects(
     () => marketData.fetchKucoin(),
     /venue fallback is disabled/,
   );
-  assert.equal(requestCount, 1, 'no adapter should fall back to a direct exchange endpoint');
+  assert.equal(requestCount, 1, 'Freqtrade snapshot consumers should reuse the cached verified snapshot');
 } finally {
   globalThis.fetch = originalFetch;
 }

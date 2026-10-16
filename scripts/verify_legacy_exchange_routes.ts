@@ -4,6 +4,7 @@ import { createServer } from 'node:net';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import WebSocket from 'ws';
 
 const adminToken = 'legacy-route-test-admin-token-long-enough';
 
@@ -72,6 +73,27 @@ child.stderr.setEncoding('utf8').on('data', (chunk: string) => { output += chunk
 
 try {
   await waitForServer(baseUrl, child);
+  const marketSocket = new WebSocket(`ws://127.0.0.1:${port}/api/market-stream`);
+  const streamStatus = await new Promise<{ type?: string; state?: string; source?: string }>((resolveStatus, rejectStatus) => {
+    const timeout = setTimeout(() => rejectStatus(new Error('Market websocket did not return its initial status.')), 5_000);
+    marketSocket.once('message', (data) => {
+      clearTimeout(timeout);
+      try {
+        resolveStatus(JSON.parse(data.toString()));
+      } catch (error) {
+        rejectStatus(error);
+      }
+    });
+    marketSocket.once('error', (error) => {
+      clearTimeout(timeout);
+      rejectStatus(error);
+    });
+  });
+  assert.equal(streamStatus.type, 'status');
+  assert.ok(['LIVE', 'DEGRADED'].includes(streamStatus.state ?? ''));
+  assert.equal(streamStatus.source, 'bybit');
+  marketSocket.close();
+  console.log('SBK1 market websocket handshake passed.');
   const unknownApiResponse = await fetch(`${baseUrl}/api/v1/ping`);
   assert.equal(unknownApiResponse.status, 404);
   assert.match(unknownApiResponse.headers.get('content-type') || '', /application\/json/);

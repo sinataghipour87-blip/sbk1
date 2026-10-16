@@ -17,7 +17,7 @@ export default defineConfig(() => {
       port: 3000,
       // Disable HMR WebSocket to avoid iframe preview connection drops
       hmr: false,
-      watch: null,
+      ws: false as const,
     },
   };
 });

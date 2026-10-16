@@ -58,6 +58,13 @@ assert.equal(settings.market, 'futures');
 assert.equal(settings.apiBaseUrl, 'http://127.0.0.1:8080/api/v1');
 assert.equal(settings.bridgeBaseUrl, 'http://127.0.0.1:3000');
 
+const blankBridgeSettings = validateRuntimeSettings(config, {
+  ...environment,
+  SBK1_PORT: '3002',
+  SBK1_BRIDGE_URL: '',
+});
+assert.equal(blankBridgeSettings.bridgeBaseUrl, 'http://127.0.0.1:3002');
+
 assert.equal(
   validateRuntimeSettings({
     ...config,

@@ -90,6 +90,16 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "signals": [{"signal": self.signal, "status": "STRATEGY_ACCEPTED"}],
         }
 
+    def test_empty_bridge_environment_uses_default_loopback_url(self):
+        with patch.dict("os.environ", {
+            "SBK1_BRIDGE_URL": "",
+            "SBK1_FREQTRADE_PAIR": self.strategy._pair,
+            "SBK1_FREQTRADE_BRIDGE_TOKEN": self.strategy._bridge_token,
+        }):
+            self.strategy.bot_start()
+
+        self.assertEqual(self.strategy._bridge_url, "http://127.0.0.1:3000")
+
     def test_market_snapshot_uses_only_completed_dataprovider_candles(self):
         now = datetime.now(UTC)
         now_ms = int(now.timestamp() * 1000)

@@ -123,7 +123,7 @@ function validateCandles(
   return generatedAtMs - latestCandleCloseMs <= timeframeMs * 2 + 60_000;
 }
 
-function validateTicker(value: unknown, nowMs: number): value is FreqtradeMarketTicker | null {
+function validateTickerShape(value: unknown): value is FreqtradeMarketTicker | null {
   if (value === null) return true;
   if (!isRecord(value)) return false;
   const rawExchangeTimestampMs = value.exchangeTimestampMs;
@@ -140,13 +140,7 @@ function validateTicker(value: unknown, nowMs: number): value is FreqtradeMarket
   if (value.markPrice !== null && !isPositive(value.markPrice)) return false;
   if (value.indexPrice !== null && !isPositive(value.indexPrice)) return false;
   if (value.bid !== null && value.ask !== null && value.bid >= value.ask) return false;
-  if (
-    retrievedAtMs > nowMs + 1_000 ||
-    nowMs - retrievedAtMs > FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
-  ) return false;
-  return exchangeTimestampMs === null ||
-    (exchangeTimestampMs <= retrievedAtMs + 1_000 &&
-      retrievedAtMs - exchangeTimestampMs <= FREQTRADE_TICKER_MAX_AGE_MS);
+  return exchangeTimestampMs === null || exchangeTimestampMs <= retrievedAtMs + 1_000;
 }
 
 function validateLevels(value: unknown, descending: boolean): value is Array<{ price: number; amount: number }> {
@@ -163,13 +157,12 @@ function validateLevels(value: unknown, descending: boolean): value is Array<{ p
   return true;
 }
 
-function validateOrderBook(value: unknown, nowMs: number): value is FreqtradeMarketOrderBook | null {
+function validateOrderBookShape(value: unknown, nowMs: number): value is FreqtradeMarketOrderBook | null {
   if (value === null) return true;
   if (
     !isRecord(value) ||
     !isTimestamp(value.timestampMs) ||
     value.timestampMs > nowMs + 1_000 ||
-    nowMs - value.timestampMs > 10_000 ||
     !validateLevels(value.bids, true) ||
     !validateLevels(value.asks, false)
   ) return false;
@@ -178,12 +171,10 @@ function validateOrderBook(value: unknown, nowMs: number): value is FreqtradeMar
   return bestBid < bestAsk;
 }
 
-function validateFundingRate(value: unknown, nowMs: number): value is FreqtradeMarketFundingRate | null {
+function validateFundingRateShape(value: unknown): value is FreqtradeMarketFundingRate | null {
   if (value === null) return true;
   return isRecord(value) &&
     isTimestamp(value.retrievedAtMs) &&
-    value.retrievedAtMs <= nowMs + 1_000 &&
-    nowMs - value.retrievedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS &&
     typeof value.rate === 'number' &&
     Number.isFinite(value.rate) &&
     (value.nextFundingAtMs === null || isTimestamp(value.nextFundingAtMs));
@@ -261,20 +252,42 @@ export function validateFreqtradeMarketSnapshot(
     additionalCandles[timeframe] = candidateCandles.map((candle) => ({ ...candle }));
   }
   const ticker = value.ticker;
-  if (
-    !validateTicker(ticker, nowMs) ||
-    (isRecord(ticker) && ticker.retrievedAtMs > value.generatedAtMs + 1_000)
-  ) {
+  if (!validateTickerShape(ticker)) {
     throw new FreqtradeMarketSnapshotValidationError('Ticker is invalid or stale.', 'INVALID_TICKER');
   }
+  if (
+    isRecord(ticker) &&
+    (ticker.retrievedAtMs > nowMs + 1_000 || ticker.retrievedAtMs > value.generatedAtMs + 1_000)
+  ) {
+    throw new FreqtradeMarketSnapshotValidationError('Ticker is future-dated.', 'INVALID_TICKER');
+  }
+  const verifiedTicker = ticker !== null &&
+    nowMs - ticker.retrievedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS &&
+    (ticker.exchangeTimestampMs === null ||
+      ticker.retrievedAtMs - ticker.exchangeTimestampMs <= FREQTRADE_TICKER_MAX_AGE_MS)
+    ? ticker
+    : null;
   const orderBook = value.orderBook;
-  if (!validateOrderBook(orderBook, nowMs)) {
+  if (!validateOrderBookShape(orderBook, nowMs)) {
     throw new FreqtradeMarketSnapshotValidationError('Order book is invalid or stale.', 'INVALID_ORDER_BOOK');
   }
+  if (isRecord(orderBook) && orderBook.timestampMs > value.generatedAtMs + 1_000) {
+    throw new FreqtradeMarketSnapshotValidationError('Order book is future-dated.', 'INVALID_ORDER_BOOK');
+  }
+  const verifiedOrderBook = orderBook !== null && nowMs - orderBook.timestampMs <= 10_000
+    ? orderBook
+    : null;
   const fundingRate = value.fundingRate;
-  if (!validateFundingRate(fundingRate, nowMs)) {
+  if (!validateFundingRateShape(fundingRate)) {
     throw new FreqtradeMarketSnapshotValidationError('Funding rate is invalid or stale.', 'INVALID_FUNDING_RATE');
   }
+  if (isRecord(fundingRate) && (fundingRate.retrievedAtMs > nowMs + 1_000 || fundingRate.retrievedAtMs > value.generatedAtMs + 1_000)) {
+    throw new FreqtradeMarketSnapshotValidationError('Funding rate is future-dated.', 'INVALID_FUNDING_RATE');
+  }
+  const verifiedFundingRate = fundingRate !== null &&
+    nowMs - fundingRate.retrievedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
+    ? fundingRate
+    : null;
   return {
     contractVersion: FREQTRADE_MARKET_SNAPSHOT_VERSION,
     source: 'freqtrade.dataprovider',
@@ -285,13 +298,13 @@ export function validateFreqtradeMarketSnapshot(
     generatedAtMs: value.generatedAtMs,
     candles,
     additionalCandles,
-    ticker: ticker && { ...ticker },
-    orderBook: orderBook && {
-      timestampMs: orderBook.timestampMs,
-      bids: orderBook.bids.map((level) => ({ ...level })),
-      asks: orderBook.asks.map((level) => ({ ...level })),
+    ticker: verifiedTicker && { ...verifiedTicker },
+    orderBook: verifiedOrderBook && {
+      timestampMs: verifiedOrderBook.timestampMs,
+      bids: verifiedOrderBook.bids.map((level) => ({ ...level })),
+      asks: verifiedOrderBook.asks.map((level) => ({ ...level })),
     },
-    fundingRate: fundingRate && { ...fundingRate },
+    fundingRate: verifiedFundingRate && { ...verifiedFundingRate },
   };
 }
 

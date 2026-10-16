@@ -102,13 +102,27 @@ expectCode(
   }, expected, nowMs),
   'INVALID_ORDER_BOOK',
 );
-expectCode(
-  () => validateFreqtradeMarketSnapshot({
-    ...snapshot,
-    ticker: { ...snapshot.ticker, retrievedAtMs: nowMs - 16_000 },
-  }, expected, nowMs),
-  'INVALID_TICKER',
-);
+const staleOptionalFeeds = validateFreqtradeMarketSnapshot({
+  ...snapshot,
+  ticker: { ...snapshot.ticker, retrievedAtMs: nowMs - 16_000 },
+  orderBook: { ...snapshot.orderBook, timestampMs: nowMs - 10_001 },
+  fundingRate: { ...snapshot.fundingRate, retrievedAtMs: nowMs - 16_000 },
+}, expected, nowMs);
+assert.equal(staleOptionalFeeds.candles.length, snapshot.candles.length);
+assert.equal(staleOptionalFeeds.ticker, null, 'stale ticker must not invalidate otherwise fresh candles');
+assert.equal(staleOptionalFeeds.orderBook, null, 'stale order book must not invalidate otherwise fresh candles');
+assert.equal(staleOptionalFeeds.fundingRate, null, 'stale funding must not invalidate otherwise fresh candles');
+const partialBridge = new FreqtradeMarketDataBridge();
+const acceptedPartial = partialBridge.accept({
+  ...snapshot,
+  ticker: { ...snapshot.ticker, retrievedAtMs: nowMs - 16_000 },
+  orderBook: { ...snapshot.orderBook, timestampMs: nowMs - 10_001 },
+  fundingRate: { ...snapshot.fundingRate, retrievedAtMs: nowMs - 16_000 },
+}, expected, nowMs);
+assert.equal(partialBridge.getLatest(expected, nowMs).candles.length, snapshot.candles.length);
+assert.equal(acceptedPartial.orderBook, null);
+assert.equal(acceptedPartial.ticker, null);
+assert.equal(acceptedPartial.fundingRate, null);
 expectCode(
   () => validateFreqtradeMarketSnapshot({
     ...snapshot,
@@ -117,13 +131,12 @@ expectCode(
   }, expected, nowMs),
   'INVALID_TICKER',
 );
-expectCode(
-  () => validateFreqtradeMarketSnapshot({
-    ...snapshot,
-    ticker: { ...snapshot.ticker, exchangeTimestampMs: nowMs - 6_000 },
-  }, expected, nowMs),
-  'INVALID_TICKER',
-);
+const staleExchangeTicker = validateFreqtradeMarketSnapshot({
+  ...snapshot,
+  ticker: { ...snapshot.ticker, exchangeTimestampMs: nowMs - 6_000 },
+}, expected, nowMs);
+assert.equal(staleExchangeTicker.candles.length, snapshot.candles.length);
+assert.equal(staleExchangeTicker.ticker, null, 'stale exchange timestamps must not invalidate otherwise fresh candles');
 expectCode(
   () => validateFreqtradeMarketSnapshot({
     ...snapshot,

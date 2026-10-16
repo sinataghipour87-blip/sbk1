@@ -87,6 +87,7 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
     const [loading, setLoading] = useState(false);
     const [actionMessage, setActionMessage] = useState<string | null>(null);
     const [loadError, setLoadError] = useState<string | null>(null);
+    const [adminTokenDraft, setAdminTokenDraft] = useState(() => localStorage.getItem('admin_token') ?? '');
 
     const getAdminToken = () => localStorage.getItem('admin_token');
 
@@ -117,6 +118,18 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
             setLoadError(error instanceof Error ? error.message : 'وضعیت سرور قابل دریافت نیست.');
         }
     }, []);
+
+    const saveAdminToken = async () => {
+        const token = adminTokenDraft.trim();
+        if (!token) {
+            localStorage.removeItem('admin_token');
+            setLoadError('توکن ادمین پاک شد؛ برای خواندن داشبورد، ADMIN_TOKEN پیکربندی‌شده در سرور را وارد کنید.');
+            setDashboard(null);
+            return;
+        }
+        localStorage.setItem('admin_token', token);
+        await refresh();
+    };
 
     useEffect(() => {
         onModeSelected('DRY_RUN', false);
@@ -236,6 +249,22 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
                         تازه‌سازی
                     </button>
                 </div>
+            </div>
+
+            <div className="mb-3 flex flex-wrap items-end gap-2 rounded border border-slate-700 bg-slate-950/70 p-3">
+                <label className="min-w-[16rem] flex-1 text-xs text-slate-300">
+                    توکن داشبورد (همان ADMIN_TOKEN سمت سرور)
+                    <input
+                        type="password"
+                        autoComplete="off"
+                        value={adminTokenDraft}
+                        onChange={(event) => setAdminTokenDraft(event.target.value)}
+                        className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-white"
+                    />
+                </label>
+                <button type="button" onClick={() => void saveAdminToken()} className="rounded bg-slate-700 px-3 py-2 text-sm">
+                    اتصال داشبورد
+                </button>
             </div>
 
             {loadError && <p role="alert" className="mb-3 rounded border border-amber-700 bg-amber-950/40 p-2 text-sm text-amber-100">{loadError}</p>}

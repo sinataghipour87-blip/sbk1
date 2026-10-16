@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const NODE_PORT = 3000;
+const DEFAULT_NODE_PORT = 3000;
 const STRATEGY_NAME = 'SbkSignalStrategy';
 const FREQTRADE_CONFIG_PATH = path.join(ROOT_DIR, 'freqtrade', 'user_data', 'config.json');
 const STRATEGY_PATH = path.join(ROOT_DIR, 'freqtrade_integration', 'strategies');
@@ -64,6 +64,7 @@ interface RuntimeSettings {
   market: 'spot' | 'futures';
   apiPort: number;
   apiHost: string;
+  nodePort: number;
 }
 
 interface SignalStoreLock {
@@ -112,6 +113,10 @@ function parseLocalHttpUrl(value: string, name: string): URL {
 }
 
 export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.ProcessEnv): RuntimeSettings {
+  const nodePort = Number(env.SBK1_PORT || DEFAULT_NODE_PORT);
+  if (!Number.isInteger(nodePort) || nodePort < 1 || nodePort > 65535) {
+    throw new Error('SBK1_PORT must be an integer between 1 and 65535.');
+  }
   const pair = requireEnv(env, 'FREQTRADE_PAIR');
   const sbkPair = requireEnv(env, 'SBK1_FREQTRADE_PAIR');
   const exchange = requireEnv(env, 'SBK1_SIGNAL_EXCHANGE').toLowerCase();
@@ -239,11 +244,11 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   }
 
   const bridgeUrl = parseLocalHttpUrl(
-    env.SBK1_BRIDGE_URL?.trim() || `http://127.0.0.1:${NODE_PORT}`,
+    env.SBK1_BRIDGE_URL?.trim() || `http://127.0.0.1:${nodePort}`,
     'SBK1_BRIDGE_URL',
   );
-  if (Number(bridgeUrl.port || (bridgeUrl.protocol === 'https:' ? 443 : 80)) !== NODE_PORT) {
-    throw new Error(`SBK1_BRIDGE_URL must use the SBK1 server port ${NODE_PORT}.`);
+  if (Number(bridgeUrl.port || (bridgeUrl.protocol === 'https:' ? 443 : 80)) !== nodePort) {
+    throw new Error(`SBK1_BRIDGE_URL must use the SBK1 server port ${nodePort}.`);
   }
 
   return {
@@ -255,6 +260,7 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
     market: config.trading_mode,
     apiPort: api.listen_port,
     apiHost: api.listen_ip_address,
+    nodePort,
   };
 }
 
@@ -425,11 +431,11 @@ function describePortListeners(port: number): string {
 }
 
 async function ensurePortsAvailable(healthDiagnostics: string[]): Promise<void> {
-  const nodeBusy = await isPortOpen(NODE_PORT);
+  const nodeBusy = await isPortOpen(settings!.nodePort);
   const freqtradeBusy = await isPortOpen(settings!.apiPort, settings!.apiHost);
   if (nodeBusy || freqtradeBusy) {
     const listeners = [
-      ...(nodeBusy ? [describePortListeners(NODE_PORT)] : []),
+      ...(nodeBusy ? [describePortListeners(settings!.nodePort)] : []),
       ...(freqtradeBusy ? [describePortListeners(settings!.apiPort)] : []),
     ];
     const health = healthDiagnostics.length > 0 ? `Health checks: ${healthDiagnostics.join('; ')}. ` : '';
@@ -544,8 +550,13 @@ function verifyStrategyDiscovery(): void {
   console.log(`[sbk1] Freqtrade discovered ${STRATEGY_NAME} successfully.`);
 }
 
-function spawnManaged(command: string, args: string[], label: string): ChildProcess {
-  const child = spawn(command, args, { cwd: ROOT_DIR, env: process.env, stdio: 'inherit' });
+function spawnManaged(
+  command: string,
+  args: string[],
+  label: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ChildProcess {
+  const child = spawn(command, args, { cwd: ROOT_DIR, env, stdio: 'inherit' });
   child.once('error', (error) => {
     console.error(`[sbk1] Could not start ${label}: ${error.message}`);
     void requestShutdown(1);
@@ -585,7 +596,7 @@ function requestShutdown(code = 0): Promise<void> {
 }
 
 async function checkSbk1Ready(): Promise<void> {
-  const response = await fetch(`http://127.0.0.1:${NODE_PORT}/api/health`, {
+  const response = await fetch(`http://127.0.0.1:${settings!.nodePort}/api/health`, {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -604,6 +615,14 @@ async function checkSbk1Ready(): Promise<void> {
 }
 
 async function statusCommand(): Promise<void> {
+  try {
+    settings = await loadRuntimeSettings();
+  } catch (error) {
+    console.error(`[sbk1] Runtime configuration check failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+    return;
+  }
+
   let nodeReady = false;
   try {
     await checkSbk1Ready();
@@ -613,7 +632,6 @@ async function statusCommand(): Promise<void> {
   }
   let freqtradeReady = false;
   try {
-    settings = await loadRuntimeSettings();
     await checkFreqtradeReady();
     freqtradeReady = true;
   } catch (error) {
@@ -698,6 +716,7 @@ async function runStack(): Promise<void> {
         STRATEGY_NAME,
       ],
       'Freqtrade',
+      { ...process.env, SBK1_BRIDGE_URL: settings.bridgeBaseUrl },
     );
     await waitFor('Freqtrade RPC and strategy', checkFreqtradeReady, freqtradeProcess);
     console.log('[sbk1] Both services are healthy. Press Ctrl+C to stop the managed stack.');
