@@ -90,6 +90,7 @@ function currentTrade(): FreqtradeTrade {
   return {
     trade_id: tradeId,
     pair,
+    enter_tag: signal.signalId,
     is_open: open,
     is_short: false,
     amount: filledAmount,
@@ -190,6 +191,7 @@ const signal = {
   generatedAtMs: nowMs,
   expiresAtMs: nowMs + 60_000,
   referencePrice: 60_000,
+  engineScore: 80,
   dataQuality: {
     status: 'LIVE' as const,
     source: 'dry-run-contract-test',
@@ -198,6 +200,7 @@ const signal = {
   },
   entryConditions: {
     setupType: 'CONTRACT_E2E_TEST_ONLY',
+    entryPrice: 60_000,
     stopLoss: 59_000,
     takeProfit: 62_000,
     maxPriceDeviationBps: 100,
@@ -278,6 +281,23 @@ async function postLifecycle(
   assert.equal(response.status, 200, `${status} callback: ${JSON.stringify(body)}`);
   assert.equal(body.signalId, signal.signalId);
   assert.equal(body.status, status);
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const archiveResponse = await fetch(`${baseUrl}/api/hunter/trade-archive/${signal.signalId}`, {
+      headers: { 'x-admin-token': adminToken },
+    });
+    if (archiveResponse.ok) {
+      const archived = await archiveResponse.json() as {
+        lifecycleEvents?: Array<{ status: string; filledAmount?: number }>;
+      };
+      if (archived.lifecycleEvents?.some((event) =>
+        event.status === status &&
+        (details.filledAmount === undefined || event.filledAmount === details.filledAmount)
+      )) return;
+    }
+    await new Promise((resolveRetry) => setTimeout(resolveRetry, 25));
+  }
+  throw new Error(`Signal lifecycle event ${status} was not persisted to the archive.`);
 }
 
 try {
@@ -325,6 +345,15 @@ try {
     signalId: string;
     lifecycleEvents: Array<{ status: string; filledAmount?: number; tradeId?: number }>;
     freqtradeTrades: Array<{ executionMode?: string; trade: FreqtradeTrade }>;
+    outcome?: {
+      source: string;
+      tradeId: number;
+      outcome: string;
+      pnlUsd: number;
+      feesUsd: number;
+      exitReason: string;
+      closedAtMs: number;
+    };
   };
   assert.equal(archivedBeforeRestart.signalId, signal.signalId);
   assert.deepEqual(
@@ -334,9 +363,7 @@ try {
     [0.0004, 0.00075],
   );
   assert.equal(archivedBeforeRestart.lifecycleEvents.at(-1)?.tradeId, tradeId);
-  assert.equal(archivedBeforeRestart.freqtradeTrades.at(-1)?.executionMode, 'DRY_RUN');
-  assert.equal(archivedBeforeRestart.freqtradeTrades.at(-1)?.trade.trade_id, tradeId);
-  assert.equal(archivedBeforeRestart.freqtradeTrades.at(-1)?.trade.orders[0]?.filled, 0.001);
+  assert.equal(archivedBeforeRestart.freqtradeTrades.length, 0, 'lifecycle persistence does not make an extra RPC call or delay the Freqtrade callback');
 
   const exitResponse = await fetch(`${baseUrl}/api/hunter/exit`, {
     method: 'POST',
@@ -362,6 +389,13 @@ try {
   assert.equal(archivedAfterRestart.freqtradeTrades.at(-1)?.executionMode, 'DRY_RUN');
   assert.equal(archivedAfterRestart.freqtradeTrades.at(-1)?.trade.is_open, false);
   assert.equal(archivedAfterRestart.freqtradeTrades.at(-1)?.trade.exit_reason, 'force_exit');
+  assert.equal(archivedAfterRestart.outcome?.source, 'FREQTRADE_RPC');
+  assert.equal(archivedAfterRestart.outcome?.tradeId, tradeId);
+  assert.equal(archivedAfterRestart.outcome?.outcome, 'WIN');
+  assert.ok(Math.abs((archivedAfterRestart.outcome?.pnlUsd ?? 0) - 0.04) < 1e-12);
+  assert.equal(archivedAfterRestart.outcome?.feesUsd, 0.06);
+  assert.equal(archivedAfterRestart.outcome?.exitReason, 'force_exit');
+  assert.equal(archivedAfterRestart.outcome?.closedAtMs, 1_800_000_003_000);
   assert.equal(forceExitRequests, 1, 'restart/archive refresh never submits another exit');
 
   const storedArchive = JSON.parse(await readFile(archivePath, 'utf8')) as {

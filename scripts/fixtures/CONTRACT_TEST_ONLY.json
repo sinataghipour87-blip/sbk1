@@ -1,0 +1,15 @@
+{
+  "purpose": "Historical OHLCV contract test only; this is not a live signal or order.",
+  "sourceFile": "freqtrade/tests/testdata/BTC_USDT-5m.feather",
+  "sourceTimeframe": "5m",
+  "derivedTimeframe": "15m",
+  "aggregation": "2025-12-04T18:00:00Z through 18:15:00Z: first open, maximum high, minimum low, last close, summed volume.",
+  "candle": {
+    "timestampMs": 1764871200000,
+    "open": 92426.77,
+    "high": 92449.55,
+    "low": 92187.52,
+    "close": 92378.82,
+    "volume": 151.23321
+  }
+}

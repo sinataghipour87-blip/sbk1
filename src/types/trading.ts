@@ -143,6 +143,7 @@ export interface RealOrderBookImbalance {
   spreadUsd?: number | null;
   levelsCount: number;
   status: FeedStatus;
+  error?: string;
   timestamp: number;
   ageMs: number;
   latencyMs: number;
@@ -187,7 +188,7 @@ export interface OrderFlowFeatures {
 }
 
 export interface CanonicalExchangeFeed {
-  exchange: 'BYBIT' | 'KUCOIN' | 'BINANCE' | 'COINBASE' | 'OKX';
+  exchange: 'BYBIT' | 'KUCOIN' | 'COINBASE' | 'OKX';
   marketType: 'SPOT' | 'PERPETUAL_FUTURES' | 'PERPETUAL' | 'DELIVERY_FUTURES';
   symbol: string;
   contract?: string;
@@ -234,9 +235,9 @@ export interface FearAndGreed {
 }
 
 export interface SentimentData {
-  score: number; // -1 to 1
-  label: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL';
-  trend: 'UP' | 'DOWN' | 'STABLE';
+  score: number | null; // -1 to 1; null when unavailable
+  label: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL' | 'UNAVAILABLE';
+  trend: 'UP' | 'DOWN' | 'STABLE' | 'UNAVAILABLE';
   drivers: string[];
   status?: 'LIVE' | 'PROTECTED' | 'UNAVAILABLE';
 }
@@ -271,6 +272,7 @@ export interface DerivativesData {
   ageMs?: number;
   latencyMs?: number;
   source?: string;
+  error?: string;
 }
 
 export type SignalLifecycleState = 'SETUP_IDENTIFIED' | 'ARMED' | 'TRIGGERED' | 'EXECUTED' | 'MANAGED' | 'CANCELLED';
@@ -624,6 +626,7 @@ export interface DecisionPipelineStageState {
 export interface DecisionPipelineResult {
   decision: 'EXECUTE_APPROVED' | 'WAIT_NO_TRADE';
   direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  signalCandidate?: DirectionalSignalCandidate;
   activeStage: PipelineStageId;
   stages: DecisionPipelineStageState[];
   passedStagesCount: number;
@@ -640,6 +643,15 @@ export interface DecisionPipelineResult {
   waitReasonFa: string;
   prerequisitesToArmFa: string[];
   evaluatedAtIso: string;
+}
+
+export interface DirectionalSignalCandidate {
+  direction: 'LONG' | 'SHORT';
+  entryPrice: number;
+  stopLoss: number;
+  takeProfit: number;
+  engineScore: number;
+  setupType: string;
 }
 
 export interface UserSettings {

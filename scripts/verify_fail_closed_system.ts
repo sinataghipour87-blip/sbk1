@@ -15,7 +15,10 @@ const storageMock = (() => {
 
 import { hunterExecutionEngine } from '../src/services/hunterExecutionEngine';
 import { orderFlowEngine } from '../src/services/orderFlowEngine';
-import { computeCentralCalibratedProbability } from '../src/services/centralProbabilityEngine';
+import {
+  computeCentralCalibratedProbability,
+  evaluateRealLearnedSegmentMetrics,
+} from '../src/services/centralProbabilityEngine';
 import { runPreTradeRiskGate, verifyAutoTradePrerequisites } from '../src/services/autoTradeGuard';
 import { riskEngine } from '../src/services/productionGateThreeLayerEngine';
 import { MissingDataIntegrityGuardService } from '../src/services/missingDataIntegrityGuard';
@@ -31,10 +34,85 @@ import { autoTradeDecisionTracer } from '../src/services/autoTradeGuard';
 import { evaluateSignalToExecution } from '../src/services/signalToExecution';
 import { predict30mTrendReversalPatternLayer } from '../src/services/predictiveEngine';
 import { centralPriceSourcePolicy } from '../src/services/priceSourcePolicy';
+import { centralTradeDatasetService } from '../src/services/centralTradeDataset';
 
 console.log('🧪 Starting 18 Mandatory System & Fail-Closed Integrity Verification Tests...');
 
 async function runTests() {
+  storageMock.setItem('quantum_central_predictions_dataset', JSON.stringify([{ outcome: 'WIN' }]));
+  assert.deepStrictEqual(
+    centralTradeDatasetService.getAllPredictions(),
+    [],
+    'browser localStorage must never be used as a training dataset',
+  );
+  assert.equal(
+    centralTradeDatasetService.isSegmentActivated('15m', 'LONG', 'TREND').isAllowed,
+    true,
+    'historical archive statistics must never gate execution',
+  );
+  const originalFetch = globalThis.fetch;
+  async function namedArchiveTrainingFetchMock(): Promise<Response> {
+    return new Response(JSON.stringify({
+      records: [{
+        signalId: 'archive-training-signal',
+        decisionId: 'archive-training-decision',
+        modelVersion: 'archive-model-v1',
+        featureVersion: 'archive-features-v1',
+        featureSnapshot: {
+          price: 100,
+          scoreLong: 4,
+          scoreShort: 1,
+          obi: 0.2,
+          rsi: 55,
+          adx: 25,
+          volatilityPct: 1,
+          ema20: 101,
+          ema50: 100,
+          ema200: 99,
+          setupType: 'SWEEP',
+          marketRegime: 'TREND',
+          timeframe: '15m',
+        },
+        decision: {
+          signalId: 'archive-training-signal',
+          decisionId: 'archive-training-decision',
+          generatedAtMs: 1_800_000_000_000,
+          direction: 'LONG',
+          exchange: 'bybit',
+          pair: 'BTC/USDT:USDT',
+          timeframe: '15m',
+          entryConditions: {
+            setupType: 'SWEEP:1800000000000',
+            entryPrice: 100,
+            stopLoss: 98,
+            takeProfit: 104,
+          },
+        },
+        outcome: {
+          source: 'FREQTRADE_RPC',
+          tradeId: 73,
+          outcome: 'WIN',
+          pnlUsd: 1,
+          feesUsd: 0.1,
+          exitReason: 'roi',
+          closedAtMs: 1_800_000_060_000,
+        },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  globalThis.fetch = namedArchiveTrainingFetchMock;
+  try {
+    assert.equal(await centralTradeDatasetService.refreshTrainingArchive('named-admin-token'), 1);
+    assert.equal(centralTradeDatasetService.getFreqtradeVerifiedPredictions().length, 1);
+    const insufficientMetrics = evaluateRealLearnedSegmentMetrics('SWEEP', 'TREND', '15m');
+    assert.equal(insufficientMetrics.sampleSize, 1);
+    assert.equal(insufficientMetrics.calibratedWinProbability, null);
+    assert.equal(insufficientMetrics.calibrationStatus, 'UNCALIBRATED');
+  } finally {
+    centralTradeDatasetService.clearServerTrainingArchive();
+    globalThis.fetch = originalFetch;
+  }
+
   // =========================================================================
   // سناریو ۱: داده بازار ناموجود -> هیچ سفارش واقعی ارسال نشود
   // =========================================================================
@@ -83,7 +161,7 @@ async function runTests() {
   console.log('✅ سناریو ۳ پاس شد: داده مصنوعی در محیط لایو مسدود شد.');
 
   // =========================================================================
-  // سناریو ۴: احتمال برد نامعتبر یا کالیبره‌نشده -> سفارش مسدود شود
+  // سناریو ۴: نبود کالیبراسیون فقط اطلاعاتی است و نباید دروازه probability را ببندد.
   // =========================================================================
   const uncalibratedGate = runPreTradeRiskGate({
     price: 88000,
@@ -102,8 +180,51 @@ async function runTests() {
     winProb: null,
     expectedValue: null
   });
-  assert.strictEqual(uncalibratedGate.allPassed, false, 'Uncalibrated probability must fail allPassed');
-  console.log('✅ سناریو ۴ پاس شد: احتمال برد کالیبره‌نشده فوراً مسدود شد.');
+  assert.strictEqual(uncalibratedGate.probabilityGate, true, 'Missing calibration must not block the technical risk gate');
+  assert.ok(
+    uncalibratedGate.reasonsFa.some((reason) => reason.includes('information only')),
+    'Missing calibration must remain visible as an informational note',
+  );
+
+  const wrongSideStopGate = runPreTradeRiskGate({
+    price: 88000,
+    dataStatus: 'LIVE',
+    canonicalSnapshot: { timestampUtc: Date.now(), basisSpreadBps: 2.0 },
+    signalOk: true,
+    entryTiming: 'IMMEDIATE',
+  } as any, [], [], {
+    side: 'LONG',
+    qty: 0.1,
+    price: 88000,
+    stopLoss: 89000,
+    takeProfit: 91000,
+    availableBalanceUsdt: 5000,
+    winProb: null,
+    expectedValue: null,
+  });
+  assert.strictEqual(wrongSideStopGate.stopValidity, false, 'A stop on the wrong side must remain a technical blocker');
+  assert.strictEqual(wrongSideStopGate.allPassed, false, 'Invalid stop must block order approval');
+  const heuristicRiskVerdict = riskEngine.evaluateRiskGate({
+    predictionId: 'PRED_UNCALIBRATED',
+    generatedAt: Date.now(),
+    symbol: 'BTCUSDT',
+    direction: 'LONG',
+    setupType: 'SWEEP',
+    entryTarget: 88000,
+    stopLoss: 87000,
+    takeProfit1: 91000,
+    takeProfit2: 92000,
+    takeProfit3: 93000,
+    calibratedProbabilityPct: null,
+    expectedValueUsd: null,
+    confidenceInterval: null,
+    signalOk: true,
+    modelVersion: 'heuristic-test',
+    rawAnalysis: null,
+  }, { availableBalanceUsdt: 5000, maxEquityUsd: 5000, currentEquityUsd: 5000 }, [], []);
+  assert.strictEqual(heuristicRiskVerdict.isApproved, true, 'Missing calibration and archive EV must not block otherwise safe risk approval');
+  assert.ok(heuristicRiskVerdict.informationalNotesFa.length > 0, 'Missing statistical evidence must remain visible as information');
+  console.log('✅ سناریو ۴ پاس شد: نبود کالیبراسیون اطلاعاتی است و حد ضرر فنی نامعتبر همچنان مسدود شد.');
 
   // =========================================================================
   // سناریو ۵: حد ضرر یا حجم نامعتبر -> سفارش رد شود
@@ -252,8 +373,8 @@ async function runTests() {
     rawAnalysis: null
   }, { availableBalanceUsdt: 8000, maxEquityUsd: 10000, currentEquityUsd: 8500 }, [], [
     // معاملات ضررده روزانه فراتر از حد مجاز
-    { id: 'L1', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: '', pnlUsd: -400, pnlPct: -40 },
-    { id: 'L2', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: '', pnlUsd: -350, pnlPct: -35 },
+    { id: 'L1', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: new Date().toISOString(), pnlUsd: -400, pnlPct: -40 },
+    { id: 'L2', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: new Date().toISOString(), pnlUsd: -350, pnlPct: -35 },
   ]);
   assert.strictEqual(dailyLossBlocked.isApproved, false, 'Daily loss limit breach must reject new orders');
   console.log('✅ سناریو ۱۶ پاس شد: تخطی از حد ضرر روزانه مانع ورود جدید شد.');
@@ -276,7 +397,7 @@ async function runTests() {
     receivedTimestampUtc: Date.now(),
     symbol: 'BTCUSDT',
     timeframe: 'TICK',
-    source: 'bybit',
+    source: 'freqtrade.dataprovider',
     status: 'LIVE',
     quality: 'HIGH',
   });
@@ -523,6 +644,36 @@ async function runTests() {
   const mockDqr = { overallScore: 90, isTradeAllowed: true, status: 'LIVE' as const, reasonsFa: [], feeds: {} as any };
   const analysisLow = analyzePro(mockCandles, mockFng, mockSent, {}, undefined, 0, lowBalance, 1.0, mockCandles, 'LIVE', mockDqr);
   const analysisHigh = analyzePro(mockCandles, mockFng, mockSent, {}, undefined, 0, highBalance, 1.0, mockCandles, 'LIVE', mockDqr);
+
+  const partialFeedAnalysis = analyzePro(
+    mockCandles,
+    mockFng,
+    mockSent,
+    {},
+    undefined,
+    0,
+    lowBalance,
+    1.0,
+    mockCandles,
+    'STALE',
+    {
+      overallScore: 60,
+      isTradeAllowed: false,
+      status: 'STALE',
+      reasonsFa: ['Open Interest and trade-level CVD are unavailable.'],
+      feeds: {
+        candles: { status: 'LIVE', ageMs: 500 },
+        futuresPrices: { status: 'LIVE', ageMs: 500 },
+      },
+    } as any,
+    undefined,
+    undefined,
+    { status: 'LIVE', ageMs: 500, lastPrice: mockCandles.at(-1)[3] } as any,
+  );
+  assert.ok(partialFeedAnalysis.ema20.length > 0, 'Fresh primary feeds must run technical analysis when supplemental feeds are absent');
+  assert.strictEqual(partialFeedAnalysis.dataStatus, 'STALE', 'Incomplete supplemental feeds must remain visible as stale quality');
+  assert.strictEqual(partialFeedAnalysis.signalOk, false, 'Incomplete required feeds must still block trades');
+  assert.strictEqual(partialFeedAnalysis.entryTiming, 'NO_TRADE', 'Incomplete required feeds must retain the no-trade gate');
 
   // بررسی عدم انتخاب اهرم قبل از تعیین بودجه ریسک و عدم تخصیص ساده ۱۵٪
   assert.ok(analysisLow.margin > 0, 'Margin must be calculated based on risk budget');

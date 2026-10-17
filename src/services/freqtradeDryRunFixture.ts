@@ -92,6 +92,7 @@ export function createDryRunFixtureSignal(input: {
       generatedAtMs: input.nowMs,
       expiresAtMs: input.nowMs + 60_000,
       referencePrice: input.referencePrice,
+      engineScore: 80,
       dataQuality: {
         status: 'LIVE',
         source: input.source,
@@ -100,6 +101,7 @@ export function createDryRunFixtureSignal(input: {
       },
       entryConditions: {
         setupType,
+        entryPrice: input.referencePrice,
         stopLoss,
         takeProfit,
         maxPriceDeviationBps: 100,

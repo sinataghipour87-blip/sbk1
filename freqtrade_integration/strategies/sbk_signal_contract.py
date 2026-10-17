@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 SIGNAL_CONTRACT_VERSION = "sbk1.freqtrade.signal.v1"
 DRY_RUN_FIXTURE_SETUP_PREFIX = "DRY_RUN_E2E_FIXTURE_"
 _SIGNAL_ID_PATTERN = re.compile(r"^sbk1_[a-f0-9]{32}$")
+_EXIT_SIGNAL_ID_PATTERN = re.compile(r"^sbk1_exit_[a-f0-9]{32}$")
+_EXIT_ENTRY_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _PAIR_PATTERN = re.compile(r"^[A-Z0-9]{2,20}/[A-Z0-9]{2,20}(?::[A-Z0-9]{2,20})?$")
 _TIMEFRAME_PATTERN = re.compile(r"^\d+[mhdw]$")
 
@@ -53,8 +55,49 @@ def validate_bridge_url(value: str) -> str:
     return value.rstrip("/")
 
 
-def is_dry_run_fixture_runtime(config: dict[str, Any], runmode: str) -> bool:
-    return config.get("dry_run") is True and runmode == "dry_run"
+def is_signal_runtime(runmode: str) -> bool:
+    return runmode in ("dry_run", "live")
+
+
+def is_valid_sbk_exit_signal(
+    signal: Any,
+    *,
+    now_ms: int,
+    expected_pair: str,
+) -> bool:
+    if not isinstance(signal, dict):
+        return False
+    trade_id = signal.get("tradeId")
+    entry_tag = signal.get("entryTag")
+    has_trade_id = isinstance(trade_id, int) and not isinstance(trade_id, bool) and trade_id > 0
+    has_entry_tag = isinstance(entry_tag, str) and bool(_EXIT_ENTRY_TAG_PATTERN.fullmatch(entry_tag))
+    generated_at_ms = signal.get("generatedAtMs")
+    expires_at_ms = signal.get("expiresAtMs")
+    reason = signal.get("reason")
+    return (
+        signal.get("contractVersion") == SIGNAL_CONTRACT_VERSION
+        and signal.get("signalType") == "EXIT"
+        and isinstance(signal.get("exitId"), str)
+        and bool(_EXIT_SIGNAL_ID_PATTERN.fullmatch(signal["exitId"]))
+        and signal.get("pair") == expected_pair
+        and isinstance(signal.get("pair"), str)
+        and bool(_PAIR_PATTERN.fullmatch(signal["pair"]))
+        and signal.get("direction") in ("LONG", "SHORT")
+        and (has_trade_id or has_entry_tag)
+        and (trade_id is None or has_trade_id)
+        and (entry_tag is None or has_entry_tag)
+        and isinstance(reason, str)
+        and bool(reason.strip())
+        and len(reason) <= 240
+        and isinstance(generated_at_ms, int)
+        and not isinstance(generated_at_ms, bool)
+        and generated_at_ms <= now_ms + 1_000
+        and isinstance(expires_at_ms, int)
+        and not isinstance(expires_at_ms, bool)
+        and expires_at_ms > now_ms
+        and expires_at_ms > generated_at_ms
+        and expires_at_ms - generated_at_ms <= 120_000
+    )
 
 
 def unresolved_inflight_signal_ids(
@@ -100,7 +143,7 @@ def is_valid_sbk_signal(
         and entry_conditions["setupType"].startswith(DRY_RUN_FIXTURE_SETUP_PREFIX)
     )
     maximum_signal_age_ms = 55_000 if is_dry_run_fixture else 15_000
-    maximum_data_age_ms = 55_000 if is_dry_run_fixture else 5_000
+    maximum_data_age_ms = 55_000 if is_dry_run_fixture else 15_000
 
     decision_id = signal.get("decisionId")
     signal_id = signal.get("signalId")
@@ -139,7 +182,7 @@ def is_valid_sbk_signal(
         or (require_fresh and now_ms - generated_at_ms > maximum_signal_age_ms)
         or (require_fresh and expires_at_ms <= now_ms)
         or expires_at_ms <= generated_at_ms
-        or expires_at_ms - generated_at_ms > 60_000
+        or expires_at_ms - generated_at_ms > 120_000
         or data_quality.get("status") != "LIVE"
         or not isinstance(data_quality.get("source"), str)
         or not data_quality["source"].strip()
@@ -151,12 +194,19 @@ def is_valid_sbk_signal(
         return False
 
     reference_price = signal.get("referencePrice")
+    engine_score = signal.get("engineScore")
+    evidence_level = signal.get("evidenceLevel", "UNCALIBRATED_HEURISTIC")
+    entry_price = entry_conditions.get("entryPrice")
     stop_loss = entry_conditions.get("stopLoss")
     take_profit = entry_conditions.get("takeProfit")
     max_price_deviation_bps = entry_conditions.get("maxPriceDeviationBps")
     setup_type = entry_conditions.get("setupType")
     if (
         not _positive_number(reference_price)
+        or "engineScore" not in signal
+        or (engine_score is not None and (not _finite_number(engine_score) or not 0 <= engine_score <= 100))
+        or evidence_level != "UNCALIBRATED_HEURISTIC"
+        or not _positive_number(entry_price)
         or not _positive_number(stop_loss)
         or not _positive_number(take_profit)
         or not _positive_number(max_price_deviation_bps)
@@ -179,14 +229,15 @@ def is_valid_sbk_signal(
         return False
 
     if signal["direction"] == "LONG":
-        if not stop_loss < reference_price < take_profit:
+        if not stop_loss < entry_price < take_profit:
             return False
-    elif not take_profit < reference_price < stop_loss:
+    elif not take_profit < entry_price < stop_loss:
         return False
 
-    risk_distance = abs(reference_price - stop_loss)
-    reward_distance = abs(take_profit - reference_price)
-    if reward_distance < risk_distance:
+    risk_distance = abs(entry_price - stop_loss)
+    reward_distance = abs(take_profit - entry_price)
+    entry_deviation_bps = abs(entry_price - reference_price) / reference_price * 10_000
+    if reward_distance < risk_distance or entry_deviation_bps > max_price_deviation_bps:
         return False
 
     return True

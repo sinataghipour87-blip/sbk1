@@ -587,14 +587,6 @@ export class DataProvenanceLayerService {
       contractMultiplier: 1.0,
       volumeUnit: 'CONTRACT',
     },
-    'BINANCE:BTCUSDT': {
-      canonicalBase: 'BTC',
-      canonicalQuote: 'USDT',
-      marketType: 'LINEAR_PERPETUAL',
-      settlementCoin: 'USDT',
-      contractMultiplier: 1.0,
-      volumeUnit: 'BTC',
-    },
   };
 
   /**

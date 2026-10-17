@@ -20,7 +20,7 @@ export interface PriceContextMap {
   receivedTimestampUtc: number;
   symbol: string;
   timeframe: 'TICK';
-  source: 'bybit' | 'binance' | 'okx';
+  source: 'freqtrade.dataprovider';
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   quality: 'HIGH' | 'DEGRADED' | 'UNRELIABLE' | 'UNKNOWN';
   spreadBps?: number | null;

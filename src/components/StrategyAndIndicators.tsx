@@ -100,8 +100,8 @@ export const StrategyAndIndicators: React.FC<StrategyAndIndicatorsProps> = ({ an
               <div className="p-2 rounded-xl bg-[#020b17] border border-cyan-950 col-span-2">
                 <span className="text-[10px] text-slate-400 block">اخبار و سنتیمنت شبکه اجتماعی:</span>
                 <div className="flex items-center gap-3 mt-1">
-                  <span className={`font-bold ${analysis.sentiment.score > 0 ? 'text-emerald-400' : analysis.sentiment.score < 0 ? 'text-rose-400' : 'text-slate-200'}`}>
-                     {analysis.sentiment.label} ({analysis.sentiment.score.toFixed(2)})
+                  <span className={`font-bold ${analysis.sentiment.score === null ? 'text-slate-400' : analysis.sentiment.score > 0 ? 'text-emerald-400' : analysis.sentiment.score < 0 ? 'text-rose-400' : 'text-slate-200'}`}>
+                     {analysis.sentiment.score === null ? 'UNAVAILABLE' : `${analysis.sentiment.label} (${analysis.sentiment.score.toFixed(2)})`}
                   </span>
                   <span className="text-xs text-slate-400">روند: {analysis.sentiment.trend}</span>
                 </div>

@@ -110,14 +110,21 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
             if (!response.ok) {
                 throw new Error(payload.error || `HTTP ${response.status}`);
             }
-            if (settings.mode !== 'DRY_RUN' || settings.selectedProfile !== 'DEMO') {
-                throw new Error('حالت انتخاب‌شده از سرور با پروفایل DEMO تطبیق ندارد.');
+            const liveSelected = settings.mode === 'LIVE' && settings.selectedProfile === 'LIVE';
+            const demoSelected = settings.mode === 'DRY_RUN' && settings.selectedProfile === 'DEMO';
+            if (
+                (!liveSelected && !demoSelected) ||
+                (liveSelected && (payload.freqtradeMode !== 'LIVE' || payload.modeMatchesSelection !== true)) ||
+                (demoSelected && payload.freqtradeMode !== 'DEMO' && payload.freqtradeMode !== 'UNKNOWN')
+            ) {
+                throw new Error('حالت واقعی Freqtrade از RPC با انتخاب سرور تطبیق ندارد.');
             }
+            onModeSelected(settings.mode, liveSelected);
             setLoadError(null);
         } catch (error) {
             setLoadError(error instanceof Error ? error.message : 'وضعیت سرور قابل دریافت نیست.');
         }
-    }, []);
+    }, [onModeSelected]);
 
     const saveAdminToken = async () => {
         const token = adminTokenDraft.trim();
@@ -132,7 +139,6 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
     };
 
     useEffect(() => {
-        onModeSelected('DRY_RUN', false);
         void refresh();
         const interval = window.setInterval(() => void refresh(), 5_000);
         return () => window.clearInterval(interval);

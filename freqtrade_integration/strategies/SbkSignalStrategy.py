@@ -10,7 +10,8 @@ from pandas import DataFrame
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
 from sbk_signal_contract import (
-    is_dry_run_fixture_runtime,
+    is_signal_runtime,
+    is_valid_sbk_exit_signal,
     is_valid_sbk_signal,
     unresolved_inflight_signal_ids,
     validate_bridge_url,
@@ -19,6 +20,7 @@ from sbk_signal_contract import (
 
 logger = logging.getLogger(__name__)
 INFORMATIVE_TIMEFRAMES = ("1m", "5m", "1h", "4h")
+MARKET_SNAPSHOT_PUBLISH_INTERVAL_MS = 1_000
 
 
 class SbkSignalStrategy(IStrategy):
@@ -27,7 +29,7 @@ class SbkSignalStrategy(IStrategy):
     can_short = True
     process_only_new_candles = False
 
-    minimal_roi = {"0": 100.0}
+    minimal_roi = {}
     stoploss = -0.05
     trailing_stop = False
     use_custom_stoploss = True
@@ -38,6 +40,8 @@ class SbkSignalStrategy(IStrategy):
         self._signals: dict[str, dict[str, Any]] = {}
         self._signal_statuses: dict[str, str] = {}
         self._signals_by_pair: dict[str, dict[str, Any]] = {}
+        self._exit_signals: dict[str, dict[str, Any]] = {}
+        self._consumed_exit_ids: set[str] = set()
         self._market_snapshot_last_publish_ms = 0
         self._pair = os.getenv("SBK1_FREQTRADE_PAIR", "")
         try:
@@ -67,16 +71,17 @@ class SbkSignalStrategy(IStrategy):
         self._signals = {}
         self._signal_statuses = {}
         self._signals_by_pair = {}
+        self._exit_signals = {}
         runmode = getattr(self.config.get("runmode"), "value", self.config.get("runmode"))
         if runmode in ("dry_run", "live"):
             self._publish_market_snapshot(current_time)
-        if not is_dry_run_fixture_runtime(self.config, runmode):
+        if not is_signal_runtime(runmode):
             return
         if len(self._bridge_token) < 32 or not self._pair or not self._bridge_url:
             return
 
         try:
-            logger.debug("Polling the SBK1 bridge for dry-run fixtures for pair %s.", self._pair)
+            logger.debug("Polling the SBK1 bridge for signals for pair %s.", self._pair)
             response = requests.get(
                 f"{self._bridge_url}/api/freqtrade/signals",
                 headers={"Authorization": f"Bearer {self._bridge_token}"},
@@ -93,6 +98,16 @@ class SbkSignalStrategy(IStrategy):
             if not isinstance(records, list):
                 logger.error("SBK1 signal bridge returned an invalid signal list.")
                 return
+            exit_signals = payload.get("exitSignals", [])
+            if not isinstance(exit_signals, list):
+                logger.error("SBK1 signal bridge returned an invalid exit signal list.")
+                return
+            now_ms = int(current_time.timestamp() * 1000)
+            self._exit_signals = {
+                signal["exitId"]: signal
+                for signal in exit_signals
+                if is_valid_sbk_exit_signal(signal, now_ms=now_ms, expected_pair=self._pair)
+            }
             logger.debug("SBK1 bridge returned %d signal record(s).", len(records))
 
             inflight_signal_records = [
@@ -250,7 +265,7 @@ class SbkSignalStrategy(IStrategy):
         now_ms = int(current_time.timestamp() * 1000)
         if (
             len(bridge_token) < 32 or not bridge_url or not pair or data_provider is None
-            or now_ms - getattr(self, "_market_snapshot_last_publish_ms", 0) < 10_000
+            or now_ms - getattr(self, "_market_snapshot_last_publish_ms", 0) < MARKET_SNAPSHOT_PUBLISH_INTERVAL_MS
         ):
             return False
 
@@ -519,8 +534,7 @@ class SbkSignalStrategy(IStrategy):
         signal = self._signals_by_pair.get(pair)
         if not signal or signal["timeframe"] != self.timeframe:
             return dataframe
-        if not is_dry_run_fixture_runtime(
-            self.config,
+        if not is_signal_runtime(
             getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
         ):
             return dataframe
@@ -537,7 +551,7 @@ class SbkSignalStrategy(IStrategy):
                 return dataframe
         drift_bps = abs(price - signal["referencePrice"]) / signal["referencePrice"] * 10_000
         if drift_bps > signal["entryConditions"]["maxPriceDeviationBps"]:
-            self._post_status(signal["signalId"], "REJECTED", "Freqtrade candle price exceeded the fixture deviation limit.")
+            self._post_status(signal["signalId"], "REJECTED", "Freqtrade candle price exceeded the signal deviation limit.")
             return dataframe
 
         last_index = dataframe.index[-1]
@@ -552,7 +566,46 @@ class SbkSignalStrategy(IStrategy):
         dataframe.loc[:, "exit_long"] = 0
         dataframe.loc[:, "exit_short"] = 0
         dataframe.loc[:, "exit_tag"] = ""
+        if dataframe.empty or not is_signal_runtime(
+            getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
+        ):
+            return dataframe
+        pair = metadata.get("pair")
+        latest = dataframe.iloc[-1]
+        current_entry_tag = latest.get("enter_tag")
+        if not isinstance(current_entry_tag, str):
+            return dataframe
+        for exit_id, signal in self._exit_signals.items():
+            if (
+                exit_id in self._consumed_exit_ids
+                or signal["pair"] != pair
+                or signal.get("entryTag") != current_entry_tag
+                or int(datetime.now(UTC).timestamp() * 1000) >= signal["expiresAtMs"]
+            ):
+                continue
+            last_index = dataframe.index[-1]
+            if signal["direction"] == "LONG":
+                dataframe.loc[last_index, "exit_long"] = 1
+            else:
+                dataframe.loc[last_index, "exit_short"] = 1
+            dataframe.loc[last_index, "exit_tag"] = f"sbk_exit_{exit_id}"
+            break
         return dataframe
+
+    def custom_entry_price(
+        self,
+        pair: str,
+        trade: Trade | None,
+        current_time: datetime,
+        proposed_rate: float,
+        entry_tag: str | None,
+        side: str,
+        **kwargs: Any,
+    ) -> float:
+        signal = self._signals.get(entry_tag or "")
+        if not signal or pair != signal["pair"] or side.lower() != signal["direction"].lower():
+            return proposed_rate
+        return float(signal["entryConditions"]["entryPrice"])
 
     def confirm_trade_entry(
         self,
@@ -568,12 +621,10 @@ class SbkSignalStrategy(IStrategy):
     ) -> bool:
         signal = self._signals.get(entry_tag or "")
         if (
-            not is_dry_run_fixture_runtime(
-                self.config,
+            not is_signal_runtime(
                 getattr(self.config.get("runmode"), "value", self.config.get("runmode")),
             )
-            or
-            not signal
+            or not signal
             or self._signal_statuses.get(entry_tag or "") != "ACCEPTED"
             or not self._is_valid_signal(
                 signal,
@@ -670,19 +721,40 @@ class SbkSignalStrategy(IStrategy):
         **kwargs: Any,
     ) -> float:
         signal = self._signals.get(entry_tag or "")
-        if not signal or current_rate <= 0 or max_stake <= 0:
+        if (
+            not signal
+            or not math.isfinite(current_rate)
+            or current_rate <= 0
+            or not math.isfinite(max_stake)
+            or max_stake <= 0
+            or not math.isfinite(proposed_stake)
+            or proposed_stake <= 0
+            or not math.isfinite(leverage)
+            or leverage <= 0
+        ):
             return 0.0
         stop_fraction = abs(current_rate - signal["entryConditions"]["stopLoss"]) / current_rate
-        if not math.isfinite(stop_fraction) or stop_fraction <= 0 or leverage <= 0:
+        if not math.isfinite(stop_fraction) or stop_fraction <= 0:
             return 0.0
-        risk_budget = max_stake * signal["riskLimits"]["riskBudgetPct"] / 100
-        risk_limited_stake = risk_budget / stop_fraction / leverage
-        selected_stake = min(
-            risk_limited_stake,
+
+        configured_stake = self.config.get("stake_amount")
+        if isinstance(configured_stake, (int, float)):
+            if isinstance(configured_stake, bool) or not math.isfinite(configured_stake) or configured_stake <= 0:
+                return 0.0
+            configured_stake_cap = float(configured_stake)
+        else:
+            configured_stake_cap = max_stake
+        stake_cap = min(
             max_stake,
-            signal["riskLimits"]["maxStakeQuote"],
+            configured_stake_cap,
+            float(signal["riskLimits"]["maxStakeQuote"]),
             proposed_stake,
         )
+        risk_budget = stake_cap * signal["riskLimits"]["riskBudgetPct"] / 100
+        risk_limited_stake = risk_budget / stop_fraction / leverage
+        selected_stake = min(risk_limited_stake, stake_cap)
+        if not math.isfinite(selected_stake):
+            return 0.0
         if min_stake is not None and selected_stake < min_stake:
             return 0.0
         return max(0.0, selected_stake)
@@ -690,7 +762,15 @@ class SbkSignalStrategy(IStrategy):
     def order_filled(self, pair: str, trade: Any, order: Any, current_time: datetime, **kwargs: Any) -> None:
         signal_id = getattr(trade, "enter_tag", None)
         signal = self._signals.get(signal_id or "")
-        if not signal or getattr(order, "ft_order_side", "").lower() != ("sell" if trade.is_short else "buy"):
+        order_side = getattr(order, "ft_order_side", "").lower()
+        if order_side == ("buy" if trade.is_short else "sell"):
+            exit_id = trade.get_custom_data("sbk_exit_signal_id")
+            if isinstance(exit_id, str) and not getattr(trade, "is_open", True):
+                self._post_exit_status(exit_id, "CLOSED", "Freqtrade confirmed the SBK1-directed position close.")
+                self._consumed_exit_ids.add(exit_id)
+                self._exit_signals.pop(exit_id, None)
+            return
+        if not signal or order_side != ("sell" if trade.is_short else "buy"):
             return
         average_fill_price = float(getattr(order, "safe_price", 0) or 0)
         trade.set_custom_data("sbk_signal", signal)
@@ -717,8 +797,17 @@ class SbkSignalStrategy(IStrategy):
         signal = trade.get_custom_data("sbk_signal")
         if not isinstance(signal, dict):
             signal = self._signals.get(getattr(trade, "enter_tag", "") or "")
-        if not signal or current_rate <= 0:
-            return None
+        if (
+            not isinstance(signal, dict)
+            or not isinstance(signal.get("entryConditions"), dict)
+            or not isinstance(signal["entryConditions"].get("stopLoss"), (int, float))
+            or isinstance(signal["entryConditions"].get("stopLoss"), bool)
+            or not math.isfinite(signal["entryConditions"]["stopLoss"])
+            or signal["entryConditions"]["stopLoss"] <= 0
+            or not math.isfinite(current_rate)
+            or current_rate <= 0
+        ):
+            return self.stoploss
         return stoploss_from_absolute(
             float(signal["entryConditions"]["stopLoss"]),
             current_rate,
@@ -735,15 +824,56 @@ class SbkSignalStrategy(IStrategy):
         current_profit: float,
         **kwargs: Any,
     ) -> str | None:
-        signal = trade.get_custom_data("sbk_signal")
-        if not isinstance(signal, dict):
-            signal = self._signals.get(getattr(trade, "enter_tag", "") or "")
-        if not signal:
-            return None
-        target = float(signal["entryConditions"]["takeProfit"])
-        if (trade.is_short and current_rate <= target) or (not trade.is_short and current_rate >= target):
-            return "sbk_take_profit"
+        entry_tag = getattr(trade, "enter_tag", None)
+        trade_id = getattr(trade, "id", None)
+        direction = "SHORT" if getattr(trade, "is_short", False) else "LONG"
+        now_ms = int(current_time.timestamp() * 1000)
+        for exit_id, signal in self._exit_signals.items():
+            if (
+                exit_id not in self._consumed_exit_ids
+                and is_valid_sbk_exit_signal(signal, now_ms=now_ms, expected_pair=pair)
+                and (signal.get("tradeId") is None or signal["tradeId"] == trade_id)
+                and (signal.get("entryTag") is None or signal["entryTag"] == entry_tag)
+                and signal["direction"] == direction
+            ):
+                trade.set_custom_data("sbk_exit_signal_id", exit_id)
+                return f"sbk_exit_{exit_id}"
         return None
+
+    def confirm_trade_exit(
+        self,
+        pair: str,
+        trade: Any,
+        order_type: str,
+        amount: float,
+        rate: float,
+        time_in_force: str,
+        exit_reason: str,
+        current_time: datetime,
+        **kwargs: Any,
+    ) -> bool:
+        if exit_reason in ("stop_loss", "stoploss_on_exchange", "emergency_exit", "force_exit"):
+            return True
+        if not exit_reason.startswith("sbk_exit_") and exit_reason != "exit_signal":
+            return False
+        entry_tag = getattr(trade, "enter_tag", None)
+        trade_id = getattr(trade, "id", None)
+        direction = "SHORT" if getattr(trade, "is_short", False) else "LONG"
+        requested_exit_id = exit_reason.removeprefix("sbk_exit_")
+        for exit_id, signal in self._exit_signals.items():
+            if (
+                (exit_reason == "exit_signal" or exit_id == requested_exit_id)
+                and signal["pair"] == pair
+                and (signal.get("tradeId") is None or signal["tradeId"] == trade_id)
+                and (signal.get("entryTag") is None or signal["entryTag"] == entry_tag)
+                and signal["direction"] == direction
+                and current_time.timestamp() * 1000 < signal["expiresAtMs"]
+            ):
+                self._post_exit_status(exit_id, "CONFIRMED", "Freqtrade accepted the SBK1-directed exit order.")
+                self._consumed_exit_ids.add(exit_id)
+                trade.set_custom_data("sbk_exit_signal_id", exit_id)
+                return True
+        return False
 
     def _is_valid_signal(
         self,
@@ -791,6 +921,23 @@ class SbkSignalStrategy(IStrategy):
             return True
         except (requests.RequestException, ValueError) as exc:
             logger.error("Could not persist Freqtrade signal lifecycle status %s: %s", status, exc)
+            return False
+
+    def _post_exit_status(self, exit_id: str, status: str, reason: str) -> bool:
+        if len(self._bridge_token) < 32 or not self._bridge_url:
+            return False
+        try:
+            response = requests.post(
+                f"{self._bridge_url}/api/freqtrade/exits/{exit_id}/status",
+                headers={"Authorization": f"******"},
+                json={"status": status, "reason": reason},
+                timeout=(1.0, 2.0),
+                allow_redirects=False,
+            )
+            response.raise_for_status()
+            return True
+        except (requests.RequestException, ValueError) as exc:
+            logger.error("Could not persist SBK1 exit lifecycle status %s: %s", status, exc)
             return False
 
     def _timeframe_seconds(self) -> int:

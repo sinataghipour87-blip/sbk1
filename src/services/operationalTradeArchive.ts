@@ -5,13 +5,32 @@ import { isDeepStrictEqual } from 'node:util';
 import type { FreqtradeTrade } from './freqtradeBridge';
 import type { SbkFreqtradeSignalRecord } from './freqtradeSignalAdapter';
 
+export interface OperationalTradeArchiveMetadata {
+  featureSnapshot: Record<string, number | string | boolean | null>;
+  featureVersion: string;
+  modelVersion: string;
+  codeVersion: string;
+}
+
+export interface OperationalTradeOutcome {
+  source: 'FREQTRADE_RPC';
+  tradeId: number;
+  outcome: 'WIN' | 'LOSS' | 'BREAKEVEN';
+  pnlUsd: number;
+  feesUsd: number;
+  exitReason: string;
+  closedAtMs: number;
+}
+
 export interface OperationalTradeArchiveRecord {
   decisionId: string;
   signalId: string;
   decision: SbkFreqtradeSignalRecord['signal'];
-  featureSnapshot: null;
-  featureVersion: null;
-  modelVersion: null;
+  featureSnapshot: OperationalTradeArchiveMetadata['featureSnapshot'] | null;
+  featureVersion: string | null;
+  modelVersion: string | null;
+  codeVersion: string | null;
+  outcome?: OperationalTradeOutcome;
   provenance: SbkFreqtradeSignalRecord['signal']['dataQuality'];
   lifecycleEvents: Array<{
     status: SbkFreqtradeSignalRecord['status'];
@@ -113,7 +132,10 @@ export class OperationalTradeArchive {
     await rename(temporaryPath, this.storePath);
   }
 
-  async recordSignalLifecycle(signalRecord: SbkFreqtradeSignalRecord): Promise<void> {
+  async recordSignalLifecycle(
+    signalRecord: SbkFreqtradeSignalRecord,
+    metadata?: OperationalTradeArchiveMetadata,
+  ): Promise<void> {
     if (signalRecord.signal.entryConditions.setupType.startsWith('DRY_RUN_E2E_FIXTURE_')) return;
     await this.withExclusiveAccess(async () => {
       await this.load();
@@ -135,10 +157,17 @@ export class OperationalTradeArchive {
         featureSnapshot: null,
         featureVersion: null,
         modelVersion: null,
+        codeVersion: null,
         provenance: signalRecord.signal.dataQuality,
         lifecycleEvents: [],
         freqtradeTrades: [],
       };
+      if (metadata) {
+        record.featureSnapshot = structuredClone(metadata.featureSnapshot);
+        record.featureVersion = metadata.featureVersion;
+        record.modelVersion = metadata.modelVersion;
+        record.codeVersion = metadata.codeVersion;
+      }
       const lifecycleEvents = signalRecord.lifecycleEvents.length > 0
         ? signalRecord.lifecycleEvents
         : [{
@@ -184,9 +213,30 @@ export class OperationalTradeArchive {
       }
       if (
         trade.pair !== record.decision.pair ||
-        trade.is_short !== (record.decision.direction === 'SHORT')
+        trade.is_short !== (record.decision.direction === 'SHORT') ||
+        trade.enter_tag !== signalId
       ) {
         throw new Error(`Freqtrade trade ${trade.trade_id} does not match signal ${signalId}.`);
+      }
+      const pnlUsd = trade.realized_profit ?? trade.close_profit_abs;
+      if (
+        !trade.is_open &&
+        (
+          typeof pnlUsd !== 'number' ||
+          !Number.isFinite(pnlUsd) ||
+          typeof trade.fee_open_cost !== 'number' ||
+          !Number.isFinite(trade.fee_open_cost) ||
+          typeof trade.fee_close_cost !== 'number' ||
+          !Number.isFinite(trade.fee_close_cost) ||
+          trade.fee_open_cost < 0 ||
+          trade.fee_close_cost < 0 ||
+          !Number.isSafeInteger(trade.close_timestamp) ||
+          (trade.close_timestamp ?? 0) <= 0 ||
+          typeof trade.exit_reason !== 'string' ||
+          trade.exit_reason.trim().length === 0
+        )
+      ) {
+        throw new Error(`Closed Freqtrade trade ${trade.trade_id} is missing a verified PnL, fee, close-time, or exit-reason field.`);
       }
       const alreadyLinked = [...this.recordsBySignalId.values()].find((candidate) =>
         candidate.signalId !== signalId &&
@@ -210,8 +260,50 @@ export class OperationalTradeArchive {
           executionMode,
           trade,
         });
-        await this.persist();
       }
+      if (
+        !trade.is_open &&
+        pnlUsd !== undefined &&
+        pnlUsd !== null &&
+        trade.fee_open_cost !== null &&
+        trade.fee_close_cost !== null &&
+        trade.close_timestamp !== null &&
+        trade.exit_reason !== undefined &&
+        trade.exit_reason !== null
+      ) {
+        const feesUsd = trade.fee_open_cost + trade.fee_close_cost;
+        record.outcome = {
+          source: 'FREQTRADE_RPC',
+          tradeId: trade.trade_id,
+          outcome: pnlUsd > 0 ? 'WIN' : pnlUsd < 0 ? 'LOSS' : 'BREAKEVEN',
+          pnlUsd,
+          feesUsd,
+          exitReason: trade.exit_reason,
+          closedAtMs: trade.close_timestamp!,
+        };
+      }
+      if (!existingFingerprints.has(fingerprint) || record.outcome) await this.persist();
+    });
+  }
+
+  async getPendingOutcomeTrades(): Promise<Array<{ signalId: string; tradeId: number }>> {
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      return [...this.recordsBySignalId.values()].flatMap((record) => {
+        if (record.outcome) return [];
+        const tradeId = [...record.lifecycleEvents]
+          .reverse()
+          .find((event) => event.source === 'FREQTRADE' && Number.isSafeInteger(event.tradeId) && (event.tradeId ?? 0) > 0)
+          ?.tradeId;
+        return tradeId === undefined ? [] : [{ signalId: record.signalId, tradeId }];
+      });
+    });
+  }
+
+  async getAll(): Promise<OperationalTradeArchiveRecord[]> {
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      return structuredClone([...this.recordsBySignalId.values()]);
     });
   }
 

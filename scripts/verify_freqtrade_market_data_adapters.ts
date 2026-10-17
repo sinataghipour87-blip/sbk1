@@ -30,7 +30,7 @@ const marketSnapshot = {
   },
   ticker: {
     exchangeTimestampMs: null,
-    retrievedAtMs: nowMs - 6_000,
+    retrievedAtMs: nowMs - 1_000,
     last: 60_001,
     bid: 60_000,
     ask: 60_002,
@@ -53,16 +53,12 @@ const marketSnapshot = {
 
 Object.defineProperty(globalThis, 'window', { value: {}, configurable: true });
 let requestCount = 0;
+let responseSnapshot = marketSnapshot;
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (input) => {
-  if (
-    String(input).startsWith('https://api.bybit.com/') ||
-    String(input).startsWith('/api/market/bybit/')
-  ) {
-    throw new Error('Public Bybit network access is disabled in this focused adapter check.');
-  }
+  assert.equal(String(input), '/api/market/freqtrade-snapshot', 'market data must use only the internal snapshot endpoint');
   requestCount += 1;
-  return new Response(JSON.stringify(marketSnapshot), {
+  return new Response(JSON.stringify(responseSnapshot), {
     status: 200,
     headers: {
       'Content-Type': 'application/json',
@@ -73,17 +69,24 @@ globalThis.fetch = async (input) => {
 
 try {
 const marketData = await import('../src/services/marketData');
-const originalDateNow = Date.now;
-try {
-  Date.now = () => nowMs + 60_000;
-  await marketData.getFreqtradeMarketSnapshot();
-} finally {
-  Date.now = originalDateNow;
-}
+await marketData.getFreqtradeMarketSnapshot();
+const { setupFreqtradeMarketFeed } = await import('../src/services/websocket');
+let feedMessage: { price: number; source: string } | null = null;
+let feedState = 'DISCONNECTED';
+const feed = setupFreqtradeMarketFeed((price, message) => {
+  feedMessage = { price, source: message.source };
+}, (state) => {
+  feedState = state;
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(feedState, 'LIVE');
+assert.deepEqual(feedMessage, { price: 60_001, source: 'freqtrade.dataprovider' });
+feed.close();
+
 const candles = await marketData.fetchCandles();
   assert.equal(candles.candles.length, 500);
   assert.equal(candles.status, 'LIVE');
-  assert.match(candles.source, /freqtrade\.dataprovider/);
+  assert.equal(candles.source, 'freqtrade.dataprovider');
   assert.equal(marketData.validateMarketDataLiveSafety(candles.candles, candles.status).isLiveSafe, true);
   assert.equal(marketData.validateMarketDataLiveSafety(candles.candles.slice(-299), candles.status).isLiveSafe, false);
 
@@ -92,17 +95,22 @@ const candles = await marketData.fetchCandles();
   assert.equal(htf['Freqtrade 4h']?.length, 10);
   assert.equal(requestCount, 1, 'snapshot consumers should share the in-memory snapshot');
 
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs + 6_000;
   const futuresPrices = await marketData.fetchFuturesPrices();
+  Date.now = originalDateNow;
   assert.equal(futuresPrices.lastPrice, 60_001);
   assert.equal(futuresPrices.markPrice, 60_003);
   assert.equal(futuresPrices.indexPrice, 59_999);
-  assert.equal(futuresPrices.status, 'UNAVAILABLE', 'recent retrieval older than the trading freshness limit cannot authorize use');
+  assert.equal(futuresPrices.status, 'STALE', 'recent retrieval older than the trading freshness limit cannot authorize use');
   assert.equal(futuresPrices.timestampSource, 'FREQTRADE_RECEIVED');
   assert.equal(futuresPrices.exchangeTimestampUtc, null);
+  assert.equal(futuresPrices.source, 'freqtrade.dataprovider');
 
   const orderBook = await marketData.fetchRealOrderBookImbalance();
   assert.equal(orderBook.status, 'LIVE');
   assert.ok(orderBook.obi !== null);
+  assert.equal(orderBook.source, 'freqtrade.dataprovider');
   assert.equal(orderBook.obiVelocity, null, 'temporal metrics are not fabricated without history');
 
   const derivatives = await marketData.fetchDerivatives();
@@ -127,15 +135,53 @@ const candles = await marketData.fetchCandles();
   assert.equal(crossExchange.available, false);
   assert.equal(crossExchange.exchanges.length, 0);
 
+  responseSnapshot = { ...marketSnapshot, ticker: null };
+  const noTickerMessages: number[] = [];
+  let noTickerState = 'DISCONNECTED';
+  Date.now = () => nowMs + 8_000;
+  const noTickerFeed = setupFreqtradeMarketFeed((price) => {
+    noTickerMessages.push(price);
+  }, (state) => {
+    noTickerState = state;
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(noTickerState, 'STALE');
+    assert.deepEqual(noTickerMessages, [], 'a missing ticker must not produce a synthetic price');
+  } finally {
+    noTickerFeed.close();
+    Date.now = originalDateNow;
+  }
+
   await assert.rejects(
     () => marketData.fetchBybit('7', 30),
     /Unsupported Bybit candle request/,
+  );
+  responseSnapshot = marketSnapshot;
+  const insufficientSnapshot = {
+    ...marketSnapshot,
+    candles: makeCandles(15 * 60_000, 19),
+  };
+  responseSnapshot = insufficientSnapshot;
+  await assert.rejects(
+    () => marketData.fetchBybit('15', 30, true),
+    /داده از فریکترید در دسترس نیست/,
+    'insufficient snapshot candles must fail without a fallback',
+  );
+  responseSnapshot = {
+    ...marketSnapshot,
+    generatedAtMs: nowMs - 16_000,
+  };
+  await assert.rejects(
+    () => marketData.fetchBybit('15', 30, true),
+    /داده از فریکترید در دسترس نیست/,
+    'stale snapshots must fail without a fallback',
   );
   await assert.rejects(
     () => marketData.fetchKucoin(),
     /venue fallback is disabled/,
   );
-  assert.equal(requestCount, 1, 'Freqtrade snapshot consumers should reuse the cached verified snapshot');
+  assert.equal(requestCount, 5, 'all adapter requests must use the internal Freqtrade snapshot endpoint');
 } finally {
   globalThis.fetch = originalFetch;
 }

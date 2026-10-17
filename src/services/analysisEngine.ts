@@ -207,8 +207,29 @@ export function analyzePro(
   futuresPrices?: FuturesPrices,
   orderFlowFeatures?: OrderFlowFeatures
 ): AnalysisResult {
-  // Strict Safety Guard (Item 35): If real candles are unavailable, stale, or data quality report disallows trade -> Strictly disable trading!
-  if (!candles || candles.length < 300 || dataStatus === 'DATA_UNAVAILABLE' || dataStatus === 'STALE' || (dataQualityReport && !dataQualityReport.isTradeAllowed)) {
+  const hasFreshPrimaryFeeds =
+    dataQualityReport?.feeds?.candles?.status === 'LIVE' &&
+    dataQualityReport.feeds.futuresPrices?.status === 'LIVE' &&
+    futuresPrices?.status === 'LIVE' &&
+    Number.isFinite(dataQualityReport.feeds.candles.ageMs) &&
+    dataQualityReport.feeds.candles.ageMs >= 0 &&
+    dataQualityReport.feeds.candles.ageMs <= 15_000 &&
+    Number.isFinite(futuresPrices.ageMs) &&
+    futuresPrices.ageMs >= 0 &&
+    futuresPrices.ageMs <= 5_000 &&
+    Number.isFinite(futuresPrices.lastPrice) &&
+    futuresPrices.lastPrice > 0;
+  const primaryFeedsUnavailable = !hasFreshPrimaryFeeds;
+
+  // Missing optional feeds disables execution, but fresh candles and ticker still support technical analysis.
+  if (
+    !candles ||
+    candles.length < 300 ||
+    dataStatus === 'DATA_UNAVAILABLE' ||
+    dataStatus === 'SIMULATED' ||
+    (dataStatus === 'STALE' && primaryFeedsUnavailable) ||
+    (dataQualityReport && !dataQualityReport.isTradeAllowed && primaryFeedsUnavailable)
+  ) {
     const dummyPrice = futuresPrices?.lastPrice || (candles && candles.length > 0 ? candles[candles.length - 1][3] : 0);
     const reasonsMsg = dataQualityReport?.reasonsFa?.join(' | ') || 'فیدهای زنده بازار در دسترس نیستند یا کهنه شده‌اند';
     return {
@@ -760,7 +781,7 @@ export function analyzePro(
   posUsd = Math.round(qtyBtc * executableEntryPrice * 100) / 100;
 
   // 4. Permissible Leverage: Strictly constrained by Liquidation Distance buffer including MMR, Fees & Mark Price
-  // Bybit/Binance BTC Linear Maintenance Margin Rate: 0.5% + Liquidation Clearance Fee Buffer 0.08%
+  // Configured linear perpetual maintenance margin and liquidation clearance fee buffer.
   const mmrPct = 0.50;
   const feeBufferPct = 0.08;
   const totalLiqBufferPct = mmrPct + feeBufferPct;
@@ -842,7 +863,7 @@ export function analyzePro(
   const sharedDecision = evaluateSharedStrategy(candles, {}, {
     orderBookImbalance: realObiData?.obi ?? undefined,
     fundingRate: deriv.funding,
-    sentimentScore: sentiment.score,
+    sentimentScore: sentiment.score ?? undefined,
   });
 
   // Entry Timing and Strict R:R & Expectancy Gating (Issues 21, 22, 23, 25)

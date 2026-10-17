@@ -3,6 +3,7 @@ import { Target, TrendingUp, Cpu, ShieldCheck, Zap, BarChart2, CheckCircle2, Loc
 import { AnalysisResult, TradeHistory } from '../types/trading';
 import { CollapsibleCard } from './CollapsibleCard';
 import { computeCentralCalibratedProbability } from '../services/centralProbabilityEngine';
+import { centralTradeDatasetService } from '../services/centralTradeDataset';
 
 export interface WinRateOptimizerConfig {
   minWinProbability: number; // default 90% for ultra high-precision
@@ -49,6 +50,12 @@ export const WinRateOptimizerComponent: React.FC<WinRateOptimizerProps> = ({
     if (!analysis) return;
     setIsCalibrating(true);
     try {
+      const adminToken = localStorage.getItem('admin_token');
+      if (adminToken) {
+        await centralTradeDatasetService.refreshTrainingArchive(adminToken);
+      } else {
+        centralTradeDatasetService.clearServerTrainingArchive();
+      }
       const calib = computeCentralCalibratedProbability({
         trendBias: analysis.direction === 'LONG' ? 'BULLISH' : 'BEARISH',
         scoreLong: analysis.scoreLong,
@@ -68,7 +75,7 @@ export const WinRateOptimizerComponent: React.FC<WinRateOptimizerProps> = ({
       const isCalibrated = calib.calibratedWinProbability !== null;
       setProbabilityModelEvaluation({
         statusColor: isCalibrated ? '#10b981' : '#f59e0b',
-        statusPersian: isCalibrated ? 'مدل کالیبره‌شده و تایید OOS' : 'OOS کافی نیست؛ احتمال نامشخص',
+        statusPersian: isCalibrated ? 'مدل کالیبره‌شده و تایید OOS' : 'نمونه ناکافی؛ احتمال آماری فقط اطلاع‌رسانی است',
         modelProbability: calib.calibratedWinProbability === null
           ? null
           : Math.round(calib.calibratedWinProbability * 100),
@@ -83,6 +90,19 @@ export const WinRateOptimizerComponent: React.FC<WinRateOptimizerProps> = ({
       });
     } catch (e) {
       console.error(e);
+      setProbabilityModelEvaluation({
+        statusColor: '#f59e0b',
+        statusPersian: 'آرشیو آموزشی سروری در دسترس نیست؛ احتمال محاسبه نشد',
+        modelProbability: null,
+        criteriaChecks: [
+          { name: 'حجم داده آموزش/Validation/OOS کافی', passed: false },
+          { name: 'حد پایین CI حداقل ۵۵٪', passed: false },
+          { name: 'ECE حداکثر ۱۰٪', passed: false },
+        ],
+        optimizedLevels: {
+          strategy: 'ورود بر اساس سوئیپ نقدینگی و حد ضرر قطعی زیر کندل سوئیپ'
+        },
+      });
     } finally {
       setIsCalibrating(false);
     }

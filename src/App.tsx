@@ -227,19 +227,26 @@ export default function App() {
   const [showSidebar, setShowSidebar] = useState(false);
   const executionModeRef = useRef<ExecutionMode | null>(null);
   const [freqtradeDashboard, setFreqtradeDashboard] = useState<{
-    status: 'CHECKING' | 'CONNECTED' | 'UNAVAILABLE' | 'SIMULATION';
+    status: 'CHECKING' | 'CONNECTED' | 'UNAVAILABLE';
     openTrades: FreqtradeTrade[];
+    openTradesCount?: number;
+    connection?: {
+      exchange: string | null;
+      market: string | null;
+      pair: string | null;
+      timeframe: string | null;
+      dryRun: boolean | null;
+      marketDataAvailable: boolean;
+    };
     error?: string;
   }>({ status: 'CHECKING', openTrades: [] });
   const handleExecutionModeSelected = useCallback((mode: ExecutionMode, _isLocalSelection: boolean) => {
     executionModeRef.current = mode;
     if (mode === 'PAPER') {
-      setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
       setActivePositions([]);
       return;
     }
     if (mode === 'BACKTEST') {
-      setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
       setActivePositions([]);
       return;
     }
@@ -1353,38 +1360,89 @@ export default function App() {
     try {
       try {
         const usesFreqtrade = executionModeRef.current === 'LIVE' || executionModeRef.current === 'TESTNET';
-        if (!usesFreqtrade) {
-          setFreqtradeDashboard({ status: 'SIMULATION', openTrades: [] });
-        } else {
-          const exchangeStatusRes = await fetch('/api/exchange/status');
-          const exchangeStatusData = await exchangeStatusRes.json();
-          if (
-            exchangeStatusRes.ok &&
-            exchangeStatusData.connected === true &&
-            Array.isArray(exchangeStatusData.openTrades)
-          ) {
-            setFreqtradeDashboard({
-              status: 'CONNECTED',
-              openTrades: exchangeStatusData.openTrades as FreqtradeTrade[],
-            });
-            setActivePositions([]);
-            activePositionsRef.current = [];
-            if (typeof exchangeStatusData.walletBalanceUsdt === 'number') {
-              setBalance(exchangeStatusData.walletBalanceUsdt);
-              balanceRef.current = exchangeStatusData.walletBalanceUsdt;
-              localStorage.setItem('quantum_balance', exchangeStatusData.walletBalanceUsdt.toString());
-            }
-          } else {
-            setFreqtradeDashboard({
-              status: 'UNAVAILABLE',
-              openTrades: [],
-              error: typeof exchangeStatusData.error === 'string' ? exchangeStatusData.error : 'Freqtrade did not return an authoritative trading state.',
-            });
+        const connectionResponse = await fetch('/api/freqtrade/connection-status', { cache: 'no-store' });
+        const connectionData = await connectionResponse.json();
+        if (!connectionResponse.ok || connectionData.connected !== true) {
+          setFreqtradeDashboard({
+            status: 'UNAVAILABLE',
+            openTrades: [],
+            error: typeof connectionData.error === 'string'
+              ? connectionData.error
+              : typeof connectionData.marketData?.error === 'string'
+                ? connectionData.marketData.error
+                : 'Freqtrade RPC did not confirm a running market-data connection.',
+          });
+          if (usesFreqtrade) {
             setActivePositions([]);
             activePositionsRef.current = [];
             setBalance(0);
             balanceRef.current = 0;
           }
+        } else {
+          let openTrades: FreqtradeTrade[] = [];
+          let privateStateAvailable = false;
+          let privateStateError: string | undefined;
+          if (usesFreqtrade) {
+            const adminToken = localStorage.getItem('admin_token');
+            if (adminToken) {
+              try {
+                const privateResponse = await fetch('/api/exchange/status', {
+                  cache: 'no-store',
+                  headers: { 'x-admin-token': adminToken },
+                });
+                const privateStatus = await privateResponse.json();
+                if (
+                  privateResponse.ok &&
+                  privateStatus.connected === true &&
+                  Array.isArray(privateStatus.openTrades)
+                ) {
+                  openTrades = privateStatus.openTrades as FreqtradeTrade[];
+                  privateStateAvailable = true;
+                  setActivePositions([]);
+                  activePositionsRef.current = [];
+                  if (typeof privateStatus.walletBalanceUsdt === 'number') {
+                    setBalance(privateStatus.walletBalanceUsdt);
+                    balanceRef.current = privateStatus.walletBalanceUsdt;
+                    localStorage.setItem('quantum_balance', privateStatus.walletBalanceUsdt.toString());
+                  }
+                }
+                if (!privateStateAvailable) {
+                  privateStateError = typeof privateStatus.error === 'string'
+                    ? privateStatus.error
+                    : `جزئیات حساب خصوصی دریافت نشد (HTTP ${privateResponse.status}).`;
+                }
+              } catch (error) {
+                privateStateError = error instanceof Error ? error.message : String(error);
+                console.warn('[Freqtrade] Private account details could not be refreshed.', error);
+              }
+            } else {
+              privateStateError = 'برای نمایش موجودی و جزئیات خصوصی حساب، توکن ادمین لازم است.';
+            }
+            if (!privateStateAvailable) {
+              setActivePositions([]);
+              activePositionsRef.current = [];
+              setBalance(0);
+              balanceRef.current = 0;
+            }
+          }
+          setFreqtradeDashboard({
+            status: 'CONNECTED',
+            openTrades,
+            openTradesCount: privateStateAvailable
+              ? openTrades.length
+              : Number.isSafeInteger(connectionData.openTradesCount)
+                ? connectionData.openTradesCount
+                : undefined,
+            connection: {
+              exchange: typeof connectionData.exchange === 'string' ? connectionData.exchange : null,
+              market: typeof connectionData.market === 'string' ? connectionData.market : null,
+              pair: typeof connectionData.pair === 'string' ? connectionData.pair : null,
+              timeframe: typeof connectionData.timeframe === 'string' ? connectionData.timeframe : null,
+              dryRun: typeof connectionData.dryRun === 'boolean' ? connectionData.dryRun : null,
+              marketDataAvailable: connectionData.marketData?.available === true,
+            },
+            error: usesFreqtrade && !privateStateAvailable ? privateStateError : undefined,
+          });
         }
       } catch (err) {
         if (executionModeRef.current === 'LIVE' || executionModeRef.current === 'TESTNET') {
@@ -1398,7 +1456,7 @@ export default function App() {
           setBalance(0);
           balanceRef.current = 0;
         }
-        console.error('[Freqtrade] Could not refresh authoritative trading state:', err);
+        console.error('[Freqtrade] Could not refresh connection state:', err);
       }
 
       let sentiment: SentimentData = {
@@ -1888,51 +1946,68 @@ export default function App() {
             تحلیل: {lastAnalysisAtMs ? `آخرین اجرا ${new Date(lastAnalysisAtMs).toLocaleTimeString('fa-IR')}` : 'در انتظار دادهٔ معتبر'}
             {analysis?.dataStatus ? ` · کیفیت داده: ${analysis.dataStatus}` : ''}
           </p>
+          {analysis && analysis.candles.length > 0 && (
+            <p role="status" aria-live="polite" className="px-2 text-[11px] text-slate-400">
+              تحلیل فنی با {analysis.candles.length} کندل از {analysis.dataQualityReport?.feeds.candles.source || source} انجام شد.
+              {analysis.dataQualityReport?.isTradeAllowed
+                ? ' مجوز کیفیت داده برای معامله برقرار است.'
+                : ` معامله مسدود است: ${analysis.dataQualityReport?.reasonsFa.join('، ') || 'کیفیت داده برای معامله کافی نیست.'}`}
+            </p>
+          )}
            <TickerBar btcPrice={liveEffectivePrice} />
           </div>
 
-          {freqtradeDashboard.status !== 'SIMULATION' && (
-            <section
-              role="status"
-              aria-live="polite"
-              className={`rounded-xl border px-4 py-3 text-sm ${
-                freqtradeDashboard.status === 'CONNECTED'
-                  ? 'border-emerald-700/60 bg-emerald-950/30 text-emerald-100'
-                  : 'border-amber-700/60 bg-amber-950/30 text-amber-100'
-              }`}
-            >
-              <p className="font-bold">
-                {freqtradeDashboard.status === 'CONNECTED'
-                  ? `وضعیت معاملات از Freqtrade دریافت شد؛ ${freqtradeDashboard.openTrades.length} معاملهٔ باز.`
-                  : freqtradeDashboard.status === 'CHECKING'
-                    ? 'در حال دریافت وضعیت معتبر معاملات از Freqtrade؛ وضعیت محلی به‌عنوان وضعیت زنده نمایش داده نمی‌شود.'
-                    : 'وضعیت معاملات Freqtrade در دسترس نیست؛ هیچ وضعیت محلی به‌عنوان وضعیت زنده نمایش داده نمی‌شود.'}
+          <section
+            role="status"
+            aria-live="polite"
+            className={`rounded-xl border px-4 py-3 text-sm ${
+              freqtradeDashboard.status === 'CONNECTED' && freqtradeDashboard.connection?.marketDataAvailable
+                ? 'border-emerald-700/60 bg-emerald-950/30 text-emerald-100'
+                : 'border-amber-700/60 bg-amber-950/30 text-amber-100'
+            }`}
+          >
+            <p className="font-bold">
+              {freqtradeDashboard.status === 'CONNECTED'
+                ? `ارتباط Freqtrade برقرار است؛ فید بازار ${freqtradeDashboard.connection?.marketDataAvailable ? 'دادهٔ تازه دارد' : 'snapshot تازه ندارد'}؛ ${freqtradeDashboard.openTradesCount ?? 'نامشخص'} معاملهٔ باز.`
+                : freqtradeDashboard.status === 'CHECKING'
+                  ? 'در حال بررسی اتصال Freqtrade و فید بازار؛ وضعیت حساب خصوصی جداگانه احراز می‌شود.'
+                  : 'اتصال Freqtrade یا فید بازار در دسترس نیست؛ هیچ وضعیت محلی به‌عنوان وضعیت زنده نمایش داده نمی‌شود.'}
+            </p>
+            {freqtradeDashboard.status === 'CONNECTED' && freqtradeDashboard.connection && (
+              <p className="mt-1 text-xs opacity-90">
+                منبع: {freqtradeDashboard.connection.exchange || 'نامشخص'}
+                {freqtradeDashboard.connection.market ? ` ${freqtradeDashboard.connection.market}` : ''}
+                {freqtradeDashboard.connection.pair ? ` · ${freqtradeDashboard.connection.pair}` : ''}
+                {freqtradeDashboard.connection.timeframe ? ` · ${freqtradeDashboard.connection.timeframe}` : ''}
+                {freqtradeDashboard.connection.dryRun === true
+                  ? ' · حالت Dry-run؛ اتصال حساب خصوصی/اجرای واقعی از این وضعیت تأیید نمی‌شود.'
+                  : ''}
               </p>
-              {freqtradeDashboard.status === 'UNAVAILABLE' && freqtradeDashboard.error && (
-                <p className="mt-1 text-xs opacity-90">{freqtradeDashboard.error}</p>
-              )}
-              {freqtradeDashboard.status === 'CONNECTED' && freqtradeDashboard.openTrades.length > 0 && (
-                <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                  {freqtradeDashboard.openTrades.map((trade) => (
-                    <div key={trade.trade_id} className="rounded-lg border border-emerald-800/50 bg-black/20 p-2 text-xs">
-                      <strong>{trade.pair}</strong>
-                      <span className="mx-2">{trade.is_short ? 'SHORT' : 'LONG'}</span>
-                      <span>شناسهٔ Freqtrade: {trade.trade_id}</span>
-                      <div className="mt-1">
-                        مقدار {trade.amount}، قیمت ورود {trade.open_rate}، وثیقه {trade.stake_amount}
-                      </div>
-                      <div className="mt-1">
-                        سفارش‌ها: {trade.orders.map((order) => `${order.ft_order_side} ${order.status}`).join('، ') || 'ندارد'}
-                      </div>
+            )}
+            {freqtradeDashboard.error && (
+              <p className="mt-1 text-xs opacity-90">{freqtradeDashboard.error}</p>
+            )}
+            {freqtradeDashboard.status === 'CONNECTED' && freqtradeDashboard.openTrades.length > 0 && (
+              <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {freqtradeDashboard.openTrades.map((trade) => (
+                  <div key={trade.trade_id} className="rounded-lg border border-emerald-800/50 bg-black/20 p-2 text-xs">
+                    <strong>{trade.pair}</strong>
+                    <span className="mx-2">{trade.is_short ? 'SHORT' : 'LONG'}</span>
+                    <span>شناسهٔ Freqtrade: {trade.trade_id}</span>
+                    <div className="mt-1">
+                      مقدار {trade.amount}، قیمت ورود {trade.open_rate}، وثیقه {trade.stake_amount}
                     </div>
-                  ))}
-                </div>
-              )}
-              <p className="mt-2 text-xs opacity-80">
-                تاریخچهٔ بسته‌شدهٔ نمایش‌داده‌شده در ابزارهای قدیمی هنوز از ذخیرهٔ محلی است و از Freqtrade تأیید نشده است.
-              </p>
-            </section>
-          )}
+                    <div className="mt-1">
+                      سفارش‌ها: {trade.orders.map((order) => `${order.ft_order_side} ${order.status}`).join('، ') || 'ندارد'}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="mt-2 text-xs opacity-80">
+              تاریخچهٔ بسته‌شدهٔ نمایش‌داده‌شده در ابزارهای قدیمی هنوز از ذخیرهٔ محلی است و از Freqtrade تأیید نشده است.
+            </p>
+          </section>
 
           {/* Analysis and read-only monitoring; all order controls are owned by Freqtrade. */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[600px]">

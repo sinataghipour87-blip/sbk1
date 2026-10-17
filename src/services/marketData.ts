@@ -12,6 +12,7 @@ import {
 } from '../types/trading';
 import { dataProvenanceLayerService } from './dataProvenanceLayer';
 import {
+  FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS,
   FREQTRADE_MARKET_SNAPSHOT_VERSION,
   FREQTRADE_TICKER_MAX_AGE_MS,
   validateFreqtradeMarketSnapshot,
@@ -23,11 +24,7 @@ async function safeFetchJson<T>(url: string, timeoutMs = 6000): Promise<{ data: 
   const id = setTimeout(() => controller.abort(), timeoutMs);
   const start = performance.now();
   try {
-    const requestUrl = new URL(url);
-    const requestTarget = typeof window !== 'undefined' && requestUrl.hostname === 'api.bybit.com'
-      ? `/api/market/bybit${requestUrl.pathname}${requestUrl.search}`
-      : url;
-    const res = await fetch(requestTarget, { signal: controller.signal });
+    const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
     if (text.trim().startsWith('<')) {
@@ -43,7 +40,6 @@ async function safeFetchJson<T>(url: string, timeoutMs = 6000): Promise<{ data: 
 
 export interface BybitCandlesResult {
   candles: Candle[];
-  systemCandles?: Candle[];
   latencyMs: number;
   sourceStartTimeMs: number;
   sourceCloseTimeMs: number;
@@ -150,106 +146,40 @@ function candleDataForTimeframe(snapshot: FreqtradeMarketSnapshot, timeframe: st
 
 const bybitIntervals = new Set(['1', '3', '5', '15', '30', '60', '120', '240', '360', '720']);
 
-async function fetchSystemBybitCandles(interval: string, limit: number): Promise<BybitCandlesResult> {
-  if (!bybitIntervals.has(interval) || !Number.isInteger(limit) || limit < 20 || limit > 1000) {
-    throw new Error(`Unsupported Bybit candle request: interval=${interval}, limit=${limit}.`);
-  }
-  const timeframeMs = Number(interval) * 60_000;
-  const { data, latencyMs } = await safeFetchJson<{
-    retCode?: number;
-    retMsg?: string;
-    result?: { list?: unknown };
-  }>(
-    `https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=${interval}&limit=${limit}`,
-  );
-  if (data.retCode !== 0 || !Array.isArray(data.result?.list)) {
-    throw new Error(`Bybit candles are unavailable: ${data.retMsg || 'invalid response'}.`);
-  }
-  const receivedTimestampMs = Date.now();
-  const rows = data.result.list
-    .map((row) => {
-      if (!Array.isArray(row) || row.length < 6) {
-        throw new Error('Bybit returned a malformed candle row.');
-      }
-      const [rawTimestamp, rawOpen, rawHigh, rawLow, rawClose, rawVolume] = row;
-      const timestampMs = Number(rawTimestamp);
-      const open = Number(rawOpen);
-      const high = Number(rawHigh);
-      const low = Number(rawLow);
-      const close = Number(rawClose);
-      const volume = Number(rawVolume);
-      if (
-        !Number.isSafeInteger(timestampMs) ||
-        ![open, high, low, close, volume].every(Number.isFinite) ||
-        open <= 0 || high <= 0 || low <= 0 || close <= 0 || volume < 0 ||
-        high < Math.max(open, close, low) ||
-        low > Math.min(open, close, high)
-      ) {
-        throw new Error('Bybit returned invalid OHLCV candle data.');
-      }
-      if (timestampMs > receivedTimestampMs + 1_000) {
-        throw new Error('Bybit returned a future-dated candle.');
-      }
-      return { timestampMs, candle: [open, high, low, close, volume] as Candle };
-    })
-    .filter(({ timestampMs }) => timestampMs + timeframeMs <= receivedTimestampMs)
-    .sort((left, right) => left.timestampMs - right.timestampMs);
-  const completedRows = rows.slice(-limit);
-  if (completedRows.length < 20) {
-    throw new Error(`Bybit returned only ${completedRows.length} completed ${interval}m candles.`);
-  }
-  const lastRow = completedRows[completedRows.length - 1];
-  return {
-    candles: completedRows.map(({ candle }) => candle),
-    latencyMs,
-    sourceStartTimeMs: lastRow.timestampMs,
-    sourceCloseTimeMs: lastRow.timestampMs + timeframeMs,
-    receivedTimestampMs,
-    source: 'sbk1.bybit.public-market',
-  };
-}
-
 export async function fetchBybit(interval = '15', limit = 150, forceRefresh = false): Promise<BybitCandlesResult> {
   if (!bybitIntervals.has(interval) || !Number.isInteger(limit) || limit < 20 || limit > 1000) {
     throw new Error(`Unsupported Bybit candle request: interval=${interval}, limit=${limit}.`);
   }
   const timeframe = timeframeForMinuteInterval(interval) || '15m';
-  const [freqtradeResult, systemResult] = await Promise.allSettled([
-    getFreqtradeMarketSnapshot(forceRefresh),
-    fetchSystemBybitCandles(interval, limit),
-  ]);
-  const freqtradeError = freqtradeResult.status === 'rejected'
-    ? (freqtradeResult.reason instanceof Error ? freqtradeResult.reason.message : String(freqtradeResult.reason))
-    : null;
-  const systemError = systemResult.status === 'rejected'
-    ? (systemResult.reason instanceof Error ? systemResult.reason.message : String(systemResult.reason))
-    : null;
-
-  if (freqtradeResult.status === 'fulfilled') {
-    const snapshot = freqtradeResult.value;
+  try {
+    const snapshot = await getFreqtradeMarketSnapshot(forceRefresh);
+    const snapshotAgeMs = Date.now() - snapshot.generatedAtMs;
+    if (
+      snapshotAgeMs < -1_000 ||
+      snapshotAgeMs > FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
+    ) {
+      throw new Error('snapshot is stale');
+    }
     const sourceCandles = timeframe === snapshot.timeframe
       ? snapshot.candles
       : snapshot.additionalCandles[timeframe];
     const candles = candleDataForTimeframe(snapshot, timeframe).slice(-limit);
     if (candles.length < 20 || !sourceCandles?.length) {
-      if (systemResult.status === 'fulfilled') return systemResult.value;
-      throw new Error(`Freqtrade DataProvider returned insufficient fresh ${timeframe} candles; ${systemError}`);
+      throw new Error(`insufficient fresh ${timeframe} candles`);
     }
     const lastSourceCandle = sourceCandles.at(-1)!;
     return {
       candles,
-      ...(systemResult.status === 'fulfilled' ? { systemCandles: systemResult.value.candles } : {}),
       latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 0,
       sourceStartTimeMs: lastSourceCandle.timestampMs,
       sourceCloseTimeMs: lastSourceCandle.timestampMs + Number(interval) * 60_000,
       receivedTimestampMs: snapshot.generatedAtMs,
-      source: systemResult.status === 'fulfilled'
-        ? 'freqtrade.dataprovider + sbk1.bybit.public-market'
-        : `freqtrade.dataprovider (system Bybit feed unavailable: ${systemError})`,
+      source: 'freqtrade.dataprovider',
     };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`داده از فریکترید در دسترس نیست: ${reason}`);
   }
-  if (systemResult.status === 'fulfilled') return systemResult.value;
-  throw new Error(`Market data unavailable from Freqtrade (${freqtradeError}) and SBK1 Bybit feed (${systemError}).`);
 }
 
 function isValidMarketCandle(candle: Candle): boolean {
@@ -258,173 +188,57 @@ function isValidMarketCandle(candle: Candle): boolean {
     open > 0 && high > 0 && low > 0 && close > 0 && volume >= 0;
 }
 
-interface BybitTickerPayload {
-  retCode?: number;
-  retMsg?: string;
-  time?: number;
-  result?: { list?: Array<Record<string, unknown>> };
-}
-
-let bybitTickerCache: { data: BybitTickerPayload; latencyMs: number; fetchedAtMs: number } | null = null;
-let bybitTickerRequest: Promise<{ data: BybitTickerPayload; latencyMs: number }> | null = null;
-
-async function getBybitTicker(forceRefresh = false): Promise<{ data: BybitTickerPayload; latencyMs: number }> {
-  if (!forceRefresh && bybitTickerCache && Date.now() - bybitTickerCache.fetchedAtMs <= 1_000) {
-    return bybitTickerCache;
-  }
-  if (bybitTickerRequest) return bybitTickerRequest;
-  const request = safeFetchJson<BybitTickerPayload>(
-    'https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT',
-  );
-  bybitTickerRequest = request;
-  try {
-    const result = await request;
-    bybitTickerCache = { ...result, fetchedAtMs: Date.now() };
-    return result;
-  } finally {
-    if (bybitTickerRequest === request) bybitTickerRequest = null;
-  }
-}
-
 export async function fetchFuturesPrices(forceRefresh = false): Promise<FuturesPrices> {
-  const now = Date.now();
-  const [freqtradeResult, systemResult] = await Promise.allSettled([
-    getFreqtradeMarketSnapshot(forceRefresh),
-    getBybitTicker(forceRefresh),
-  ]);
-  let systemTicker: {
-    lastPrice: number;
-    markPrice: number;
-    indexPrice: number;
-    timestampUtc: number;
-    exchangeTimestampUtc: number | null;
-    receivedTimestampMs: number;
-    isoTimeUtc: string;
-    ageMs: number;
-    latencyMs: number;
-    openInterest: number | null;
-    fundingRate: number | null;
-  } | null = null;
-  if (systemResult.status === 'fulfilled' && systemResult.value.data.retCode === 0) {
-    const data = systemResult.value.data;
-    const ticker = data.result?.list?.[0];
-    const lastPrice = Number(ticker?.lastPrice);
-    const markPrice = Number(ticker?.markPrice ?? lastPrice);
-    const indexPrice = Number(ticker?.indexPrice ?? lastPrice);
-    const openInterestValue = Number(ticker?.openInterest);
-    const fundingRateValue = Number(ticker?.fundingRate);
-    const exchangeTimestampUtc = Number.isSafeInteger(data.time) && Number(data.time) > 0
-      ? Number(data.time)
-      : null;
-    if ([lastPrice, markPrice, indexPrice].every((price) => Number.isFinite(price) && price > 0)) {
-      const receivedTimestampMs = Date.now();
-      systemTicker = {
-        lastPrice,
-        markPrice,
-        indexPrice,
-        timestampUtc: exchangeTimestampUtc ?? receivedTimestampMs,
-        exchangeTimestampUtc,
-        receivedTimestampMs,
-        isoTimeUtc: new Date(receivedTimestampMs).toISOString(),
-        ageMs: exchangeTimestampUtc === null ? 0 : receivedTimestampMs - exchangeTimestampUtc,
-        latencyMs: systemResult.value.latencyMs,
-        openInterest: Number.isFinite(openInterestValue) && openInterestValue > 0 ? openInterestValue : null,
-        fundingRate: Number.isFinite(fundingRateValue) ? fundingRateValue : null,
-      };
-    }
-  }
-
-  if (freqtradeResult.status === 'fulfilled') {
-    const snapshot = freqtradeResult.value;
+  const nowMs = Date.now();
+  try {
+    const snapshot = await getFreqtradeMarketSnapshot(forceRefresh);
     const ticker = snapshot.ticker;
-    if (ticker && ticker.last > 0) {
-      const ageMs = Date.now() - ticker.retrievedAtMs;
-      const isFresh = ageMs >= 0 && ageMs <= FREQTRADE_TICKER_MAX_AGE_MS;
-      if (isFresh) return {
-        lastPrice: ticker.last,
-        markPrice: ticker.markPrice ?? ticker.last,
-        indexPrice: ticker.indexPrice ?? ticker.last,
-        timestampUtc: ticker.exchangeTimestampMs ?? ticker.retrievedAtMs,
-        exchangeTimestampUtc: ticker.exchangeTimestampMs,
-        timestampSource: ticker.exchangeTimestampMs === null ? 'FREQTRADE_RECEIVED' : 'EXCHANGE',
-        receivedTimestampMs: Date.now(),
-        isoTimeUtc: new Date(ticker.retrievedAtMs).toISOString(),
-        ageMs,
-        latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 5,
-        ...(systemTicker ? {
-          systemLastPrice: systemTicker.lastPrice,
-          systemOpenInterest: systemTicker.openInterest,
-          systemPriceStatus: systemTicker.ageMs >= 0 && systemTicker.ageMs <= FREQTRADE_TICKER_MAX_AGE_MS
-            ? 'LIVE' as const
-            : 'STALE' as const,
-        } : { systemLastPrice: null, systemPriceStatus: 'UNAVAILABLE' as const }),
-        source: systemTicker
-          ? 'Freqtrade DataProvider + SBK1 Bybit public ticker'
-          : 'Bybit Freqtrade Snapshot',
-        status: 'LIVE',
-      };
-    }
-  }
-
-  if (systemTicker && systemTicker.ageMs >= 0 && systemTicker.ageMs <= FREQTRADE_TICKER_MAX_AGE_MS) {
+    const ageMs = ticker ? nowMs - ticker.retrievedAtMs : Number.POSITIVE_INFINITY;
+    const isFresh = ticker !== null &&
+      ageMs >= -1_000 &&
+      ageMs <= FREQTRADE_TICKER_MAX_AGE_MS &&
+      nowMs - snapshot.generatedAtMs >= -1_000 &&
+      nowMs - snapshot.generatedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS;
     return {
-      ...systemTicker,
-      timestampSource: systemTicker.exchangeTimestampUtc === null ? 'FREQTRADE_RECEIVED' : 'EXCHANGE',
-      systemLastPrice: systemTicker.lastPrice,
-      systemOpenInterest: systemTicker.openInterest,
-      systemPriceStatus: 'LIVE',
-      source: 'SBK1 Bybit public ticker',
-      status: 'LIVE',
-    };
-  }
-
-  if (freqtradeResult.status === 'fulfilled' && freqtradeResult.value.ticker) {
-    const ticker = freqtradeResult.value.ticker;
-    const ageMs = now - ticker.retrievedAtMs;
-    return {
-      lastPrice: ticker.last,
-      markPrice: ticker.markPrice ?? ticker.last,
-      indexPrice: ticker.indexPrice ?? ticker.last,
-      timestampUtc: ticker.exchangeTimestampMs ?? ticker.retrievedAtMs,
-      exchangeTimestampUtc: ticker.exchangeTimestampMs,
-      timestampSource: ticker.exchangeTimestampMs === null ? 'FREQTRADE_RECEIVED' : 'EXCHANGE',
-      receivedTimestampMs: now,
-      isoTimeUtc: new Date(ticker.retrievedAtMs).toISOString(),
+      lastPrice: ticker?.last ?? 0,
+      markPrice: ticker?.markPrice ?? 0,
+      indexPrice: ticker?.indexPrice ?? 0,
+      timestampUtc: ticker?.exchangeTimestampMs ?? ticker?.retrievedAtMs ?? 0,
+      exchangeTimestampUtc: ticker?.exchangeTimestampMs ?? null,
+      timestampSource: ticker
+        ? ticker.exchangeTimestampMs === null ? 'FREQTRADE_RECEIVED' : 'EXCHANGE'
+        : 'UNAVAILABLE',
+      receivedTimestampMs: nowMs,
+      isoTimeUtc: ticker ? new Date(ticker.retrievedAtMs).toISOString() : '',
       ageMs,
-      latencyMs: getSnapshotNetworkLatencyMs(freqtradeResult.value) ?? 0,
-      systemLastPrice: systemTicker?.lastPrice ?? null,
-      systemOpenInterest: systemTicker?.openInterest ?? null,
-      systemPriceStatus: systemTicker ? 'STALE' : 'UNAVAILABLE',
-      source: 'Stale Freqtrade ticker; SBK1 Bybit ticker unavailable',
+      latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 0,
+      systemLastPrice: null,
+      systemOpenInterest: null,
+      systemPriceStatus: 'UNAVAILABLE',
+      source: 'freqtrade.dataprovider',
+      status: isFresh ? 'LIVE' : ticker ? 'STALE' : 'UNAVAILABLE',
+      ...(!isFresh ? { error: ticker ? 'Freqtrade ticker is stale.' : 'Freqtrade snapshot has no valid ticker.' } : {}),
+    };
+  } catch (error) {
+    return {
+      lastPrice: 0,
+      markPrice: 0,
+      indexPrice: 0,
+      timestampUtc: 0,
+      exchangeTimestampUtc: null,
+      timestampSource: 'UNAVAILABLE',
+      receivedTimestampMs: nowMs,
+      isoTimeUtc: '',
+      ageMs: Number.POSITIVE_INFINITY,
+      latencyMs: 0,
+      systemLastPrice: null,
+      systemOpenInterest: null,
+      systemPriceStatus: 'UNAVAILABLE',
+      source: 'freqtrade.dataprovider',
       status: 'UNAVAILABLE',
-      error: 'No fresh price is available from either data source.',
+      error: error instanceof Error ? error.message : String(error),
     };
   }
-
-  const freqtradeError = freqtradeResult.status === 'rejected'
-    ? (freqtradeResult.reason instanceof Error ? freqtradeResult.reason.message : String(freqtradeResult.reason))
-    : 'Freqtrade snapshot has no valid ticker.';
-  const systemError = systemResult.status === 'rejected'
-    ? (systemResult.reason instanceof Error ? systemResult.reason.message : String(systemResult.reason))
-    : systemTicker ? 'SBK1 Bybit ticker is stale.' : systemResult.value.data.retMsg || 'SBK1 Bybit ticker is invalid.';
-  return {
-    lastPrice: 0,
-    markPrice: 0,
-    indexPrice: 0,
-    timestampUtc: 0,
-    exchangeTimestampUtc: null,
-    timestampSource: 'UNAVAILABLE',
-    receivedTimestampMs: now,
-    isoTimeUtc: '',
-    ageMs: Number.POSITIVE_INFINITY,
-    latencyMs: 0,
-    systemLastPrice: systemTicker?.lastPrice ?? null,
-    systemOpenInterest: systemTicker?.openInterest ?? null,
-    systemPriceStatus: systemTicker ? 'STALE' : 'UNAVAILABLE',
-    source: 'Freqtrade and SBK1 Bybit public ticker unavailable',
-    status: 'UNAVAILABLE',
-    error: `Freqtrade: ${freqtradeError}; SBK1 Bybit: ${systemError}`,
-  };
 }
 
 export interface KucoinCandlesResult {
@@ -482,7 +296,6 @@ function setCache<T>(key: string, data: T): void {
 export interface FetchCandlesResult {
   candles: Candle[];
   rawCandles: Candle[];
-  systemCandles?: Candle[];
   source: string;
   status: 'LIVE' | 'STALE' | 'DATA_UNAVAILABLE' | 'SIMULATED';
   error?: string;
@@ -507,7 +320,6 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
     const result: FetchCandlesResult = {
       candles: rawCandles,
       rawCandles,
-      ...(bybitRes.systemCandles ? { systemCandles: bybitRes.systemCandles } : {}),
       source: bybitRes.source,
       status: 'LIVE',
       timestamp: bybitRes.receivedTimestampMs,
@@ -525,7 +337,7 @@ export async function fetchCandles(forceRefresh = false): Promise<FetchCandlesRe
     return {
       candles: [],
       rawCandles: [],
-      source: 'Freqtrade DataProvider unavailable',
+      source: 'freqtrade.dataprovider',
       status: 'DATA_UNAVAILABLE',
       error: error instanceof Error ? error.message : String(error),
     };
@@ -581,166 +393,46 @@ export async function fetchFearGreed(): Promise<FearAndGreed> {
 }
 
 export async function fetchDerivatives(): Promise<DerivativesData> {
-  const [snapshotResult, tickerResult] = await Promise.allSettled([
-    getFreqtradeMarketSnapshot(),
-    getBybitTicker(),
-  ]);
   const nowMs = Date.now();
-  const data = tickerResult.status === 'fulfilled' ? tickerResult.value.data : null;
-  const ticker = data?.result?.list?.[0];
-  const observedAtMs = data && Number.isSafeInteger(data.time) && Number(data.time) > 0
-    ? Number(data.time)
-    : null;
-  const ageMs = observedAtMs === null ? Number.POSITIVE_INFINITY : nowMs - observedAtMs;
-  const tickerFresh = ageMs >= -1_000 && ageMs <= 15_000;
-  const openInterestValue = Number(ticker?.openInterest);
-  const fundingRateValue = Number(ticker?.fundingRate);
-  let snapshotFunding: { rate: number; retrievedAtMs: number } | null = null;
-  if (snapshotResult.status === 'fulfilled' && snapshotResult.value.fundingRate) {
-    const candidate = snapshotResult.value.fundingRate;
-    if (nowMs - candidate.retrievedAtMs >= -1_000 && nowMs - candidate.retrievedAtMs <= 15_000) {
-      snapshotFunding = candidate;
-    }
-  }
-  const funding = Number.isFinite(fundingRateValue) ? fundingRateValue : snapshotFunding?.rate ?? null;
-  const openInterest = Number.isFinite(openInterestValue) && openInterestValue > 0
-    ? openInterestValue
-    : null;
-  const validFunding = funding !== null && Number.isFinite(funding);
-  const live = tickerFresh && validFunding && openInterest !== null;
-  const source = data
-    ? 'Bybit public market ticker (funding and open interest)'
-    : snapshotFunding
-      ? 'Freqtrade DataProvider funding; Bybit open interest unavailable'
-      : 'Bybit and Freqtrade derivatives unavailable';
-  return {
-    funding,
-    oi: openInterest,
-    fundingHistory: [],
-    status: live ? 'LIVE' : openInterest === null || !validFunding ? 'UNAVAILABLE' : 'STALE',
-    timestampUtc: observedAtMs ?? snapshotFunding?.retrievedAtMs ?? 0,
-    isoTimeUtc: observedAtMs || snapshotFunding
-      ? new Date(observedAtMs ?? snapshotFunding!.retrievedAtMs).toISOString()
-      : '',
-    ageMs: observedAtMs === null && snapshotFunding
-      ? nowMs - snapshotFunding.retrievedAtMs
-      : ageMs,
-    latencyMs: tickerResult.status === 'fulfilled'
-      ? tickerResult.value.latencyMs
-      : snapshotResult.status === 'fulfilled'
-        ? getSnapshotNetworkLatencyMs(snapshotResult.value) ?? 0
-        : 0,
-    source,
-  };
-}
-
-interface BybitOrderBookPayload {
-  retCode?: number;
-  retMsg?: string;
-  time?: number;
-  result?: { ts?: number; b?: unknown; a?: unknown };
-}
-
-let bybitOrderBookCache: { data: BybitOrderBookPayload; latencyMs: number; fetchedAtMs: number } | null = null;
-let bybitOrderBookRequest: Promise<{ data: BybitOrderBookPayload; latencyMs: number }> | null = null;
-
-async function getBybitOrderBook(): Promise<{ data: BybitOrderBookPayload; latencyMs: number }> {
-  if (bybitOrderBookCache && Date.now() - bybitOrderBookCache.fetchedAtMs <= 1_000) {
-    return bybitOrderBookCache;
-  }
-  if (bybitOrderBookRequest) return bybitOrderBookRequest;
-  const request = safeFetchJson<BybitOrderBookPayload>(
-    'https://api.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=20',
-  );
-  bybitOrderBookRequest = request;
   try {
-    const result = await request;
-    bybitOrderBookCache = { ...result, fetchedAtMs: Date.now() };
-    return result;
-  } finally {
-    if (bybitOrderBookRequest === request) bybitOrderBookRequest = null;
+    const snapshot = await getFreqtradeMarketSnapshot();
+    const fundingRate = snapshot.fundingRate;
+    const ageMs = fundingRate ? nowMs - fundingRate.retrievedAtMs : Number.POSITIVE_INFINITY;
+    const freshFunding = fundingRate !== null &&
+      ageMs >= -1_000 &&
+      ageMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS;
+    return {
+      funding: freshFunding ? fundingRate.rate : null,
+      oi: null,
+      fundingHistory: [],
+      status: 'UNAVAILABLE',
+      timestampUtc: fundingRate?.retrievedAtMs ?? 0,
+      isoTimeUtc: fundingRate ? new Date(fundingRate.retrievedAtMs).toISOString() : '',
+      ageMs,
+      latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 0,
+      source: 'freqtrade.dataprovider',
+      ...(!freshFunding
+        ? { error: 'No fresh Freqtrade funding rate is available.' }
+        : { error: 'Open interest is not available in the Freqtrade market snapshot.' }),
+    };
+  } catch (error) {
+    return {
+      funding: null,
+      oi: null,
+      fundingHistory: [],
+      status: 'UNAVAILABLE',
+      timestampUtc: 0,
+      isoTimeUtc: '',
+      ageMs: Number.POSITIVE_INFINITY,
+      latencyMs: 0,
+      source: 'freqtrade.dataprovider',
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
-}
-
-function validBybitLevels(value: unknown, descending: boolean): value is Array<[unknown, unknown]> {
-  if (!Array.isArray(value) || value.length === 0) return false;
-  let previousPrice: number | undefined;
-  for (const level of value) {
-    if (!Array.isArray(level) || level.length < 2) return false;
-    const price = Number(level[0]);
-    const amount = Number(level[1]);
-    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(amount) || amount <= 0) return false;
-    if (previousPrice !== undefined && (descending ? price > previousPrice : price < previousPrice)) return false;
-    previousPrice = price;
-  }
-  return true;
 }
 
 export async function fetchRealOrderBookImbalance(): Promise<RealOrderBookImbalance> {
-  const [snapshotResult, systemResult] = await Promise.allSettled([
-    getFreqtradeMarketSnapshot(),
-    getBybitOrderBook(),
-  ]);
-  const nowMs = Date.now();
-  const candidates: Array<{
-    bids: Array<{ price: number; amount: number }>;
-    asks: Array<{ price: number; amount: number }>;
-    timestampMs: number;
-    latencyMs: number;
-    source: string;
-    snapshotAgeMs?: number;
-  }> = [];
-
-  if (snapshotResult.status === 'fulfilled' && snapshotResult.value.orderBook) {
-    const snapshot = snapshotResult.value;
-    const orderBook = snapshot.orderBook!;
-    candidates.push({
-      bids: orderBook.bids,
-      asks: orderBook.asks,
-      timestampMs: orderBook.timestampMs,
-      latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 0,
-      source: 'Freqtrade DataProvider order book',
-      snapshotAgeMs: nowMs - snapshot.generatedAtMs,
-    });
-  }
-  if (systemResult.status === 'fulfilled') {
-    const { data } = systemResult.value;
-    const result = data.result;
-    const timestampMs = Number.isSafeInteger(result?.ts) && Number(result?.ts) > 0
-      ? Number(result?.ts)
-      : Number(data.time);
-    if (
-      data.retCode === 0 &&
-      Number.isSafeInteger(timestampMs) &&
-      timestampMs > 0 &&
-      validBybitLevels(result?.b, true) &&
-      validBybitLevels(result?.a, false) &&
-      result.b[0].length >= 2 &&
-      result.a[0].length >= 2 &&
-      Number(result.b[0][0]) < Number(result.a[0][0])
-    ) {
-      candidates.push({
-        bids: result.b.map((level) => ({ price: Number(level[0]), amount: Number(level[1]) })),
-        asks: result.a.map((level) => ({ price: Number(level[0]), amount: Number(level[1]) })),
-        timestampMs,
-        latencyMs: systemResult.value.latencyMs,
-        source: 'SBK1 Bybit public order book',
-      });
-    }
-  }
-
-  const freshCandidates = candidates
-    .map((candidate) => ({ ...candidate, ageMs: nowMs - candidate.timestampMs }))
-    .filter((candidate) => candidate.ageMs >= -1_000 && candidate.ageMs <= 10_000)
-    .sort((left, right) => left.ageMs - right.ageMs);
-  const selected = freshCandidates[0];
-  if (!selected) {
-    const snapshotError = snapshotResult.status === 'rejected'
-      ? snapshotResult.reason instanceof Error ? snapshotResult.reason.message : String(snapshotResult.reason)
-      : 'No fresh Freqtrade order book is available.';
-    const systemError = systemResult.status === 'rejected'
-      ? systemResult.reason instanceof Error ? systemResult.reason.message : String(systemResult.reason)
-      : systemResult.value.data.retMsg || 'No fresh Bybit order book is available.';
+  const unavailable = (error: string): RealOrderBookImbalance => {
     return {
       obi: null,
       bidDepthUsd: 0,
@@ -750,11 +442,12 @@ export async function fetchRealOrderBookImbalance(): Promise<RealOrderBookImbala
       spreadUsd: null,
       levelsCount: 0,
       status: 'UNAVAILABLE',
+      error,
       timestamp: 0,
       ageMs: Number.POSITIVE_INFINITY,
       snapshotAgeMs: Number.POSITIVE_INFINITY,
       latencyMs: 0,
-      source: `Order book unavailable; Freqtrade: ${snapshotError}; SBK1 Bybit: ${systemError}`,
+      source: 'freqtrade.dataprovider',
       obiVelocity: null,
       obiAcceleration: null,
       bidWallPersistence: null,
@@ -767,25 +460,44 @@ export async function fetchRealOrderBookImbalance(): Promise<RealOrderBookImbala
       wallCancellationObserved: null,
       liquidityMigration: 'UNKNOWN',
     };
+  };
+  let snapshot: FreqtradeMarketSnapshot;
+  try {
+    snapshot = await getFreqtradeMarketSnapshot();
+  } catch (error) {
+    return unavailable(error instanceof Error ? error.message : String(error));
   }
+  const orderBook = snapshot.orderBook;
+  if (!orderBook) return unavailable('No Freqtrade order book is available.');
+  const nowMs = Date.now();
+  const ageMs = nowMs - orderBook.timestampMs;
+  const snapshotAgeMs = nowMs - snapshot.generatedAtMs;
+  if (
+    ageMs < -1_000 ||
+    ageMs > 10_000 ||
+    snapshotAgeMs < -1_000 ||
+    snapshotAgeMs > FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
+  ) return unavailable('The Freqtrade order book is stale.');
 
-  const bidDepthUsd = selected.bids.reduce((total, level) => total + level.price * level.amount, 0);
-  const askDepthUsd = selected.asks.reduce((total, level) => total + level.price * level.amount, 0);
+  const bidDepthUsd = orderBook.bids.reduce((total, level) => total + level.price * level.amount, 0);
+  const askDepthUsd = orderBook.asks.reduce((total, level) => total + level.price * level.amount, 0);
   const totalDepthUsd = bidDepthUsd + askDepthUsd;
   return {
     obi: totalDepthUsd > 0 ? (bidDepthUsd - askDepthUsd) / totalDepthUsd : null,
     bidDepthUsd,
     askDepthUsd,
-    bestBid: selected.bids[0]?.price ?? null,
-    bestAsk: selected.asks[0]?.price ?? null,
-    spreadUsd: selected.asks[0] && selected.bids[0] ? selected.asks[0].price - selected.bids[0].price : null,
-    levelsCount: selected.bids.length + selected.asks.length,
+    bestBid: orderBook.bids[0]?.price ?? null,
+    bestAsk: orderBook.asks[0]?.price ?? null,
+    spreadUsd: orderBook.asks[0] && orderBook.bids[0]
+      ? orderBook.asks[0].price - orderBook.bids[0].price
+      : null,
+    levelsCount: orderBook.bids.length + orderBook.asks.length,
     status: 'LIVE',
-    timestamp: selected.timestampMs,
-    ageMs: selected.ageMs,
-    snapshotAgeMs: selected.snapshotAgeMs ?? selected.ageMs,
-    latencyMs: selected.latencyMs,
-    source: selected.source,
+    timestamp: orderBook.timestampMs,
+    ageMs,
+    snapshotAgeMs,
+    latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 0,
+    source: 'freqtrade.dataprovider',
     obiVelocity: null,
     obiAcceleration: null,
     bidWallPersistence: null,
@@ -804,122 +516,27 @@ export async function fetchOrderBookImbalance(): Promise<number | null> {
   return (await fetchRealOrderBookImbalance()).obi;
 }
 
-let cachedTradeFlow: { data: OrderFlowFeatures; fetchedAtMs: number } | null = null;
-let tradeFlowRequest: Promise<OrderFlowFeatures> | null = null;
-
 export async function fetchRealTradeFlowCvd(): Promise<OrderFlowFeatures> {
-  if (cachedTradeFlow && Date.now() - cachedTradeFlow.fetchedAtMs <= 1_000) {
-    return cachedTradeFlow.data;
-  }
-  if (tradeFlowRequest) return tradeFlowRequest;
-  const request = (async (): Promise<OrderFlowFeatures> => {
-    try {
-    const { data, latencyMs } = await safeFetchJson<{
-      retCode?: number;
-      retMsg?: string;
-      time?: number;
-      result?: { list?: unknown };
-    }>('https://api.bybit.com/v5/market/recent-trade?category=linear&symbol=BTCUSDT&limit=1000');
-    if (data.retCode !== 0 || !Array.isArray(data.result?.list)) {
-      throw new Error(`Bybit recent trades are unavailable: ${data.retMsg || 'invalid response'}.`);
-    }
-    const trades = data.result.list.map((rawTrade) => {
-      if (typeof rawTrade !== 'object' || rawTrade === null || Array.isArray(rawTrade)) {
-        throw new Error('Bybit returned a malformed recent trade.');
-      }
-      const trade = rawTrade as Record<string, unknown>;
-      const timestampMs = Number(trade.time);
-      const price = Number(trade.price);
-      const size = Number(trade.size);
-      if (
-        trade.symbol !== 'BTCUSDT' ||
-        (trade.side !== 'Buy' && trade.side !== 'Sell') ||
-        !Number.isSafeInteger(timestampMs) ||
-        timestampMs <= 0 ||
-        !Number.isFinite(price) ||
-        price <= 0 ||
-        !Number.isFinite(size) ||
-        size <= 0
-      ) {
-        throw new Error('Bybit returned invalid trade side, symbol, timestamp, price, or size.');
-      }
-      return { timestampMs, price, size, side: trade.side };
-    }).sort((left, right) => left.timestampMs - right.timestampMs);
-
-    const nowMs = Date.now();
-    const timestampUtc = trades.at(-1)?.timestampMs ?? 0;
-    const ageMs = nowMs - timestampUtc;
-    if (trades.length < 20 || ageMs < -1_000 || ageMs > 5_000) {
-      throw new Error(`Bybit recent trades are insufficient or stale (${trades.length} trades, ${ageMs}ms age).`);
-    }
-    const firstTrade = trades[0];
-    const lastTrade = trades[trades.length - 1];
-    const takerBuyVol = trades.reduce((sum, trade) => sum + (trade.side === 'Buy' ? trade.size : 0), 0);
-    const takerSellVol = trades.reduce((sum, trade) => sum + (trade.side === 'Sell' ? trade.size : 0), 0);
-    const takerDelta = takerBuyVol - takerSellVol;
-    const totalVolume = takerBuyVol + takerSellVol;
-    const cvdDeltaUsd = trades.reduce(
-      (sum, trade) => sum + (trade.side === 'Buy' ? 1 : -1) * trade.price * trade.size,
-      0,
-    );
-    const tradePriceChangePct = ((lastTrade.price - firstTrade.price) / firstTrade.price) * 100;
-    const elapsedSeconds = Math.max((lastTrade.timestampMs - firstTrade.timestampMs) / 1_000, 1);
-    const cvdDivergence = takerDelta > 0 && tradePriceChangePct < 0
-      ? 'Bullish divergence'
-      : takerDelta < 0 && tradePriceChangePct > 0
-        ? 'Bearish divergence'
-        : takerDelta * tradePriceChangePct > 0
-          ? 'Confirmed'
-          : 'Mixed';
-    return {
-      cvdDelta: takerDelta,
-      cvdDeltaUsd,
-      cvdDivergence,
-      takerBuyVol,
-      takerSellVol,
-      takerRatio: totalVolume > 0 ? takerBuyVol / totalVolume : null,
-      takerDelta,
-      tradePriceChangePct,
-      delta: takerDelta,
-      cumulativeDelta: takerDelta,
-      deltaVelocity: takerDelta / elapsedSeconds,
-      isRealTradeFlow: true,
-      status: 'LIVE',
-      timestampUtc,
-      ageMs,
-      latencyMs,
-      source: 'Bybit recent trades (latest 1000 trade window)',
-    };
-    } catch (error) {
-      return {
-      cvdDelta: null,
-      cvdDeltaUsd: null,
-      cvdDivergence: 'UNAVAILABLE',
-      takerBuyVol: null,
-      takerSellVol: null,
-      takerRatio: null,
-      takerDelta: null,
-      tradePriceChangePct: null,
-      delta: null,
-      cumulativeDelta: null,
-      deltaVelocity: null,
-      isRealTradeFlow: false,
-      status: 'UNAVAILABLE',
-      timestampUtc: 0,
-      ageMs: Number.POSITIVE_INFINITY,
-      source: 'Bybit recent trades',
-      error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  })();
-  tradeFlowRequest = request;
-  try {
-    const data = await request;
-    cachedTradeFlow = { data, fetchedAtMs: Date.now() };
-    return data;
-  } finally {
-    if (tradeFlowRequest === request) tradeFlowRequest = null;
-  }
+  return {
+    cvdDelta: null,
+    cvdDeltaUsd: null,
+    cvdDivergence: 'UNAVAILABLE',
+    takerBuyVol: null,
+    takerSellVol: null,
+    takerRatio: null,
+    takerDelta: null,
+    tradePriceChangePct: null,
+    delta: null,
+    cumulativeDelta: null,
+    deltaVelocity: null,
+    isRealTradeFlow: false,
+    status: 'UNAVAILABLE',
+    timestampUtc: 0,
+    ageMs: Number.POSITIVE_INFINITY,
+    latencyMs: 0,
+    source: 'freqtrade.dataprovider',
+    error: 'Freqtrade market snapshots do not contain trade-level flow data.',
+  };
 }
 
 export function calculateOrderFlowFeatures(candles: Candle[]): OrderFlowFeatures {

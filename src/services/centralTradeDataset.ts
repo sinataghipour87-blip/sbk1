@@ -153,13 +153,114 @@ export interface TraceableIdsPack {
   executionAttemptId: string;
 }
 
-const PREDICTIONS_DATASET_KEY = 'quantum_central_predictions_dataset';
-const TRADES_DATASET_KEY = 'quantum_central_trades_dataset';
-const PERFORMANCE_MATRIX_KEY = 'quantum_performance_matrix_freqtrade_v1';
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function predictionFromArchive(value: unknown): PredictionDatasetRecord | null {
+  if (!isObjectRecord(value)) return null;
+  const decision = value.decision;
+  const features = value.featureSnapshot;
+  if (
+    !isObjectRecord(decision) ||
+    typeof decision.signalId !== 'string' ||
+    typeof decision.decisionId !== 'string' ||
+    typeof decision.generatedAtMs !== 'number' ||
+    !Number.isSafeInteger(decision.generatedAtMs) ||
+    typeof decision.direction !== 'string' ||
+    !['LONG', 'SHORT'].includes(decision.direction) ||
+    typeof decision.exchange !== 'string' ||
+    typeof decision.pair !== 'string' ||
+    typeof decision.timeframe !== 'string' ||
+    !isObjectRecord(decision.entryConditions) ||
+    !isObjectRecord(features)
+  ) {
+    return null;
+  }
+  const timeframe = ['1m', '5m', '15m', '30m', '1H', '4H'].includes(decision.timeframe)
+    ? decision.timeframe as PredictionDatasetRecord['timeframe']
+    : '15m';
+  const outcome = isObjectRecord(value.outcome) &&
+    value.outcome.source === 'FREQTRADE_RPC' &&
+    Number.isSafeInteger(value.outcome.tradeId) &&
+    (value.outcome.tradeId as number) > 0 &&
+    typeof value.outcome.outcome === 'string' &&
+    ['WIN', 'LOSS', 'BREAKEVEN'].includes(value.outcome.outcome) &&
+    typeof value.outcome.pnlUsd === 'number' &&
+    Number.isFinite(value.outcome.pnlUsd) &&
+    typeof value.outcome.feesUsd === 'number' &&
+    Number.isFinite(value.outcome.feesUsd) &&
+    typeof value.outcome.exitReason === 'string' &&
+    typeof value.outcome.closedAtMs === 'number' &&
+    Number.isSafeInteger(value.outcome.closedAtMs)
+    ? value.outcome
+    : null;
+  const marketRegime = typeof features.marketRegime === 'string' ? features.marketRegime : 'UNKNOWN';
+  const timestamp = decision.generatedAtMs;
+  const direction = decision.direction as 'LONG' | 'SHORT';
+  const entryConditions = decision.entryConditions;
+  const tp = entryConditions.takeProfit;
+  const entryPrice = entryConditions.entryPrice;
+
+  return {
+    predictionId: decision.signalId,
+    decisionId: decision.decisionId,
+    timestamp,
+    timestampIso: new Date(timestamp).toISOString(),
+    market: 'BTC/USDT',
+    exchange: decision.exchange,
+    marketType: 'PERPETUAL',
+    timeframe,
+    direction,
+    setupType: typeof features.setupType === 'string'
+      ? features.setupType
+      : typeof entryConditions.setupType === 'string'
+        ? entryConditions.setupType
+        : 'UNKNOWN',
+    marketRegime,
+    entryPrice: typeof entryPrice === 'number' && Number.isFinite(entryPrice) ? entryPrice : null,
+    stopPrice: typeof entryConditions.stopLoss === 'number' && Number.isFinite(entryConditions.stopLoss)
+      ? entryConditions.stopLoss
+      : null,
+    tpLevels: {
+      tp1: typeof tp === 'number' && Number.isFinite(tp) ? tp : null,
+      tp2: typeof tp === 'number' && Number.isFinite(tp) ? tp : null,
+      tp3: typeof tp === 'number' && Number.isFinite(tp) ? tp : null,
+    },
+    probability: null,
+    confidenceInterval: null,
+    modelVersion: typeof value.modelVersion === 'string' ? value.modelVersion : 'unknown',
+    featureVersion: typeof value.featureVersion === 'string' ? value.featureVersion : 'unknown',
+    decisionVersion: 'freqtrade-signal-contract',
+    features,
+    orderBookState: {
+      bidDepthUsd: null,
+      askDepthUsd: null,
+      imbalancePct: typeof features.obi === 'number' ? Math.round(features.obi * 100) : null,
+    },
+    CVD: null,
+    funding: typeof features.fundingRate === 'number' ? features.fundingRate : null,
+    OI: null,
+    volatility: typeof features.volatilityPct === 'number' ? features.volatilityPct : null,
+    spread: null,
+    latency: null,
+    executionStatus: outcome ? 'CLOSED_COMPLETED' : 'EXECUTED_FILLED',
+    ...(outcome ? {
+      outcome: outcome.outcome as PredictionDatasetRecord['outcome'],
+      outcomeSource: 'FREQTRADE_CONFIRMED' as const,
+      freqtradeTradeId: outcome.tradeId as number,
+      PnL: outcome.pnlUsd as number,
+      fees: outcome.feesUsd as number,
+      exitReason: outcome.exitReason as string,
+      feedbackProcessedAtMs: outcome.closedAtMs as number,
+    } : {}),
+  };
+}
 
 export class CentralTradeDatasetService {
   private static instance: CentralTradeDatasetService;
   private batchCycleCount = 14;
+  private serverPredictions: PredictionDatasetRecord[] = [];
 
   private constructor() {}
 
@@ -277,12 +378,6 @@ export class CentralTradeDatasetService {
       decisionRejectionReasonFa: rejectionReasonFa,
     };
 
-    const predictions = this.getAllPredictions();
-    predictions.push(record);
-    // Keep max 2000 predictions history for real historical traceability
-    const trimmed = predictions.slice(-2000);
-    localStorage.setItem(PREDICTIONS_DATASET_KEY, JSON.stringify(trimmed));
-
     return record;
   }
 
@@ -314,10 +409,6 @@ export class CentralTradeDatasetService {
       outcomeSource: 'UNVERIFIED_LOCAL',
     };
 
-    const trades = this.getAllTradeRecords();
-    trades.push(tradeRecord);
-    localStorage.setItem(TRADES_DATASET_KEY, JSON.stringify(trades.slice(-100)));
-
     return tradeRecord;
   }
 
@@ -337,30 +428,16 @@ export class CentralTradeDatasetService {
     feeUsd: number,
     exitReason: string
   ): boolean {
-    const predictions = this.getAllPredictions();
-    const predIndex = predictions.findIndex(p => p.predictionId === predictionId || p.tradeId === predictionId);
-
-    if (predIndex !== -1) {
-      predictions[predIndex].outcome = outcome;
-      predictions[predIndex].outcomeSource = 'UNVERIFIED_LOCAL';
-      predictions[predIndex].PnL = pnlUsd;
-      predictions[predIndex].R = rMultiple;
-      predictions[predIndex].MAE = maeUsd;
-      predictions[predIndex].MFE = mfeUsd;
-      predictions[predIndex].timeInTrade = durationSeconds;
-      predictions[predIndex].slippage = slippageUsd;
-      predictions[predIndex].fees = feeUsd;
-      predictions[predIndex].exitReason = exitReason;
-      predictions[predIndex].executionStatus = 'CLOSED_COMPLETED';
-      predictions[predIndex].feedbackProcessedAtMs = Date.now();
-
-      localStorage.setItem(PREDICTIONS_DATASET_KEY, JSON.stringify(predictions));
-
-      // Trigger batch model evaluation cycle if queue reaches threshold
-      this.checkAndTriggerBatchModelEvaluation();
-      return true;
-    }
-
+    void predictionId;
+    void outcome;
+    void pnlUsd;
+    void rMultiple;
+    void maeUsd;
+    void mfeUsd;
+    void durationSeconds;
+    void slippageUsd;
+    void feeUsd;
+    void exitReason;
     return false;
   }
 
@@ -422,11 +499,13 @@ export class CentralTradeDatasetService {
       const validationStatus: 'VALIDATED' | 'UNVALIDATED' = isSampleSufficient ? 'VALIDATED' : 'UNVALIDATED';
 
       let isSegmentActivated = isSampleSufficient;
-      let activationReasonFa = isSampleSufficient ? 'فعال با برتری آماری تاییدشده' : `🛑 وضعیت: UNVALIDATED (حجم نمونه ${segCompleted.length}/${minRequiredSamples}). معامله تا تکمیل حجم نمونه آماری مسدود است.`;
+      let activationReasonFa = isSampleSufficient
+        ? 'آمار تاریخی در حداقل نمونهٔ لازم است؛ این معیار فقط اطلاع‌رسانی است.'
+        : `نمونه ناکافی (${segCompleted.length}/${minRequiredSamples})؛ صرفاً گزارش آماری و بدون اثر بر اجرای معامله.`;
 
       if (isSampleSufficient && (winRatePct < 45 || expectancyUsd <= 0)) {
         isSegmentActivated = false;
-        activationReasonFa = `🛑 غیرفعال هوشمند: نرخ برد (${winRatePct}٪) یا امید ریاضی ($${expectancyUsd}) زیر حد نصاب است.`;
+        activationReasonFa = `آمار تاریخی ضعیف است (نرخ برد ${winRatePct}٪، امید ریاضی $${expectancyUsd})؛ صرفاً اطلاع‌رسانی.`;
       }
 
       return {
@@ -479,7 +558,6 @@ export class CentralTradeDatasetService {
       modelUpdateBatchCycle: this.batchCycleCount,
     };
 
-    localStorage.setItem(PERFORMANCE_MATRIX_KEY, JSON.stringify(matrix));
     return matrix;
   }
 
@@ -487,35 +565,34 @@ export class CentralTradeDatasetService {
    * Check if a specific setup/timeframe/regime segment is activated
    */
   public isSegmentActivated(timeframe = '15m', direction = 'LONG', regime = 'TREND'): { isAllowed: boolean; rejectionReasonFa?: string } {
-    const matrix = this.getPerformanceMatrix();
-
-    const tfSeg = matrix.timeframeSegments[timeframe];
-    if (tfSeg && !tfSeg.isSegmentActivated) {
-      return { isAllowed: false, rejectionReasonFa: `🛑 غیرفعال‌سازی هوشمند: ستاپ در تایم‌فریم [${timeframe}] بر اساس داده‌های تاریخی فاقد برتری آماری است.` };
-    }
-
-    const dirSeg = matrix.directionSegments[direction];
-    if (dirSeg && !dirSeg.isSegmentActivated) {
-      return { isAllowed: false, rejectionReasonFa: `🛑 غیرفعال‌سازی هوشمند: معاملات [${direction}] در ارزیابی تاریخی عملکرد منفی داشته است.` };
-    }
-
-    const regSeg = matrix.regimeSegments[regime];
-    if (regSeg && !regSeg.isSegmentActivated) {
-      return { isAllowed: false, rejectionReasonFa: `🛑 غیرفعال‌سازی هوشمند: ستاپ در رژیم [${regime}] بر اساس ماتریس عملکرد تاریخی مسدود می‌باشد.` };
-    }
-
+    void timeframe;
+    void direction;
+    void regime;
     return { isAllowed: true };
   }
 
   public getAllPredictions(): PredictionDatasetRecord[] {
-    if (typeof window === 'undefined' || typeof localStorage === 'undefined') return [];
-    const saved = localStorage.getItem(PREDICTIONS_DATASET_KEY);
-    if (!saved) return [];
-    try {
-      return JSON.parse(saved);
-    } catch {
-      return [];
+    return structuredClone(this.serverPredictions);
+  }
+
+  public async refreshTrainingArchive(adminToken: string): Promise<number> {
+    const response = await fetch('/api/operational-trade-archive', {
+      headers: { 'x-admin-token': adminToken },
+      cache: 'no-store',
+    });
+    if (!response.ok) throw new Error(`آرشیو سروری در دسترس نیست (HTTP ${response.status}).`);
+    const payload: unknown = await response.json();
+    if (!isObjectRecord(payload) || !Array.isArray(payload.records)) {
+      throw new Error('پاسخ آرشیو سروری ساختار معتبری ندارد.');
     }
+    this.serverPredictions = payload.records
+      .map(predictionFromArchive)
+      .filter((record): record is PredictionDatasetRecord => record !== null);
+    return this.serverPredictions.length;
+  }
+
+  public clearServerTrainingArchive(): void {
+    this.serverPredictions = [];
   }
 
   public getFreqtradeVerifiedPredictions(): PredictionDatasetRecord[] {
@@ -525,14 +602,7 @@ export class CentralTradeDatasetService {
   }
 
   public getAllTradeRecords(): TradeDatasetRecord[] {
-    if (typeof window === 'undefined' || typeof localStorage === 'undefined') return [];
-    const saved = localStorage.getItem(TRADES_DATASET_KEY);
-    if (!saved) return [];
-    try {
-      return JSON.parse(saved);
-    } catch {
-      return [];
-    }
+    return [];
   }
 
   public getFreqtradeVerifiedTradeRecords(): TradeDatasetRecord[] {
@@ -542,12 +612,6 @@ export class CentralTradeDatasetService {
   }
 
   public getPerformanceMatrix(): MultiDimensionalPerformanceMatrix {
-    const saved = localStorage.getItem(PERFORMANCE_MATRIX_KEY);
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch {}
-    }
     return this.recalculatePerformanceMatrix();
   }
 }

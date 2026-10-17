@@ -16,7 +16,7 @@
     "unit": "seconds"
   },
   "internals": {
-    "process_throttle_secs": 5
+    "process_throttle_secs": 1
   },
   "entry_pricing": {
     "price_side": "same",

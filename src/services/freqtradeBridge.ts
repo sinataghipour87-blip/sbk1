@@ -36,8 +36,10 @@ export interface FreqtradeOrder {
 export interface FreqtradeTrade {
   trade_id: number;
   pair: string;
+  enter_tag?: string | null;
   is_open: boolean;
   is_short: boolean;
+  leverage?: number;
   amount: number;
   amount_requested: number | null;
   open_rate: number;
@@ -399,8 +401,10 @@ class FreqtradeBridge {
       trade.trade_id !== expectedId ||
       typeof trade.pair !== 'string' ||
       !trade.pair ||
+      (trade.enter_tag !== undefined && trade.enter_tag !== null && typeof trade.enter_tag !== 'string') ||
       typeof trade.is_open !== 'boolean' ||
       typeof trade.is_short !== 'boolean' ||
+      (trade.leverage !== undefined && (!Number.isFinite(trade.leverage) || trade.leverage < 1)) ||
       typeof trade.has_open_orders !== 'boolean' ||
       !Array.isArray(trade.orders) ||
       !trade.orders.every((order) =>

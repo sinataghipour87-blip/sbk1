@@ -4,12 +4,14 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  deriveSbkExitSignalId,
   deriveSbkSignalIds,
   FreqtradeSignalAdapter,
   isValidBridgeToken,
   SBK_SIGNAL_CONTRACT_VERSION,
   SbkSignalValidationError,
   validateSbkFreqtradeSignal,
+  validateSbkFreqtradeExitSignal,
 } from '../src/services/freqtradeSignalAdapter';
 
 const nowMs = Date.now();
@@ -34,14 +36,16 @@ const signal = {
   generatedAtMs: nowMs,
   expiresAtMs: nowMs + 45_000,
   referencePrice: 62_100,
+  engineScore: 84,
   dataQuality: {
     status: 'LIVE',
-    source: 'Bybit Linear Futures Ticker (BTCUSDT)',
+    source: 'freqtrade.dataprovider',
     observedAtMs: nowMs,
     maxAgeMs: 5_000,
   },
   entryConditions: {
     setupType: 'BULLISH_LIQUIDITY_SWEEP',
+    entryPrice: 62_100,
     stopLoss: 61_800,
     takeProfit: 62_700,
     maxPriceDeviationBps: 50,
@@ -64,6 +68,13 @@ try {
     expectedTimeframe: '15m',
   });
   assert.equal(validated.signalId, ids.signalId);
+  assert.equal(validated.evidenceLevel, 'UNCALIBRATED_HEURISTIC');
+  const unscoredSignal = validateSbkFreqtradeSignal({
+    ...signal,
+    engineScore: null,
+  }, { nowMs });
+  assert.equal(unscoredSignal.engineScore, null, 'an unavailable heuristic score must stay explicitly unavailable');
+  assert.equal(unscoredSignal.evidenceLevel, 'UNCALIBRATED_HEURISTIC');
   assert.equal(isValidBridgeToken('a'.repeat(32), 'a'.repeat(32)), true);
   assert.equal(isValidBridgeToken('a'.repeat(31), 'a'.repeat(32)), false);
   assert.equal(isValidBridgeToken('a'.repeat(32), 'short'), false);
@@ -101,6 +112,32 @@ try {
       entryConditions: { ...signal.entryConditions, stopLoss: 63_000 },
     }, { nowMs }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_RISK_REWARD',
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({ ...signal, evidenceLevel: 'CALIBRATED' }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_EVIDENCE_LEVEL',
+  );
+  const exitSignal = {
+    contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
+    signalType: 'EXIT' as const,
+    exitId: deriveSbkExitSignalId({
+      tradeId: 42,
+      entryTag: ids.signalId,
+      reason: 'CONTRACT_TEST_ONLY exit',
+      generatedAtMs: nowMs,
+    }),
+    pair: signal.pair,
+    tradeId: 42,
+    entryTag: ids.signalId,
+    direction: signal.direction,
+    reason: 'CONTRACT_TEST_ONLY exit',
+    generatedAtMs: nowMs,
+    expiresAtMs: nowMs + 30_000,
+  };
+  assert.deepEqual(validateSbkFreqtradeExitSignal(exitSignal, nowMs), exitSignal);
+  assert.throws(
+    () => validateSbkFreqtradeExitSignal({ ...exitSignal, tradeId: 0 }, nowMs),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_EXIT_TARGET',
   );
 
   const adapter = new FreqtradeSignalAdapter();
@@ -150,6 +187,21 @@ try {
   );
   assert.equal(filled.lifecycleEvents.at(-1)?.tradeId, 42);
   assert.equal(filled.lifecycleEvents.at(-1)?.source, 'FREQTRADE');
+  const queuedExit = await adapter.submitExitSignal(exitSignal, nowMs);
+  assert.equal(queuedExit.status, 'PENDING');
+  assert.equal((await adapter.getPendingExitSignals(signal.pair)).length, 1);
+  const duplicateExit = await adapter.submitExitSignal(exitSignal, nowMs);
+  assert.equal(duplicateExit.duplicate, true, 'repeated exit submissions must be idempotent');
+  const confirmedExit = await adapter.updateExitSignalStatus(
+    exitSignal.exitId,
+    'CONFIRMED',
+    'CONTRACT_TEST_ONLY accepted by named RPC mock',
+  );
+  assert.equal(confirmedExit.status, 'CONFIRMED');
+  const closedExit = await adapter.updateExitSignalStatus(exitSignal.exitId, 'CLOSED');
+  assert.equal(closedExit.status, 'CLOSED');
+  assert.equal((await adapter.getPendingExitSignals(signal.pair)).length, 0);
+  assert.equal((await adapter.submitExitSignal(exitSignal, nowMs)).status, 'CLOSED');
   await assert.rejects(
     adapter.updateStatus(signal.signalId, { status: 'FILLED', tradeId: 43 }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'TRADE_ID_CONFLICT',
@@ -260,6 +312,7 @@ print("Python signal contract checks passed.")
     cwd: process.cwd(),
     input: JSON.stringify([
       { name: 'valid', signal, nowMs, valid: true },
+      { name: 'explicitly unscored heuristic signal', signal: { ...signal, engineScore: null }, nowMs, valid: true },
       { name: 'expired', signal: { ...signal, expiresAtMs: nowMs - 1 }, nowMs, valid: false },
       {
         name: 'expiry precedes future generation time',
@@ -268,6 +321,13 @@ print("Python signal contract checks passed.")
         valid: false,
       },
       { name: 'pair mismatch', signal: { ...signal, pair: 'ETH/USDT:USDT' }, nowMs, valid: false },
+      { name: 'unsupported evidence level', signal: { ...signal, evidenceLevel: 'CALIBRATED' }, nowMs, valid: false },
+      {
+        name: 'wrong-side stop',
+        signal: { ...signal, entryConditions: { ...signal.entryConditions, stopLoss: 63_000 } },
+        nowMs,
+        valid: false,
+      },
       {
         name: 'stale source evidence',
         signal: { ...signal, dataQuality: { ...signal.dataQuality, observedAtMs: nowMs - 3_000, maxAgeMs: 1_000 } },

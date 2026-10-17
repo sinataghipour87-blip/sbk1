@@ -14,6 +14,7 @@ import {
   MasterDecisionObject,
   MetaLearnerInputFeatures,
   MetaModelHealthState,
+  DirectionalSignalCandidate,
 } from '../types/trading';
 import { evaluateCognitiveConviction } from './kellyRisk';
 import { runWavePredictionEngine } from './predictiveEngine';
@@ -53,6 +54,36 @@ export interface RunPipelineOptions {
   userLeverage?: number;
   minWinProbability?: number;
   isAutoTrade?: boolean;
+  signalCandidateMode?: boolean;
+}
+
+function buildDirectionalSignalCandidate(analysis: AnalysisResult): DirectionalSignalCandidate | null {
+  const direction = analysis.direction;
+  const entryPrice = analysis.pullbackLimitPrice;
+  const stopLoss = analysis.sl;
+  const takeProfit = analysis.tp1;
+  const engineScore = analysis.confidenceScore ?? analysis.technicalScore;
+  const setupType = analysis.setupContext?.setupType;
+
+  if (
+    (direction !== 'LONG' && direction !== 'SHORT') ||
+    typeof entryPrice !== 'number' || !Number.isFinite(entryPrice) || entryPrice <= 0 ||
+    typeof stopLoss !== 'number' || !Number.isFinite(stopLoss) || stopLoss <= 0 ||
+    typeof takeProfit !== 'number' || !Number.isFinite(takeProfit) || takeProfit <= 0 ||
+    typeof engineScore !== 'number' || !Number.isFinite(engineScore) || engineScore < 0 || engineScore > 100 ||
+    typeof setupType !== 'string' || !setupType.trim()
+  ) {
+    return null;
+  }
+
+  const correctSide = direction === 'LONG'
+    ? stopLoss < entryPrice && takeProfit > entryPrice
+    : takeProfit < entryPrice && stopLoss > entryPrice;
+  if (!correctSide || Math.abs(takeProfit - entryPrice) < Math.abs(entryPrice - stopLoss)) {
+    return null;
+  }
+
+  return { direction, entryPrice, stopLoss, takeProfit, engineScore, setupType };
 }
 
 /**
@@ -75,6 +106,38 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   const now = new Date();
   const timestampMs = Date.now();
   const timestampIso = now.toISOString();
+
+  if (options.signalCandidateMode) {
+    const signalCandidate = buildDirectionalSignalCandidate(analysis);
+    const waitReasonFa = signalCandidate
+      ? 'نامزد جهت‌دار برای صف Freqtrade؛ این نتیجه مجوز اجرای مستقیم SBK1 نیست.'
+      : 'از دادهٔ موجود نامزد جهت‌دار با ورود، استاپ و هدف فنی معتبر ساخته نشد.';
+    return {
+      decision: 'WAIT_NO_TRADE',
+      direction: signalCandidate?.direction ?? 'NEUTRAL',
+      signalCandidate: signalCandidate ?? undefined,
+      activeStage: 'STAGE_10_STOP_INVALIDATION',
+      stages: [{
+        id: 'STAGE_10_STOP_INVALIDATION',
+        name: 'Directional Signal Candidate',
+        nameFa: 'نامزد جهت‌دار برای موتور اجرای Freqtrade',
+        passed: signalCandidate !== null,
+        status: signalCandidate ? 'PASSED' : 'FAILED',
+        value: signalCandidate?.direction ?? 'NO TRADE',
+        threshold: 'ورود، استاپ و هدف واقعی و هم‌جهت با معامله',
+        reasonFa: waitReasonFa,
+      }],
+      passedStagesCount: signalCandidate ? 1 : 0,
+      totalStagesCount: 1,
+      isEdgeProven: false,
+      expectedValueUsd: null,
+      expectedR: null,
+      calibratedWinProb: null,
+      waitReasonFa,
+      prerequisitesToArmFa: signalCandidate ? [] : ['دادهٔ کندلی با ساختار فنی معتبر'],
+      evaluatedAtIso: timestampIso,
+    };
+  }
 
   // Generate Immutable Audit Traceability IDs (Item 18)
   const traceableIds = centralTradeDatasetService.generateTraceableIds();

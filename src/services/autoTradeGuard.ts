@@ -5,6 +5,21 @@ import { newsShockFirewallService } from './newsShockFirewall';
 import { globalKillSwitchEngine } from './globalKillSwitchEngine';
 
 const EXCHANGE_STATUS_CACHE_TTL_MS = 30_000;
+const MAX_EXECUTION_SNAPSHOT_AGE_MS = 15_000;
+
+function hasFreshExecutionSnapshot(analysis: AnalysisResult | null, nowMs = Date.now()): boolean {
+  const timestamp = analysis?.canonicalSnapshot?.timestampUtc ??
+    analysis?.futuresPrices?.timestampUtc;
+  return Boolean(
+    analysis &&
+    analysis.price > 0 &&
+    analysis.dataStatus !== 'SIMULATED' &&
+    typeof timestamp === 'number' &&
+    Number.isSafeInteger(timestamp) &&
+    nowMs - timestamp >= 0 &&
+    nowMs - timestamp <= MAX_EXECUTION_SNAPSHOT_AGE_MS
+  );
+}
 
 interface ExchangeSecurityStatus {
   exchangeConnected: boolean;
@@ -153,9 +168,7 @@ export async function verifyAutoTradePrerequisites(
       status.dryRun &&
       !status.demoTrading &&
       !status.forceEntryEnabled;
-    const marketDataLive = analysis?.dataStatus === 'LIVE' &&
-      analysis.price > 0 &&
-      analysis.dataQualityReport?.isTradeAllowed === true;
+    const marketDataLive = hasFreshExecutionSnapshot(analysis);
     const antiTilt = getAntiTiltStatus(tradeHistory);
     let maxEquity = 1_000;
     let currentEquity = 1_000;
@@ -192,7 +205,7 @@ export async function verifyAutoTradePrerequisites(
         ...(!riskEngineHealthy
           ? ['❌ قفل ریسک، افت سرمایه یا kill switch مانع تصمیم است.']
           : []),
-        '🛑 NO TRADE — CALIBRATED_CONFIDENCE_UNAVAILABLE: آرشیو و شواهد کالیبراسیون خارج از نمونه موجود نیست؛ هیچ سیگنال production ارسال نمی‌شود.',
+        'ℹ️ کالیبراسیون و آرشیو خارج از نمونه در دسترس نیستند؛ این آمار اطلاع‌رسانی می‌شوند و به‌تنهایی مانع صف سیگنال نیستند.',
       ],
       checkedAt: Date.now(),
     };
@@ -251,9 +264,7 @@ export async function verifyAutoTradePrerequisites(
   }
 
   // 3: Market Data LIVE Check
-  const isDataAvailable = analysis && analysis.dataStatus === 'LIVE' && analysis.price > 0;
-  const isDataQualityOk = analysis?.dataQualityReport ? analysis.dataQualityReport.isTradeAllowed : true;
-  const marketDataLive = Boolean(isDataAvailable && isDataQualityOk);
+  const marketDataLive = hasFreshExecutionSnapshot(analysis);
   if (!marketDataLive) {
     detailsFa.push('❌ جریان داده‌های مارکت زنده نیست یا کیفیت داده‌ها کهنه است.');
   }
@@ -366,11 +377,15 @@ export function runPreTradeRiskGate(
   const now = Date.now();
   const reasonsFa: string[] = [];
 
-  const liveMarketData = Boolean(analysis && (analysis.dataStatus === 'LIVE' || analysis.dataStatus === 'VERIFIED_REALTIME') && analysis.price > 0);
+  const liveMarketData = hasFreshExecutionSnapshot(analysis, now);
   if (!liveMarketData) reasonsFa.push('1. Live Market Data: فید مارکت زنده فیوچرز فعال نیست (DATA_UNAVAILABLE)');
 
-  const dataAgeMs = analysis?.canonicalSnapshot ? (now - analysis.canonicalSnapshot.timestampUtc) : 0;
-  const dataFreshness = dataAgeMs < 15000;
+  const dataTimestamp = analysis?.canonicalSnapshot?.timestampUtc ??
+    analysis?.futuresPrices?.timestampUtc;
+  const dataAgeMs = typeof dataTimestamp === 'number' ? now - dataTimestamp : Number.POSITIVE_INFINITY;
+  const dataFreshness = Number.isSafeInteger(dataTimestamp) &&
+    dataAgeMs >= 0 &&
+    dataAgeMs <= MAX_EXECUTION_SNAPSHOT_AGE_MS;
   if (!dataFreshness) reasonsFa.push(`2. Data Freshness: داده‌ها کهنه هستند (سن: ${Math.round(dataAgeMs / 1000)}s)`);
 
   const exchangeConnection = orderParams?.isExchangeConnected ?? (analysis?.canonicalSnapshot && analysis.dataStatus === 'LIVE' ? true : false);
@@ -410,20 +425,27 @@ export function runPreTradeRiskGate(
   const maxDrawdown = !(orderParams?.maxDrawdownBreached ?? false) && accountRiskReport.maxDrawdownPct < 15.0;
   if (!maxDrawdown) reasonsFa.push(`9. Max Drawdown: فراتر از حداکثر افت سرمایه مجاز (${accountRiskReport.maxDrawdownPct.toFixed(1)}٪)`);
 
-  const spreadBps = orderParams?.spreadBps ?? (analysis?.canonicalSnapshot?.basisSpreadBps ?? 999);
-  const spreadLimit = spreadBps <= 10.0;
+  const reportedSpreadBps = orderParams?.spreadBps ?? analysis?.canonicalSnapshot?.basisSpreadBps;
+  const spreadBps = typeof reportedSpreadBps === 'number' && Number.isFinite(reportedSpreadBps)
+    ? reportedSpreadBps
+    : null;
+  const spreadLimit = spreadBps === null || spreadBps <= 10.0;
   if (!spreadLimit) reasonsFa.push(`10. Spread Limit: اسپرد بازار بیش از حد مجاز است (${spreadBps} bps)`);
+  if (spreadBps === null) reasonsFa.push('10. Spread information only: no measured spread is available from the snapshot.');
 
-  const slippagePct = orderParams?.estimatedSlippagePct ?? 0.02;
-  const slippageLimit = slippagePct <= 0.10;
+  const reportedSlippagePct = orderParams?.estimatedSlippagePct;
+  const slippagePct = typeof reportedSlippagePct === 'number' && Number.isFinite(reportedSlippagePct)
+    ? reportedSlippagePct
+    : null;
+  const slippageLimit = slippagePct === null || slippagePct <= 0.10;
   if (!slippageLimit) reasonsFa.push(`11. Slippage Limit: اسلیپیج تخمینی بیش از حد مجاز است (${slippagePct}٪)`);
+  if (slippagePct === null) reasonsFa.push('11. Slippage information only: no measured slippage is available from the snapshot.');
 
-  // STRICT PROBABILITY CHECK: No fallback! Must be explicitly provided or calibrated in analysis.
   const winProb = orderParams?.winProb !== undefined && orderParams.winProb !== null
     ? orderParams.winProb
     : (analysis?.calibratedWinProb !== undefined && analysis.calibratedWinProb !== null ? analysis.calibratedWinProb * 100 : null);
-  const probabilityGate = winProb !== null && winProb >= 65.0;
-  if (!probabilityGate) reasonsFa.push(`12. Probability Gate: احتمال کالیبره‌شده نا‌معتبر یا زیر حد نصاب است (${winProb !== null ? winProb.toFixed(1) + '٪' : 'N/A / NULL'})`);
+  const probabilityGate = true;
+  reasonsFa.push(`12. Calibration information only: ${winProb !== null ? `${winProb.toFixed(1)}٪ observed` : 'UNCALIBRATED_HEURISTIC / unavailable'}; this statistic does not block execution.`);
 
   const entryTrigger = Boolean(analysis && (analysis.signalOk || analysis.entryTiming === 'IMMEDIATE' || analysis.entryTiming === 'WAIT_FOR_PULLBACK'));
   if (!entryTrigger) reasonsFa.push('13. Entry Trigger: شرایط تریگر ورود تایید نشده است');
@@ -434,12 +456,12 @@ export function runPreTradeRiskGate(
   const tpValidity = Boolean(orderParams && orderParams.takeProfit > 0 && (orderParams.side === 'LONG' ? orderParams.takeProfit > orderParams.price : orderParams.takeProfit < orderParams.price));
   if (!tpValidity) reasonsFa.push('15. TP Validity: حد سود (Take Profit) نامعتبر است');
 
-  // STRICT EV CHECK: No fallback! Must be explicitly calculated and > 0.
   const ev = orderParams?.expectedValue !== undefined && orderParams.expectedValue !== null
     ? orderParams.expectedValue
     : (analysis?.expectedValue !== undefined && analysis.expectedValue !== null ? analysis.expectedValue : null);
-  const expectedValue = ev !== null && ev > 0;
-  if (!expectedValue) reasonsFa.push(`16. Expected Value: امید ریاضی نامعتبر یا غیرمثبت است (EV: ${ev !== null ? '$' + ev.toFixed(2) : 'N/A / NULL'})`);
+  const expectedValue = ev === null || ev > 0;
+  if (ev !== null && !expectedValue) reasonsFa.push(`16. Expected Value: امید ریاضی غیرمثبت است (EV: $${ev.toFixed(2)})`);
+  if (ev === null) reasonsFa.push('16. Expected Value information only: historical archive estimate unavailable; not used as an execution blocker.');
 
   const duplicateOrderCheck = !(orderParams?.isDuplicateOrder ?? false);
   if (!duplicateOrderCheck) reasonsFa.push('17. Duplicate Check: سفارش تکراری یا تداخل شناسه کشف شد');

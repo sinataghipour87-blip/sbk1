@@ -11,6 +11,7 @@ import dotenv from 'dotenv';
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_NODE_PORT = 3000;
 const STRATEGY_NAME = 'SbkSignalStrategy';
+const FREQTRADE_PROCESS_THROTTLE_SECS = 1;
 const FREQTRADE_CONFIG_PATH = path.join(ROOT_DIR, 'freqtrade', 'user_data', 'config.json');
 const STRATEGY_PATH = path.join(ROOT_DIR, 'freqtrade_integration', 'strategies');
 const LOCK_PATH = path.join(ROOT_DIR, '.sbk1-run.lock');
@@ -40,10 +41,15 @@ interface FreqtradeConfig {
   strategy?: string;
   trading_mode?: string;
   timeframe?: string;
+  internals?: {
+    process_throttle_secs?: number;
+  };
   initial_state?: string;
   force_entry_enable?: boolean;
   exchange?: {
     name?: string;
+    key?: string;
+    secret?: string;
     pair_whitelist?: string[];
   };
   api_server?: {
@@ -65,6 +71,7 @@ interface RuntimeSettings {
   apiPort: number;
   apiHost: string;
   nodePort: number;
+  liveEnabled: boolean;
 }
 
 interface SignalStoreLock {
@@ -135,14 +142,23 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   if (pair !== sbkPair) {
     throw new Error('FREQTRADE_PAIR and SBK1_FREQTRADE_PAIR must match exactly.');
   }
-  if (config.dry_run !== true) {
-    throw new Error('Startup is restricted to dry-run: set dry_run to true in the private Freqtrade config.');
-  }
   if (config.strategy !== STRATEGY_NAME) {
     throw new Error(`Freqtrade config must select ${STRATEGY_NAME}.`);
   }
   if (config.force_entry_enable !== false) {
-    throw new Error('force_entry_enable must be false; entries must pass through the SBK1 signal strategy.');
+    throw new Error('برای اجرا، force_entry_enable باید false باشد؛ ورودها فقط از مسیر سیگنال SBK1 انجام می‌شوند.');
+  }
+  const liveEnabled = env.SBK1_LIVE_ENABLED?.trim().toLowerCase() === 'true';
+  if (config.dry_run !== true && config.dry_run !== false) {
+    throw new Error('مقدار dry_run در تنظیم خصوصی Freqtrade باید صریحاً true یا false باشد.');
+  }
+  if (config.dry_run === false) {
+    if (!liveEnabled) {
+      throw new Error('اجرای لایو مسدود است؛ مالک باید ابتدا SBK1_LIVE_ENABLED=true را صریحاً در محیط سرور تنظیم کند.');
+    }
+    if (!config.exchange?.key?.trim() || !config.exchange?.secret?.trim()) {
+      throw new Error('اجرای لایو مسدود است؛ کلید و secret صرافی باید در تنظیم خصوصی Freqtrade پر باشند.');
+    }
   }
   if (
     config.exchange?.name?.toLowerCase() !== exchange ||
@@ -153,6 +169,11 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   }
   if (config.timeframe !== timeframe) {
     throw new Error('Freqtrade timeframe and SBK1_FREQTRADE_TIMEFRAME must match.');
+  }
+  if (config.internals?.process_throttle_secs !== FREQTRADE_PROCESS_THROTTLE_SECS) {
+    throw new Error(
+      `Freqtrade internals.process_throttle_secs must be ${FREQTRADE_PROCESS_THROTTLE_SECS} second to keep SBK1 market data fresh.`,
+    );
   }
   if (config.trading_mode !== 'spot' && config.trading_mode !== 'futures') {
     throw new Error('Freqtrade trading_mode must be spot or futures.');
@@ -196,9 +217,10 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
     orderTypes.emergency_exit !== 'market' ||
     orderTypes.force_exit !== 'market' ||
     orderTypes.stoploss !== 'market' ||
-    orderTypes.stoploss_on_exchange !== false
+    typeof orderTypes.stoploss_on_exchange !== 'boolean' ||
+    (config.dry_run && orderTypes.stoploss_on_exchange !== false)
   ) {
-    throw new Error('Freqtrade must use market stoploss and emergency/force exits with stoploss_on_exchange explicitly disabled.');
+    throw new Error('Freqtrade must use market stoploss and emergency/force exits; dry-run must keep stoploss_on_exchange disabled.');
   }
   const riskPctRaw = env.SBK1_SIGNAL_RISK_PCT?.trim();
   const maxStakeRaw = env.SBK1_SIGNAL_MAX_STAKE_QUOTE?.trim();
@@ -261,6 +283,7 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
     apiPort: api.listen_port,
     apiHost: api.listen_ip_address,
     nodePort,
+    liveEnabled,
   };
 }
 

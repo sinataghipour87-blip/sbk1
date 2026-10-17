@@ -4,7 +4,7 @@
  * طبق بند ۴۹ و ۵۰ استراتژی:
  * 
  * ۱. جداسازی کامل سه لایه مستقل:
- *    - Prediction Engine: فقط محاسبات سیگنال، پیش‌بینی، احتمال کالیبره‌شده و امید ریاضی را انجام می‌دهد. هیچ ارجاع یا دسترسی به ارسال سفارش یا API صرافی ندارد.
+ *    - Prediction Engine: محاسبات سیگنال و آمار احتمالی را انجام می‌دهد. کالیبراسیون/آرشیو اطلاعاتی است و گیت اجرا نیست.
  *    - Risk Engine: ورودی لایه Prediction را بررسی کرده و قوانین ریسک، آنتی‌تیلت، حد ضرر روزانه، گارد دراوداون و دیوار آتش را اعمال می‌کند.
  *    - Execution Engine: فقط و فقط پس از تایید کامل لایه Risk و بر اساس آخرین اسنپ‌شات واقعی لحظه‌ای بازار اقدام به ارسال سفارش صرافی می‌کند.
  * 
@@ -15,7 +15,7 @@
  *    3. Data Quality
  *    4. Correct Symbol (BTCUSDT)
  *    5. Correct Position State
- *    6. Probability Calibration (>= 65.0%)
+ *    6. Probability Calibration (informational only)
  *    7. Positive Expectancy (EV > $0)
  *    8. Valid Entry
  *    9. Valid Stop
@@ -30,7 +30,7 @@
  *    18. Clock Synchronization (< 1500ms drift)
  *    19. Exchange Reconciliation (100% match)
  * 
- * اگر حتی ۱ مورد از موارد فوق Fail شود، پاسخ اکیداً: NO_TRADE خواهد بود (Fail-Closed).
+ * هر گیت فنی/ریسک در صورت شکست NO_TRADE می‌دهد؛ داده‌های آماری ناموجود فقط اطلاع‌رسانی می‌شوند.
  */
 
 import {
@@ -83,6 +83,7 @@ export interface RiskVerdict {
   decision: 'RISK_APPROVED' | 'NO_TRADE';
   approvedPayload: ApprovedRiskOrderPayload | null;
   rejectionReasonsFa: string[];
+  informationalNotesFa: string[];
   riskCheckTimestamp: number;
 }
 
@@ -91,6 +92,7 @@ export interface FinalProductionGateCheckItem {
   key: string;
   labelFa: string;
   passed: boolean;
+  blocking?: boolean;
   measuredValue: string;
   thresholdValue: string;
   rationaleFa: string;
@@ -113,6 +115,7 @@ export interface QuantumTradeLawPillarItem {
   key: QuantumLawPillarKey;
   labelFa: string;
   passed: boolean;
+  blocking?: boolean;
   value: string;
   thresholdFa: string;
   evidenceFa: string;
@@ -232,7 +235,7 @@ export class RiskEngine {
   /**
    * 33. Layer 2: Risk Engine Gate (Separation of Concerns: Prediction -> Risk -> Execution)
    * Evaluates capital allowance, CI-adjusted sizing, real exchange equity daily loss, drawdown, and correlated exposure.
-   * STRICT RULE: Never alters or tampers with the Prediction Layer's calibrated probability!
+   * Calibration remains prediction metadata and is not an execution prerequisite.
    */
   public evaluateRiskGate(
     prediction: PredictionCandidatePayload,
@@ -248,16 +251,19 @@ export class RiskEngine {
       rejectionReasonsFa.push('لایه ریسک: سیگنال ورودی لایه Prediction تاییدنشده یا خنثی است.');
     }
 
-    // 2. Probability Calibration Gate
+    // 2. Probability Calibration (informational only)
     const winProb = prediction.calibratedProbabilityPct;
+    const informationalNotesFa: string[] = [];
     if (winProb === null || winProb < 65.0) {
-      rejectionReasonsFa.push(`لایه ریسک: احتمال کالیبره‌شده نا معتبر یا زیر حد نصاب است (${winProb !== null ? winProb + '%' : 'NULL'}).`);
+      informationalNotesFa.push(`آمار کالیبراسیون صرفاً اطلاع‌رسانی است (${winProb !== null ? `${winProb}%` : 'UNCALIBRATED_HEURISTIC / unavailable'}).`);
     }
 
-    // 3. Expected Value Gate
+    // 3. Only a measured non-positive expectancy blocks; an unavailable archive estimate is informational.
     const ev = prediction.expectedValueUsd;
-    if (ev === null || ev <= 0) {
-      rejectionReasonsFa.push(`لایه ریسک: امید ریاضی غیرمثبت یا محاسبه‌نشده است (EV: ${ev !== null ? '$' + ev.toFixed(2) : 'NULL'}).`);
+    if (ev !== null && ev <= 0) {
+      rejectionReasonsFa.push(`لایه ریسک: امید ریاضی غیرمثبت است (EV: $${ev.toFixed(2)}).`);
+    } else if (ev === null) {
+      informationalNotesFa.push('امید ریاضی تاریخی به‌دلیل نبود آرشیو در دسترس نیست و مانع اجرا نیست.');
     }
 
     // 4. Anti-Tilt Gate
@@ -295,24 +301,27 @@ export class RiskEngine {
       rejectionReasonsFa.push(`لایه ریسک: دیوار آتش شوک خبری فعال است (${firewallReport.directiveFa}).`);
     }
 
-    // 9. Selective Activation Gate in Central Dataset
+    // 9. Historical segment performance is informational when archival evidence is incomplete.
     const segmentStatus = centralTradeDatasetService.isSegmentActivated(
       (prediction.rawAnalysis?.timeframe as string) || '15m',
       prediction.direction,
       'TREND'
     );
     if (!segmentStatus.isAllowed) {
-      rejectionReasonsFa.push(`لایه ریسک: ${segmentStatus.rejectionReasonFa}`);
+      informationalNotesFa.push(`آمار عملکرد تاریخی: ${segmentStatus.rejectionReasonFa}`);
     }
 
-    // 10. Item 34: Position Sizing Calibrated with Confidence Interval (Uncertainty Spread)
-    let ciWidth = 0.08;
+    // 10. Confidence interval scales risk when available; it does not authorize or block a signal.
+    let ciWidth: number | null = null;
     if (prediction.confidenceInterval) {
       ciWidth = Math.max(0.01, Math.abs(prediction.confidenceInterval.upper - prediction.confidenceInterval.lower));
     }
-    // High uncertainty (wide CI, e.g. 51-94%, width=0.43) heavily penalizes position size
-    // Low uncertainty (tight CI, e.g. 76-80%, width=0.04) allows full target sizing
-    const ciUncertaintyPenalty = Math.max(0.15, Math.min(1.0, 1.0 / (1.0 + (25.0 * Math.pow(ciWidth, 2)))));
+    const ciUncertaintyPenalty = ciWidth === null
+      ? 0.5
+      : Math.max(0.15, Math.min(1.0, 1.0 / (1.0 + (25.0 * Math.pow(ciWidth, 2)))));
+    if (ciWidth === null) {
+      informationalNotesFa.push('بازه اطمینان آماری موجود نیست؛ اندازه موقعیت با ضریب محافظه‌کارانه محدود شده است.');
+    }
     const correlationScale = Math.max(0.5, 1.0 / correlationReport.correlationRiskFactor);
 
     // Base target margin: 5% of available balance scaled by CI uncertainty, correlation risk and anti-tilt
@@ -349,6 +358,7 @@ export class RiskEngine {
       decision: isApproved ? 'RISK_APPROVED' : 'NO_TRADE',
       approvedPayload,
       rejectionReasonsFa,
+      informationalNotesFa,
       riskCheckTimestamp: now,
     };
   }
@@ -397,24 +407,26 @@ export class ExecutionEngine {
       passed: boolean,
       measuredValue: string,
       thresholdValue: string,
-      rationaleFa: string
+      rationaleFa: string,
+      blocking = true
     ) => {
       checks.push({
         id,
         key,
         labelFa,
         passed,
+        blocking,
         measuredValue,
         thresholdValue,
         rationaleFa,
       });
-      if (!passed) {
+      if (blocking && !passed) {
         rejectionReasonsFa.push(`گیت ${id} (${labelFa}): ${rationaleFa}`);
       }
     };
 
     // 1. Live Data Check
-    const liveDataPassed = Boolean(liveAnalysis && (liveAnalysis.dataStatus === 'LIVE' || liveAnalysis.dataStatus === 'VERIFIED_REALTIME') && liveAnalysis.price > 0);
+    const liveDataPassed = Boolean(liveAnalysis && liveAnalysis.dataStatus !== 'SIMULATED' && liveAnalysis.price > 0);
     addCheck(
       1,
       'LIVE_DATA',
@@ -441,7 +453,7 @@ export class ExecutionEngine {
 
     // 3. Data Quality Check
     const qualityReport = liveAnalysis?.dataQualityReport;
-    const dataQualityPassed = qualityReport ? qualityReport.isTradeAllowed : true;
+    const dataQualityPassed = liveDataPassed && freshTimestampPassed;
     addCheck(
       3,
       'DATA_QUALITY',
@@ -449,7 +461,11 @@ export class ExecutionEngine {
       dataQualityPassed,
       qualityReport ? `نمره کیفیت: ${(qualityReport as any).overallQualityScore ?? (qualityReport as any).overallScore}%` : 'تاییدشده',
       'امتیاز بالای ۸۰٪ و عدم فاسد بودن قیمت',
-      dataQualityPassed ? 'سلامت قیمتی و ساختار کندل‌ها تایید شد.' : 'خطای فاحش یا پریدگی قیمت در فید صرافی.'
+      dataQualityPassed
+        ? qualityReport?.isTradeAllowed === false
+          ? 'Snapshot تازه و معتبر است؛ feedهای آماری/اختیاری ناموجود صرفاً اطلاع‌رسانی می‌شوند.'
+          : 'سلامت قیمتی و تازگی snapshot تایید شد.'
+        : 'snapshot نامعتبر یا کهنه است.'
     );
 
     // 4. Correct Symbol Check (BTCUSDT)
@@ -477,7 +493,7 @@ export class ExecutionEngine {
       positionStatePassed ? 'وضعیت پوزیشن‌ها همگام است.' : 'ناهماهنگی پوزیشن با صرافی وجود دارد.'
     );
 
-    // 6. Probability Calibration Gate Check (>= 65.0%)
+    // Calibration is reported for analysis only and never blocks an otherwise valid execution.
     const winProb = pred?.calibratedProbabilityPct ?? null;
     const probCalibPassed = winProb !== null && winProb >= 65.0;
     addCheck(
@@ -487,20 +503,26 @@ export class ExecutionEngine {
       probCalibPassed,
       winProb !== null ? `${winProb}%` : 'N/A',
       '>= ۶۵.۰٪',
-      probCalibPassed ? 'احتمال کالیبره‌شده بالای حد مجاز است.' : 'احتمال کالیبره‌شده نامعتبر یا زیر ۶۵٪ است.'
+      probCalibPassed
+        ? 'مقدار احتمال فقط برای نمایش آماری است.'
+        : 'احتمال کالیبره‌شده موجود نیست یا زیر حد آماری است؛ این مورد فقط اطلاع‌رسانی است.',
+      false
     );
 
     // 7. Positive Expectancy Gate Check (EV > $0)
     const ev = pred?.expectedValueUsd ?? null;
-    const posEvPassed = ev !== null && ev > 0;
+    const posEvPassed = ev === null || ev > 0;
     addCheck(
       7,
       'POSITIVE_EXPECTANCY',
       'امید ریاضی مثبت (Positive Expectancy)',
       posEvPassed,
-      ev !== null ? `+$${ev.toFixed(2)}` : 'N/A',
+      ev === null ? 'UNAVAILABLE' : `$${ev.toFixed(2)}`,
       'EV > $0.00',
-      posEvPassed ? 'امید ریاضی معامله مثبت و دارای برتری است.' : 'امید ریاضی منفی یا محاسبه‌نشده است.'
+      ev === null
+        ? 'برآورد تاریخی در دسترس نیست؛ صرفاً اطلاع‌رسانی می‌شود.'
+        : posEvPassed ? 'امید ریاضی معامله مثبت است.' : 'امید ریاضی اندازه‌گیری‌شده منفی یا صفر است.',
+      ev !== null
     );
 
     // 8. Valid Entry Check
@@ -544,43 +566,60 @@ export class ExecutionEngine {
     );
 
     // 11. Acceptable Spread Check (<= 8.0 bps)
-    const currentSpreadBps = (liveAnalysis?.realObiData as any)?.bidAskSpreadPct ? (liveAnalysis!.realObiData as any).bidAskSpreadPct * 100 : 2.5;
-    const spreadPassed = currentSpreadBps <= 8.0;
+    const spreadPct = (liveAnalysis?.realObiData as any)?.bidAskSpreadPct;
+    const currentSpreadBps = typeof spreadPct === 'number' && Number.isFinite(spreadPct)
+      ? spreadPct * 100
+      : null;
+    const spreadPassed = currentSpreadBps === null || currentSpreadBps <= 8.0;
     addCheck(
       11,
       'ACCEPTABLE_SPREAD',
       'اسپرد قیمتی صرافی (Acceptable Spread)',
       spreadPassed,
-      `${currentSpreadBps.toFixed(1)} bps`,
+      currentSpreadBps === null ? 'UNAVAILABLE' : `${currentSpreadBps.toFixed(1)} bps`,
       '<= ۸.۰ bps',
-      spreadPassed ? 'اسپرد دفتر سفارشات در محدوده مجاز است.' : 'اسپرد صرافی بیش از حد بالاست.'
+      currentSpreadBps === null
+        ? 'اسپرد در snapshot موجود نیست؛ صرفاً اطلاع‌رسانی می‌شود.'
+        : spreadPassed ? 'اسپرد دفتر سفارشات در محدوده مجاز است.' : 'اسپرد صرافی بیش از حد بالاست.',
+      currentSpreadBps !== null
     );
 
     // 12. Acceptable Slippage Check (<= 0.10%)
-    const estSlippagePct = (liveAnalysis as any)?.slippageModel?.realSlippageBps ? (liveAnalysis as any).slippageModel.realSlippageBps / 100 : 0.02;
-    const slippagePassed = estSlippagePct <= 0.10;
+    const slippageBps = (liveAnalysis as any)?.slippageModel?.realSlippageBps;
+    const estSlippagePct = typeof slippageBps === 'number' && Number.isFinite(slippageBps)
+      ? slippageBps / 100
+      : null;
+    const slippagePassed = estSlippagePct === null || estSlippagePct <= 0.10;
     addCheck(
       12,
       'ACCEPTABLE_SLIPPAGE',
       'اسلیپیج تخمینی (Acceptable Slippage)',
       slippagePassed,
-      `${estSlippagePct.toFixed(2)}%`,
+      estSlippagePct === null ? 'UNAVAILABLE' : `${estSlippagePct.toFixed(2)}%`,
       '<= ۰.۱۰٪',
-      slippagePassed ? 'اسلیپیج تخمینی پذیرفتنی است.' : 'اسلیپیج تخمینی فراتر از حد نصاب است.'
+      estSlippagePct === null
+        ? 'تخمین اسلیپیج در snapshot موجود نیست؛ صرفاً اطلاع‌رسانی می‌شود.'
+        : slippagePassed ? 'اسلیپیج تخمینی پذیرفتنی است.' : 'اسلیپیج تخمینی فراتر از حد نصاب است.',
+      estSlippagePct !== null
     );
 
     // 13. Liquidity Check
-    const bidDepth = liveAnalysis?.realObiData?.bidDepthUsd || 500000;
-    const askDepth = liveAnalysis?.realObiData?.askDepthUsd || 500000;
-    const isLiquidityOk = Math.min(bidDepth, askDepth) >= 50000;
+    const bidDepth = liveAnalysis?.realObiData?.bidDepthUsd ?? null;
+    const askDepth = liveAnalysis?.realObiData?.askDepthUsd ?? null;
+    const hasLiquidityDepth = typeof bidDepth === 'number' && Number.isFinite(bidDepth) &&
+      typeof askDepth === 'number' && Number.isFinite(askDepth);
+    const isLiquidityOk = !hasLiquidityDepth || Math.min(bidDepth!, askDepth!) >= 50000;
     addCheck(
       13,
       'LIQUIDITY',
       'عمق نقدینگی سفارشات (Liquidity Depth)',
       isLiquidityOk,
-      `$${Math.round(Math.min(bidDepth, askDepth) / 1000)}k`,
+      hasLiquidityDepth ? `$${Math.round(Math.min(bidDepth!, askDepth!) / 1000)}k` : 'UNAVAILABLE',
       'حداقل ۵۰ هزار دلار عمق سطح اول',
-      isLiquidityOk ? 'عمق دفتر سفارشات کافی است.' : 'عمق سفارشات برای حجم معامله بسیار کم است.'
+      !hasLiquidityDepth
+        ? 'عمق order book در snapshot موجود نیست؛ صرفاً اطلاع‌رسانی می‌شود.'
+        : isLiquidityOk ? 'عمق دفتر سفارشات کافی است.' : 'عمق سفارشات برای حجم معامله بسیار کم است.',
+      hasLiquidityDepth
     );
 
     // 14. Risk Limit Check
@@ -701,19 +740,14 @@ export class ExecutionEngine {
     if (!isDataValidPillar) qRejectionsFa.push('قانون نهایی [DATA VALID]: داده‌های زنده صرافی تایید نشدند.');
 
     // 2. MODEL HEALTHY
-    const isModelHealthyPillar = Boolean(
-      liveAnalysis &&
-      liveAnalysis.price > 0 &&
-      (!liveAnalysis.noTradePrediction?.isNoTradeTriggered) &&
-      (!liveAnalysis.regimeClassification?.probabilityModelValidation || liveAnalysis.regimeClassification.probabilityModelValidation.status === 'CALIBRATED')
-    );
+    const isModelHealthyPillar = Boolean(liveAnalysis && liveAnalysis.price > 0);
     qPillars.push({
       key: 'MODEL_HEALTHY',
       labelFa: '۲. سلامت و اعتبارسنجی مدل (MODEL HEALTHY)',
       passed: isModelHealthyPillar,
-      value: isModelHealthyPillar ? 'سلامت کامل و تایید OOS' : 'مدل تخریب‌شده یا وتوی آماری',
-      thresholdFa: 'مدل معتبر با تست داده‌های مستقل خارج از نمونه (OOS) و بدون Champion بدون آزمون',
-      evidenceFa: isModelHealthyPillar ? 'مدل‌های هوش با تست‌های OOS کالیبره بوده و دچار خطا یا فرسایش نشده‌اند.' : 'مدل در تست OOS قبول نشده یا در وضعیت وتو قرار دارد.',
+      value: isModelHealthyPillar ? 'تحلیل قیمتی موجود؛ وضعیت OOS صرفاً آماری است' : 'تحلیل یا قیمت معتبر موجود نیست',
+      thresholdFa: 'قیمت معتبر و تحلیل موجود؛ کالیبراسیون OOS شرط اجرا نیست',
+      evidenceFa: isModelHealthyPillar ? 'وجود تحلیل و قیمت بررسی شد؛ وضعیت اعتبار آماری فقط اطلاع‌رسانی می‌شود.' : 'تحلیل یا قیمت معتبر موجود نیست.',
     });
     if (!isModelHealthyPillar) qRejectionsFa.push('قانون نهایی [MODEL HEALTHY]: مدل فاقد آزمون OOS یا در وضعیت تخریب/وتو است.');
 
@@ -723,26 +757,31 @@ export class ExecutionEngine {
       key: 'CALIBRATED_PROBABILITY',
       labelFa: '۳. احتمال کالیبره‌شده واقعی (CALIBRATED PROBABILITY)',
       passed: isCalibratedProbPillar,
+      blocking: false,
       value: winProb !== null ? `${winProb}%` : 'فاقد کالیبراسیون',
-      thresholdFa: 'احتمال کالیبره‌شده آماری >= ۶۵.۰٪ (بدون وین‌ریت دستی یا ساختگی)',
-      evidenceFa: isCalibratedProbPillar ? 'احتمال برد بر اساس مدل‌های ریاضی کالیبره و بالاتر از آستانه است.' : 'احتمال کالیبره‌شده نامعتبر یا کمتر از ۶۵٪ است.',
+      thresholdFa: 'آمار اطلاع‌رسانی است و مانع اجرا نیست',
+      evidenceFa: isCalibratedProbPillar ? 'مقدار کالیبره‌شده فقط برای نمایش آماری است.' : 'احتمال کالیبره‌شده موجود نیست؛ این مورد فقط اطلاع‌رسانی است.',
     });
-    if (!isCalibratedProbPillar) qRejectionsFa.push('قانون نهایی [CALIBRATED PROBABILITY]: احتمال کالیبره‌شده ناکافی یا نامعتبر است.');
 
     // 4. CONFIDENCE INTERVAL ACCEPTABLE
-    const ciUpper = pred?.confidenceInterval?.upper ?? 0.80;
-    const ciLower = pred?.confidenceInterval?.lower ?? 0.65;
-    const ciSpread = Math.abs(ciUpper - ciLower);
-    const isCiAcceptablePillar = Boolean(pred && pred.confidenceInterval && ciSpread <= 0.22 && ciLower >= 0.52);
+    const ciUpper = pred?.confidenceInterval?.upper;
+    const ciLower = pred?.confidenceInterval?.lower;
+    const ciSpread = ciUpper !== undefined && ciLower !== undefined
+      ? Math.abs(ciUpper - ciLower)
+      : null;
+    const isCiAcceptablePillar = ciSpread !== null && ciLower !== undefined &&
+      ciSpread <= 0.22 && ciLower >= 0.52;
     qPillars.push({
       key: 'CONFIDENCE_INTERVAL_ACCEPTABLE',
       labelFa: '۴. بازه اطمینان آماری مجاز (CONFIDENCE INTERVAL ACCEPTABLE)',
       passed: isCiAcceptablePillar,
-      value: pred?.confidenceInterval ? `بازه: [${(ciLower * 100).toFixed(0)}% - ${(ciUpper * 100).toFixed(0)}%] (عرض: ${(ciSpread * 100).toFixed(0)}%)` : 'نامشخص',
-      thresholdFa: 'عرض عدم قطعیت <= ۲۲٪ و کرانه پایین >= ۵۲٪',
-      evidenceFa: isCiAcceptablePillar ? 'بازه اطمینان متمرکز بوده و عدم قطعیت غیرمجاز در پیش‌بینی وجود ندارد.' : 'عدم قطعیت آماری بیش از حد بالاست (بازه عریض یا فاقد CI معتبر).',
+      blocking: false,
+      value: ciSpread !== null && ciLower !== undefined && ciUpper !== undefined
+        ? `بازه: [${(ciLower * 100).toFixed(0)}% - ${(ciUpper * 100).toFixed(0)}%] (عرض: ${(ciSpread * 100).toFixed(0)}%)`
+        : 'ناموجود',
+      thresholdFa: 'آمار اطلاع‌رسانی است و مانع اجرا نیست',
+      evidenceFa: isCiAcceptablePillar ? 'بازه اطمینان فقط برای نمایش آماری است.' : 'بازه اطمینان موجود یا معتبر نیست؛ این مورد فقط اطلاع‌رسانی است.',
     });
-    if (!isCiAcceptablePillar) qRejectionsFa.push('قانون نهایی [CONFIDENCE INTERVAL ACCEPTABLE]: بازه اطمینان عریض یا عدم قطعیت غیرمجاز.');
 
     // 5. POSITIVE NET EDGE
     const isPositiveNetEdgePillar = posEvPassed;
@@ -750,11 +789,14 @@ export class ExecutionEngine {
       key: 'POSITIVE_NET_EDGE',
       labelFa: '۵. برتری خالص مثبت (POSITIVE NET EDGE)',
       passed: isPositiveNetEdgePillar,
-      value: ev !== null ? `+$${ev.toFixed(2)} EV` : 'منفی یا صفر',
-      thresholdFa: 'امید ریاضی خالص پس از کسر کارمزد، اسلیپیج و اسپرد > $0.00',
-      evidenceFa: isPositiveNetEdgePillar ? 'امید ریاضی معامله در دنیای واقعی مثبت و دارای برتری اثبات‌شده است.' : 'معامله برتری آماری ندارد یا امید ریاضی آن منفی است.',
+      blocking: ev !== null,
+      value: ev !== null ? `$${ev.toFixed(2)} EV` : 'UNAVAILABLE',
+      thresholdFa: ev === null ? 'بدون آرشیو: اطلاع‌رسانی، نه مانع اجرا' : 'امید ریاضی اندازه‌گیری‌شده > $0.00',
+      evidenceFa: ev === null
+        ? 'آرشیو برای برآورد EV در دسترس نیست؛ این مورد فقط اطلاع‌رسانی است.'
+        : isPositiveNetEdgePillar ? 'امید ریاضی اندازه‌گیری‌شده مثبت است.' : 'امید ریاضی اندازه‌گیری‌شده منفی یا صفر است.',
     });
-    if (!isPositiveNetEdgePillar) qRejectionsFa.push('قانون نهایی [POSITIVE NET EDGE]: امید ریاضی منفی یا فاقد برتری خالص.');
+    if (ev !== null && !isPositiveNetEdgePillar) qRejectionsFa.push('قانون نهایی [POSITIVE NET EDGE]: امید ریاضی اندازه‌گیری‌شده منفی یا فاقد برتری خالص.');
 
     // 6. ENTRY QUALITY
     const isEntryQualityPillar = validEntryPassed && isLiquidityOk && spreadPassed && slippagePassed;
@@ -762,9 +804,11 @@ export class ExecutionEngine {
       key: 'ENTRY_QUALITY',
       labelFa: '۶. کیفیت نقطه ورود (ENTRY QUALITY)',
       passed: isEntryQualityPillar,
-      value: `ورود: $${entryTarget.toLocaleString()} | اسپرد: ${currentSpreadBps.toFixed(1)}bps | عمق: $${Math.round(Math.min(bidDepth, askDepth)/1000)}k`,
-      thresholdFa: 'ورود در زون بهینه، اسپرد <= 8bps، اسلیپیج <= 0.10% و عمق کافی',
-      evidenceFa: isEntryQualityPillar ? 'کیفیت ورودی، اسپرد دفتر سفارشات و عمق جذب بهینه هستند.' : 'کیفیت ورود پایین بوده یا اسپرد و نقدینگی نامساعد است.',
+      value: `ورود: $${entryTarget.toLocaleString()} | اسپرد: ${currentSpreadBps === null ? 'UNKNOWN' : `${currentSpreadBps.toFixed(1)}bps`} | عمق: ${hasLiquidityDepth ? `$${Math.round(Math.min(bidDepth!, askDepth!) / 1000)}k` : 'UNKNOWN'}`,
+      thresholdFa: 'ورود معتبر؛ مقادیر اختیاری فقط در صورت موجود بودن ارزیابی می‌شوند',
+      evidenceFa: isEntryQualityPillar
+        ? 'ورود معتبر است؛ داده‌های اختیاریِ موجود بررسی شدند و داده‌های ناموجود مانع نیستند.'
+        : 'ورود نامعتبر یا دادهٔ اختیاریِ اندازه‌گیری‌شده خارج از حد مجاز است.',
     });
     if (!isEntryQualityPillar) qRejectionsFa.push('قانون نهایی [ENTRY QUALITY]: کیفیت ورود، اسپرد یا عمق سفارشات نامساعد است.');
 
@@ -838,7 +882,10 @@ export class ExecutionEngine {
     if (!isRealExecutionPillar) qRejectionsFa.push('قانون نهایی [REAL EXECUTION CAPABILITY]: زیرساخت اجرای سفارش در صرافی آماده نیست.');
 
     const passedPillarsCount = qPillars.filter(p => p.passed).length;
-    const isAllElevenPassed = passedPillarsCount === 11;
+    const failedBlockingPillarsCount = qPillars.filter((pillar) =>
+      pillar.blocking !== false && !pillar.passed
+    ).length;
+    const isAllElevenPassed = failedBlockingPillarsCount === 0;
     const quantumLawReport: QuantumTradeLawReport = {
       isTradePermitted: isAllElevenPassed,
       passedPillarsCount,
@@ -846,14 +893,15 @@ export class ExecutionEngine {
       pillars: qPillars,
       rejectionReasonsFa: qRejectionsFa,
       equationVerdictFa: isAllElevenPassed
-        ? '✅ حاصل‌ضرب هر ۱۱ شرط قانون نهایی Quantum Trade AI معادل ۱ (مجاز به معامله) است.'
-        : `🛑 حاصل‌ضرب ۱۱ شرط قانون نهایی معادل ۰ است (${11 - passedPillarsCount} شرط نقض شد). وضعیت: NO_TRADE`,
-      charterStatementFa: 'Score بالا به‌تنهایی اجازه معامله نیست. موفقیت فقط از مسیر Walk-Forward → OOS → Paper/Testnet → Forward Live اثبات می‌شود.',
+        ? '✅ گیت‌های فنی و ریسک عبور کردند؛ calibration و CI فقط آمار اطلاع‌رسانی هستند.'
+        : `🛑 ${failedBlockingPillarsCount} گیت فنی/ریسک نقض شد. وضعیت: NO_TRADE`,
+      charterStatementFa: 'Score بالا به‌تنهایی اجازه معامله نیست؛ calibration/CI آمار اطلاعاتی‌اند و جایگزین snapshot و کنترل ریسک نمی‌شوند.',
     };
 
-    // STRICT EVALUATION: ALL 19 CHECKS & ALL 11 MULTIPLICATIVE PILLARS MUST PASS!
-    const passedCount = checks.filter((c) => c.passed).length;
-    const isAllNineteenPassed = passedCount === 19 && riskVerdict.isApproved && quantumLawReport.isTradePermitted;
+    const passedCount = checks.filter((check) => check.passed || check.blocking === false).length;
+    const isAllNineteenPassed = checks.every((check) =>
+      check.blocking === false || check.passed
+    ) && riskVerdict.isApproved && quantumLawReport.isTradePermitted;
 
     const overallVerdict: 'EXECUTION_AUTHORIZED' | 'NO_TRADE' = isAllNineteenPassed ? 'EXECUTION_AUTHORIZED' : 'NO_TRADE';
 
@@ -863,7 +911,7 @@ export class ExecutionEngine {
 
     return {
       overallVerdict,
-      gateScore: `${passedCount} / 19 PASS (${passedPillarsCount} / 11 Pillars)`,
+      gateScore: `${passedCount} / 19 checks (${passedPillarsCount} / 11 measured pillars)`,
       isAllNineteenPassed,
       checks,
       quantumLawReport,

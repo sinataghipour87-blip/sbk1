@@ -1,7 +1,8 @@
 import unittest
 
 from freqtrade_integration.strategies.sbk_signal_contract import (
-    is_dry_run_fixture_runtime,
+    is_signal_runtime,
+    is_valid_sbk_exit_signal,
     is_valid_sbk_signal,
     validate_bridge_url,
 )
@@ -26,6 +27,7 @@ def valid_sbk_signal(now_ms=1_800_000_000_000):
         "generatedAtMs": now_ms - 1_000,
         "expiresAtMs": now_ms + 44_000,
         "referencePrice": 62_100,
+        "engineScore": 84,
         "dataQuality": {
             "status": "LIVE",
             "source": "Bybit Linear Futures Ticker (BTCUSDT)",
@@ -34,6 +36,7 @@ def valid_sbk_signal(now_ms=1_800_000_000_000):
         },
         "entryConditions": {
             "setupType": "BULLISH_LIQUIDITY_SWEEP",
+            "entryPrice": 62_100,
             "stopLoss": 61_800,
             "takeProfit": 62_700,
             "maxPriceDeviationBps": 50,
@@ -47,12 +50,48 @@ def valid_sbk_signal(now_ms=1_800_000_000_000):
 
 
 class MarketModelFailClosedTests(unittest.TestCase):
-    def test_dry_run_fixture_is_never_enabled_in_live_runtime(self):
-        self.assertTrue(is_dry_run_fixture_runtime({"dry_run": True}, "dry_run"))
-        self.assertFalse(is_dry_run_fixture_runtime({"dry_run": False}, "live"))
-        self.assertFalse(is_dry_run_fixture_runtime({"dry_run": True}, "live"))
-        self.assertFalse(is_dry_run_fixture_runtime({"dry_run": 1}, "dry_run"))
-        self.assertFalse(is_dry_run_fixture_runtime({}, "dry_run"))
+    def test_signal_runtime_accepts_dry_run_and_live_only(self):
+        self.assertTrue(is_signal_runtime("dry_run"))
+        self.assertTrue(is_signal_runtime("live"))
+        self.assertFalse(is_signal_runtime("backtest"))
+        self.assertFalse(is_signal_runtime(""))
+
+    def test_exit_signal_contract_requires_target_direction_reason_and_expiry(self):
+        now_ms = 1_800_000_000_000
+        signal = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signalType": "EXIT",
+            "exitId": "sbk1_exit_" + "b" * 32,
+            "pair": "BTC/USDT:USDT",
+            "tradeId": 42,
+            "entryTag": "sbk1_" + "a" * 32,
+            "direction": "LONG",
+            "reason": "CONTRACT_TEST_ONLY thesis invalidation",
+            "generatedAtMs": now_ms,
+            "expiresAtMs": now_ms + 30_000,
+        }
+        self.assertTrue(
+            is_valid_sbk_exit_signal(
+                signal,
+                now_ms=now_ms,
+                expected_pair="BTC/USDT:USDT",
+            )
+        )
+        for invalid in (
+            {**signal, "tradeId": 0, "entryTag": None},
+            {**signal, "direction": "FLAT"},
+            {**signal, "reason": ""},
+            {**signal, "expiresAtMs": now_ms},
+            {**signal, "exitId": "wrong"},
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(
+                    is_valid_sbk_exit_signal(
+                        invalid,
+                        now_ms=now_ms,
+                        expected_pair="BTC/USDT:USDT",
+                    )
+                )
 
     def test_dry_run_fixture_allows_bounded_strategy_poll_latency(self):
         now_ms = 1_800_000_000_000
@@ -135,10 +174,38 @@ class MarketModelFailClosedTests(unittest.TestCase):
             )
         )
 
+    def test_python_consumer_defaults_to_uncalibrated_heuristic_without_fabricating_score(self):
+        now_ms = 1_800_000_000_000
+        signal = valid_sbk_signal(now_ms)
+        signal["engineScore"] = None
+
+        self.assertTrue(
+            is_valid_sbk_signal(
+                signal,
+                now_ms=now_ms,
+                expected_exchange="bybit",
+                expected_market="futures",
+                expected_pair="BTC/USDT:USDT",
+                expected_timeframe="15m",
+            )
+        )
+
+        signal["evidenceLevel"] = "CALIBRATED"
+        self.assertFalse(
+            is_valid_sbk_signal(
+                signal,
+                now_ms=now_ms,
+                expected_exchange="bybit",
+                expected_market="futures",
+                expected_pair="BTC/USDT:USDT",
+                expected_timeframe="15m",
+            )
+        )
+
     def test_python_consumer_rejects_stale_and_mismatched_contract_data(self):
         now_ms = 1_800_000_000_000
         stale = valid_sbk_signal(now_ms)
-        stale["dataQuality"]["observedAtMs"] = now_ms - 5_001
+        stale["dataQuality"]["observedAtMs"] = now_ms - 15_001
         invalid_timestamp = valid_sbk_signal(now_ms)
         invalid_timestamp["generatedAtMs"] = True
 

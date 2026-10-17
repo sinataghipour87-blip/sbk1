@@ -7,6 +7,7 @@ export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v1';
 export const DRY_RUN_FIXTURE_SETUP_PREFIX = 'DRY_RUN_E2E_FIXTURE_';
 
 export type SbkSignalDirection = 'LONG' | 'SHORT';
+export type SbkExitSignalStatus = 'PENDING' | 'CONFIRMED' | 'CLOSED' | 'EXPIRED';
 export type SbkSignalStatus =
   | 'ACCEPTED'
   | 'STRATEGY_ACCEPTED'
@@ -31,6 +32,8 @@ export interface SbkFreqtradeSignal {
   generatedAtMs: number;
   expiresAtMs: number;
   referencePrice: number;
+  engineScore: number | null;
+  evidenceLevel?: 'UNCALIBRATED_HEURISTIC';
   dataQuality: {
     status: 'LIVE';
     source: string;
@@ -39,6 +42,7 @@ export interface SbkFreqtradeSignal {
   };
   entryConditions: {
     setupType: string;
+    entryPrice: number;
     stopLoss: number;
     takeProfit: number;
     maxPriceDeviationBps: number;
@@ -72,9 +76,32 @@ export interface SbkFreqtradeSignalRecord {
   duplicate?: boolean;
 }
 
+export type SbkFreqtradeExitSignal = {
+  contractVersion: typeof SBK_SIGNAL_CONTRACT_VERSION;
+  signalType: 'EXIT';
+  exitId: string;
+  pair: string;
+  direction: SbkSignalDirection;
+  reason: string;
+  generatedAtMs: number;
+  expiresAtMs: number;
+} & (
+  | { tradeId: number; entryTag?: string }
+  | { tradeId?: number; entryTag: string }
+);
+
+export interface SbkFreqtradeExitSignalRecord {
+  signal: SbkFreqtradeExitSignal;
+  status: SbkExitSignalStatus;
+  createdAtMs: number;
+  updatedAtMs: number;
+  statusReason?: string;
+}
+
 interface SignalStore {
   version: 1;
   records: SbkFreqtradeSignalRecord[];
+  exitRecords?: SbkFreqtradeExitSignalRecord[];
 }
 
 export interface SignalStatusUpdate {
@@ -147,6 +174,68 @@ export function deriveSbkSignalIds(input: {
   return { decisionId: `sbk1_${digest}`, signalId: `sbk1_${digest}` };
 }
 
+export function deriveSbkExitSignalId(input: {
+  tradeId: number;
+  entryTag: string;
+  reason: string;
+  generatedAtMs: number;
+}): string {
+  const digest = createHash('sha256')
+    .update([input.tradeId, input.entryTag, input.reason, input.generatedAtMs].join('|'))
+    .digest('hex')
+    .slice(0, 32);
+  return `sbk1_exit_${digest}`;
+}
+
+export function validateSbkFreqtradeExitSignal(
+  value: unknown,
+  nowMs = Date.now(),
+): SbkFreqtradeExitSignal {
+  if (!isRecord(value)) {
+    throw new SbkSignalValidationError('Exit signal payload must be an object.', 'INVALID_EXIT_SIGNAL');
+  }
+  const signal = value as unknown as SbkFreqtradeExitSignal;
+  if (
+    signal.contractVersion !== SBK_SIGNAL_CONTRACT_VERSION ||
+    signal.signalType !== 'EXIT' ||
+    typeof signal.exitId !== 'string' ||
+    !/^sbk1_exit_[a-f0-9]{32}$/.test(signal.exitId)
+  ) {
+    throw new SbkSignalValidationError('Exit signal type or identifier is invalid.', 'INVALID_EXIT_ID');
+  }
+  if (
+    typeof signal.pair !== 'string' ||
+    !/^[A-Z0-9]{2,20}\/[A-Z0-9]{2,20}(?::[A-Z0-9]{2,20})?$/.test(signal.pair) ||
+    (signal.direction !== 'LONG' && signal.direction !== 'SHORT') ||
+    typeof signal.reason !== 'string' ||
+    !signal.reason.trim() ||
+    signal.reason.length > 240
+  ) {
+    throw new SbkSignalValidationError('Exit pair, direction, or reason is invalid.', 'INVALID_EXIT_DETAILS');
+  }
+  const hasTradeId = Number.isSafeInteger(signal.tradeId) && (signal.tradeId ?? 0) > 0;
+  const hasEntryTag = typeof signal.entryTag === 'string' &&
+    /^[A-Za-z0-9_.:-]{1,128}$/.test(signal.entryTag);
+  if (
+    (!hasTradeId && !hasEntryTag) ||
+    (signal.tradeId !== undefined && !hasTradeId) ||
+    (signal.entryTag !== undefined && !hasEntryTag)
+  ) {
+    throw new SbkSignalValidationError('Exit signal requires a valid Freqtrade trade ID or entry tag.', 'INVALID_EXIT_TARGET');
+  }
+  if (
+    !Number.isSafeInteger(signal.generatedAtMs) ||
+    signal.generatedAtMs > nowMs + 1_000 ||
+    !Number.isSafeInteger(signal.expiresAtMs) ||
+    signal.expiresAtMs <= nowMs ||
+    signal.expiresAtMs <= signal.generatedAtMs ||
+    signal.expiresAtMs - signal.generatedAtMs > 120_000
+  ) {
+    throw new SbkSignalValidationError('Exit signal is expired or has invalid timestamps.', 'EXIT_SIGNAL_EXPIRED');
+  }
+  return structuredClone(signal);
+}
+
 export function validateSbkFreqtradeSignal(
   value: unknown,
   options: { nowMs?: number; expectedPair?: string; expectedExchange?: string; expectedTimeframe?: string } = {},
@@ -207,14 +296,14 @@ export function validateSbkFreqtradeSignal(
     !Number.isSafeInteger(signal.expiresAtMs) ||
     signal.expiresAtMs <= nowMs ||
     signal.expiresAtMs <= signal.generatedAtMs ||
-    signal.expiresAtMs - signal.generatedAtMs > 60_000
+    signal.expiresAtMs - signal.generatedAtMs > 120_000
   ) {
     throw new SbkSignalValidationError('Signal is stale, future-dated, or has an invalid expiry.', 'SIGNAL_EXPIRED');
   }
   if (!finitePositive(signal.referencePrice)) {
     throw new SbkSignalValidationError('Reference price must be finite and positive.', 'INVALID_REFERENCE_PRICE');
   }
-  const maximumDataAgeMs = isDryRunFixture ? 55_000 : 5_000;
+  const maximumDataAgeMs = isDryRunFixture ? 55_000 : 15_000;
   if (
     !isRecord(signal.dataQuality) ||
     signal.dataQuality.status !== 'LIVE' ||
@@ -234,6 +323,7 @@ export function validateSbkFreqtradeSignal(
     !isRecord(signal.entryConditions) ||
     typeof signal.entryConditions.setupType !== 'string' ||
     !signal.entryConditions.setupType.trim() ||
+    !finitePositive(signal.entryConditions.entryPrice) ||
     !finitePositive(signal.entryConditions.stopLoss) ||
     !finitePositive(signal.entryConditions.takeProfit) ||
     !finitePositive(signal.entryConditions.maxPriceDeviationBps) ||
@@ -241,13 +331,26 @@ export function validateSbkFreqtradeSignal(
   ) {
     throw new SbkSignalValidationError('Entry, stop, target, or price-deviation condition is invalid.', 'INVALID_ENTRY_CONDITIONS');
   }
+  if (
+    signal.engineScore !== null &&
+    (typeof signal.engineScore !== 'number' ||
+      !Number.isFinite(signal.engineScore) ||
+      signal.engineScore < 0 ||
+      signal.engineScore > 100)
+  ) {
+    throw new SbkSignalValidationError('The analysis engine score must be null or between 0 and 100.', 'INVALID_ENGINE_SCORE');
+  }
+  if (signal.evidenceLevel !== undefined && signal.evidenceLevel !== 'UNCALIBRATED_HEURISTIC') {
+    throw new SbkSignalValidationError('Unsupported signal evidence level.', 'INVALID_EVIDENCE_LEVEL');
+  }
   const stopValid = signal.direction === 'LONG'
-    ? signal.entryConditions.stopLoss < signal.referencePrice && signal.entryConditions.takeProfit > signal.referencePrice
-    : signal.entryConditions.stopLoss > signal.referencePrice && signal.entryConditions.takeProfit < signal.referencePrice;
-  const riskDistance = Math.abs(signal.referencePrice - signal.entryConditions.stopLoss);
-  const rewardDistance = Math.abs(signal.entryConditions.takeProfit - signal.referencePrice);
-  if (!stopValid || rewardDistance < riskDistance) {
-    throw new SbkSignalValidationError('Stop/target direction or minimum 1:1 reward-to-risk is invalid.', 'INVALID_RISK_REWARD');
+    ? signal.entryConditions.stopLoss < signal.entryConditions.entryPrice && signal.entryConditions.takeProfit > signal.entryConditions.entryPrice
+    : signal.entryConditions.stopLoss > signal.entryConditions.entryPrice && signal.entryConditions.takeProfit < signal.entryConditions.entryPrice;
+  const riskDistance = Math.abs(signal.entryConditions.entryPrice - signal.entryConditions.stopLoss);
+  const rewardDistance = Math.abs(signal.entryConditions.takeProfit - signal.entryConditions.entryPrice);
+  const entryDeviationBps = Math.abs(signal.entryConditions.entryPrice - signal.referencePrice) / signal.referencePrice * 10_000;
+  if (!stopValid || rewardDistance < riskDistance || entryDeviationBps > signal.entryConditions.maxPriceDeviationBps) {
+    throw new SbkSignalValidationError('Entry deviation, stop/target direction, or minimum 1:1 reward-to-risk is invalid.', 'INVALID_RISK_REWARD');
   }
   if (
     !isRecord(signal.riskLimits) ||
@@ -262,11 +365,15 @@ export function validateSbkFreqtradeSignal(
   ) {
     throw new SbkSignalValidationError('Position sizing exceeds configured risk limits.', 'INVALID_RISK_LIMITS');
   }
-  return signal;
+  return {
+    ...signal,
+    evidenceLevel: signal.evidenceLevel ?? 'UNCALIBRATED_HEURISTIC',
+  };
 }
 
 export class FreqtradeSignalAdapter {
   private readonly recordsById = new Map<string, SbkFreqtradeSignalRecord>();
+  private readonly exitRecordsById = new Map<string, SbkFreqtradeExitSignalRecord>();
   private loaded = false;
   private operationQueue: Promise<void> = Promise.resolve();
 
@@ -341,6 +448,28 @@ export class FreqtradeSignalAdapter {
         record.signal = validated;
         this.recordsById.set(validated.signalId, record);
       }
+      const exitRecords = parsed.exitRecords;
+      if (exitRecords !== undefined && !Array.isArray(exitRecords)) {
+        throw new Error('Signal store contains an invalid exit-signal list.');
+      }
+      for (const value of Array.isArray(exitRecords) ? exitRecords : []) {
+        if (
+          !isRecord(value) ||
+          !isRecord(value.signal) ||
+          !['PENDING', 'CONFIRMED', 'CLOSED', 'EXPIRED'].includes(String(value.status))
+        ) {
+          throw new Error('Signal store contains an invalid exit-signal record.');
+        }
+        const record = value as unknown as SbkFreqtradeExitSignalRecord;
+        record.signal = validateSbkFreqtradeExitSignal(
+          record.signal,
+          record.signal.generatedAtMs,
+        );
+        if (!Number.isSafeInteger(record.createdAtMs) || !Number.isSafeInteger(record.updatedAtMs)) {
+          throw new Error('Signal store contains invalid exit-signal timestamps.');
+        }
+        this.exitRecordsById.set(record.signal.exitId, record);
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw new Error(`Could not load the Freqtrade signal store: ${error instanceof Error ? error.message : String(error)}`);
@@ -365,7 +494,14 @@ export class FreqtradeSignalAdapter {
       record.signal.signalId,
       record,
     ])).values()];
-    await writeFile(temporaryPath, JSON.stringify({ version: 1, records } satisfies SignalStore), { mode: 0o600 });
+    const exitRecords = [...this.exitRecordsById.values()]
+      .filter((record) => record.status === 'PENDING' || record.status === 'CONFIRMED' || record.signal.expiresAtMs > Date.now())
+      .slice(-5_000);
+    await writeFile(temporaryPath, JSON.stringify({
+      version: 1,
+      records,
+      exitRecords,
+    } satisfies SignalStore), { mode: 0o600 });
     await rename(temporaryPath, filePath);
   }
 
@@ -380,7 +516,7 @@ export class FreqtradeSignalAdapter {
         }
         return { ...structuredClone(existing), duplicate: true };
       }
-      const nowMs = Date.now();
+      const nowMs = options?.nowMs ?? Date.now();
       const record: SbkFreqtradeSignalRecord = {
         signal,
         status: 'ACCEPTED',
@@ -390,6 +526,92 @@ export class FreqtradeSignalAdapter {
         lifecycleEvents: [{ status: 'ACCEPTED', observedAtMs: nowMs, source: 'SBK1' }],
       };
       this.recordsById.set(signal.signalId, record);
+      await this.persist();
+      return structuredClone(record);
+    });
+  }
+
+  async submitExitSignal(value: unknown, nowMs = Date.now()): Promise<SbkFreqtradeExitSignalRecord & { duplicate?: boolean }> {
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      const signal = validateSbkFreqtradeExitSignal(value, nowMs);
+      const existing = this.exitRecordsById.get(signal.exitId);
+      if (existing) {
+        if (!isDeepStrictEqual(existing.signal, signal)) {
+          throw new SbkSignalValidationError('Exit ID was already used for a different decision.', 'EXIT_IDEMPOTENCY_CONFLICT');
+        }
+        return { ...structuredClone(existing), duplicate: true };
+      }
+      const activeForTrade = [...this.exitRecordsById.values()].find((record) =>
+        (record.status === 'PENDING' || record.status === 'CONFIRMED') &&
+        ((signal.tradeId !== undefined && record.signal.tradeId === signal.tradeId) ||
+          (signal.entryTag !== undefined && record.signal.entryTag === signal.entryTag))
+      );
+      if (activeForTrade) {
+        return { ...structuredClone(activeForTrade), duplicate: true };
+      }
+      const record: SbkFreqtradeExitSignalRecord = {
+        signal,
+        status: 'PENDING',
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+      this.exitRecordsById.set(signal.exitId, record);
+      await this.persist();
+      return structuredClone(record);
+    });
+  }
+
+  async getPendingExitSignals(pair: string): Promise<SbkFreqtradeExitSignal[]> {
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      const nowMs = Date.now();
+      let changed = false;
+      for (const record of this.exitRecordsById.values()) {
+        if (record.status === 'PENDING' && record.signal.expiresAtMs <= nowMs) {
+          record.status = 'EXPIRED';
+          record.statusReason = 'Exit signal expired before Freqtrade accepted it.';
+          record.updatedAtMs = nowMs;
+          changed = true;
+        }
+      }
+      if (changed) await this.persist();
+      return [...this.exitRecordsById.values()]
+        .filter((record) => record.status === 'PENDING' && record.signal.pair === pair)
+        .map((record) => structuredClone(record.signal));
+    });
+  }
+
+  async updateExitSignalStatus(
+    exitId: string,
+    status: SbkExitSignalStatus,
+    reason?: string,
+  ): Promise<SbkFreqtradeExitSignalRecord> {
+    return this.withExclusiveAccess(async () => {
+      await this.load();
+      const record = this.exitRecordsById.get(exitId);
+      if (!record) {
+        throw new SbkSignalValidationError('Exit signal ID was not found.', 'EXIT_SIGNAL_NOT_FOUND');
+      }
+      const allowed: Record<SbkExitSignalStatus, ReadonlySet<SbkExitSignalStatus>> = {
+        PENDING: new Set(['CONFIRMED', 'CLOSED', 'EXPIRED']),
+        CONFIRMED: new Set(['CLOSED']),
+        CLOSED: new Set(),
+        EXPIRED: new Set(),
+      };
+      if (record.status !== status && !allowed[record.status].has(status)) {
+        throw new SbkSignalValidationError(
+          `Exit lifecycle transition ${record.status} -> ${status} is not allowed.`,
+          'INVALID_EXIT_STATUS_TRANSITION',
+        );
+      }
+      const normalizedReason = reason?.slice(0, 240) ?? record.statusReason;
+      if (record.status === status && record.statusReason === normalizedReason) {
+        return structuredClone(record);
+      }
+      record.status = status;
+      record.statusReason = normalizedReason;
+      record.updatedAtMs = Date.now();
       await this.persist();
       return structuredClone(record);
     });

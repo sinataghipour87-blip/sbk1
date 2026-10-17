@@ -149,8 +149,11 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
             وضعیت: <strong className={riskVerdict?.isApproved ? 'text-emerald-400' : 'text-rose-400'}>{riskVerdict?.decision || 'NO_TRADE'}</strong>
           </div>
           <p className="text-[10px] text-slate-400 leading-relaxed">
-            اعمال آستانه‌های احتمالی، $EV، دراوداون کل، حد ضرر روزانه و دیوار آتش شوک خبری.
+            کنترل ریسک، دراوداون، حد ضرر روزانه و دیوار آتش؛ کالیبراسیون و EV بدون آرشیو فقط اطلاعاتی هستند.
           </p>
+          {riskVerdict?.informationalNotesFa.map((note, index) => (
+            <p key={`${index}-${note}`} className="text-[10px] text-sky-300">{note}</p>
+          ))}
         </div>
 
         {/* Layer 3: Execution Engine */}
@@ -168,7 +171,7 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
             گیت نهایی: <strong className={gateReport?.overallVerdict === 'EXECUTION_AUTHORIZED' ? 'text-emerald-400 font-black' : 'text-rose-400 font-black'}>{gateReport?.overallVerdict || 'NO_TRADE'}</strong>
           </div>
           <p className="text-[10px] text-slate-400 leading-relaxed">
-            بررسی اسنپ‌شات میلی‌ثانیه‌ای بازار و اجرای شلیک نهایی فقط با قبولی هم‌زمان هر ۱۹ گیت.
+            موانع فنی و ریسک اجباری‌اند؛ سنجه‌های آماری و feedهای اختیاریِ ناموجود صرفاً اطلاعاتی هستند.
           </p>
         </div>
       </div>
@@ -194,7 +197,7 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
           </div>
           <p className="text-xs opacity-90 leading-relaxed">
             {gateReport?.overallVerdict === 'EXECUTION_AUTHORIZED'
-              ? '✅ تمام ۱۹ شرط امنیتی و ۱۱ ستون ضربی قانون نهایی پروداکشن به طور همزمان PASS شدند. سیستم دارای برتری آماری تاییدشده برای معامله است.'
+              ? '✅ گیت‌های فنی و ریسک عبور کردند. برتری آماری بدون آرشیو تأییدشده تلقی نمی‌شود.'
               : '🛑 بر اساس قانون Fail-Closed، به دلیل رد شدن حداقل یک شرط حیاتی، معامله به طور کامل مسدود گردید (NO TRADE). Score بالا به‌تنهایی هرگز مجوز معامله نیست.'}
           </p>
         </div>
@@ -234,7 +237,7 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
 
           {/* Formula Display */}
           <div className="p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px] font-mono text-slate-300 leading-relaxed overflow-x-auto text-center" dir="ltr">
-            <span className="text-amber-400 font-bold">TRADE_ALLOWED</span> = DATA_VALID × MODEL_HEALTHY × CALIBRATED_PROBABILITY × CONFIDENCE_INTERVAL × POSITIVE_NET_EDGE × ENTRY_QUALITY × TRIGGER_CONFIRMED × WAVE_CONDITIONS × RISK_APPROVED × FRESH_SNAPSHOT × REAL_EXECUTION
+            <span className="text-amber-400 font-bold">TRADE_ALLOWED</span> = TECHNICAL_GATES × RISK_GATES (CALIBRATION / CI / ARCHIVE = INFORMATION ONLY)
           </div>
 
           {/* 11 Pillars Grid */}
@@ -243,14 +246,18 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
               <div
                 key={pillar.key}
                 className={`p-2.5 rounded-lg border transition-all flex flex-col justify-between space-y-1.5 ${
-                  pillar.passed
+                  pillar.blocking === false
+                    ? 'bg-sky-950/20 border-sky-500/30 text-sky-100'
+                    : pillar.passed
                     ? 'bg-slate-900/60 border-slate-800/80'
                     : 'bg-rose-950/25 border-rose-500/30 text-rose-200'
                 }`}
               >
                 <div className="flex items-center justify-between gap-1.5">
                   <div className="flex items-center gap-1.5 truncate">
-                    {pillar.passed ? (
+                    {pillar.blocking === false ? (
+                      <span className="w-3.5 h-3.5 text-sky-300 flex-shrink-0">ℹ</span>
+                    ) : pillar.passed ? (
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
                     ) : (
                       <XCircle className="w-3.5 h-3.5 text-rose-400 flex-shrink-0" />
@@ -259,12 +266,14 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
                   </div>
                   <span
                     className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold flex-shrink-0 ${
-                      pillar.passed
+                      pillar.blocking === false
+                        ? 'bg-sky-500/20 text-sky-200 border border-sky-500/30'
+                        : pillar.passed
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                         : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                     }`}
                   >
-                    {pillar.passed ? 'PASS' : 'FAIL'}
+                    {pillar.blocking === false ? 'INFO' : pillar.passed ? 'PASS' : 'FAIL'}
                   </span>
                 </div>
 
@@ -303,7 +312,7 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
         <div className="space-y-2">
           <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
             <Layers className="w-3.5 h-3.5 text-amber-400" />
-            چک‌لیست ۱۹ گیت هم‌زمان قبل از شلیک سفارش (Nineteen Production Gates)
+            چک‌لیست کنترل‌های فنی، ریسک و اطلاعات آماری
           </span>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
@@ -311,14 +320,18 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
               <div
                 key={c.id}
                 className={`p-2.5 rounded-xl border transition-all flex flex-col justify-between space-y-1.5 ${
-                  c.passed
+                  c.blocking === false
+                    ? 'bg-sky-950/20 border-sky-500/30 text-sky-100'
+                    : c.passed
                     ? 'bg-slate-950/60 border-slate-800/80'
                     : 'bg-rose-950/30 border-rose-500/40 text-rose-200'
                 }`}
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 truncate">
-                    {c.passed ? (
+                    {c.blocking === false ? (
+                      <span className="w-3.5 h-3.5 text-sky-300 flex-shrink-0">ℹ</span>
+                    ) : c.passed ? (
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
                     ) : (
                       <XCircle className="w-3.5 h-3.5 text-rose-400 flex-shrink-0" />
@@ -327,12 +340,14 @@ export const FinalProductionGateWidget: React.FC<FinalProductionGateWidgetProps>
                   </div>
                   <span
                     className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${
-                      c.passed
+                      c.blocking === false
+                        ? 'bg-sky-500/20 text-sky-200 border border-sky-500/30'
+                        : c.passed
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                         : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                     }`}
                   >
-                    {c.passed ? 'PASS' : 'FAIL'}
+                    {c.blocking === false ? 'INFO' : c.passed ? 'PASS' : 'FAIL'}
                   </span>
                 </div>
 

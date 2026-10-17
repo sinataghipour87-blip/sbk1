@@ -39,6 +39,7 @@ const config = {
   strategy: 'SbkSignalStrategy',
   trading_mode: 'futures',
   timeframe: '15m',
+  internals: { process_throttle_secs: 1 },
   force_entry_enable: false,
   exchange: {
     name: 'bybit',
@@ -57,6 +58,13 @@ const settings = validateRuntimeSettings(config, environment);
 assert.equal(settings.market, 'futures');
 assert.equal(settings.apiBaseUrl, 'http://127.0.0.1:8080/api/v1');
 assert.equal(settings.bridgeBaseUrl, 'http://127.0.0.1:3000');
+assert.throws(
+  () => validateRuntimeSettings({
+    ...config,
+    internals: { process_throttle_secs: 5 },
+  }, environment),
+  /process_throttle_secs must be 1 second/,
+);
 
 const blankBridgeSettings = validateRuntimeSettings(config, {
   ...environment,
@@ -79,7 +87,28 @@ assert.equal(
 
 assert.throws(
   () => validateRuntimeSettings({ ...config, dry_run: false }, environment),
-  /restricted to dry-run/,
+  /SBK1_LIVE_ENABLED=true/,
+);
+const liveEnabledEnvironment = { ...environment, SBK1_LIVE_ENABLED: 'true' };
+assert.throws(
+  () => validateRuntimeSettings({ ...config, dry_run: false }, liveEnabledEnvironment),
+  /کلید و secret صرافی/,
+);
+const liveConfigWithNamedCredentials = {
+  ...config,
+  dry_run: false,
+  exchange: { ...config.exchange, key: 'private-test-key', secret: 'private-test-secret' },
+};
+assert.equal(
+  validateRuntimeSettings(liveConfigWithNamedCredentials, liveEnabledEnvironment).liveEnabled,
+  true,
+);
+assert.throws(
+  () => validateRuntimeSettings({
+    ...liveConfigWithNamedCredentials,
+    force_entry_enable: true,
+  }, liveEnabledEnvironment),
+  /force_entry_enable باید false/,
 );
 assert.throws(
   () => validateRuntimeSettings({ ...config, stake_amount: 'unlimited' }, environment),
@@ -121,7 +150,7 @@ assert.throws(
 );
 assert.throws(
   () => validateRuntimeSettings({ ...config, force_entry_enable: true }, environment),
-  /force_entry_enable must be false/,
+  /force_entry_enable باید false/,
 );
 assert.throws(
   () => validateRuntimeSettings({

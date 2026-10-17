@@ -751,7 +751,7 @@ export function resolveIntrabarExecution(
 // -----------------------------------------------------------------------------
 // ۱۸: REALISTIC DYNAMIC SLIPPAGE & MULTI-EXCHANGE FEE ENGINE
 // -----------------------------------------------------------------------------
-export type ExchangeTier = 'BYBIT_FUTURES' | 'BINANCE_FUTURES' | 'OKX_FUTURES' | 'GENERIC_EXCHANGE';
+export type ExchangeTier = 'BYBIT_FUTURES' | 'OKX_FUTURES' | 'GENERIC_EXCHANGE';
 export type OrderExecutionType = 'MARKET_TAKER' | 'LIMIT_MAKER';
 
 export interface FeeStructure {
@@ -762,7 +762,6 @@ export interface FeeStructure {
 
 export const EXCHANGE_FEE_CATALOG: Record<ExchangeTier, FeeStructure> = {
   BYBIT_FUTURES: { makerFeeRate: 0.0002, takerFeeRate: 0.00055, baseSpreadBps: 1.0 },
-  BINANCE_FUTURES: { makerFeeRate: 0.0002, takerFeeRate: 0.0005, baseSpreadBps: 0.8 },
   OKX_FUTURES: { makerFeeRate: 0.0002, takerFeeRate: 0.0005, baseSpreadBps: 1.2 },
   GENERIC_EXCHANGE: { makerFeeRate: 0.00025, takerFeeRate: 0.0006, baseSpreadBps: 1.5 },
 };

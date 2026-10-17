@@ -42,6 +42,8 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.strategy._signals = {}
         self.strategy._signal_statuses = {}
         self.strategy._signals_by_pair = {}
+        self.strategy._exit_signals = {}
+        self.strategy._consumed_exit_ids = set()
         self.strategy._pair = "BTC/USDT:USDT"
         self.strategy._bridge_url = "http://127.0.0.1:3000"
         self.strategy._bridge_token = "a" * 64
@@ -50,6 +52,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "runmode": SimpleNamespace(value="dry_run"),
             "exchange": {"name": "bybit"},
             "trading_mode": "futures",
+            "stake_amount": 100,
         }
         self.now_ms = int(datetime.now(UTC).timestamp() * 1000)
         self.signal_id = "sbk1_" + "a" * 32
@@ -62,17 +65,19 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "pair": "BTC/USDT:USDT",
             "direction": "LONG",
             "timeframe": "15m",
-            "generatedAtMs": self.now_ms - 40_000,
+            "generatedAtMs": self.now_ms - 1_000,
             "expiresAtMs": self.now_ms + 20_000,
             "referencePrice": 62_100,
+            "engineScore": 84,
             "dataQuality": {
                 "status": "LIVE",
-                "source": "dry-run test fixture",
-                "observedAtMs": self.now_ms - 40_000,
-                "maxAgeMs": 55_000,
+                "source": "SBK1 signal engine",
+                "observedAtMs": self.now_ms - 1_000,
+                "maxAgeMs": 5_000,
             },
             "entryConditions": {
-                "setupType": "DRY_RUN_E2E_FIXTURE_TEST",
+                "setupType": "BULLISH_LIQUIDITY_SWEEP",
+                "entryPrice": 62_100,
                 "stopLoss": 61_800,
                 "takeProfit": 62_700,
                 "maxPriceDeviationBps": 50,
@@ -100,9 +105,10 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
 
         self.assertEqual(self.strategy._bridge_url, "http://127.0.0.1:3000")
 
-    def test_market_snapshot_uses_only_completed_dataprovider_candles(self):
+    def test_market_snapshot_refreshes_inside_ticker_window_with_completed_candles(self):
         now = datetime.now(UTC)
         now_ms = int(now.timestamp() * 1000)
+        self.strategy._market_snapshot_last_publish_ms = now_ms - 5_000
         timeframe_ms = 15 * 60 * 1000
         current_candle_start = now_ms // timeframe_ms * timeframe_ms
         timestamps = [
@@ -142,10 +148,20 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         )
         response = Mock()
         response.raise_for_status.return_value = None
+        poll_response = Mock()
+        poll_response.raise_for_status.return_value = None
+        poll_response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "signals": [],
+        }
 
-        with patch("SbkSignalStrategy.requests.post", return_value=response) as post:
+        with (
+            patch("SbkSignalStrategy.requests.post", return_value=response) as post,
+            patch("SbkSignalStrategy.requests.get", return_value=poll_response) as get,
+        ):
             self.strategy.bot_loop_start(now)
 
+        get.assert_called_once()
         self.assertEqual(self.strategy.dp.get_pair_dataframe.call_count, 5)
         self.strategy.dp.get_pair_dataframe.assert_any_call("BTC/USDT:USDT", "15m")
         post.assert_called_once()
@@ -213,6 +229,266 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.assertIn("CALIBRATED_CONFIDENCE_UNAVAILABLE", captured.output[0])
         self.assertIn("trace-123", captured.output[0])
         self.assertEqual(self.strategy._signals, {})
+
+    def test_production_signal_is_available_for_entry_in_dry_run_and_live(self):
+        for runmode, dry_run in (("dry_run", True), ("live", False)):
+            with self.subTest(runmode=runmode):
+                self.strategy.config["dry_run"] = dry_run
+                self.strategy.config["runmode"] = SimpleNamespace(value=runmode)
+                self.response.json.return_value = {
+                    "contractVersion": "sbk1.freqtrade.signal.v1",
+                    "signals": [{"signal": self.signal, "status": "ACCEPTED"}],
+                }
+                with patch("SbkSignalStrategy.requests.get", return_value=self.response) as get:
+                    self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+                get.assert_called_once()
+                self.assertEqual(self.strategy._signals[self.signal_id], self.signal)
+                self.assertEqual(self.strategy._signal_statuses[self.signal_id], "ACCEPTED")
+                self.assertEqual(self.strategy._signals_by_pair[self.signal["pair"]], self.signal)
+
+                dataframe = pd.DataFrame(
+                    {
+                        "date": [datetime.fromtimestamp((self.now_ms - 60_000) / 1000, UTC)],
+                        "close": [self.signal["referencePrice"]],
+                    }
+                )
+                entries = self.strategy.populate_entry_trend(
+                    dataframe,
+                    {"pair": self.signal["pair"]},
+                )
+                self.assertEqual(entries.iloc[-1]["enter_long"], 1)
+                self.assertEqual(entries.iloc[-1]["enter_tag"], self.signal_id)
+
+                with patch.object(self.strategy, "_post_status", return_value=True):
+                    accepted = self.strategy.confirm_trade_entry(
+                        self.signal["pair"],
+                        "limit",
+                        0.001,
+                        self.signal["referencePrice"],
+                        "gtc",
+                        datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                        self.signal_id,
+                        "long",
+                    )
+                self.assertTrue(accepted)
+                self.assertEqual(self.strategy._signal_statuses[self.signal_id], "STRATEGY_ACCEPTED")
+
+    def test_stake_uses_signal_risk_and_never_exceeds_configured_cap(self):
+        self.strategy._signals = {self.signal_id: self.signal}
+        self.strategy.config["stake_amount"] = 100
+        self.signal["entryConditions"]["stopLoss"] = 62_100 * 0.99
+        self.signal["riskLimits"]["riskBudgetPct"] = 0.5
+
+        stake = self.strategy.custom_stake_amount(
+            self.signal["pair"],
+            datetime.fromtimestamp(self.now_ms / 1000, UTC),
+            62_100,
+            500,
+            1,
+            500,
+            2,
+            self.signal_id,
+            "long",
+        )
+
+        self.assertAlmostEqual(stake, 25)
+        self.assertLessEqual(stake, self.strategy.config["stake_amount"])
+
+        self.strategy.config["stake_amount"] = 20
+        capped_stake = self.strategy.custom_stake_amount(
+            self.signal["pair"],
+            datetime.fromtimestamp(self.now_ms / 1000, UTC),
+            62_100,
+            500,
+            1,
+            500,
+            1,
+            self.signal_id,
+            "long",
+        )
+        self.assertLessEqual(capped_stake, 20)
+
+    def test_leverage_is_capped_by_signal_and_exchange_and_defaults_to_one(self):
+        self.strategy._signals = {self.signal_id: self.signal}
+        self.signal["riskLimits"]["maxLeverage"] = 1.5
+        current_time = datetime.fromtimestamp(self.now_ms / 1000, UTC)
+
+        self.assertEqual(
+            self.strategy.leverage(
+                self.signal["pair"], current_time, 62_100, 3, 10, self.signal_id, "long"
+            ),
+            1.5,
+        )
+        self.assertEqual(
+            self.strategy.leverage(
+                self.signal["pair"], current_time, 62_100, 3, 1.25, self.signal_id, "long"
+            ),
+            1.25,
+        )
+        self.assertEqual(
+            self.strategy.leverage(
+                self.signal["pair"], current_time, 62_100, 3, 10, None, "long"
+            ),
+            1,
+        )
+
+    def test_signal_stoploss_is_used_and_fixed_stoploss_is_fallback(self):
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            is_short=False,
+            leverage=1,
+            get_custom_data=Mock(return_value=self.signal),
+        )
+
+        with patch("SbkSignalStrategy.stoploss_from_absolute", return_value=-0.01) as convert:
+            result = self.strategy.custom_stoploss(
+                self.signal["pair"],
+                trade,
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                62_100,
+                0,
+                False,
+            )
+
+        convert.assert_called_once_with(
+            61_800,
+            62_100,
+            is_short=False,
+            leverage=1,
+        )
+        self.assertEqual(result, -0.01)
+
+        trade.get_custom_data.return_value = None
+        self.assertEqual(
+            self.strategy.custom_stoploss(
+                self.signal["pair"],
+                trade,
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                62_100,
+                0,
+                False,
+            ),
+            -0.05,
+        )
+
+    def test_minimal_roi_does_not_create_a_separate_roi_exit(self):
+        self.assertEqual(self.strategy.minimal_roi, {})
+
+    def test_populate_exit_trend_requires_the_matching_entry_tag(self):
+        exit_id = "sbk1_exit_" + "b" * 32
+        self.strategy._exit_signals = {
+            exit_id: {
+                "contractVersion": "sbk1.freqtrade.signal.v1",
+                "signalType": "EXIT",
+                "exitId": exit_id,
+                "pair": self.signal["pair"],
+                "tradeId": 42,
+                "entryTag": self.signal_id,
+                "direction": "LONG",
+                "reason": "CONTRACT_TEST_ONLY thesis invalidation",
+                "generatedAtMs": self.now_ms,
+                "expiresAtMs": self.now_ms + 30_000,
+            },
+        }
+        frame = pd.DataFrame({"enter_tag": [self.signal_id]})
+        result = self.strategy.populate_exit_trend(frame, {"pair": self.signal["pair"]})
+
+        self.assertEqual(result.iloc[-1]["exit_long"], 1)
+        self.assertEqual(result.iloc[-1]["exit_short"], 0)
+        self.assertEqual(result.iloc[-1]["exit_tag"], f"sbk_exit_{exit_id}")
+
+        frame.loc[0, "enter_tag"] = "sbk1_" + "c" * 32
+        unrelated = self.strategy.populate_exit_trend(frame, {"pair": self.signal["pair"]})
+        self.assertEqual(unrelated.iloc[-1]["exit_long"], 0)
+
+    def test_custom_exit_matches_trade_id_entry_tag_and_direction_and_is_one_shot(self):
+        exit_id = "sbk1_exit_" + "b" * 32
+        self.strategy._exit_signals = {
+            exit_id: {
+                "contractVersion": "sbk1.freqtrade.signal.v1",
+                "signalType": "EXIT",
+                "exitId": exit_id,
+                "pair": self.signal["pair"],
+                "tradeId": 42,
+                "entryTag": self.signal_id,
+                "direction": "LONG",
+                "reason": "CONTRACT_TEST_ONLY thesis invalidation",
+                "generatedAtMs": self.now_ms,
+                "expiresAtMs": self.now_ms + 30_000,
+            },
+        }
+        trade = SimpleNamespace(
+            id=42,
+            enter_tag=self.signal_id,
+            is_short=False,
+            set_custom_data=Mock(),
+        )
+        current_time = datetime.fromtimestamp(self.now_ms / 1000, UTC)
+
+        self.assertEqual(
+            self.strategy.custom_exit(self.signal["pair"], trade, current_time, 62_100, 0),
+            f"sbk_exit_{exit_id}",
+        )
+        trade.set_custom_data.assert_called_once_with("sbk_exit_signal_id", exit_id)
+        with patch.object(self.strategy, "_post_exit_status", return_value=True) as post_status:
+            accepted = self.strategy.confirm_trade_exit(
+                self.signal["pair"],
+                trade,
+                "market",
+                0.002,
+                62_100,
+                "gtc",
+                f"sbk_exit_{exit_id}",
+                current_time,
+            )
+        self.assertTrue(accepted)
+        post_status.assert_called_once_with(
+            exit_id,
+            "CONFIRMED",
+            "Freqtrade accepted the SBK1-directed exit order.",
+        )
+        self.assertIsNone(
+            self.strategy.custom_exit(self.signal["pair"], trade, current_time, 62_100, 0)
+        )
+
+    def test_take_profit_does_not_create_an_exit_without_an_sbk1_exit_signal(self):
+        trade = SimpleNamespace(id=42, enter_tag=self.signal_id, is_short=False)
+
+        self.assertIsNone(
+            self.strategy.custom_exit(
+                self.signal["pair"],
+                trade,
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                self.signal["entryConditions"]["takeProfit"] + 1,
+                0.01,
+            )
+        )
+
+    def test_exit_fill_marks_the_matching_exit_signal_closed(self):
+        exit_id = "sbk1_exit_" + "b" * 32
+        self.strategy._exit_signals = {exit_id: {"exitId": exit_id}}
+        trade = SimpleNamespace(
+            enter_tag=self.signal_id,
+            is_short=False,
+            is_open=False,
+            get_custom_data=Mock(return_value=exit_id),
+        )
+        order = SimpleNamespace(ft_order_side="sell")
+        with patch.object(self.strategy, "_post_exit_status", return_value=True) as post_status:
+            self.strategy.order_filled(
+                self.signal["pair"],
+                trade,
+                order,
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+            )
+
+        post_status.assert_called_once_with(
+            exit_id,
+            "CLOSED",
+            "Freqtrade confirmed the SBK1-directed position close.",
+        )
+        self.assertNotIn(exit_id, self.strategy._exit_signals)
 
     def test_restart_without_a_persisted_freqtrade_trade_quarantines_signal(self):
         with (

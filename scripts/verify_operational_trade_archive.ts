@@ -37,6 +37,7 @@ function makeSignal(nowMs: number, setupType = 'AUDITABLE_SETUP') {
     generatedAtMs: nowMs,
     expiresAtMs: nowMs + 60_000,
     referencePrice,
+    engineScore: 80,
     dataQuality: {
       status: 'LIVE',
       source: 'freqtrade.dataprovider.ticker',
@@ -45,6 +46,7 @@ function makeSignal(nowMs: number, setupType = 'AUDITABLE_SETUP') {
     },
     entryConditions: {
       setupType,
+      entryPrice: referencePrice,
       stopLoss: 59_000,
       takeProfit: 62_000,
       maxPriceDeviationBps: 100,
@@ -88,6 +90,7 @@ function makeStatusUpdate(
 const trade: FreqtradeTrade = {
   trade_id: 73,
   pair: 'BTC/USDT:USDT',
+  enter_tag: makeSignal(1_800_000_000_000).signalId,
   is_open: false,
   is_short: false,
   amount: 0.001,
@@ -121,7 +124,12 @@ try {
   const storePath = path.join(temporaryDirectory, 'archive.json');
   const archive = new OperationalTradeArchive(storePath);
   const initialRecord = makeRecord(1_800_000_000_000, 'ACCEPTED');
-  await archive.recordSignalLifecycle(initialRecord);
+  await archive.recordSignalLifecycle(initialRecord, {
+    featureSnapshot: { price: 60_000, rsi: 54, scoreLong: 4, scoreShort: 1 },
+    featureVersion: 'test-features-v1',
+    modelVersion: 'test-model-v1',
+    codeVersion: 'test-commit',
+  });
   await archive.recordSignalLifecycle(makeStatusUpdate(
     initialRecord,
     'ORDER_SUBMITTED',
@@ -143,14 +151,21 @@ try {
     averageFillPrice: 60_000,
   });
   await archive.recordSignalLifecycle(filledRecord);
+  assert.deepEqual(
+    await archive.getPendingOutcomeTrades(),
+    [{ signalId: initialRecord.signal.signalId, tradeId: 73 }],
+    'filled signals are scheduled for authoritative Freqtrade outcome verification',
+  );
   await archive.recordFreqtradeTrade(initialRecord.signal.signalId, trade, 'DRY_RUN', 1_800_000_602_000);
   await archive.recordFreqtradeTrade(initialRecord.signal.signalId, trade, 'DRY_RUN', 1_800_000_603_000);
 
   const recovered = await new OperationalTradeArchive(storePath).getBySignalId(initialRecord.signal.signalId);
   assert.ok(recovered, 'record survives service restart');
   assert.equal(recovered.decisionId, initialRecord.signal.decisionId);
-  assert.equal(recovered.featureSnapshot, null);
-  assert.equal(recovered.modelVersion, null);
+  assert.deepEqual(recovered.featureSnapshot, { price: 60_000, rsi: 54, scoreLong: 4, scoreShort: 1 });
+  assert.equal(recovered.featureVersion, 'test-features-v1');
+  assert.equal(recovered.modelVersion, 'test-model-v1');
+  assert.equal(recovered.codeVersion, 'test-commit');
   assert.equal(recovered.lifecycleEvents.length, 5, 'partial-fill updates with the same status are retained');
   assert.equal(recovered.lifecycleEvents[2]?.source, 'FREQTRADE');
   assert.equal(recovered.lifecycleEvents[2]?.tradeId, 73);
@@ -163,6 +178,16 @@ try {
   assert.equal(recovered.freqtradeTrades[0]?.trade.orders[0]?.order_id, 'entry-73');
   assert.equal(recovered.freqtradeTrades[0]?.trade.fee_close_cost, 0.03);
   assert.equal(recovered.freqtradeTrades[0]?.trade.close_profit_abs, 0.94);
+  assert.deepEqual(recovered.outcome, {
+    source: 'FREQTRADE_RPC',
+    tradeId: 73,
+    outcome: 'WIN',
+    pnlUsd: 0.94,
+    feesUsd: 0.06,
+    exitReason: 'roi',
+    closedAtMs: 1_800_000_601_000,
+  });
+  assert.deepEqual(await archive.getPendingOutcomeTrades(), [], 'confirmed close is no longer pending');
 
   const restartedArchive = new OperationalTradeArchive(storePath);
   await restartedArchive.recordSignalLifecycle(filledRecord);
@@ -182,7 +207,7 @@ try {
     signal: secondSignal,
   });
   await assert.rejects(
-    archive.recordFreqtradeTrade(secondSignal.signalId, trade, 'DRY_RUN'),
+    archive.recordFreqtradeTrade(secondSignal.signalId, { ...trade, enter_tag: secondSignal.signalId }, 'DRY_RUN'),
     /already linked to signal/,
   );
   await assert.rejects(

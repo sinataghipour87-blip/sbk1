@@ -4,11 +4,11 @@
  */
 
 export interface ExchangeDepthData {
-  exchange: 'Bybit' | 'Binance' | 'Coinbase' | 'OKX' | 'KuCoin';
-  exchangeName: 'Bybit' | 'Binance' | 'Coinbase' | 'OKX' | 'KuCoin';
+  exchange: 'Bybit' | 'Coinbase' | 'OKX' | 'KuCoin';
+  exchangeName: 'Bybit' | 'Coinbase' | 'OKX' | 'KuCoin';
   symbol: string; // e.g. 'BTCUSDT' or 'BTC-USDT'
   marketType: 'PERPETUAL_FUTURES' | 'SPOT' | 'DELIVERY_FUTURES';
-  contract: string; // e.g. 'Bybit BTCUSDT Linear Perpetual', 'Binance BTCUSDT Spot'
+  contract: string; // e.g. 'Bybit BTCUSDT Linear Perpetual'
   timestamp: number;
   timestampUtc: number;
   latency: number;

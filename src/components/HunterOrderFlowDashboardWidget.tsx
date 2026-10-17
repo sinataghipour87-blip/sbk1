@@ -47,12 +47,12 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
   const analysisDataTimestamp =
     analysis?.futuresPrices?.timestampUtc ?? analysis?.canonicalSnapshot?.timestampUtc;
   const isSubmissionDataReady =
-    analysis?.dataStatus === 'LIVE' &&
-    analysis.dataQualityReport?.isTradeAllowed === true &&
+    analysis !== null &&
+    analysis !== undefined &&
     typeof analysisDataTimestamp === 'number' &&
     Number.isSafeInteger(analysisDataTimestamp) &&
     Date.now() - analysisDataTimestamp >= 0 &&
-    Date.now() - analysisDataTimestamp <= 5_000;
+    Date.now() - analysisDataTimestamp <= 15_000;
 
   const updateOrderFlow = () => {
     if (analysis?.rawCandles) {
@@ -93,7 +93,6 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
 
   const handleExecuteOrder = async () => {
     if (
-      snapshot.activeSignal.signalConfidencePct === null ||
       !analysis ||
       !isSubmissionDataReady
     ) {
@@ -202,7 +201,7 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
           </div>
           <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-200">
             <span className="text-indigo-400 font-bold block mb-0.5">۳. Evidence & Risk Gates</span>
-            <span>Calibration required; fail closed</span>
+            <span>Calibration is informational</span>
           </div>
           <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-200">
             <span className="text-emerald-400 font-bold block mb-0.5">۴. Execution</span>
@@ -276,18 +275,20 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
               <span className="text-sm font-bold text-slate-100 block">
                 سیگنال شکار نقدینگی: {sig.setupType !== 'NONE' ? sig.setupType : 'در حال پایش سطح بعدی...'}
               </span>
-              <span className="text-[10px] text-slate-400">احتمال کالیبره‌شده: موجود نیست</span>
+              <span className="text-[10px] text-slate-400">
+                امتیاز موتور: {sig.signalConfidencePct === null ? 'موجود نیست' : sig.signalConfidencePct}
+              </span>
             </div>
           </div>
 
           {sig.direction !== 'NEUTRAL' && (
             <button
               onClick={handleExecuteOrder}
-              disabled
+              disabled={isExecuting || !isSubmissionDataReady}
               className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs transition flex items-center gap-1.5 shadow-lg"
             >
               <Zap className="w-4 h-4 fill-current" />
-              <span>ارسال سیگنال production مسدود</span>
+              <span>{isExecuting ? 'در حال ارسال...' : 'ارسال سیگنال به صف Freqtrade'}</span>
             </button>
           )}
         </div>
@@ -338,12 +339,11 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
         </div>
       )}
 
-      <div role="status" className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-950/20 p-3 text-xs text-rose-100">
-        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+      <div role="status" className="flex items-start gap-2 rounded-lg border border-sky-500/30 bg-sky-950/20 p-3 text-xs text-sky-100">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-sky-400" />
         <div>
-          <p className="font-bold">NO TRADE — CALIBRATED_CONFIDENCE_UNAVAILABLE</p>
-          <p className="mt-1">آرشیو معتبر تصمیم‌ها، ویژگی‌های هم‌زمان و نتایج تأییدشدهٔ Freqtrade برای کالیبراسیون و آزمون خارج از نمونه موجود نیست؛ ارسال سیگنال عادی SBK1 به صف Freqtrade عمداً بسته است. درخواست ردشده با `CALIBRATED_CONFIDENCE_UNAVAILABLE` و correlation ID ثبت می‌شود.</p>
-          <p className="mt-1">در حال حاضر strategy فقط fixture صریحاً فعال‌شدهٔ Dry-run را برای آزمون قرارداد می‌پذیرد؛ fixture شاهد برتری آماری یا مجوز ورود واقعی نیست. این گیت برای افزایش تعداد معامله دور زده نمی‌شود.</p>
+          <p className="font-bold">اطلاعات کالیبراسیون</p>
+          <p className="mt-1">نبود آرشیو یا احتمال کالیبره‌شده فقط به‌عنوان محدودیت آماری نمایش داده می‌شود؛ ارسال همچنان به snapshot تازه، جهت معتبر و اعتبار فنی ورود/استاپ/هدف وابسته است.</p>
           <p className="mt-1">
             وضعیت Last/Mark/Index: {analysis?.futuresPrices?.status ?? 'UNAVAILABLE'}
             {typeof analysis?.futuresPrices?.ageMs === 'number' ? `؛ سن داده ${analysis.futuresPrices.ageMs}ms` : ''}
