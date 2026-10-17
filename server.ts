@@ -1,6 +1,5 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type, GenerateVideosOperation } from "@google/genai";
 import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -28,6 +27,7 @@ import {
 } from './src/services/freqtradeMarketDataBridge';
 import { createServerSignalRunner, type ServerSignalRunner } from './src/services/serverSignalRunner';
 import { operationalTradeArchive } from './src/services/operationalTradeArchive';
+import { fetchDirectNewsHeadlines } from './src/services/directNewsFeeds';
 
 dotenv.config();
 
@@ -1070,741 +1070,126 @@ app.post('/api/ultra-winrate-optimizer', async (req, res) => {
     }
 });
 
-function getAvailableGeminiKeys(): string[] {
-  const keys: string[] = [];
-  const envKeys = Object.keys(process.env)
-    .filter(k => k.startsWith("GEMINI_API_KEY"))
-    .sort();
-
-  for (const k of envKeys) {
-    const val = process.env[k];
-    if (val && typeof val === 'string' && val.trim().length > 10) {
-      const trimmed = val.trim();
-      if (!keys.includes(trimmed)) {
-        keys.push(trimmed);
-      }
-    }
-  }
-  return keys;
-}
-
-let quotaCooldownUntil = 0;
-let lastQuotaWarnTimestamp = 0;
-
-function getSafeAiFallbackPayload(): { text: string } {
-  return {
-    text: JSON.stringify({
-      status: "RATE_LIMITED",
-      score: 0.15,
-      label: "NEUTRAL",
-      trend: "STABLE",
-      drivers: [
-        "سهمیه موقت هوش مصنوعی در حال بازیابی است",
-        "فعالیت سیستم بر مبنای مدل‌های آماری و تکنیکال مستقل ادامه دارد"
-      ],
-      oscillatorScore: 50,
-      regime: "محافظه‌کارانه (مدیریت سهمیه API)",
-      impactLevel: "MEDIUM",
-      blackoutCaution: false,
-      summaryPersian: "سهمیه درخواست‌های هوش مصنوعی موقتاً به پایان رسیده است (خطای 429). سیستم تحلیل آماری خودکار و محافظت از سرمایه را بدون وقفه فعال نگه داشته است.",
-      keyEvents: [],
-      macroDrivers: ["پایان سهمیه موقت API", "حالت حفاظتی خودکار"],
-      exchangeNetflowBtc: 0,
-      exchangeReserveBtc: 1845000,
-      reserveStatus: "پایدار (حالت محافظتی)",
-      whalePressureIndex: 50,
-      whaleSentiment: "NEUTRAL",
-      summary: "سهمیه موقت هوش مصنوعی مصرف شده است؛ تحلیل به حالت پایدار و ایمن تغییر یافت.",
-      recentWhaleTransfers: [],
-      sp500Price: null,
-      sp500DailyChangePct: 0,
-      dxyIndex: null,
-      dxyDailyChangePct: 0,
-      spotEtfNetInflowMillionUsd: 0,
-      fedRateCutExpectationPct: 50,
-      newsSentimentScore: 0,
-      headlines: []
-    })
-  };
-}
-
-async function generateContentWithFallback(params: any) {
-  const now = Date.now();
-  if (now < quotaCooldownUntil) {
-    return getSafeAiFallbackPayload();
-  }
-
-  const keys = getAvailableGeminiKeys();
-  if (keys.length === 0) {
-    return getSafeAiFallbackPayload();
-  }
-
-  for (let i = 0; i < keys.length; i++) {
-    try {
-      const client = new GoogleGenAI({
-        apiKey: keys[i],
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      });
-      const result = await client.models.generateContent(params);
-      quotaCooldownUntil = 0;
-      return result;
-    } catch (err: any) {
-      const errStr = err?.message || JSON.stringify(err);
-      const is429 = errStr.includes('429') || errStr.includes('RESOURCE_EXHAUSTED') || errStr.includes('quota');
-      if (is429) {
-        quotaCooldownUntil = Date.now() + 90 * 1000; // 90 seconds cooldown
-        if (Date.now() - lastQuotaWarnTimestamp > 60 * 1000) {
-          lastQuotaWarnTimestamp = Date.now();
-          console.warn('[AI-Quota-Notice] سهمیه مصرف شده است (429 RESOURCE_EXHAUSTED). فعال‌سازی حالت پشتیبان خودکار تا ۹۰ ثانیه دیگر.');
-        }
-        break; // Stop querying additional keys if quota is exhausted for the project
-      } else {
-        console.warn(`[AI-Fallback] کلید ${i + 1} رد شد. خطا: ${err?.message || 'Unknown'}`);
-      }
-    }
-  }
-
-  return getSafeAiFallbackPayload();
-}
-
-let cachedBtcFundamental: any = null;
-let lastBtcCacheTime = 0;
-const BTC_FUNDAMENTAL_CACHE_MS = 2 * 60 * 1000; // 2 minutes cache for real-time news
-
-// Bitcoin Fundamental News Oscillator with Google Search Grounding
-app.get('/api/btc-fundamental-grounding', async (req, res) => {
-    const now = Date.now();
-    if (cachedBtcFundamental && (now - lastBtcCacheTime) < BTC_FUNDAMENTAL_CACHE_MS) {
-        return res.json(cachedBtcFundamental);
-    }
-
-    const fallbackResponse = {
-        oscillatorScore: 68,
-        regime: "صعودی ملایم (Bullish Momentum)",
-        impactLevel: "MEDIUM",
-        blackoutCaution: false,
-        summaryPersian: "تثبیت قیمت بیت‌کوین بالای محدوده حمایتی کلیدی همراه با تداوم ورود سرمایه سازمانی به صندوق‌های ETF و آرامش نسبی در بازارهای کلان اقتصادی.",
-        keyEvents: [
-            {
-                title: "ورودی مثبت سرمایه به ETFهای اسپات بیت‌کوین",
-                summary: "ثبت ورودی خالص ۲۸۰ میلیون دلاری به صندوق‌های ETF بیت‌کوین در روز گذشته نشان‌دهنده تقاضای مستمر سازمانی است.",
-                impact: "BULLISH",
-                source: "Farside Investors / CoinDesk"
-            },
-            {
-                title: "کاهش فشار فروش در صرافی‌ها",
-                summary: "موجودی بیت‌کوین در صرافی‌های متمرکز به نازل‌ترین سطح ۳ سال اخیر رسیده که احتمال شوک عرضه را افزایش می‌دهد.",
-                impact: "BULLISH",
-                source: "Glassnode"
-            },
-            {
-                title: "انتظار بازار برای نشست بعدی فدرال رزرو",
-                summary: "معامله‌گران در حال ارزیابی داده‌های تورمی آمریکا جهت پیش‌بینی نرخ بهره بعدی هستند.",
-                impact: "NEUTRAL",
-                source: "Bloomberg Crypto"
-            }
-        ],
-        macroDrivers: [
-            "ورودی خالص به ETFهای اسپات",
-            "کاهش موجودی بیت‌کوین صرافی‌ها",
-            "ثبات شاخص دلار آمریکا (DXY)",
-            "کاهش نرخ سوددهی اوراق قرضه ۱۰ ساله"
-        ],
-        lastUpdated: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        sourceGrounding: "Google Search Grounding (Live Data)"
-    };
-
-    try {
-        const prompt = `Perform a live search for breaking Bitcoin (BTC) news, macro economic events, Fed policy, US ETF flows, and institutional liquidations in the past 15 minutes to today. 
-Evaluate the immediate fundamental impact on Bitcoin price.
-
-Output MUST be a raw JSON object (and nothing else) matching this structure:
-{
-  "oscillatorScore": number between -100 (extreme bearish) and +100 (extreme bullish),
-  "regime": "string in Persian (e.g. بسیار صعودی, صعودی ملایم, خنثی, نزولی ملایم, بسیار نزولی)",
-  "impactLevel": "HIGH" | "MEDIUM" | "LOW",
-  "blackoutCaution": boolean (true if extreme shock event like SEC lawsuit or Fed surprise in last 15 mins),
-  "summaryPersian": "2 sentence summary in fluent Persian analyzing Bitcoin fundamental status",
-  "keyEvents": [
-     {
-       "title": "Short title in Persian",
-       "summary": "Description in Persian",
-       "impact": "BULLISH" | "BEARISH" | "NEUTRAL",
-       "source": "Source name"
-     }
-  ],
-  "macroDrivers": ["List of 3-4 bullet drivers in Persian"]
-}`;
-
-        const response = await generateContentWithFallback({
-          model: 'gemini-3.8-flash',
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          config: {
-            tools: [{ googleSearch: {} }],
-          }
-        });
-
-        if (response.text) {
-            // Clean markdown blocks if present
-            const cleanText = response.text.replace(/```json/g, '').replace(/```/g, '').trim();
-            const parsed = JSON.parse(cleanText);
-            parsed.status = "LIVE";
-            parsed.lastUpdated = new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            parsed.sourceGrounding = "Google Search Grounding (Live Data)";
-            cachedBtcFundamental = parsed;
-            lastBtcCacheTime = now;
-            return res.json(parsed);
-        }
-    } catch (err: any) {
-        // Fallback must NEVER use hardcoded static mock values as live data
-    }
-
-    const unavailableFundamental = {
-        status: "UNAVAILABLE",
-        oscillatorScore: null,
-        regime: "UNAVAILABLE (منبع در دسترس نیست)",
-        impactLevel: "LOW",
-        blackoutCaution: false,
-        summaryPersian: "داده‌های فاندامنتال زنده به دلیل قطع اتصال به منبع در دسترس نیست (UNAVAILABLE). هیچ فرضیه کاذبی اعمال نمی‌شود.",
-        keyEvents: [],
-        macroDrivers: [],
-        lastUpdated: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        sourceGrounding: "UNAVAILABLE"
-    };
-
-    cachedBtcFundamental = unavailableFundamental;
-    lastBtcCacheTime = now;
-    res.json(unavailableFundamental);
-});
-
-let cachedWhaleOnChain: any = null;
-let lastWhaleCacheTime = 0;
-const WHALE_CACHE_MS = 2 * 60 * 1000; // 2 minutes cache for live whale movement
-
-// API Route for Whale On-Chain Netflow Radar with Google Search Grounding
-app.get('/api/whale-onchain-radar', async (req, res) => {
-    const now = Date.now();
-    if (cachedWhaleOnChain && (now - lastWhaleCacheTime) < WHALE_CACHE_MS) {
-        return res.json(cachedWhaleOnChain);
-    }
-
-    try {
-        const prompt = `Perform a live search for current Bitcoin (BTC) On-Chain whale movements, Whale Alert transfers, exchange netflow across major venues, and CryptoQuant/Glassnode reserve metrics right now.
-Evaluate whether whales are ACCUMULATING (outflow/bullish) or DISTRIBUTING (inflow/bearish).
-
-Output MUST be a raw JSON object (and nothing else) matching this exact schema:
-{
-  "exchangeNetflowBtc": number (negative for net outflow/bullish, positive for net inflow/bearish),
-  "exchangeReserveBtc": number,
-  "reserveStatus": "string description in Persian",
-  "whalePressureIndex": number between 0 and 100,
-  "whaleSentiment": "ACCUMULATION" | "DISTRIBUTION" | "NEUTRAL",
-  "summary": "Short 2 sentence summary in Persian of recent whale on-chain activity",
-  "recentWhaleTransfers": [
-    {
-      "id": "tx-1",
-      "amountBtc": number,
-      "usdValueM": number,
-      "from": "source name",
-      "to": "destination name",
-      "type": "OUTFLOW" | "INFLOW",
-      "timeAgo": "Persian string like ۵ دقیقه پیش"
-    }
-  ]
-}`;
-
-        const response = await generateContentWithFallback({
-            model: 'gemini-3.8-flash',
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            config: {
-                tools: [{ googleSearch: {} }],
-            }
-        });
-
-        if (response.text) {
-            const cleanText = response.text.replace(/```json/g, '').replace(/```/g, '').trim();
-            const parsed = JSON.parse(cleanText);
-            parsed.status = "LIVE";
-            parsed.lastUpdated = new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            parsed.sourceGrounding = "Google Search Grounding (Live On-Chain Data)";
-            cachedWhaleOnChain = parsed;
-            lastWhaleCacheTime = now;
-            return res.json(parsed);
-        }
-    } catch (err: any) {
-        // Fallback must NEVER use hardcoded mock numbers as live data
-    }
-
-    const unknownWhale = {
-        status: "UNKNOWN",
-        exchangeNetflowBtc: null,
-        exchangeReserveBtc: null,
-        reserveStatus: "UNKNOWN (داده زنده آن‌چین در دسترس نیست)",
-        whalePressureIndex: null,
-        whaleSentiment: "UNKNOWN",
-        summary: "داده‌های زنده ردپای نهنگ‌ها و آن‌چین در دسترس نیست (UNKNOWN). بر اساس قانون ۴۵، داده‌های فرضی حذف شدند و هیچ تاثیری در محاسبه احتمال یا سیگنال ندارند.",
-        recentWhaleTransfers: [],
-        lastUpdated: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        sourceGrounding: "UNKNOWN"
-    };
-
-    cachedWhaleOnChain = unknownWhale;
-    lastWhaleCacheTime = now;
-    res.json(unknownWhale);
-});
-
-// Comprehensive Macro & Fundamental Context Endpoint (Item 43)
-let cachedMacroContext: any = null;
-let lastMacroContextTime = 0;
-const MACRO_CONTEXT_CACHE_MS = 60 * 1000; // 1 minute cache
-
-app.get('/api/macro-context', async (req, res) => {
-    const now = Date.now();
-    if (cachedMacroContext && (now - lastMacroContextTime) < MACRO_CONTEXT_CACHE_MS) {
-        return res.json(cachedMacroContext);
-    }
-
-    // 1. Fear & Greed: Real free API from alternative.me
-    let fearAndGreedStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
-    let fearAndGreedIndex: number | null = null;
-    let fearAndGreedLabelFa: string = 'UNAVAILABLE';
-
-    try {
-        const fgController = new AbortController();
-        const fgTimeout = setTimeout(() => fgController.abort(), 4000);
-        const fgRes = await fetch('https://api.alternative.me/fng/?limit=1', { signal: fgController.signal });
-        clearTimeout(fgTimeout);
-        if (fgRes.ok) {
-            const fgData = await fgRes.json();
-            if (fgData && fgData.data && fgData.data.length > 0) {
-                const val = Number(fgData.data[0].value);
-                if (!isNaN(val)) {
-                    fearAndGreedIndex = val;
-                    fearAndGreedStatus = 'LIVE';
-                    const cls = fgData.data[0].value_classification;
-                    fearAndGreedLabelFa = `${cls} (${val})`;
-                }
-            }
-        }
-    } catch {
-        fearAndGreedStatus = 'UNAVAILABLE';
-        fearAndGreedIndex = null;
-    }
-
-    // 2. Fetch S&P500, DXY, ETF Flow, Fed Expectations, News Sentiment, Whale Flow
-    let sp500Status: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
-    let sp500Price: number | null = null;
-    let sp500DailyChangePct: number | null = null;
-
-    let dxyStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
-    let dxyIndex: number | null = null;
-    let dxyDailyChangePct: number | null = null;
-
-    let etfFlowStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
-    let spotEtfNetInflowMillionUsd: number | null = null;
-
-    let fedExpectationsStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
-    let fedRateCutExpectationPct: number | null = null;
-
-    let newsSentimentStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
-    let newsSentimentScore: number | null = null;
-    let recentHeadlines: any[] = [];
-
-    let whaleFlowStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
-    let whaleNetflowBtc: number | null = null;
-    let whalePressureIndex: number | null = null;
-    let whaleSentiment: string | null = null;
-
-    try {
-        const prompt = `Search live right now for:
-1. S&P 500 index price and today's percentage change
-2. US Dollar Index (DXY) and today's percentage change
-3. Latest net inflow/outflow into US Bitcoin Spot ETFs in million USD (e.g. +280 or -120)
-4. CME FedWatch probability percentage of Fed interest rate cut at next FOMC
-5. 3 breaking Bitcoin news headlines with sentiment (BULLISH/BEARISH/NEUTRAL) and overall news sentiment score from -100 to +100
-6. Bitcoin 24h whale netflow in BTC and sentiment (ACCUMULATION/DISTRIBUTION/NEUTRAL)
-
-Output MUST be a single raw JSON object matching:
-{
-  "sp500Price": number or null,
-  "sp500DailyChangePct": number or null,
-  "dxyIndex": number or null,
-  "dxyDailyChangePct": number or null,
-  "spotEtfNetInflowMillionUsd": number or null,
-  "fedRateCutExpectationPct": number or null,
-  "newsSentimentScore": number or null,
-  "headlines": [
-    {
-      "id": "h1",
-      "headlineFa": "Persian headline text",
-      "source": "source name",
-      "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
-      "impactScore": number,
-      "timeAgoFa": "Persian time string"
-    }
-  ],
-  "whaleNetflowBtc": number or null,
-  "whalePressureIndex": number or null,
-  "whaleSentiment": "ACCUMULATION" | "DISTRIBUTION" | "NEUTRAL" | null
-}`;
-
-        const response = await generateContentWithFallback({
-            model: 'gemini-3.8-flash',
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            config: {
-                tools: [{ googleSearch: {} }],
-            }
-        });
-
-        if (response.text) {
-            const cleanText = response.text.replace(/```json/g, '').replace(/```/g, '').trim();
-            const jsonStart = cleanText.indexOf('{');
-            const jsonEnd = cleanText.lastIndexOf('}');
-            if (jsonStart !== -1 && jsonEnd !== -1) {
-                const parsed = JSON.parse(cleanText.substring(jsonStart, jsonEnd + 1));
-                if (typeof parsed.sp500Price === 'number' && !isNaN(parsed.sp500Price)) {
-                    sp500Price = parsed.sp500Price;
-                    sp500DailyChangePct = typeof parsed.sp500DailyChangePct === 'number' ? parsed.sp500DailyChangePct : 0;
-                    sp500Status = 'LIVE';
-                }
-                if (typeof parsed.dxyIndex === 'number' && !isNaN(parsed.dxyIndex)) {
-                    dxyIndex = parsed.dxyIndex;
-                    dxyDailyChangePct = typeof parsed.dxyDailyChangePct === 'number' ? parsed.dxyDailyChangePct : 0;
-                    dxyStatus = 'LIVE';
-                }
-                if (typeof parsed.spotEtfNetInflowMillionUsd === 'number' && !isNaN(parsed.spotEtfNetInflowMillionUsd)) {
-                    spotEtfNetInflowMillionUsd = parsed.spotEtfNetInflowMillionUsd;
-                    etfFlowStatus = 'LIVE';
-                }
-                if (typeof parsed.fedRateCutExpectationPct === 'number' && !isNaN(parsed.fedRateCutExpectationPct)) {
-                    fedRateCutExpectationPct = parsed.fedRateCutExpectationPct;
-                    fedExpectationsStatus = 'LIVE';
-                }
-                if (typeof parsed.newsSentimentScore === 'number' && !isNaN(parsed.newsSentimentScore)) {
-                    newsSentimentScore = parsed.newsSentimentScore;
-                    recentHeadlines = Array.isArray(parsed.headlines) ? parsed.headlines : [];
-                    newsSentimentStatus = 'LIVE';
-                }
-                if (typeof parsed.whaleNetflowBtc === 'number' && !isNaN(parsed.whaleNetflowBtc)) {
-                    whaleNetflowBtc = parsed.whaleNetflowBtc;
-                    whalePressureIndex = typeof parsed.whalePressureIndex === 'number' ? parsed.whalePressureIndex : 50;
-                    whaleSentiment = parsed.whaleSentiment || 'NEUTRAL';
-                    whaleFlowStatus = 'LIVE';
-                }
-            }
-        }
-    } catch {
-        // Failed: Keep status UNAVAILABLE and values null. Never inject hardcoded mock values.
-    }
-
-    const payload = {
-        fearAndGreedStatus,
-        fearAndGreedIndex,
-        fearAndGreedLabelFa,
-
-        etfFlowStatus,
-        spotEtfNetInflowMillionUsd,
-
-        dxyStatus,
-        dxyIndex,
-        dxyDailyChangePct,
-
-        sp500Status,
-        sp500Price,
-        sp500DailyChangePct,
-
-        fedExpectationsStatus,
-        fedRateCutExpectationPct,
-
-        newsSentimentStatus,
-        newsSentimentScore,
-        recentHeadlines,
-
-        whaleFlowStatus,
-        whaleNetflowBtc,
-        whalePressureIndex,
-        whaleSentiment,
-
-        lastUpdated: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-        sourceGrounding: (newsSentimentStatus === 'LIVE' || sp500Status === 'LIVE') ? "Google Search Grounding (Live Data)" : "UNAVAILABLE"
-    };
-
-    cachedMacroContext = payload;
-    lastMacroContextTime = now;
-    res.json(payload);
-});
-
-// =========================================================================
-// 🎬 Google Veo 3.1 30-Minute Video Chart Forecast Endpoints
-// =========================================================================
-function getAiClient() {
-  const keys = getAvailableGeminiKeys();
-  return new GoogleGenAI({
-    apiKey: keys[0] || process.env.GEMINI_API_KEY || "",
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
+app.get('/api/btc-fundamental-grounding', (_req, res) => {
+  res.json({
+    status: 'UNAVAILABLE', oscillatorScore: null, regime: 'UNAVAILABLE', impactLevel: null,
+    blackoutCaution: null, summaryPersian: 'منبع خبر مستقیم پیکربندی نشده است.',
+    keyEvents: [], macroDrivers: [], sourceGrounding: 'UNAVAILABLE',
+    provenance: { provider: 'NOT_CONFIGURED', retrievedAtMs: null, sources: [] },
   });
-}
-
-app.post('/api/veo/generate-video', async (req, res) => {
-    try {
-        const { scenario, price, symbol, trend } = req.body || {};
-        const currentP = (price && price > 0) ? price : (lastBtcPrice > 0 ? lastBtcPrice : 0);
-        if (currentP <= 0) {
-            return res.status(400).json({ error: 'DATA_UNAVAILABLE: Valid price required for chart animation' });
-        }
-        const sym = symbol || 'BTC/USDT';
-        const targetScenario = scenario || 'سناریوی شکست صعودی موج آلفا';
-
-        const prompt = `A professional futuristic Bloomberg-style 4K animated financial video chart showing ${sym} next 30 minutes forward price projection. Starting price $${currentP.toLocaleString()}. Realistic glowing candlestick chart animating forward in time from minute 0 to minute 30. Path follows ${targetScenario} with clear green and red candles, dynamic glowing support and resistance bands, floating holographic Take-Profit targets TP1, TP2, TP3, clean cyberpunk trading terminal HUD, ultra-smooth camera glide, cinematic lighting.`;
-
-        const aiClient = getAiClient();
-        const operation = await aiClient.models.generateVideos({
-            model: 'veo-3.1-lite-generate-preview',
-            prompt,
-            config: {
-                numberOfVideos: 1,
-                resolution: '720p',
-                aspectRatio: '16:9'
-            }
-        });
-
-        res.json({
-            operationName: operation.name,
-            prompt,
-            scenario: targetScenario,
-            startedAt: Date.now()
-        });
-    } catch (err: any) {
-        res.status(500).json({ error: err.message || 'Veo video generation initiation failed' });
-    }
 });
 
-app.post('/api/veo/video-status', async (req, res) => {
-    try {
-        const { operationName } = req.body || {};
-        if (!operationName) {
-            return res.status(400).json({ error: 'operationName is required' });
-        }
-        const op = new GenerateVideosOperation();
-        op.name = operationName;
-        const aiClient = getAiClient();
-        const updated = await aiClient.operations.getVideosOperation({ operation: op });
-        res.json({
-            done: updated.done,
-            error: updated.error || null,
-            hasVideo: !!updated.response?.generatedVideos?.[0]?.video?.uri
-        });
-    } catch (err: any) {
-        res.status(500).json({ error: err.message || 'Error checking video status' });
-    }
+app.get('/api/whale-onchain-radar', (_req, res) => {
+  res.json({
+    status: 'UNAVAILABLE', exchangeNetflowBtc: null, exchangeReserveBtc: null,
+    reserveStatus: 'UNAVAILABLE', whalePressureIndex: null, whaleSentiment: null,
+    summary: 'منبع مستقیم دادهٔ آن‌چین پیکربندی نشده است.', recentWhaleTransfers: [],
+    sourceGrounding: 'UNAVAILABLE',
+    provenance: { provider: 'NOT_CONFIGURED', retrievedAtMs: null, sources: [] },
+  });
 });
 
-app.post('/api/veo/video-download', async (req, res) => {
+app.get('/api/macro-context', async (_req, res) => {
+  const newsHeadlinesPromise = fetchDirectNewsHeadlines();
+  const endpoint = 'https://api.alternative.me/fng/?limit=1&format=json';
+  let fearAndGreedStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
+  let fearAndGreedIndex: number | null = null;
+  let fearAndGreedLabelFa = 'UNAVAILABLE';
+  let fearAndGreedRetrievedAtMs: number | null = null;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4_000);
+    let response: Response;
     try {
-        const { operationName } = req.body || {};
-        if (!operationName) {
-            return res.status(400).json({ error: 'operationName is required' });
-        }
-        const op = new GenerateVideosOperation();
-        op.name = operationName;
-        const aiClient = getAiClient();
-        const updated = await aiClient.operations.getVideosOperation({ operation: op });
-        const uri = updated.response?.generatedVideos?.[0]?.video?.uri;
-        if (!uri) {
-            return res.status(404).json({ error: 'Video URI not available yet' });
-        }
-        const keys = getAvailableGeminiKeys();
-        const apiKey = keys[0] || process.env.GEMINI_API_KEY || "";
-        const videoRes = await fetch(uri, {
-            headers: { 'x-goog-api-key': apiKey || '' }
-        });
-        res.setHeader('Content-Type', 'video/mp4');
-        videoRes.body!.pipeTo(
-            new WritableStream({
-                write(chunk) { res.write(chunk); },
-                close() { res.end(); },
-            })
-        );
-    } catch (err: any) {
-        res.status(500).json({ error: err.message || 'Error downloading video' });
+      response = await fetch(endpoint, { signal: controller.signal, cache: 'no-store' });
+    } finally {
+      clearTimeout(timeout);
     }
-});
-
-// API Route for Crypto Macro Economic Calendar & News Shock Firewall
-app.get('/api/crypto-macro-calendar', (req, res) => {
-    const now = Date.now();
-    const refDate = new Date(now);
-    const year = refDate.getUTCFullYear();
-    const month = refDate.getUTCMonth();
-
-    // Dynamically calculate upcoming real-world dates for CPI, FOMC, NFP
-    const cpiDate = new Date(Date.UTC(year, month, 12, 12, 30, 0));
-    if (cpiDate.getTime() < now - 2 * 24 * 3600 * 1000) cpiDate.setUTCMonth(month + 1);
-
-    const fomcDate = new Date(Date.UTC(year, month, 18, 18, 0, 0));
-    if (fomcDate.getTime() < now - 2 * 24 * 3600 * 1000) fomcDate.setUTCMonth(month + 1);
-
-    const nfpDate = new Date(Date.UTC(year, month, 1, 12, 30, 0));
-    while (nfpDate.getUTCDay() !== 5) nfpDate.setUTCDate(nfpDate.getUTCDate() + 1);
-    if (nfpDate.getTime() < now - 2 * 24 * 3600 * 1000) {
-        nfpDate.setUTCMonth(month + 1, 1);
-        while (nfpDate.getUTCDay() !== 5) nfpDate.setUTCDate(nfpDate.getUTCDate() + 1);
-    }
-
-    const events = [
-        {
-            id: "evt-1",
-            title: "انتشار شاخص تورم مصرف‌کننده آمریکا (US CPI Inflation)",
-            category: "CPI",
-            impact: "EXTREME",
-            scheduledTimeUtc: cpiDate.getTime(),
-            dateStr: cpiDate.toLocaleDateString('fa-IR', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
-            timeRemainingSeconds: Math.round((cpiDate.getTime() - now) / 1000),
-            forecast: "2.9%",
-            previous: "3.1%",
-            scenarioBullish: "افت تورم زیر ۲.۹٪ باعث جهش بیت‌کوین و تضعیف دلار خواهد شد.",
-            scenarioBearish: "تورم بالاتر از ۳.۱٪ فشار فروش سنگین بر بازارهای مالی وارد می‌کند.",
-            firewallWindow: {
-                preEventMinutes: 30,
-                shockMinutes: 15,
-                postStabilizationMinutes: 45
-            }
-        },
-        {
-            id: "evt-2",
-            title: "نشست تعیین نرخ بهره فدرال رزرو (FOMC Rate Decision)",
-            category: "FOMC",
-            impact: "EXTREME",
-            scheduledTimeUtc: fomcDate.getTime(),
-            dateStr: fomcDate.toLocaleDateString('fa-IR', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
-            timeRemainingSeconds: Math.round((fomcDate.getTime() - now) / 1000),
-            forecast: "4.50%",
-            previous: "4.75%",
-            scenarioBullish: "کاهش نرخ بهره یا موضع داویش باعث رالی پرقدرت بیت‌کوین می‌شود.",
-            scenarioBearish: "توقف در کاهش نرخ بهره احتمال اصلاح موقت قیمتی را به همراه دارد.",
-            firewallWindow: {
-                preEventMinutes: 30,
-                shockMinutes: 15,
-                postStabilizationMinutes: 45
-            }
-        },
-        {
-            id: "evt-3",
-            title: "گزارش اشتغال بخش غیرکشاورزی آمریکا (US NFP Payrolls)",
-            category: "NFP",
-            impact: "HIGH",
-            scheduledTimeUtc: nfpDate.getTime(),
-            dateStr: nfpDate.toLocaleDateString('fa-IR', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
-            timeRemainingSeconds: Math.round((nfpDate.getTime() - now) / 1000),
-            forecast: "145K",
-            previous: "160K",
-            scenarioBullish: "کاهش منطقی اشتغال مسیر فدرال رزرو را برای انبساط پولی هموار می‌سازد.",
-            scenarioBearish: "افزایش غافلگیرکننده اشتغال موجب بالا ماندن بازدهی اوراق و اصلاح رمزارزها می‌شود.",
-            firewallWindow: {
-                preEventMinutes: 30,
-                shockMinutes: 15,
-                postStabilizationMinutes: 45
-            }
+    if (!response.ok) throw new Error(`Alternative.me returned HTTP ${response.status}.`);
+    const payload: unknown = await response.json();
+    if (typeof payload === 'object' && payload !== null && 'data' in payload && Array.isArray(payload.data)) {
+      const latest = payload.data[0];
+      if (typeof latest === 'object' && latest !== null && 'value' in latest && 'timestamp' in latest) {
+        const value = Number(latest.value);
+        const sourceTimestampMs = Number(latest.timestamp) * 1_000;
+        const nowMs = Date.now();
+        if (Number.isInteger(value) && value >= 0 && value <= 100 && Number.isSafeInteger(sourceTimestampMs) &&
+          sourceTimestampMs > 0 && sourceTimestampMs <= nowMs + 60_000 && nowMs - sourceTimestampMs <= 36 * 60 * 60 * 1_000) {
+          fearAndGreedIndex = value;
+          fearAndGreedStatus = 'LIVE';
+          fearAndGreedRetrievedAtMs = nowMs;
+          fearAndGreedLabelFa = 'value_classification' in latest && typeof latest.value_classification === 'string'
+            ? `${latest.value_classification} (${value})` : String(value);
         }
-    ];
-    res.json(events);
-});
-let cachedSentiment: any = null;
-let lastCacheTime = 0;
-const CACHE_DURATION = 2 * 60 * 1000; // 2 minutes real-time cache for breaking news
-const SENTIMENT_FAILURE_CACHE_DURATION = 15_000;
-
-// Real-Time Live Bitcoin News Sentiment with Google Search Grounding
-app.post('/api/sentiment', async (req, res) => {
-    const now = Date.now();
-    if (
-        cachedSentiment &&
-        now - lastCacheTime < (cachedSentiment.status === 'LIVE' ? CACHE_DURATION : SENTIMENT_FAILURE_CACHE_DURATION)
-    ) {
-        return res.json(cachedSentiment);
+      }
     }
+  } catch (error) {
+    console.warn('[MarketData] Alternative.me Fear & Greed unavailable:', error);
+  }
 
-    let failureReason = 'Live sentiment service returned no analysis.';
-    try {
-        const prompt = `Search live for the latest breaking Bitcoin (BTC) news and crypto market headlines in the past 1 hour.
-Analyze current sentiment and output ONLY a JSON object:
-{
-  "score": number between -1.0 (extreme bearish) and 1.0 (extreme bullish),
-  "label": "POSITIVE" | "NEGATIVE" | "NEUTRAL",
-  "trend": "UP" | "DOWN" | "STABLE",
-  "drivers": ["3 key bullet drivers in Persian"]
-}`;
-
-        const response = await generateContentWithFallback({
-          model: 'gemini-3.8-flash',
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          config: {
-            tools: [{ googleSearch: {} }],
-          }
-        });
-        
-        if (response.text) {
-            const cleanText = response.text.replace(/```json/g, '').replace(/```/g, '').trim();
-            const jsonStart = cleanText.indexOf('{');
-            const jsonEnd = cleanText.lastIndexOf('}');
-            if (jsonStart !== -1 && jsonEnd !== -1) {
-              const parsed: unknown = JSON.parse(cleanText.substring(jsonStart, jsonEnd + 1));
-              if (
-                typeof parsed !== 'object' ||
-                parsed === null ||
-                !('score' in parsed) ||
-                typeof parsed.score !== 'number' ||
-                !Number.isFinite(parsed.score) ||
-                parsed.score < -1 ||
-                parsed.score > 1 ||
-                !('label' in parsed) ||
-                !['POSITIVE', 'NEGATIVE', 'NEUTRAL'].includes(String(parsed.label)) ||
-                !('trend' in parsed) ||
-                !['UP', 'DOWN', 'STABLE'].includes(String(parsed.trend)) ||
-                !('drivers' in parsed) ||
-                !Array.isArray(parsed.drivers) ||
-                parsed.drivers.length === 0 ||
-                !parsed.drivers.every((driver) => typeof driver === 'string' && driver.trim().length > 0)
-              ) {
-                throw new Error('Live sentiment response did not match the required data contract.');
-              }
-              const validSentiment = {
-                score: parsed.score,
-                label: parsed.label,
-                trend: parsed.trend,
-                drivers: parsed.drivers,
-                status: 'LIVE',
-              };
-              cachedSentiment = validSentiment;
-              lastCacheTime = now;
-              return res.json(validSentiment);
-            }
-        }
-    } catch (error) {
-        failureReason = error instanceof Error ? error.message : String(error);
-        console.warn(`[MarketData] Live sentiment unavailable: ${failureReason}`);
+  const newsHeadlines = await newsHeadlinesPromise;
+  for (const source of newsHeadlines.sources) {
+    if (source.status === 'UNAVAILABLE') {
+      console.warn(`[NewsData] ${source.publisher} RSS unavailable: ${source.error}`);
     }
-
-    const fallbackSentiment = {
-        status: 'UNAVAILABLE',
-        score: 0,
-        label: 'NEUTRAL',
-        trend: 'STABLE',
-        drivers: [],
-        error: failureReason,
+  }
+  const unavailable = { status: 'UNAVAILABLE', provider: 'NOT_CONFIGURED', retrievedAtMs: null, sources: [] };
+  const fearAndGreedProvenance = fearAndGreedStatus === 'LIVE'
+    ? { status: 'LIVE', provider: 'Alternative.me', endpoint, retrievedAtMs: fearAndGreedRetrievedAtMs, sources: [] }
+    : { ...unavailable, provider: 'Alternative.me', endpoint };
+  const newsHeadlinesProvenance = newsHeadlines.status === 'LIVE'
+    ? {
+      status: 'LIVE',
+      provider: 'Direct RSS feeds',
+      retrievedAtMs: newsHeadlines.retrievedAtMs,
+      sources: newsHeadlines.sources,
+    }
+    : {
+      status: 'UNAVAILABLE',
+      provider: 'Direct RSS feeds',
+      retrievedAtMs: null,
+      sources: newsHeadlines.sources,
     };
+  res.json({
+    fearAndGreedStatus, fearAndGreedIndex, fearAndGreedLabelFa,
+    provenance: {
+      fearAndGreedIndex: fearAndGreedProvenance,
+      spotEtfNetInflowMillionUsd: unavailable, dxyIndex: unavailable, dxyDailyChangePct: unavailable,
+      sp500Price: unavailable, sp500DailyChangePct: unavailable, fedRateCutExpectationPct: unavailable,
+      newsSentimentScore: unavailable, recentHeadlines: newsHeadlinesProvenance, whaleNetflowBtc: unavailable,
+      whalePressureIndex: unavailable, whaleSentiment: unavailable,
+    },
+    etfFlowStatus: 'UNAVAILABLE', spotEtfNetInflowMillionUsd: null,
+    dxyStatus: 'UNAVAILABLE', dxyIndex: null, dxyDailyChangePct: null,
+    sp500Status: 'UNAVAILABLE', sp500Price: null, sp500DailyChangePct: null,
+    fedExpectationsStatus: 'UNAVAILABLE', fedRateCutExpectationPct: null,
+    newsSentimentStatus: 'UNAVAILABLE', newsSentimentScore: null,
+    newsHeadlinesStatus: newsHeadlines.status, recentHeadlines: newsHeadlines.headlines,
+    whaleFlowStatus: 'UNAVAILABLE', whaleNetflowBtc: null, whalePressureIndex: null, whaleSentiment: null,
+    lastUpdated: fearAndGreedRetrievedAtMs, sourceGrounding: 'UNAVAILABLE',
+  });
+});
 
-    cachedSentiment = fallbackSentiment;
-    lastCacheTime = now;
-    res.json(fallbackSentiment);
+app.post('/api/veo/generate-video', (_req, res) => res.status(410).json({
+  status: 'UNAVAILABLE', error: 'AI video generation has been disabled; no direct data source is configured.',
+}));
+app.post('/api/veo/video-status', (_req, res) => res.status(410).json({
+  status: 'UNAVAILABLE', error: 'AI video generation has been disabled.',
+}));
+app.post('/api/veo/video-download', (_req, res) => res.status(410).json({
+  status: 'UNAVAILABLE', error: 'AI video generation has been disabled.',
+}));
+
+app.get('/api/crypto-macro-calendar', (_req, res) => res.status(503).json({
+  status: 'UNAVAILABLE', events: [], error: 'No direct economic-calendar provider is configured.',
+}));
+
+app.post('/api/sentiment', (_req, res) => {
+  res.json({
+    status: 'UNAVAILABLE', score: null, label: null, trend: null, drivers: [],
+    provenance: { provider: 'NOT_CONFIGURED', retrievedAtMs: null, sources: [] },
+    error: 'A direct, verifiable news source is not configured.',
+  });
 });
 
 // --- Live Trading Safety & Production Readiness Gate Engine (Items 36-40) ---

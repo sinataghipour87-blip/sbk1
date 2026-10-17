@@ -22,3 +22,4 @@ node_modules
 dist/
 bun.lock
 *.log
+.codegraphy/*

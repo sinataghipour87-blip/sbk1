@@ -4,13 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { FreqtradeSignalAdapter } from '../src/services/freqtradeSignalAdapter';
 import type { FreqtradeTrade } from '../src/services/freqtradeBridge';
+import { buildDirectionalSignalCandidate } from '../src/services/decisionPipeline';
 import {
   ServerSignalRunner,
+  toCandleTuple,
   type ServerSignalAuditRecord,
 } from '../src/services/serverSignalRunner';
 import type { FreqtradeMarketSnapshot } from '../src/services/freqtradeMarketDataBridge';
 import { OperationalTradeArchive } from '../src/services/operationalTradeArchive';
 import type { OperationalTradeArchiveMetadata } from '../src/services/operationalTradeArchive';
+import { centralTradeDatasetService } from '../src/services/centralTradeDataset';
 import type { SbkFreqtradeSignalRecord } from '../src/services/freqtradeSignalAdapter';
 
 const fixturePath = path.resolve('scripts/fixtures/CONTRACT_TEST_ONLY.json');
@@ -32,10 +35,43 @@ const candle = {
   close: candleRecord.close as number,
   volume: candleRecord.volume as number,
 };
+assert.deepEqual(
+  toCandleTuple(candle),
+  [candle.open, candle.high, candle.low, candle.close, candle.volume],
+  'analysis candles must use the canonical [open, high, low, close, volume] layout without timestamp',
+);
+const candidateAnalysis = {
+  direction: 'SHORT' as const,
+  pullbackLimitPrice: candle.close,
+  sl: candle.close * 1.01,
+  tp1: candle.close * 0.98,
+  confidenceScore: 75,
+  technicalScore: 75,
+  setupContext: { setupType: 'LIQUIDITY_SWEEP_REVERSAL' as const, isTriggerConfirmed: true },
+  signalOk: true,
+  dataQualityReport: { status: 'LIVE' as const, isTradeAllowed: true },
+  calibratedMetadata: { isCalibrationVerified: true, calibratedWinProbability: 0.65 },
+};
+assert.ok(buildDirectionalSignalCandidate(candidateAnalysis), 'verified live analysis may produce a directional candidate');
+assert.equal(
+  buildDirectionalSignalCandidate({ ...candidateAnalysis, calibratedMetadata: { isCalibrationVerified: false, calibratedWinProbability: null } }),
+  null,
+  'uncalibrated probability must fail closed',
+);
+assert.equal(
+  buildDirectionalSignalCandidate({ ...candidateAnalysis, setupContext: { ...candidateAnalysis.setupContext, isTriggerConfirmed: false } }),
+  null,
+  'unconfirmed trigger must fail closed',
+);
+assert.equal(
+  buildDirectionalSignalCandidate({ ...candidateAnalysis, dataQualityReport: { status: 'DATA_UNAVAILABLE', isTradeAllowed: false } }),
+  null,
+  'unavailable market data must fail closed',
+);
 const timeframeMs = 15 * 60_000;
 let currentNowMs = candle.timestampMs + timeframeMs + 1_000;
 const snapshot: FreqtradeMarketSnapshot = {
-  contractVersion: 'sbk1.freqtrade.market-snapshot.v3',
+  contractVersion: 'sbk1.freqtrade.market-snapshot.v4',
   source: 'freqtrade.dataprovider',
   exchange: 'bybit',
   market: 'futures',
@@ -47,6 +83,7 @@ const snapshot: FreqtradeMarketSnapshot = {
   ticker: null,
   orderBook: null,
   fundingRate: null,
+  tradeFlow: null,
 };
 const status = {
   status: 'running' as const,
@@ -150,6 +187,16 @@ try {
   assert.equal(archivedDecision.featureVersion, 'server-signal-features-v1');
   assert.equal(archivedDecision.modelVersion, 'server-signal-runner-current');
   assert.equal(archivedDecision.codeVersion, 'unversioned');
+  assert.equal(
+    centralTradeDatasetService.replaceTrainingArchiveRecords(await archive.getAll()),
+    1,
+    'server operational archive records must hydrate the central training dataset',
+  );
+  assert.equal(
+    centralTradeDatasetService.getFreqtradeVerifiedPredictions().length,
+    0,
+    'a decision without a Freqtrade-confirmed outcome must not enter verified training data',
+  );
   assert.equal(audit.filter((entry) => entry.signalId === stored[0]?.signal.signalId).length, 2);
   assert.equal(audit.filter((entry) => entry.duplicate === true).length, 1);
 

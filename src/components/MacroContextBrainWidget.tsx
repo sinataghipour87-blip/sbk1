@@ -287,7 +287,7 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
                   {data.etfFlowStatus === 'LIVE' && data.spotEtfNetInflowMillionUsd !== null ? `${data.spotEtfNetInflowMillionUsd > 0 ? '+' : ''}$${data.spotEtfNetInflowMillionUsd}M` : 'UNAVAILABLE'}
                 </span>
                 <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-300">
-                  {data.etfFlowStatus === 'LIVE' ? 'جریان نهادی' : 'UNAVAILABLE'}
+                  {data.etfFlowStatus === 'LIVE' ? 'جریان نهادی' : 'منبع مستقیم متصل نیست'}
                 </span>
               </div>
             </div>
@@ -299,7 +299,9 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
                 <span className="font-bold text-indigo-300">
                   {data.fedExpectationsStatus === 'LIVE' && data.fedRateCutExpectationPct !== null ? `${data.fedRateCutExpectationPct}%` : 'UNAVAILABLE'}
                 </span>
-                <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-950 text-indigo-300">CME Watch</span>
+                <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-950 text-indigo-300">
+                  {data.fedExpectationsStatus === 'LIVE' ? 'CME FedWatch' : 'منبع مستقیم متصل نیست'}
+                </span>
               </div>
             </div>
 
@@ -311,7 +313,7 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
                   {data.newsSentimentStatus === 'LIVE' && data.newsSentimentScore !== null ? `${data.newsSentimentScore > 0 ? '+' : ''}${data.newsSentimentScore}` : 'UNAVAILABLE'}
                 </span>
                 <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-950 text-amber-300">
-                  {data.newsSentimentStatus === 'LIVE' ? 'News Engine' : 'UNAVAILABLE'}
+                  {data.newsSentimentStatus === 'LIVE' ? 'News Engine' : 'امتیاز معتبر موجود نیست'}
                 </span>
               </div>
             </div>
@@ -331,18 +333,22 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
           </div>
 
           {/* Recent Headlines if LIVE */}
-          {data.newsSentimentStatus === 'LIVE' && data.recentHeadlines.length > 0 && (
+          {data.newsHeadlinesStatus === 'LIVE' && data.recentHeadlines.length > 0 && (
             <div className="mt-2.5 bg-[#030d1d] p-2.5 rounded-xl border border-teal-900/40 space-y-1.5">
               <span className="font-bold text-teal-300 font-sans text-[11px] block">
-                📰 تیترهای رصدشده توسط سرور:
+                📰 تیترهای دریافت‌شده مستقیم (بدون امتیازدهی خودکار):
               </span>
               {data.recentHeadlines.slice(0, 2).map((item) => (
                 <div key={item.id} className="flex items-start justify-between gap-2 text-[10px] text-slate-300">
                   <div className="flex items-center gap-1.5">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
-                    <span className="font-sans leading-tight">{item.headlineFa}</span>
+                    <a className="font-sans leading-tight hover:text-teal-200" href={item.url} target="_blank" rel="noreferrer">
+                      {item.headline} <span className="text-slate-500">— {item.source}</span>
+                    </a>
                   </div>
-                  <span className="text-slate-500 font-mono shrink-0">{item.timeAgoFa}</span>
+                  <time className="text-slate-500 font-mono shrink-0" dateTime={item.publishedAt}>
+                    {new Date(item.publishedAt).toLocaleString('fa-IR', { dateStyle: 'short', timeStyle: 'short' })}
+                  </time>
                 </div>
               ))}
             </div>
@@ -356,4 +362,3 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
     </CollapsibleCard>
   );
 };
-

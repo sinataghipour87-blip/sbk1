@@ -57,15 +57,34 @@ export interface RunPipelineOptions {
   signalCandidateMode?: boolean;
 }
 
-function buildDirectionalSignalCandidate(analysis: AnalysisResult): DirectionalSignalCandidate | null {
+type SignalCandidateAnalysis = Pick<
+  AnalysisResult,
+  'direction' | 'pullbackLimitPrice' | 'sl' | 'tp1' | 'confidenceScore' | 'technicalScore' | 'signalOk'
+> & {
+  setupContext?: Pick<NonNullable<AnalysisResult['setupContext']>, 'setupType' | 'isTriggerConfirmed'>;
+  dataQualityReport?: Pick<NonNullable<AnalysisResult['dataQualityReport']>, 'status' | 'isTradeAllowed'>;
+  calibratedMetadata?: Pick<NonNullable<AnalysisResult['calibratedMetadata']>, 'isCalibrationVerified' | 'calibratedWinProbability'>;
+};
+
+export function buildDirectionalSignalCandidate(analysis: SignalCandidateAnalysis): DirectionalSignalCandidate | null {
   const direction = analysis.direction;
   const entryPrice = analysis.pullbackLimitPrice;
   const stopLoss = analysis.sl;
   const takeProfit = analysis.tp1;
   const engineScore = analysis.confidenceScore ?? analysis.technicalScore;
   const setupType = analysis.setupContext?.setupType;
+  const calibratedProbability = analysis.calibratedMetadata?.calibratedWinProbability;
 
   if (
+    !analysis.signalOk ||
+    analysis.dataQualityReport?.status !== 'LIVE' ||
+    analysis.dataQualityReport.isTradeAllowed !== true ||
+    analysis.setupContext?.isTriggerConfirmed !== true ||
+    analysis.calibratedMetadata?.isCalibrationVerified !== true ||
+    typeof calibratedProbability !== 'number' ||
+    !Number.isFinite(calibratedProbability) ||
+    calibratedProbability <= 0 ||
+    calibratedProbability >= 1 ||
     (direction !== 'LONG' && direction !== 'SHORT') ||
     typeof entryPrice !== 'number' || !Number.isFinite(entryPrice) || entryPrice <= 0 ||
     typeof stopLoss !== 'number' || !Number.isFinite(stopLoss) || stopLoss <= 0 ||
@@ -111,7 +130,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     const signalCandidate = buildDirectionalSignalCandidate(analysis);
     const waitReasonFa = signalCandidate
       ? 'نامزد جهت‌دار برای صف Freqtrade؛ این نتیجه مجوز اجرای مستقیم SBK1 نیست.'
-      : 'از دادهٔ موجود نامزد جهت‌دار با ورود، استاپ و هدف فنی معتبر ساخته نشد.';
+      : 'نامزد فقط با دادهٔ زندهٔ مجاز، trigger تأییدشده و احتمال کالیبره‌شده پذیرفته می‌شود؛ شرایط کامل نیست.';
     return {
       decision: 'WAIT_NO_TRADE',
       direction: signalCandidate?.direction ?? 'NEUTRAL',
@@ -132,9 +151,9 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
       isEdgeProven: false,
       expectedValueUsd: null,
       expectedR: null,
-      calibratedWinProb: null,
+      calibratedWinProb: signalCandidate ? analysis.calibratedMetadata?.calibratedWinProbability ?? null : null,
       waitReasonFa,
-      prerequisitesToArmFa: signalCandidate ? [] : ['دادهٔ کندلی با ساختار فنی معتبر'],
+      prerequisitesToArmFa: signalCandidate ? [] : ['دادهٔ زندهٔ مجاز، trigger تأییدشده، تحلیل مجاز و احتمال کالیبره‌شده'],
       evaluatedAtIso: timestampIso,
     };
   }

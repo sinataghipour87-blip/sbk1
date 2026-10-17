@@ -288,8 +288,9 @@ class SbkSignalStrategy(IStrategy):
             order_book = self._snapshot_order_book(data_provider, pair, now_ms)
             funding_rate = self._snapshot_funding_rate(data_provider, pair, market, now_ms)
             generated_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+            open_interest = self._snapshot_open_interest(data_provider, pair, market, generated_at_ms)
             payload = {
-                "contractVersion": "sbk1.freqtrade.market-snapshot.v3",
+                "contractVersion": "sbk1.freqtrade.market-snapshot.v5",
                 "source": "freqtrade.dataprovider",
                 "exchange": configured_exchange,
                 "market": market,
@@ -301,6 +302,8 @@ class SbkSignalStrategy(IStrategy):
                 "ticker": ticker,
                 "orderBook": order_book,
                 "fundingRate": funding_rate,
+                "openInterest": open_interest,
+                "tradeFlow": self._snapshot_trade_flow(data_provider, pair, generated_at_ms),
             }
             response = requests.post(
                 f"{bridge_url}/api/freqtrade/market-snapshot",
@@ -367,6 +370,74 @@ class SbkSignalStrategy(IStrategy):
             logger.warning("Freqtrade DataProvider has no completed candles for %s/%s.", pair, timeframe)
             return None
         return candles
+
+    def _snapshot_trade_flow(
+        self,
+        data_provider: Any,
+        pair: str,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        exchange = getattr(data_provider, "_exchange", None)
+        api = getattr(exchange, "_api", None)
+        capabilities = getattr(api, "has", {}) if api is not None else {}
+        fetch_trades = getattr(api, "fetch_trades", None) if isinstance(capabilities, dict) and capabilities.get("fetchTrades") else None
+        if not callable(fetch_trades):
+            logger.warning("Freqtrade CCXT adapter does not support recent public trades for %s.", pair)
+            return None
+        try:
+            raw_trades = fetch_trades(pair, since=now_ms - 5_000, limit=200)
+        except Exception as exc:
+            logger.warning("Recent public trade flow is unavailable for %s: %s", pair, exc)
+            return None
+        if not isinstance(raw_trades, list):
+            logger.warning("Freqtrade CCXT returned an invalid recent-trades response for %s.", pair)
+            return None
+
+        trades = []
+        seen_ids = set()
+        for trade in raw_trades:
+            if not isinstance(trade, dict):
+                logger.warning("Freqtrade CCXT returned a malformed trade for %s.", pair)
+                return None
+            trade_id = trade.get("id")
+            timestamp_ms = trade.get("timestamp")
+            side = trade.get("side")
+            price = trade.get("price")
+            amount = trade.get("amount")
+            if (
+                trade_id is None
+                or not isinstance(timestamp_ms, (int, float))
+                or isinstance(timestamp_ms, bool)
+                or not math.isfinite(timestamp_ms)
+                or side not in ("buy", "sell")
+                or not isinstance(price, (int, float))
+                or isinstance(price, bool)
+                or not math.isfinite(price)
+                or price <= 0
+                or not isinstance(amount, (int, float))
+                or isinstance(amount, bool)
+                or not math.isfinite(amount)
+                or amount <= 0
+            ):
+                logger.warning("Freqtrade CCXT returned trade data without valid ID, time, side, price, or amount for %s.", pair)
+                return None
+            trade_id = str(trade_id)
+            timestamp_ms = int(timestamp_ms)
+            if trade_id in seen_ids:
+                continue
+            seen_ids.add(trade_id)
+            if timestamp_ms <= now_ms and now_ms - timestamp_ms <= 5_000:
+                trades.append({
+                    "timestampMs": timestamp_ms,
+                    "side": side,
+                    "price": float(price),
+                    "amount": float(amount),
+                })
+        trades.sort(key=lambda item: item["timestampMs"])
+        if not trades:
+            logger.warning("No fresh identified trades are available for %s.", pair)
+            return None
+        return {"retrievedAtMs": int(datetime.now(UTC).timestamp() * 1000), "trades": trades}
 
     def _snapshot_ticker(self, data_provider: Any, pair: str) -> dict[str, Any] | None:
         try:
@@ -468,6 +539,72 @@ class SbkSignalStrategy(IStrategy):
             if isinstance(next_funding_at, (int, float)) and not isinstance(next_funding_at, bool)
             and math.isfinite(next_funding_at) and next_funding_at > 0
             else None,
+        }
+
+    def _snapshot_open_interest(
+        self,
+        data_provider: Any,
+        pair: str,
+        market: str,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        if market != "futures":
+            return None
+        exchange = getattr(data_provider, "_exchange", None)
+        api = getattr(exchange, "_api", None)
+        capabilities = getattr(api, "has", {}) if api is not None else {}
+        fetch_history = (
+            getattr(api, "fetch_open_interest_history", None)
+            if isinstance(capabilities, dict) and capabilities.get("fetchOpenInterestHistory")
+            else None
+        )
+        if not callable(fetch_history):
+            logger.warning("Freqtrade CCXT adapter does not support open-interest history for %s.", pair)
+            return None
+        try:
+            history = fetch_history(pair, "5m", limit=2)
+        except Exception as exc:
+            logger.warning("Open-interest history is unavailable for %s: %s", pair, exc)
+            return None
+        if not isinstance(history, list) or len(history) < 2:
+            logger.warning("Freqtrade CCXT returned fewer than two open-interest records for %s.", pair)
+            return None
+
+        points = []
+        for record in history:
+            if not isinstance(record, dict):
+                logger.warning("Freqtrade CCXT returned malformed open-interest history for %s.", pair)
+                return None
+            timestamp_ms = record.get("timestamp")
+            amount = record.get("openInterestAmount")
+            if (
+                not isinstance(timestamp_ms, (int, float))
+                or isinstance(timestamp_ms, bool)
+                or not math.isfinite(timestamp_ms)
+                or not isinstance(amount, (int, float))
+                or isinstance(amount, bool)
+                or not math.isfinite(amount)
+                or timestamp_ms <= 0
+                or amount <= 0
+            ):
+                logger.warning("Open-interest history has no valid timestamp or amount for %s.", pair)
+                return None
+            points.append((int(timestamp_ms), float(amount)))
+        points.sort(key=lambda point: point[0])
+        previous, latest = points[-2:]
+        if (
+            latest[0] - previous[0] != 5 * 60_000
+            or latest[0] > now_ms + 1_000
+            or now_ms - latest[0] > 10 * 60_000
+        ):
+            logger.warning("Open-interest history is stale or does not contain adjacent five-minute records for %s.", pair)
+            return None
+        return {
+            "retrievedAtMs": int(datetime.now(UTC).timestamp() * 1000),
+            "latestTimestampMs": latest[0],
+            "previousTimestampMs": previous[0],
+            "latestAmount": latest[1],
+            "previousAmount": previous[1],
         }
 
     def _snapshot_order_book(self, data_provider: Any, pair: str, now_ms: int) -> dict[str, Any] | None:

@@ -12,18 +12,14 @@ export interface BrainActivityRecord {
   brainId: string;
   nameFa: string;
   processedCount60s: number;
-  lastTimestamp: number;
-  status: 'ACTIVE' | 'RE_INSTANTIATING' | 'OPTIMIZED';
-  healthScorePct: number;
+  lastTimestamp: number | null;
+  status: 'ACTIVE' | 'INACTIVE';
 }
 
 export interface ActivityMonitorReport {
   timestamp: string;
   totalExecutions60s: number;
-  networkSyncPct: number;
-  reinstantiationsTriggered: number;
   brains: BrainActivityRecord[];
-  statusMessageFa: string;
 }
 
 export interface LatencyBenchmarkMetric {
@@ -37,9 +33,9 @@ export interface LatencyBenchmarkMetric {
 }
 
 export interface ReliabilityAuditReport {
-  errorRatePct: number;
+  errorRatePct: number | null;
   connectionDisconnectionCount: number;
-  duplicateOrderBlockedRatePct: number;
+  duplicateOrderBlockedRatePct: number | null;
   rejectedSignalsLowDataQualityCount: number;
   totalDecisionsAudited: number;
 }
@@ -58,7 +54,7 @@ export interface DecisionAuditLogItem {
 }
 
 export interface Section9MonitoringDashboard {
-  latencyBenchmark: LatencyBenchmarkMetric;
+  latencyBenchmark: LatencyBenchmarkMetric | null;
   reliabilityAudit: ReliabilityAuditReport;
   recentDecisionAuditLogs: DecisionAuditLogItem[];
   systemHealthVerdictFa: string;
@@ -67,8 +63,6 @@ export interface Section9MonitoringDashboard {
 export class ActivityFrequencyMonitor {
   private static instance: ActivityFrequencyMonitor;
   private brainPulseTimestamps: Map<string, number[]> = new Map();
-  private brainReboots: Map<string, number> = new Map();
-  private totalRebootsCount = 0;
 
   // سنجه‌های بخش نهم: سرعت، پایداری و مانیتورینگ
   private latencyHistory: LatencyBenchmarkMetric[] = [];
@@ -78,21 +72,6 @@ export class ActivityFrequencyMonitor {
   private duplicateOrderAttemptsCount = 0;
   private rejectedSignalsLowQualityCount = 0;
   private decisionAuditLogs: DecisionAuditLogItem[] = [];
-
-  constructor() {
-    const now = Date.now();
-    // Initialize 10 brains with deterministic initial registration timestamps across past 60s
-    for (let i = 1; i <= 10; i++) {
-      const bId = `brain_${i}`;
-      const initialPulses: number[] = [];
-      const baseCount = 30 + i * 2;
-      for (let j = 0; j < baseCount; j++) {
-        initialPulses.push(now - (j * 1800));
-      }
-      this.brainPulseTimestamps.set(bId, initialPulses);
-      this.brainReboots.set(bId, 0);
-    }
-  }
 
   public static getInstance(): ActivityFrequencyMonitor {
     if (!ActivityFrequencyMonitor.instance) {
@@ -120,8 +99,6 @@ export class ActivityFrequencyMonitor {
     const now = Date.now();
     const brains: BrainActivityRecord[] = [];
     let totalCount = 0;
-    const minStandard = 20; // حداقل پردازش استاندارد در ۶۰ ثانیه
-    let needsReboot = false;
 
     const names = [
       '۱. روند فرکتالی کلان',
@@ -145,66 +122,43 @@ export class ActivityFrequencyMonitor {
 
       const count60s = activePulsesIn60s.length;
       totalCount += count60s;
-      const lastTime = activePulsesIn60s.length > 0 ? activePulsesIn60s[activePulsesIn60s.length - 1] : now - 60000;
-
-      let status: BrainActivityRecord['status'] = 'ACTIVE';
-      let health = 100;
-
-      if (count60s < minStandard) {
-        // افت فرکانس بر اساس محاسبات واقعی
-        const currentReboots = (this.brainReboots.get(bId) || 0) + 1;
-        this.brainReboots.set(bId, currentReboots);
-        this.totalRebootsCount += 1;
-        
-        // احیای خودکار و تزریق پالس‌های جدید جهت تثبیت
-        for (let p = 0; p < minStandard + 5; p++) {
-          activePulsesIn60s.push(now - p * 1000);
-        }
-        this.brainPulseTimestamps.set(bId, activePulsesIn60s);
-
-        status = 'RE_INSTANTIATING';
-        health = 95;
-        needsReboot = true;
-      } else if (count60s > 60) {
-        status = 'OPTIMIZED';
-        health = 100;
-      } else {
-        health = Math.min(100, Math.round((count60s / 40) * 100));
-      }
+      const lastTime = activePulsesIn60s.at(-1) ?? null;
 
       brains.push({
         brainId: bId,
         nameFa: names[i - 1],
-        processedCount60s: activePulsesIn60s.length,
+        processedCount60s: count60s,
         lastTimestamp: lastTime,
-        status,
-        healthScorePct: health
+        status: count60s > 0 ? 'ACTIVE' : 'INACTIVE',
       });
     }
-
-    const networkSyncPct = needsReboot ? 99.4 : 100.0;
 
     return {
       timestamp: new Date().toLocaleTimeString('fa-IR'),
       totalExecutions60s: totalCount,
-      networkSyncPct,
-      reinstantiationsTriggered: this.totalRebootsCount,
       brains,
-      statusMessageFa: needsReboot
-        ? `⚠️ افت فرکانس در پردازش برخی مغزها شناسایی شد؛ عملیات Re-instantiation خودکار بر پایه زمان‌سنجی واقعی انجام شد.`
-        : `🟢 پایش فرکانس فعالیت رانتایم: تمام ۱۰ مغز پردازشی با فرکانس تاییدشده (${minStandard}+ پردازش/۶۰ ثانیه) بدون هیچ متغیر تصادفی فعال هستند.`
     };
   }
 
   /**
    * ⚡ بخش نهم: ثبت نمونه اندازه‌گیری تاخیر در زنجیره پردازش تا اجرا
    */
-  public recordLatencySample(metric: Partial<LatencyBenchmarkMetric>): LatencyBenchmarkMetric {
-    const dataArrival = metric.dataArrivalMs ?? 18;
-    const features = metric.featureCalculationMs ?? 14;
-    const decision = metric.decisionLatencyMs ?? 12;
-    const orderSent = metric.orderSentLatencyMs ?? 22;
-    const exchangeAck = metric.exchangeAckLatencyMs ?? 45;
+  public recordLatencySample(metric: Omit<LatencyBenchmarkMetric, 'totalChainLatencyMs' | 'isWithinSla'>): LatencyBenchmarkMetric {
+    const durations = [
+      metric.dataArrivalMs,
+      metric.featureCalculationMs,
+      metric.decisionLatencyMs,
+      metric.orderSentLatencyMs,
+      metric.exchangeAckLatencyMs,
+    ];
+    if (!durations.every((duration) => Number.isFinite(duration) && duration >= 0)) {
+      throw new Error('Latency samples must contain finite, non-negative measurements for every execution stage.');
+    }
+    const dataArrival = metric.dataArrivalMs;
+    const features = metric.featureCalculationMs;
+    const decision = metric.decisionLatencyMs;
+    const orderSent = metric.orderSentLatencyMs;
+    const exchangeAck = metric.exchangeAckLatencyMs;
     const total = dataArrival + features + decision + orderSent + exchangeAck;
     const isWithinSla = total <= 250; // SLA زیر ۲۵۰ میلی‌ثانیه برای سیستم‌های HFT/Quant
 
@@ -274,23 +228,16 @@ export class ActivityFrequencyMonitor {
    * دریافت داشبورد جامع مانیتورینگ عملکرد و پایداری بخش نهم
    */
   public getSection9MonitoringReport(): Section9MonitoringDashboard {
-    const defaultLatency: LatencyBenchmarkMetric = {
-      dataArrivalMs: 18,
-      featureCalculationMs: 15,
-      decisionLatencyMs: 12,
-      orderSentLatencyMs: 24,
-      exchangeAckLatencyMs: 48,
-      totalChainLatencyMs: 117,
-      isWithinSla: true
-    };
-
     const latestLatency = this.latencyHistory.length > 0
       ? this.latencyHistory[this.latencyHistory.length - 1]
-      : defaultLatency;
+      : null;
 
-    const totalAudits = Math.max(1, this.totalCallsCount);
-    const errorRatePct = Number(((this.totalErrorsCount / totalAudits) * 100).toFixed(2));
-    const duplicateBlockedPct = Number(((this.duplicateOrderAttemptsCount / totalAudits) * 100).toFixed(2));
+    const errorRatePct = this.totalCallsCount > 0
+      ? Number(((this.totalErrorsCount / this.totalCallsCount) * 100).toFixed(2))
+      : null;
+    const duplicateBlockedPct = this.totalCallsCount > 0
+      ? Number(((this.duplicateOrderAttemptsCount / this.totalCallsCount) * 100).toFixed(2))
+      : null;
 
     const reliabilityAudit: ReliabilityAuditReport = {
       errorRatePct,
@@ -300,11 +247,13 @@ export class ActivityFrequencyMonitor {
       totalDecisionsAudited: this.decisionAuditLogs.length
     };
 
-    let systemHealthVerdictFa = '🟢 سیستم در وضعیت بهینه: تأخیر کل زنجیره در محدوده SLA و پایداری شبکه پایدار است.';
-    if (latestLatency.totalChainLatencyMs > 250) {
+    let systemHealthVerdictFa = 'دادهٔ کافی برای ارزیابی سلامت و تأخیر زنجیره ثبت نشده است.';
+    if (latestLatency && latestLatency.totalChainLatencyMs > 250) {
       systemHealthVerdictFa = '⚠️ هشدار تاخیر: زمان پاسخگویی زنجیره بالاتر از حد مجاز ۲۵۰ میلی‌ثانیه است.';
-    } else if (errorRatePct > 5.0 || this.disconnectionsCount > 2) {
+    } else if ((errorRatePct !== null && errorRatePct > 5.0) || this.disconnectionsCount > 2) {
       systemHealthVerdictFa = '⚠️ هشدار پایداری: نرخ خطای فراخوانی یا قطعی اتصال شبکه نیازمند بررسی است.';
+    } else if (latestLatency || errorRatePct !== null) {
+      systemHealthVerdictFa = 'داده‌های ثبت‌شده در محدودهٔ هشدار تعریف‌شده هستند؛ این گزارش جایگزین ارزیابی سلامت مدل یا کیفیت سیگنال نیست.';
     }
 
     return {

@@ -118,13 +118,13 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
           {/* Risk Protection */}
           <div className="bg-[#030c1d] border border-emerald-500/40 rounded-xl p-3">
             <span className="text-[10px] text-emerald-400 block mb-0.5 font-sans font-bold flex items-center gap-1">
-              <Lock className="w-3 h-3 text-emerald-400" /> محافظت از اصل سرمایه:
+              <Lock className="w-3 h-3 text-emerald-400" /> سطح قیمت محاسباتی (غیرفعال):
             </span>
             <div className="text-xs font-bold text-emerald-300">
               ${report.brain5RiskHedging.riskBreakevenTriggerPrice.toLocaleString()}
             </div>
             <span className="text-[9px] text-slate-400 block font-sans">
-              تریلینگ استاپ با بافر کارمزد ۰.۰۵٪
+              مقدار نمایشی است؛ به سفارش یا موقعیت واقعی اعمال نمی‌شود.
             </span>
           </div>
 
@@ -254,7 +254,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                   <div>حجم نمونه: <strong className="text-indigo-300">{m.sampleSize}</strong></div>
                   <div>ضریب استقلال (Decorrelation): <strong className="text-amber-300">{(1 - m.correlationWithOtherModels).toFixed(2)}</strong></div>
                   <div>سلامت مدل: <strong className={m.healthState === 'HEALTHY' ? 'text-emerald-300' : 'text-rose-300'}>{m.healthState}</strong></div>
-                  <div>وزن Ensemble: <strong className="text-cyan-300">{m.healthState === 'HEALTHY' ? `${(m.effectiveWeight * 100).toFixed(1)}٪` : '۰٪ · خارج از Ensemble'}</strong></div>
+                  <div>وزن پیکربندی‌شده Ensemble: <strong className="text-cyan-300">{m.healthState === 'HEALTHY' ? `${(m.effectiveWeight * 100).toFixed(1)}٪` : '۰٪ · خارج از Ensemble'}</strong></div>
                 </div>
               </div>
             ))}
@@ -299,8 +299,8 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                 {report.brain2Liquidity.rationaleFa}
               </p>
               <div className="flex items-center justify-between text-[10.5px] font-mono text-slate-400 pt-1">
-                <span>دیوار OBI: {(report.brain2Liquidity.obiValue * 100).toFixed(1)}٪</span>
-                <span>استخر نقدینگی: ${report.brain2Liquidity.liquidityPoolUsd.toLocaleString()}</span>
+                <span>OBI: {(report.brain2Liquidity.obiValue * 100).toFixed(1)}٪</span>
+                <span>pool نظری (فرمولی): ${report.brain2Liquidity.liquidityPoolUsd.toLocaleString()}</span>
               </div>
             </div>
 

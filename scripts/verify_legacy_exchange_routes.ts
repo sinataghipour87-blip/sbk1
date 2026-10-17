@@ -70,6 +70,91 @@ try {
   const healthResponse = await fetch(`${baseUrl}/api/health`);
   assert.match(healthResponse.headers.get('content-type') || '', /application\/json/);
   assert.equal((await healthResponse.json() as { status?: string }).status, 'ok');
+  const fundamentalResponse = await fetch(`${baseUrl}/api/btc-fundamental-grounding`);
+  const fundamental = await fundamentalResponse.json() as {
+    status?: string;
+    oscillatorScore?: number | null;
+    keyEvents?: unknown[];
+    provenance?: { retrievedAtMs?: number | null; sources?: unknown[] };
+  };
+  assert.equal(fundamental.status, 'UNAVAILABLE');
+  assert.equal(fundamental.oscillatorScore, null);
+  assert.deepEqual(fundamental.keyEvents, []);
+  assert.equal(fundamental.provenance?.retrievedAtMs, null);
+  assert.deepEqual(fundamental.provenance?.sources, []);
+
+  const whaleResponse = await fetch(`${baseUrl}/api/whale-onchain-radar`);
+  const whale = await whaleResponse.json() as {
+    status?: string;
+    exchangeNetflowBtc?: number | null;
+    whalePressureIndex?: number | null;
+    provenance?: { retrievedAtMs?: number | null; sources?: unknown[] };
+  };
+  assert.equal(whale.status, 'UNAVAILABLE');
+  assert.equal(whale.exchangeNetflowBtc, null);
+  assert.equal(whale.whalePressureIndex, null);
+  assert.equal(whale.provenance?.retrievedAtMs, null);
+  assert.deepEqual(whale.provenance?.sources, []);
+
+  const macroResponse = await fetch(`${baseUrl}/api/macro-context`);
+  const macro = await macroResponse.json() as {
+    sourceGrounding?: string;
+    sp500Status?: string;
+    sp500Price?: number | null;
+    dxyStatus?: string;
+    dxyIndex?: number | null;
+    etfFlowStatus?: string;
+    spotEtfNetInflowMillionUsd?: number | null;
+    fedExpectationsStatus?: string;
+    fedRateCutExpectationPct?: number | null;
+    newsSentimentStatus?: string;
+    newsSentimentScore?: number | null;
+    whaleFlowStatus?: string;
+    whaleNetflowBtc?: number | null;
+    provenance?: Record<string, { status?: string; provider?: string; retrievedAtMs?: number | null }>;
+  };
+  assert.equal(macro.sourceGrounding, 'UNAVAILABLE');
+  assert.equal(macro.sp500Status, 'UNAVAILABLE');
+  assert.equal(macro.sp500Price, null);
+  assert.equal(macro.dxyStatus, 'UNAVAILABLE');
+  assert.equal(macro.dxyIndex, null);
+  assert.equal(macro.etfFlowStatus, 'UNAVAILABLE');
+  assert.equal(macro.spotEtfNetInflowMillionUsd, null);
+  assert.equal(macro.fedExpectationsStatus, 'UNAVAILABLE');
+  assert.equal(macro.fedRateCutExpectationPct, null);
+  assert.equal(macro.newsSentimentStatus, 'UNAVAILABLE');
+  assert.equal(macro.newsSentimentScore, null);
+  assert.equal(macro.whaleFlowStatus, 'UNAVAILABLE');
+  assert.equal(macro.whaleNetflowBtc, null);
+  assert.equal(macro.provenance?.sp500Price.status, 'UNAVAILABLE');
+  assert.equal(macro.provenance?.sp500Price.retrievedAtMs, null);
+  assert.equal(macro.provenance?.newsSentimentScore.provider, 'NOT_CONFIGURED');
+  assert.equal(macro.provenance?.whaleNetflowBtc.provider, 'NOT_CONFIGURED');
+
+  const sentimentResponse = await fetch(`${baseUrl}/api/sentiment`, { method: 'POST' });
+  const sentiment = await sentimentResponse.json() as {
+    status?: string;
+    score?: number | null;
+    provenance?: { retrievedAtMs?: number | null; sources?: unknown[] };
+  };
+  assert.equal(sentiment.status, 'UNAVAILABLE');
+  assert.equal(sentiment.score, null);
+  assert.equal(sentiment.provenance?.retrievedAtMs, null);
+  assert.deepEqual(sentiment.provenance?.sources, []);
+
+  const calendarResponse = await fetch(`${baseUrl}/api/crypto-macro-calendar`);
+  assert.equal(calendarResponse.status, 503);
+  const calendar = await calendarResponse.json() as { status?: string; events?: unknown[] };
+  assert.equal(calendar.status, 'UNAVAILABLE');
+  assert.deepEqual(calendar.events, []);
+
+  const veoResponse = await fetch(`${baseUrl}/api/veo/generate-video`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  assert.equal(veoResponse.status, 410);
+
   const unknownApiResponse = await fetch(`${baseUrl}/api/v1/ping`);
   assert.equal(unknownApiResponse.status, 404);
   assert.match(unknownApiResponse.headers.get('content-type') || '', /application\/json/);

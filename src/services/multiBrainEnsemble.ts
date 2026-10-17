@@ -88,12 +88,12 @@ export interface Brain6OnChainWhaleFlow {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  netflowBtc24h: number;
+  netflowBtc24h: number | null;
   exchangeReserveStatusFa: string;
   whaleSentiment: 'ACCUMULATION' | 'DISTRIBUTION' | 'NEUTRAL' | 'UNKNOWN';
-  whalePressureIndex: number;
-  rawEvidenceScore: number;
-  onChainScorePct: number; // Backwards-compatibility alias for legacy UI
+  whalePressureIndex: number | null;
+  rawEvidenceScore: number | null;
+  onChainScorePct: number | null;
   rationaleFa: string;
 }
 
@@ -101,7 +101,7 @@ export interface Brain7OrderBookCvd {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  cvdDeltaScore: number;
+  cvdDeltaScore: number | null;
   bidAskRatio: number;
   subSecondOrderImbalancePct: number;
   rationaleFa: string;
@@ -114,9 +114,9 @@ export interface Brain8FundamentalMacro {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  newsOscillatorScore: number;
-  macroImpactLevel: 'HIGH' | 'MEDIUM' | 'LOW';
-  blackoutCaution: boolean;
+  newsOscillatorScore: number | null;
+  macroImpactLevel: 'HIGH' | 'MEDIUM' | 'LOW' | 'UNAVAILABLE';
+  blackoutCaution: boolean | null;
   rationaleFa: string;
 }
 
@@ -138,8 +138,8 @@ export interface Brain10AutoPilotHarmonizer {
   nameFa: string;
   autoPilotActive: boolean;
   trailingExpansionRatio: number;
-  riskProtectionEscapeSpeedMs: number;
-  feeBufferCovered: boolean;
+  riskProtectionEscapeSpeedMs: number | null;
+  feeBufferCovered: boolean | null;
   rationaleFa: string;
 }
 
@@ -147,11 +147,11 @@ export interface Brain11OnChainWhaleSentiment {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  largeTransactionsCount24h: number;
-  largeTransactionsVolumeUsd: number;
+  largeTransactionsCount24h: number | null;
+  largeTransactionsVolumeUsd: number | null;
   whaleSentimentBias: 'ACCUMULATION' | 'DISTRIBUTION' | 'MANIPULATION_ALERT' | 'NEUTRAL' | 'UNKNOWN';
-  manipulationRiskPct: number;
-  whaleActivityPressureScore: number;
+  manipulationRiskPct: number | null;
+  whaleActivityPressureScore: number | null;
   rationaleFa: string;
 }
 
@@ -339,7 +339,7 @@ export interface MultiBrainConsensusReport {
     id: string;
     category: 'PREDICTION_ACCURACY' | 'SCENARIO_READINESS' | 'FLOATING_HARMONY' | 'REAL_WORLD_EXECUTION';
     titleFa: string;
-    status: 'EXECUTED_LIVE' | 'ACTIVE_CALIBRATED' | 'READY_FOR_DEPLOYMENT';
+    status: 'ACTIVE_CALIBRATED' | 'READY_FOR_DEPLOYMENT';
     descriptionFa: string;
     impactFa: string;
   }>;
@@ -437,7 +437,7 @@ export function runUnifiedMultiBrainEnsemble(
     hurstExponent: Math.round(hurst * 100) / 100,
     mtfAlignmentScore: mtfScore,
     mtfAlignmentPct: mtfScore,
-    rationaleFa: `ضریب هرست ${hurst.toFixed(2)} و شواهد انطباق تایم‌فریمی، ساختار روند کلان را ارزیابی می‌کنند.`
+    rationaleFa: `برآورد هرست و امتیاز تایم‌فریم با heuristic از قیمت/کندل ساخته شده‌اند؛ این‌ها احتمال کالیبره‌شده یا سلامت مدل نیستند (H=${hurst.toFixed(2)}).`
   };
 
   // ۲. مغز ۲: پردازشگر ویژگی نقدینگی اردر بوک (Feature Processor)
@@ -454,7 +454,7 @@ export function runUnifiedMultiBrainEnsemble(
     liquidityPoolUsd,
     rationaleFa: trapInfo.isTrapDetected
       ? trapInfo.descriptionFa
-      : `عدم تقارن اردر بوک (${(obi * 100).toFixed(1)}٪) به‌عنوان شواهد فشار سفارشات دریافت گردید.`
+      : `عدم تقارن دفتر سفارش (${(obi * 100).toFixed(1)}٪) دریافت شد؛ امتیاز و pool قیمتی heuristic هستند و حجم نقدینگی مستقل را اندازه‌گیری نمی‌کنند.`
   };
 
   // ۳. مغز ۳: مدل نوسان‌سنج پارامتری GARCH (Statistical Model - Item 9)
@@ -505,17 +505,19 @@ export function runUnifiedMultiBrainEnsemble(
     feeBufferPct,
     hedgingAllocationRatio: 0.25,
     floatingSystemHarmonized: true,
-    rationaleFa: `تنظیم تریلینگ استاپ روی نقطه ورود + بافر کارمزد (${feeBufferPct}٪) جهت کاهش حداکثری ریسک معامله.`
+    rationaleFa: `پارامتر خروج/بافر کارمزد به‌شکل محاسباتی نمایش داده می‌شود؛ این پنل سفارش صرافی را تغییر نمی‌دهد و پوشش واقعی کارمزد را تأیید نمی‌کند.`
   };
 
   // ۶. مغز ۶: پردازشگر ویژگی آن‌چین (Feature Processor)
   const macroCtx = macroContextBrainService.getMacroContext(p);
-  const isWhaleLive = macroCtx.whaleFlowStatus === 'LIVE' && macroCtx.whaleNetflowBtc !== null;
-  const netflowBtc24h = isWhaleLive ? macroCtx.whaleNetflowBtc! : 0;
-  const whaleSentiment = isWhaleLive ? (macroCtx.whaleSentiment || 'NEUTRAL') : 'NEUTRAL';
-  const onChainRaw = isWhaleLive
+  const isWhaleLive = macroCtx.whaleFlowStatus === 'LIVE' &&
+    typeof macroCtx.whaleNetflowBtc === 'number' &&
+    Number.isFinite(macroCtx.whaleNetflowBtc);
+  const netflowBtc24h = isWhaleLive ? macroCtx.whaleNetflowBtc : null;
+  const whaleSentiment = isWhaleLive ? (macroCtx.whaleSentiment || 'NEUTRAL') : 'UNKNOWN';
+  const onChainRaw = isWhaleLive && netflowBtc24h !== null
     ? (netflowBtc24h < 0 ? 80 : 40)
-    : 50; // Neutral baseline when UNAVAILABLE
+    : null;
 
   const brain6OnChainWhale: Brain6OnChainWhaleFlow = {
     brainType: 'FEATURE_PROCESSOR',
@@ -526,12 +528,12 @@ export function runUnifiedMultiBrainEnsemble(
       ? (netflowBtc24h < 0 ? 'خروج خالص از صرافی‌ها (انباشت نهنگ)' : 'ورود بیت‌کوین به صرافی‌ها (فشار فروش)')
       : 'داده آن‌چین: UNAVAILABLE (قطع منبع زنده)',
     whaleSentiment,
-    whalePressureIndex: isWhaleLive ? (macroCtx.whalePressureIndex || 50) : 50,
+    whalePressureIndex: isWhaleLive ? macroCtx.whalePressureIndex : null,
     rawEvidenceScore: onChainRaw,
     onChainScorePct: onChainRaw,
     rationaleFa: isWhaleLive
-      ? `شواهد آن‌چین: جریان خالص ${netflowBtc24h < 0 ? 'خروج' : 'ورود'} ${Math.abs(netflowBtc24h)} BTC به صرافی‌ها.`
-      : 'وضعیت جریان آن‌چین: UNAVAILABLE. هیچ داده ساختگی اعمال نشده است.'
+      ? `خلاصهٔ جریان نهنگ از منبع خبری/جست‌وجویی grounded دریافت شد (${netflowBtc24h} BTC)؛ این فید مستقیم تراکنش آن‌چین نیست و امتیاز جهت‌گیری heuristic است.`
+      : 'وضعیت جریان نهنگ: UNAVAILABLE. فید مستقیم تراکنش آن‌چین متصل نیست.'
   };
 
   // ۷. مغز ۷: پردازشگر ویژگی CVD (Feature Processor)
@@ -539,13 +541,14 @@ export function runUnifiedMultiBrainEnsemble(
   // در صورتی که جریان زنده تریدها موجود باشد از آن استفاده می‌شود؛ در غیر اینصورت تفکیک شفاف اعمال می‌گردد.
   const liveTradeFlow = analysis?.orderFlowFeatures?.isRealTradeFlow === true &&
     analysis?.orderFlowFeatures?.status === 'LIVE' &&
-    typeof analysis?.orderFlowFeatures?.cvdDeltaUsd === 'number';
+    typeof analysis?.orderFlowFeatures?.cvdDeltaUsd === 'number' &&
+    Number.isFinite(analysis.orderFlowFeatures.cvdDeltaUsd);
   
   const measuredCvdDelta = liveTradeFlow ? analysis.orderFlowFeatures.cvdDeltaUsd : (typeof analysis?.cvdDelta === 'number' ? analysis.cvdDelta : null);
   const isCvdEmpirical = liveTradeFlow && measuredCvdDelta !== null;
   const cvdDeltaScore = isCvdEmpirical
     ? Math.min(100, Math.max(20, Math.round(50 + (measuredCvdDelta > 0 ? 25 : -25) + obi * 80)))
-    : Math.min(100, Math.max(40, Math.round(75 + obi * 150)));
+    : null;
 
   const brain7OrderBookCvd: Brain7OrderBookCvd = {
     brainType: 'FEATURE_PROCESSOR',
@@ -564,14 +567,16 @@ export function runUnifiedMultiBrainEnsemble(
 
   // ۸. مغز ۸: پردازشگر شاخص‌های کلان (Feature Processor)
   const isNewsLive = macroCtx.newsSentimentStatus === 'LIVE' && macroCtx.newsSentimentScore !== null;
-  const newsScore = isNewsLive ? macroCtx.newsSentimentScore! : 0;
+  const newsScore = isNewsLive ? macroCtx.newsSentimentScore : null;
   const brain8FundamentalMacro: Brain8FundamentalMacro = {
     brainType: 'FEATURE_PROCESSOR',
     role: 'FEATURE_PROCESSOR',
     nameFa: 'مغز ۸: پردازشگر ویژگی رویدادهای فاندامنتال (Fundamental & News Feature Processor)',
     newsOscillatorScore: newsScore,
-    macroImpactLevel: isNewsLive ? (Math.abs(newsScore) >= 60 ? 'HIGH' : 'MEDIUM') : 'LOW',
-    blackoutCaution: macroCtx.breakingNewsImpactLevel === 'SEVERE_BEARISH_THREAT',
+    macroImpactLevel: isNewsLive ? (Math.abs(newsScore) >= 60 ? 'HIGH' : 'MEDIUM') : 'UNAVAILABLE',
+    blackoutCaution: isNewsLive
+      ? macroCtx.breakingNewsImpactLevel === 'SEVERE_BEARISH_THREAT'
+      : null,
     rationaleFa: isNewsLive
       ? `ارزیابی زنده شاخص اخبار: امتیاز سنتیمنت ${newsScore > 0 ? '+' : ''}${newsScore}.`
       : 'داده‌های اخبار و فاندامنتال: UNAVAILABLE. داده جعلی اعمال نمی‌شود.'
@@ -605,16 +610,16 @@ export function runUnifiedMultiBrainEnsemble(
     brainType: 'EXECUTION_CONTROLLER',
     role: 'EXECUTION_CONTROLLER',
     nameFa: 'مغز ۱۰: پردازشگر هماهنگ‌ساز خروج و تریلینگ (Trailing Execution Processor)',
-    autoPilotActive: true,
+    autoPilotActive: false,
     trailingExpansionRatio: 1.25,
-    riskProtectionEscapeSpeedMs: 200,
-    feeBufferCovered: true,
-    rationaleFa: 'اتسال ۲۵٪ تریلینگ استاپ در جهت سود و آمادگی خروج در نقطه ورود + بافر کارمزد.'
+    riskProtectionEscapeSpeedMs: null,
+    feeBufferCovered: null,
+    rationaleFa: 'این مغز سفارش را اجرا نمی‌کند؛ زمان تاخیر و پوشش کارمزد در این مسیر اندازه‌گیری نشده است.'
   };
 
   // ۱۱. مغز ۱۱: پردازشگر ویژگی تراکنش‌های بزرگ (Feature Processor)
-  const largeTransactionsCount24h = isWhaleLive ? Math.round(Math.abs(obi) * 150 + 45) : 0;
-  const largeTransactionsVolumeUsd = isWhaleLive ? Math.round((Math.abs(obi) * 180 + 20) * 10) / 10 : 0;
+  const largeTransactionsCount24h = null;
+  const largeTransactionsVolumeUsd = null;
   let whaleSentimentBias: Brain11OnChainWhaleSentiment['whaleSentimentBias'] = isWhaleLive ? 'NEUTRAL' : 'UNKNOWN';
   if (isWhaleLive) {
     if (volPct > 2.0 && Math.abs(obi) > 0.15) {
@@ -628,7 +633,7 @@ export function runUnifiedMultiBrainEnsemble(
 
   const manipulationRiskPct = isWhaleLive
     ? (volPct > 2.0 ? Math.min(95, Math.round(30 + volPct * 20 + Math.abs(obi) * 50)) : Math.min(45, Math.round(15 + Math.abs(obi) * 80)))
-    : 0;
+    : null;
 
   const brain11OnChainWhaleSentiment: Brain11OnChainWhaleSentiment = {
     brainType: 'FEATURE_PROCESSOR',
@@ -638,10 +643,10 @@ export function runUnifiedMultiBrainEnsemble(
     largeTransactionsVolumeUsd,
     whaleSentimentBias,
     manipulationRiskPct,
-    whaleActivityPressureScore: isWhaleLive ? Math.min(100, Math.round(Math.abs(obi) * 220 + 35)) : 0,
+    whaleActivityPressureScore: null,
     rationaleFa: isWhaleLive
-      ? `پایش تراکنش‌های بزرگ زنده با حجم ${largeTransactionsVolumeUsd}M و ریسک دستکاری ${manipulationRiskPct}٪.`
-      : 'وضعیت تراکنش‌های نهنگ: UNKNOWN (منبع زنده در دسترس نیست). بر اساس قوانین ۴۵ و ۴۶، سیگنال وزن ۰ گرفت.'
+      ? `تعداد و حجم معاملات نهنگ در منبع داده نیست. برچسب ${whaleSentimentBias} فقط heuristic مبتنی بر OBI/نوسان است و اندازه‌گیری آن‌چین نیست.`
+      : 'تعداد، حجم و جریان تراکنش نهنگ: UNAVAILABLE؛ منبع معاملات آن‌چین متصل نیست.'
   };
 
   // ۱۲. مغز ۱۲: پردازشگر اسپرد و تاخیر شبکه (Execution Controller - Item 5)
@@ -934,23 +939,23 @@ export function runUnifiedMultiBrainEnsemble(
       id: 'prop_independent_models_consensus',
       category: 'PREDICTION_ACCURACY',
       titleFa: '۱. ساختار اجماع بر پایه ۴ مدل آماری مستقل (Decorrelated Model Consensus)',
-      status: 'EXECUTED_LIVE',
+      status: 'READY_FOR_DEPLOYMENT',
       descriptionFa: 'اجماع فقط از مدل‌های دارای احتمال و دقت OOS استفاده می‌کند؛ اختلاف جهت‌ها جداگانه اندازه‌گیری می‌شود و GARCH/الگو بدون اعتبارسنجی در رأی جهت‌دار وارد نمی‌شوند.',
-      impactFa: 'اختلاف شدید Brainها رأی را وتو می‌کند؛ میانگین احتمال‌ها به‌تنهایی مجوز معامله نیست.'
+      impactFa: 'وضعیت پیشنهادی در گزارش تحلیلی است؛ این proposal اجرای زندهٔ سفارش را اثبات نمی‌کند.'
     },
     {
       id: 'prop_transparent_pipeline',
       category: 'SCENARIO_READINESS',
       titleFa: '۲. شفاف‌سازی لایه‌های پردازشی (RAW DATA → FEATURE → MODEL → CALIBRATION)',
-      status: 'EXECUTED_LIVE',
+      status: 'READY_FOR_DEPLOYMENT',
       descriptionFa: 'تفکیک صریح ۱۷ ماژول پردازشگر ویژگی از ۴ مدل پیش‌بینی آماری جهت سوءتعبیر نشدن قوانین ساده به‌عنوان هوش مصنوعی/کوانتوم.',
-      impactFa: 'شفافیت ۱۰۰٪ معماری فنی و انطباق با استانداردهای ریاضی.'
+      impactFa: 'توضیح معماری پیشنهادی؛ شمار ماژول‌ها به‌معنای فید مستقل یا اعتبارسنجی زنده نیست.'
     },
     {
       id: 'prop_risk_protection_guard',
       category: 'FLOATING_HARMONY',
       titleFa: '۳. سیستم محافظت پویا از اصل سرمایه (Dynamic Risk Protection Guard)',
-      status: 'EXECUTED_LIVE',
+      status: 'READY_FOR_DEPLOYMENT',
       descriptionFa: 'تنظیم تریلینگ استاپ روی نقطه ورود + بافر کارمزد صرافی به محض تثبیت حرکت مثبت، بدون ادعای غیرواقعی تضمین عدم زیان.',
       impactFa: 'کنترل دقیق و واقع‌گرایانه ریسک معامله.'
     },
@@ -958,7 +963,7 @@ export function runUnifiedMultiBrainEnsemble(
       id: 'prop_frequency_passive_monitor',
       category: 'REAL_WORLD_EXECUTION',
       titleFa: '۴. خروج پایشگر فرکانس معامله از چرخه تصمیم‌گیری ورود (Passive Frequency Monitor)',
-      status: 'EXECUTED_LIVE',
+      status: 'READY_FOR_DEPLOYMENT',
       descriptionFa: 'غیرفعال‌سازی اثرگذاری فرکانس بر تصمیم ورود؛ اگر در یک روز هیچ معامله‌ای با edge معتبر وجود نداشته باشد، خروجی NO TRADE خواهد بود.',
       impactFa: 'جلوگیری از ورود‌های اجباری و حفظ سرمایه در شرایط بدون برتری آماری.'
     }
@@ -986,11 +991,11 @@ export function runUnifiedMultiBrainEnsemble(
       brain4PatternWeight: 0.1,
       brain5RiskHedgingWeight: 0.1,
       brain6OnChainWeight: isWhaleLive ? 0.1 : 0.0,
-      brain7CvdWeight: 0.1,
+      brain7CvdWeight: isCvdEmpirical ? 0.1 : 0.0,
       brain8MacroNewsWeight: isNewsLive ? 0.1 : 0.0,
       brain9BayesianWeight: 0.1,
-      brain10AutoPilotWeight: 0.1,
-      brain11WhaleSentimentWeight: isWhaleLive ? 0.1 : 0.0,
+      brain10AutoPilotWeight: 0.0,
+      brain11WhaleSentimentWeight: 0.0,
       brain12ExecutionSniperWeight: 0.1,
     },
     pipelineArchitecture,

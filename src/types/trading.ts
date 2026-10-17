@@ -114,6 +114,7 @@ export interface MarketFeedQuality {
   status: FeedStatus;
   timestamp: number; // UTC ms
   ageMs: number;
+  maxAgeMs?: number;
   latencyMs: number;
   score: number; // 0 - 100
   detailsFa: string;
@@ -264,6 +265,7 @@ export interface FuturesPrices {
 export interface DerivativesData {
   funding: number | null;
   oi: number | null;
+  oiChangePct?: number | null;
   fundingHistory?: number[];
   fundingTrend?: 'RISING' | 'FALLING' | 'STABLE';
   status?: 'LIVE' | 'STALE' | 'UNAVAILABLE';
@@ -1190,8 +1192,8 @@ export interface SweepReversalSetup {
 // -------------------------------------------------------------
 export type DirectionState = 'UP' | 'DOWN' | 'FLAT';
 export type CvdDirectionState = DirectionState | 'UNKNOWN';
-export type FundingState = 'HIGH_POSITIVE' | 'NEUTRAL' | 'HIGH_NEGATIVE';
-export type LiquidationDominance = 'LONGS_DOMINANT' | 'SHORTS_DOMINANT' | 'BALANCED';
+export type FundingState = 'HIGH_POSITIVE' | 'NEUTRAL' | 'HIGH_NEGATIVE' | 'UNKNOWN';
+export type LiquidationDominance = 'LONGS_DOMINANT' | 'SHORTS_DOMINANT' | 'BALANCED' | 'UNKNOWN';
 
 export type MatrixRegimeType =
   | 'HEALTHY_BULLISH_AGGRESSION'       // قیمت بالا + OI بالا + CVD بالا (خرید ارگانیک)
@@ -1217,15 +1219,15 @@ export interface CvdOiMatrixReport {
   cvdDirection: CvdDirectionState;
   cvdDeltaUsd: number | null;
   
-  oiDirection: DirectionState;
-  openInterestChangePct: number;
+  oiDirection: CvdDirectionState;
+  openInterestChangePct: number | null;
   
   fundingState: FundingState;
-  fundingRatePct: number;
+  fundingRatePct: number | null;
   
   liquidationDominance: LiquidationDominance;
-  recentLongLiqUsd: number;
-  recentShortLiqUsd: number;
+  recentLongLiqUsd: number | null;
+  recentShortLiqUsd: number | null;
   
   matrixRegime: MatrixRegimeType;
   matrixRegimeFa: string;
@@ -1241,23 +1243,23 @@ export interface CvdOiMatrixReport {
 // -------------------------------------------------------------
 // ۲۶. پیش‌بینی‌کننده آبشاری لیکوئیدیشن (Liquidation Cascade Predictor)
 // -------------------------------------------------------------
-export type CascadeRiskLevel = 'CRITICAL_IMMINENT' | 'HIGH_BUILDUP' | 'ELEVATED' | 'NORMAL';
-export type CascadeDirection = 'LONG_SQUEEZE_CASCADE' | 'SHORT_SQUEEZE_CASCADE' | 'LOW_RISK';
+export type CascadeRiskLevel = 'CRITICAL_IMMINENT' | 'HIGH_BUILDUP' | 'ELEVATED' | 'NORMAL' | 'UNAVAILABLE';
+export type CascadeDirection = 'LONG_SQUEEZE_CASCADE' | 'SHORT_SQUEEZE_CASCADE' | 'LOW_RISK' | 'UNKNOWN';
 
 export interface LiquidationCascadePrediction {
-  cascadeRiskScore: number;          // 0 - 100%
-  cascadeProbabilityPct: number;     // e.g. 84%
+  cascadeRiskScore: number | null;
+  cascadeProbabilityPct: number | null;
   predictedCascadeDirection: CascadeDirection;
   cascadeAlertLevel: CascadeRiskLevel;
   
-  squeezeTriggerPrice: number;        // قیمت ماشه‌چکان آغاز دومینوی لیکوئیدیشن
-  estimatedCascadeVolumeUsd: number;  // حجم تخمینی لیکوئیدیشن‌های اجباری دومینویی
-  timeToPotentialCascadeMin: number; // زمان تخمینی تا نقطه بحرانی
+  squeezeTriggerPrice: number | null;
+  estimatedCascadeVolumeUsd: number | null;
+  timeToPotentialCascadeMin: number | null;
   
   dominoTriggerPool: LiquidityPool | null; // استخر نقدینگی ماشه‌چکان
-  oiBuildupSeverityScore: number;    // 0 - 100
-  fundingSqueezePressure: number;     // -100 to +100
-  distanceToCascadeTriggerPct: number;// فاصله درصدی قیمت تا نقطه‌عطف
+  oiBuildupSeverityScore: number | null;
+  fundingSqueezePressure: number | null;
+  distanceToCascadeTriggerPct: number | null;
   
   riskFactorsFa: string[];
   mitigationAdviceFa: string;

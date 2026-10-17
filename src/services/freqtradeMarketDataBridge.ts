@@ -1,6 +1,8 @@
-export const FREQTRADE_MARKET_SNAPSHOT_VERSION = 'sbk1.freqtrade.market-snapshot.v3';
+export const FREQTRADE_MARKET_SNAPSHOT_VERSION = 'sbk1.freqtrade.market-snapshot.v4';
 export const FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS = 15_000;
 export const FREQTRADE_TICKER_MAX_AGE_MS = 5_000;
+export const FREQTRADE_TRADE_FLOW_MAX_AGE_MS = 5_000;
+export const FREQTRADE_OPEN_INTEREST_MAX_AGE_MS = 10 * 60_000;
 
 export interface FreqtradeMarketCandle {
   timestampMs: number;
@@ -33,6 +35,26 @@ export interface FreqtradeMarketOrderBook {
   asks: Array<{ price: number; amount: number }>;
 }
 
+export interface FreqtradeMarketTrade {
+  timestampMs: number;
+  side: 'buy' | 'sell';
+  price: number;
+  amount: number;
+}
+
+export interface FreqtradeMarketTradeFlow {
+  retrievedAtMs: number;
+  trades: FreqtradeMarketTrade[];
+}
+
+export interface FreqtradeMarketOpenInterest {
+  retrievedAtMs: number;
+  latestTimestampMs: number;
+  previousTimestampMs: number;
+  latestAmount: number;
+  previousAmount: number;
+}
+
 export interface FreqtradeMarketSnapshot {
   contractVersion: typeof FREQTRADE_MARKET_SNAPSHOT_VERSION;
   source: 'freqtrade.dataprovider';
@@ -46,6 +68,8 @@ export interface FreqtradeMarketSnapshot {
   ticker: FreqtradeMarketTicker | null;
   orderBook: FreqtradeMarketOrderBook | null;
   fundingRate: FreqtradeMarketFundingRate | null;
+  openInterest: FreqtradeMarketOpenInterest | null;
+  tradeFlow: FreqtradeMarketTradeFlow | null;
 }
 
 export interface FreqtradeMarketSnapshotExpectation {
@@ -88,6 +112,13 @@ function timeframeToMs(timeframe: string): number {
   return Number.isSafeInteger(duration) ? duration : 0;
 }
 
+function validateCandleCadence(value: FreqtradeMarketCandle[], timeframe: string): boolean {
+  const timeframeMs = timeframeToMs(timeframe);
+  return value.every((candle, index) =>
+    index === 0 || candle.timestampMs - value[index - 1].timestampMs === timeframeMs
+  );
+}
+
 function validateCandle(value: unknown): value is FreqtradeMarketCandle {
   if (!isRecord(value)) return false;
   return isTimestamp(value.timestampMs) &&
@@ -119,8 +150,30 @@ function validateCandles(
     ) return false;
     previousTimestampMs = candle.timestampMs;
   }
+  if (!validateCandleCadence(value, timeframe)) return false;
   const latestCandleCloseMs = previousTimestampMs + timeframeMs;
   return generatedAtMs - latestCandleCloseMs <= timeframeMs * 2 + 60_000;
+}
+
+function validateTradeFlowShape(value: unknown, generatedAtMs: number, nowMs: number): value is FreqtradeMarketTradeFlow | null {
+  if (value === null) return true;
+  if (!isRecord(value) || !isTimestamp(value.retrievedAtMs) ||
+    value.retrievedAtMs > nowMs + 1_000 || value.retrievedAtMs > generatedAtMs + 1_000 ||
+    !Array.isArray(value.trades) || value.trades.length === 0 || value.trades.length > 200) return false;
+  let previousTimestampMs = 0;
+  for (const trade of value.trades) {
+    if (
+      !isRecord(trade) ||
+      !isTimestamp(trade.timestampMs) ||
+      trade.timestampMs < previousTimestampMs ||
+      trade.timestampMs > value.retrievedAtMs + 1_000 ||
+      (trade.side !== 'buy' && trade.side !== 'sell') ||
+      !isPositive(trade.price) ||
+      !isPositive(trade.amount)
+    ) return false;
+    previousTimestampMs = trade.timestampMs;
+  }
+  return true;
 }
 
 function validateTickerShape(value: unknown): value is FreqtradeMarketTicker | null {
@@ -178,6 +231,24 @@ function validateFundingRateShape(value: unknown): value is FreqtradeMarketFundi
     typeof value.rate === 'number' &&
     Number.isFinite(value.rate) &&
     (value.nextFundingAtMs === null || isTimestamp(value.nextFundingAtMs));
+}
+
+function validateOpenInterestShape(
+  value: unknown,
+  generatedAtMs: number,
+  nowMs: number,
+): value is FreqtradeMarketOpenInterest | null {
+  if (value === null) return true;
+  return isRecord(value) &&
+    isTimestamp(value.retrievedAtMs) &&
+    isTimestamp(value.latestTimestampMs) &&
+    isTimestamp(value.previousTimestampMs) &&
+    isPositive(value.latestAmount) &&
+    isPositive(value.previousAmount) &&
+    value.latestTimestampMs - value.previousTimestampMs === 5 * 60_000 &&
+    value.latestTimestampMs <= value.retrievedAtMs + 1_000 &&
+    value.retrievedAtMs <= generatedAtMs + 1_000 &&
+    value.retrievedAtMs <= nowMs + 1_000;
 }
 
 export function validateFreqtradeMarketSnapshot(
@@ -262,7 +333,7 @@ export function validateFreqtradeMarketSnapshot(
     throw new FreqtradeMarketSnapshotValidationError('Ticker is future-dated.', 'INVALID_TICKER');
   }
   const verifiedTicker = ticker !== null &&
-    nowMs - ticker.retrievedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS &&
+    nowMs - ticker.retrievedAtMs <= FREQTRADE_TICKER_MAX_AGE_MS &&
     (ticker.exchangeTimestampMs === null ||
       ticker.retrievedAtMs - ticker.exchangeTimestampMs <= FREQTRADE_TICKER_MAX_AGE_MS)
     ? ticker
@@ -288,6 +359,33 @@ export function validateFreqtradeMarketSnapshot(
     nowMs - fundingRate.retrievedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
     ? fundingRate
     : null;
+  const openInterest = value.openInterest;
+  if (!validateOpenInterestShape(openInterest, value.generatedAtMs, nowMs)) {
+    throw new FreqtradeMarketSnapshotValidationError('Open interest is invalid.', 'INVALID_OPEN_INTEREST');
+  }
+  if (
+    isRecord(openInterest) &&
+    (openInterest.retrievedAtMs > nowMs + 1_000 ||
+      openInterest.retrievedAtMs > value.generatedAtMs + 1_000 ||
+      openInterest.latestTimestampMs > nowMs + 1_000 ||
+      openInterest.previousTimestampMs > nowMs + 1_000)
+  ) {
+    throw new FreqtradeMarketSnapshotValidationError('Open interest is future-dated.', 'INVALID_OPEN_INTEREST');
+  }
+  const verifiedOpenInterest = openInterest !== null &&
+    nowMs - openInterest.latestTimestampMs >= 0 &&
+    nowMs - openInterest.latestTimestampMs <= FREQTRADE_OPEN_INTEREST_MAX_AGE_MS
+    ? openInterest
+    : null;
+  const tradeFlow = value.tradeFlow;
+  if (!validateTradeFlowShape(tradeFlow, value.generatedAtMs, nowMs)) {
+    throw new FreqtradeMarketSnapshotValidationError('Trade flow is invalid, empty, or stale.', 'INVALID_TRADE_FLOW');
+  }
+  const verifiedTradeFlow = tradeFlow !== null &&
+    nowMs - tradeFlow.retrievedAtMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS &&
+    tradeFlow.trades.every((trade) => nowMs - trade.timestampMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS)
+    ? tradeFlow
+    : null;
   return {
     contractVersion: FREQTRADE_MARKET_SNAPSHOT_VERSION,
     source: 'freqtrade.dataprovider',
@@ -305,6 +403,11 @@ export function validateFreqtradeMarketSnapshot(
       asks: verifiedOrderBook.asks.map((level) => ({ ...level })),
     },
     fundingRate: verifiedFundingRate && { ...verifiedFundingRate },
+    openInterest: verifiedOpenInterest && { ...verifiedOpenInterest },
+    tradeFlow: verifiedTradeFlow && {
+      retrievedAtMs: verifiedTradeFlow.retrievedAtMs,
+      trades: verifiedTradeFlow.trades.map((trade) => ({ ...trade })),
+    },
   };
 }
 

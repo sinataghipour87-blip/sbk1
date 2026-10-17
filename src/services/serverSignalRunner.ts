@@ -6,6 +6,7 @@ import type {
   DirectionalSignalCandidate,
   FearAndGreed,
   FuturesPrices,
+  OrderFlowFeatures,
   RealOrderBookImbalance,
   SentimentData,
   AnalysisResult,
@@ -14,6 +15,7 @@ import type {
 import type { FreqtradeBotState, FreqtradeBalance, FreqtradeTrade } from './freqtradeBridge';
 import {
   FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS,
+  FREQTRADE_TRADE_FLOW_MAX_AGE_MS,
   freqtradeMarketDataBridge,
   type FreqtradeMarketSnapshot,
   type FreqtradeMarketSnapshotExpectation,
@@ -30,6 +32,7 @@ import {
 } from './freqtradeSignalAdapter';
 import { freqtradeBridge } from './freqtradeBridge';
 import { operationalTradeArchive, type OperationalTradeArchiveMetadata } from './operationalTradeArchive';
+import { centralTradeDatasetService } from './centralTradeDataset';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MINIMUM_CANDLES_FOR_ANALYSIS = 300;
@@ -136,11 +139,10 @@ function readSignalSettings(): {
   };
 }
 
-function toCandleTuple(
+export function toCandleTuple(
   candle: FreqtradeMarketSnapshot['candles'][number],
 ): Candle {
   return [
-    candle.timestampMs,
     candle.open,
     candle.high,
     candle.low,
@@ -155,6 +157,7 @@ function createMarketFeedQuality(input: {
   status: 'LIVE' | 'UNAVAILABLE';
   timestamp: number;
   ageMs: number;
+  maxAgeMs?: number;
   score: number;
   detailsFa: string;
 }) {
@@ -175,6 +178,7 @@ function makeSnapshotAnalysisInputs(
   dataQuality: DataQualityReport;
   orderBook?: RealOrderBookImbalance;
   futuresPrices?: FuturesPrices;
+  orderFlow: OrderFlowFeatures;
   unavailableInputs: string[];
 } {
   const snapshotAgeMs = nowMs - snapshot.generatedAtMs;
@@ -203,9 +207,18 @@ function makeSnapshotAnalysisInputs(
     }
     : undefined;
   const ticker = snapshot.ticker;
+  const tickerAgeMs = ticker ? nowMs - ticker.retrievedAtMs : Number.POSITIVE_INFINITY;
+  const tickerLive = Boolean(
+    ticker &&
+    tickerAgeMs >= 0 &&
+    tickerAgeMs <= 5_000 &&
+    ticker.markPrice !== null &&
+    ticker.indexPrice !== null
+  );
   const futuresPrices: FuturesPrices | undefined = ticker?.markPrice !== null &&
     ticker?.indexPrice !== null &&
-    ticker
+    ticker &&
+    tickerLive
     ? {
       lastPrice: ticker.last,
       markPrice: ticker.markPrice,
@@ -222,13 +235,91 @@ function makeSnapshotAnalysisInputs(
     }
     : undefined;
 
+  const tradeFlow = snapshot.tradeFlow;
+  const tradeFlowAgeMs = tradeFlow ? nowMs - tradeFlow.retrievedAtMs : Number.POSITIVE_INFINITY;
+  const hasFreshTradeFlow = Boolean(
+    tradeFlow &&
+    tradeFlowAgeMs >= 0 &&
+    tradeFlowAgeMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS &&
+    tradeFlow.trades.length > 0 &&
+    tradeFlow.trades.every((trade) =>
+      nowMs - trade.timestampMs >= 0 &&
+      nowMs - trade.timestampMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS &&
+      Number.isFinite(trade.price) &&
+      Number.isFinite(trade.amount)
+    )
+  );
+  const buyTrades = hasFreshTradeFlow ? tradeFlow!.trades.filter((trade) => trade.side === 'buy') : [];
+  const sellTrades = hasFreshTradeFlow ? tradeFlow!.trades.filter((trade) => trade.side === 'sell') : [];
+  const takerBuyVol = buyTrades.reduce((total, trade) => total + trade.amount, 0);
+  const takerSellVol = sellTrades.reduce((total, trade) => total + trade.amount, 0);
+  const cvdDelta = takerBuyVol - takerSellVol;
+  const cvdDeltaUsd = buyTrades.reduce((total, trade) => total + trade.amount * trade.price, 0) -
+    sellTrades.reduce((total, trade) => total + trade.amount * trade.price, 0);
+  const totalTakerVolume = takerBuyVol + takerSellVol;
+  const latestTradeTimestampMs = hasFreshTradeFlow
+    ? tradeFlow!.trades[tradeFlow!.trades.length - 1].timestampMs
+    : null;
+  const orderFlow: OrderFlowFeatures = {
+    cvdDelta: hasFreshTradeFlow ? cvdDelta : null,
+    cvdDeltaUsd: hasFreshTradeFlow ? cvdDeltaUsd : null,
+    cvdDivergence: hasFreshTradeFlow ? 'RECENT_TRADE_FLOW_WINDOW' : 'UNAVAILABLE',
+    takerBuyVol: hasFreshTradeFlow ? takerBuyVol : null,
+    takerSellVol: hasFreshTradeFlow ? takerSellVol : null,
+    takerRatio: hasFreshTradeFlow && totalTakerVolume > 0 ? takerBuyVol / totalTakerVolume : null,
+    takerDelta: hasFreshTradeFlow ? cvdDelta : null,
+    delta: hasFreshTradeFlow ? cvdDelta : null,
+    cumulativeDelta: hasFreshTradeFlow ? cvdDelta : null,
+    deltaVelocity: hasFreshTradeFlow
+      ? cvdDelta / Math.max(1, (tradeFlow!.retrievedAtMs - tradeFlow!.trades[0].timestampMs) / 1_000)
+      : null,
+    isRealTradeFlow: hasFreshTradeFlow,
+    status: hasFreshTradeFlow ? 'LIVE' : 'UNAVAILABLE',
+    timestampUtc: latestTradeTimestampMs ?? snapshot.generatedAtMs,
+    ageMs: latestTradeTimestampMs === null ? Number.POSITIVE_INFINITY : nowMs - latestTradeTimestampMs,
+    latencyMs: hasFreshTradeFlow ? tradeFlowAgeMs : Number.POSITIVE_INFINITY,
+    source: hasFreshTradeFlow ? `${snapshot.source}.ccxt.fetch_trades` : snapshot.source,
+    ...(hasFreshTradeFlow ? {} : { error: 'Fresh trade-level flow is missing from the Freqtrade snapshot.' }),
+  };
+
+  const openInterest = snapshot.openInterest;
+  const openInterestAgeMs = openInterest ? nowMs - openInterest.latestTimestampMs : Number.POSITIVE_INFINITY;
+  const openInterestFresh = Boolean(
+    openInterest &&
+    openInterestAgeMs >= 0 &&
+    openInterestAgeMs <= 10 * 60_000
+  );
+  const fundingRate = snapshot.fundingRate;
+  const fundingAgeMs = fundingRate ? nowMs - fundingRate.retrievedAtMs : Number.POSITIVE_INFINITY;
+  const fundingFresh = Boolean(
+    fundingRate &&
+    fundingAgeMs >= -1_000 &&
+    fundingAgeMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
+  );
+  const derivativesLive = openInterestFresh && fundingFresh;
+  const oiChangePct = openInterestFresh && openInterest
+    ? ((openInterest.latestAmount - openInterest.previousAmount) / openInterest.previousAmount) * 100
+    : null;
   const candleLive = candles.length >= MINIMUM_CANDLES_FOR_ANALYSIS;
+  const latestCompletedCandle = snapshot.candles.at(-1);
+  const candleCloseTimestampMs = latestCompletedCandle
+    ? latestCompletedCandle.timestampMs + timeframeToMs(snapshot.timeframe)
+    : null;
+  const candleAgeMs = candleCloseTimestampMs === null ? Number.POSITIVE_INFINITY : nowMs - candleCloseTimestampMs;
+  const candleMaxAgeMs = timeframeToMs(snapshot.timeframe) + 60_000;
+  const candleFresh = candleLive && candleAgeMs >= 0 && candleAgeMs <= candleMaxAgeMs;
+  const snapshotFresh = snapshotAgeMs >= 0 && snapshotAgeMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS;
+  const orderBookFresh = Boolean(orderBook && orderBook.obi !== null && orderBook.ageMs >= 0 && orderBook.ageMs <= 10_000);
+  const executionFeedsAvailable = candleFresh && tickerLive && orderBookFresh && hasFreshTradeFlow && snapshotFresh;
   const unavailableInputs = [
     'Fear and Greed sentiment is not included in the Freqtrade snapshot.',
-    'Open interest is not included in the Freqtrade snapshot.',
-    'Trade-level CVD/taker flow is not included in the Freqtrade snapshot.',
     'Cross-exchange data and browser-only model state are not available to the server runner.',
-    'OOS calibration and MultiBrain evidence are not used for signal-candidate generation.',
+    'MultiBrain UI evidence is not an independent input to the server signal runner.',
+    ...(!candleFresh ? ['Completed candles are missing, stale, or have invalid cadence.'] : []),
+    ...(!tickerLive ? ['A fresh ticker with Last, Mark, and Index prices is unavailable.'] : []),
+    ...(!orderBookFresh ? ['A fresh, valid order book is unavailable.'] : []),
+    ...(!hasFreshTradeFlow ? ['Fresh, timestamped public trades for CVD/taker-flow are unavailable.'] : []),
+    ...(!openInterestFresh ? ['Fresh, timestamped open-interest history is unavailable.'] : []),
     ...(!orderBook ? ['Order book is unavailable in the current snapshot.'] : []),
     ...(!ticker ? ['Ticker is unavailable; reference price will use the completed candle close.'] : []),
     ...(snapshot.fundingRate === null ? ['Funding data is unavailable in the current snapshot.'] : []),
@@ -236,20 +327,21 @@ function makeSnapshotAnalysisInputs(
   const candlesFeed = createMarketFeedQuality({
     feedName: 'Freqtrade completed candles',
     source: snapshot.source,
-    status: candleLive ? 'LIVE' : 'UNAVAILABLE',
-    timestamp: candles.at(-1)?.[0] ?? snapshot.generatedAtMs,
-    ageMs: candles.at(-1) ? nowMs - candles.at(-1)![0] : snapshotAgeMs,
-    score: candleLive ? 100 : 0,
-    detailsFa: candleLive ? 'کندل‌های تکمیل‌شده از snapshot داخلی Freqtrade.' : 'تعداد کندل برای تحلیل کافی نیست.',
+    status: candleFresh ? 'LIVE' : 'UNAVAILABLE',
+    timestamp: candleCloseTimestampMs ?? snapshot.generatedAtMs,
+    ageMs: candleAgeMs,
+    maxAgeMs: candleMaxAgeMs,
+    score: candleFresh ? 100 : 0,
+    detailsFa: candleFresh ? 'کندل‌های تکمیل‌شده با cadence پیوسته از snapshot داخلی Freqtrade.' : 'کندل ناقص، کهنه یا دارای فاصلهٔ زمانی نامعتبر است.',
   });
   const orderBookFeed = createMarketFeedQuality({
     feedName: 'Freqtrade order book',
     source: snapshot.source,
-    status: orderBook ? 'LIVE' : 'UNAVAILABLE',
+    status: orderBookFresh ? 'LIVE' : 'UNAVAILABLE',
     timestamp: orderBook?.timestamp ?? snapshot.generatedAtMs,
     ageMs: orderBook?.ageMs ?? Number.POSITIVE_INFINITY,
-    score: orderBook?.obi === null || !orderBook ? 0 : 100,
-    detailsFa: orderBook ? 'دفتر سفارش واقعی از snapshot داخلی Freqtrade.' : 'دفتر سفارش در snapshot موجود نیست.',
+    score: orderBookFresh ? 100 : 0,
+    detailsFa: orderBookFresh ? 'دفتر سفارش تازه و معتبر از snapshot داخلی Freqtrade.' : 'دفتر سفارش تازه و معتبر در snapshot موجود نیست.',
   });
   const unavailableFeed = (feedName: string, detailsFa: string) => createMarketFeedQuality({
     feedName,
@@ -263,26 +355,51 @@ function makeSnapshotAnalysisInputs(
   const pricesFeed = createMarketFeedQuality({
     feedName: 'Freqtrade ticker',
     source: snapshot.source,
-    status: ticker ? 'LIVE' : 'UNAVAILABLE',
+    status: tickerLive ? 'LIVE' : 'UNAVAILABLE',
     timestamp: ticker?.retrievedAtMs ?? snapshot.generatedAtMs,
-    ageMs: ticker ? nowMs - ticker.retrievedAtMs : Number.POSITIVE_INFINITY,
-    score: ticker ? 100 : 0,
-    detailsFa: ticker ? 'Ticker واقعی از snapshot داخلی Freqtrade.' : 'Ticker در snapshot موجود نیست.',
+    ageMs: tickerAgeMs,
+    maxAgeMs: 5_000,
+    score: tickerLive ? 100 : 0,
+    detailsFa: tickerLive ? 'Ticker تازه با Last، Mark و Index از snapshot داخلی Freqtrade.' : 'Ticker تازه با قیمت‌های موردنیاز در snapshot موجود نیست.',
+  });
+  const orderFlowFeed = createMarketFeedQuality({
+    feedName: 'Freqtrade recent public trades / taker flow',
+    source: orderFlow.source ?? snapshot.source,
+    status: hasFreshTradeFlow ? 'LIVE' : 'UNAVAILABLE',
+    timestamp: orderFlow.timestampUtc ?? snapshot.generatedAtMs,
+    ageMs: orderFlow.ageMs ?? Number.POSITIVE_INFINITY,
+    maxAgeMs: FREQTRADE_TRADE_FLOW_MAX_AGE_MS,
+    score: hasFreshTradeFlow ? 100 : 0,
+    detailsFa: hasFreshTradeFlow
+      ? `جریان معاملات واقعی در پنجرهٔ کوتاه دریافت شد (${tradeFlow?.trades.length} معامله).`
+      : 'تاریخچهٔ معاملات تازه برای محاسبهٔ CVD/taker flow در دسترس نیست.',
+  });
+  const derivativesFeed = createMarketFeedQuality({
+    feedName: 'Freqtrade CCXT open-interest history / funding',
+    source: 'freqtrade.dataprovider.ccxt.fetch_open_interest_history',
+    status: derivativesLive ? 'LIVE' : 'UNAVAILABLE',
+    timestamp: openInterest?.latestTimestampMs ?? snapshot.generatedAtMs,
+    ageMs: Math.max(openInterestAgeMs, fundingAgeMs),
+    maxAgeMs: 10 * 60_000,
+    score: derivativesLive ? 100 : 0,
+    detailsFa: derivativesLive
+      ? 'دو رکورد پنج‌دقیقه‌ای سود باز و Funding تازه از صرافی دریافت شد.'
+      : 'تاریخچهٔ معتبر Open Interest یا Funding در snapshot موجود نیست.',
   });
   const dataQuality: DataQualityReport = {
     overallScore: Math.round(
-      [candleLive, Boolean(orderBook), Boolean(ticker)].filter(Boolean).length / 6 * 100,
+      [candleFresh, orderBookFresh, tickerLive, hasFreshTradeFlow, snapshotFresh, derivativesLive].filter(Boolean).length / 6 * 100,
     ),
-    isTradeAllowed: candleLive && snapshotAgeMs >= 0 && snapshotAgeMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS,
-    status: candleLive ? 'LIVE' : 'DATA_UNAVAILABLE',
+    isTradeAllowed: executionFeedsAvailable,
+    status: executionFeedsAvailable ? 'LIVE' : 'DATA_UNAVAILABLE',
     reasonsFa: unavailableInputs,
     feeds: {
       candles: candlesFeed,
       orderBook: orderBookFeed,
-      derivatives: unavailableFeed('Derivatives / open interest', 'Open interest در snapshot موجود نیست.'),
+      derivatives: derivativesFeed,
       futuresPrices: pricesFeed,
       sentiment: unavailableFeed('Fear and Greed sentiment', 'Sentiment در snapshot موجود نیست.'),
-      orderFlow: unavailableFeed('Trade-level CVD / taker flow', 'Trade-level flow در snapshot موجود نیست.'),
+      orderFlow: orderFlowFeed,
     },
   };
 
@@ -302,16 +419,19 @@ function makeSnapshotAnalysisInputs(
       status: 'UNAVAILABLE',
     },
     derivatives: {
-      funding: snapshot.fundingRate?.rate ?? null,
-      oi: null,
-      status: 'UNAVAILABLE',
-      timestampUtc: snapshot.fundingRate?.retrievedAtMs ?? snapshot.generatedAtMs,
-      ageMs: snapshot.fundingRate ? nowMs - snapshot.fundingRate.retrievedAtMs : Number.POSITIVE_INFINITY,
-      source: snapshot.source,
+      funding: fundingFresh ? fundingRate?.rate ?? null : null,
+      oi: openInterestFresh ? openInterest?.latestAmount ?? null : null,
+      oiChangePct: openInterestFresh && Number.isFinite(oiChangePct) ? oiChangePct : null,
+      status: derivativesLive ? 'LIVE' : 'UNAVAILABLE',
+      timestampUtc: openInterestFresh ? openInterest?.latestTimestampMs ?? 0 : snapshot.generatedAtMs,
+      ageMs: Math.max(openInterestAgeMs, fundingAgeMs),
+      source: 'freqtrade.dataprovider.ccxt.fetch_open_interest_history',
+      ...(!derivativesLive ? { error: 'Fresh verified open-interest history and funding are both required.' } : {}),
     },
     dataQuality,
     orderBook,
     futuresPrices,
+    orderFlow,
     unavailableInputs,
   };
 }
@@ -345,23 +465,7 @@ async function analyzeSnapshotData(
     inputs.orderBook,
     undefined,
     inputs.futuresPrices,
-    {
-      cvdDelta: null,
-      cvdDivergence: 'UNAVAILABLE',
-      takerBuyVol: null,
-      takerSellVol: null,
-      takerRatio: null,
-      takerDelta: null,
-      delta: null,
-      cumulativeDelta: null,
-      deltaVelocity: null,
-      isRealTradeFlow: false,
-      status: 'UNAVAILABLE',
-      timestampUtc: snapshot.generatedAtMs,
-      ageMs: Number.POSITIVE_INFINITY,
-      source: snapshot.source,
-      error: 'Trade-level flow is not included in the Freqtrade snapshot.',
-    },
+    inputs.orderFlow,
   );
   return analysis;
 }
@@ -384,6 +488,7 @@ async function analyzeSnapshot(
     analysis,
     signalCandidateMode: true,
   });
+  const latestCandle = analysis.candles.at(-1);
   return {
     candidate: decision.signalCandidate ?? null,
     reason: decision.waitReasonFa || 'No directional signal candidate was returned.',
@@ -403,6 +508,11 @@ async function analyzeSnapshot(
       marketRegime: analysis.marketRegime ?? null,
       timeframe: analysis.timeframe ?? null,
       setupType: analysis.setupContext?.setupType ?? null,
+      candleOpen: latestCandle?.[0] ?? null,
+      candleHigh: latestCandle?.[1] ?? null,
+      candleLow: latestCandle?.[2] ?? null,
+      candleClose: latestCandle?.[3] ?? null,
+      candleVolume: latestCandle?.[4] ?? null,
     },
     featureVersion: 'server-signal-features-v1',
     modelVersion: analysis.calibratedMetadata?.modelVersion ?? 'analysis-engine-current',
@@ -598,11 +708,12 @@ export class ServerSignalRunner {
 
       const timeframeMs = timeframeToMs(snapshot.timeframe);
       if (timeframeMs <= 0) throw new Error(`Unsupported Freqtrade timeframe: ${snapshot.timeframe}.`);
-      const completedCandles = snapshot.candles
-        .filter((candle) => candle.timestampMs + timeframeMs <= nowMs)
-        .map(toCandleTuple);
+      const completedSnapshotCandles = snapshot.candles
+        .filter((candle) => candle.timestampMs + timeframeMs <= nowMs);
+      const completedCandles = completedSnapshotCandles.map(toCandleTuple);
       const latestCandle = completedCandles.at(-1);
-      if (!latestCandle) {
+      const latestSnapshotCandle = completedSnapshotCandles.at(-1);
+      if (!latestCandle || !latestSnapshotCandle) {
         await this.record({
           candleTimestampMs: null,
           decision: 'NO TRADE',
@@ -610,7 +721,7 @@ export class ServerSignalRunner {
         });
         return;
       }
-      candleTimestampMs = latestCandle[0];
+      candleTimestampMs = latestSnapshotCandle.timestampMs;
       if (this.lastProcessedCandleMs !== null && candleTimestampMs <= this.lastProcessedCandleMs) return;
       this.lastProcessedCandleMs = candleTimestampMs;
 
@@ -710,6 +821,9 @@ export class ServerSignalRunner {
         });
         return;
       }
+      if (!this.dependencies.analyze) {
+        centralTradeDatasetService.replaceTrainingArchiveRecords(await operationalTradeArchive.getAll());
+      }
       const result = await this.analyze(snapshot, completedCandles, nowMs, balance.equity);
       const candidate = result.candidate;
       if (!candidate) {
@@ -722,7 +836,7 @@ export class ServerSignalRunner {
         return;
       }
 
-      const referencePrice = latestCandle[4];
+      const referencePrice = latestCandle[3];
       const entryDeviationBps = Math.abs(candidate.entryPrice - referencePrice) / referencePrice * 10_000;
       if (entryDeviationBps > settings.maxDeviationBps) {
         await this.record({
@@ -803,11 +917,11 @@ export class ServerSignalRunner {
           stopLoss: candidate.stopLoss,
           takeProfit: candidate.takeProfit,
           referencePrice,
-          candleOpen: latestCandle[1],
-          candleHigh: latestCandle[2],
-          candleLow: latestCandle[3],
-          candleClose: latestCandle[4],
-          candleVolume: latestCandle[5],
+          candleOpen: latestCandle[0],
+          candleHigh: latestCandle[1],
+          candleLow: latestCandle[2],
+          candleClose: latestCandle[3],
+          candleVolume: latestCandle[4],
           fundingRate: snapshot.fundingRate?.rate ?? null,
           marketRegime: null,
           timeframe: snapshot.timeframe,

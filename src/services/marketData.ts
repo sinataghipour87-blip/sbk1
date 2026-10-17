@@ -13,6 +13,7 @@ import {
 import { dataProvenanceLayerService } from './dataProvenanceLayer';
 import {
   FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS,
+  FREQTRADE_OPEN_INTEREST_MAX_AGE_MS,
   FREQTRADE_MARKET_SNAPSHOT_VERSION,
   FREQTRADE_TICKER_MAX_AGE_MS,
   validateFreqtradeMarketSnapshot,
@@ -397,28 +398,41 @@ export async function fetchDerivatives(): Promise<DerivativesData> {
   try {
     const snapshot = await getFreqtradeMarketSnapshot();
     const fundingRate = snapshot.fundingRate;
-    const ageMs = fundingRate ? nowMs - fundingRate.retrievedAtMs : Number.POSITIVE_INFINITY;
+    const openInterest = snapshot.openInterest;
+    const fundingAgeMs = fundingRate ? nowMs - fundingRate.retrievedAtMs : Number.POSITIVE_INFINITY;
     const freshFunding = fundingRate !== null &&
-      ageMs >= -1_000 &&
-      ageMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS;
+      fundingAgeMs >= -1_000 &&
+      fundingAgeMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS;
+    const openInterestAgeMs = openInterest ? nowMs - openInterest.latestTimestampMs : Number.POSITIVE_INFINITY;
+    const freshOpenInterest = openInterest !== null &&
+      openInterestAgeMs >= 0 &&
+      openInterestAgeMs <= FREQTRADE_OPEN_INTEREST_MAX_AGE_MS;
+    const derivativesLive = freshFunding && freshOpenInterest;
+    const oiChangePct = freshOpenInterest
+      ? Number((((openInterest.latestAmount - openInterest.previousAmount) / openInterest.previousAmount) * 100).toFixed(4))
+      : null;
     return {
       funding: freshFunding ? fundingRate.rate : null,
-      oi: null,
+      oi: freshOpenInterest ? openInterest.latestAmount : null,
+      oiChangePct,
       fundingHistory: [],
-      status: 'UNAVAILABLE',
-      timestampUtc: fundingRate?.retrievedAtMs ?? 0,
-      isoTimeUtc: fundingRate ? new Date(fundingRate.retrievedAtMs).toISOString() : '',
-      ageMs,
+      status: derivativesLive ? 'LIVE' : 'UNAVAILABLE',
+      timestampUtc: freshOpenInterest ? openInterest.latestTimestampMs : (fundingRate?.retrievedAtMs ?? 0),
+      isoTimeUtc: freshOpenInterest ? new Date(openInterest.latestTimestampMs).toISOString() : '',
+      ageMs: Math.max(fundingAgeMs, openInterestAgeMs),
       latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 0,
-      source: 'freqtrade.dataprovider',
-      ...(!freshFunding
-        ? { error: 'No fresh Freqtrade funding rate is available.' }
-        : { error: 'Open interest is not available in the Freqtrade market snapshot.' }),
+      source: 'freqtrade.dataprovider.ccxt.fetch_open_interest_history',
+      ...(!derivativesLive
+        ? { error: !freshFunding
+          ? 'No fresh Freqtrade funding rate is available.'
+          : 'Fresh open-interest history is unavailable in the Freqtrade market snapshot.' }
+        : {}),
     };
   } catch (error) {
     return {
       funding: null,
       oi: null,
+      oiChangePct: null,
       fundingHistory: [],
       status: 'UNAVAILABLE',
       timestampUtc: 0,

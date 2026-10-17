@@ -213,7 +213,7 @@ export function analyzePro(
     futuresPrices?.status === 'LIVE' &&
     Number.isFinite(dataQualityReport.feeds.candles.ageMs) &&
     dataQualityReport.feeds.candles.ageMs >= 0 &&
-    dataQualityReport.feeds.candles.ageMs <= 15_000 &&
+    dataQualityReport.feeds.candles.ageMs <= (dataQualityReport.feeds.candles.maxAgeMs ?? 15_000) &&
     Number.isFinite(futuresPrices.ageMs) &&
     futuresPrices.ageMs >= 0 &&
     futuresPrices.ageMs <= 5_000 &&

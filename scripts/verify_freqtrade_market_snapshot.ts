@@ -47,6 +47,10 @@ const snapshot = {
     asks: [{ price: 60_101, amount: 1 }],
   },
   fundingRate: { retrievedAtMs: nowMs - 500, rate: -0.0001, nextFundingAtMs: nowMs + 3_600_000 },
+  tradeFlow: {
+    retrievedAtMs: nowMs - 100,
+    trades: [{ timestampMs: nowMs - 200, side: 'buy', price: 60_100, amount: 0.01 }],
+  },
 };
 
 function expectCode(operation: () => unknown, code: string): void {
@@ -65,7 +69,7 @@ const delayedTicker = validateFreqtradeMarketSnapshot({
   ...snapshot,
   ticker: { ...snapshot.ticker, retrievedAtMs: nowMs - 6_000 },
 }, expected, nowMs);
-assert.equal(delayedTicker.ticker?.retrievedAtMs, nowMs - 6_000);
+assert.equal(delayedTicker.ticker, null, 'ticker retrieval older than five seconds must be unavailable without exchange timestamp');
 
 const bridge = new FreqtradeMarketDataBridge();
 bridge.accept(snapshot, expected, nowMs);
@@ -107,22 +111,50 @@ const staleOptionalFeeds = validateFreqtradeMarketSnapshot({
   ticker: { ...snapshot.ticker, retrievedAtMs: nowMs - 16_000 },
   orderBook: { ...snapshot.orderBook, timestampMs: nowMs - 10_001 },
   fundingRate: { ...snapshot.fundingRate, retrievedAtMs: nowMs - 16_000 },
+  tradeFlow: {
+    retrievedAtMs: nowMs - 6_000,
+    trades: [{ ...snapshot.tradeFlow.trades[0], timestampMs: nowMs - 6_100 }],
+  },
 }, expected, nowMs);
 assert.equal(staleOptionalFeeds.candles.length, snapshot.candles.length);
 assert.equal(staleOptionalFeeds.ticker, null, 'stale ticker must not invalidate otherwise fresh candles');
 assert.equal(staleOptionalFeeds.orderBook, null, 'stale order book must not invalidate otherwise fresh candles');
 assert.equal(staleOptionalFeeds.fundingRate, null, 'stale funding must not invalidate otherwise fresh candles');
+assert.equal(staleOptionalFeeds.tradeFlow, null, 'stale trade flow must not authorize CVD features');
+const staleTradesInFreshBatch = validateFreqtradeMarketSnapshot({
+  ...snapshot,
+  tradeFlow: {
+    retrievedAtMs: nowMs - 100,
+    trades: [{ ...snapshot.tradeFlow.trades[0], timestampMs: nowMs - 6_100 }],
+  },
+}, expected, nowMs);
+assert.equal(staleTradesInFreshBatch.tradeFlow, null, 'old trades must make only the optional trade feed unavailable');
+expectCode(
+  () => validateFreqtradeMarketSnapshot({
+    ...snapshot,
+    tradeFlow: {
+      ...snapshot.tradeFlow,
+      trades: [{ ...snapshot.tradeFlow.trades[0], side: 'unknown' }],
+    },
+  }, expected, nowMs),
+  'INVALID_TRADE_FLOW',
+);
 const partialBridge = new FreqtradeMarketDataBridge();
 const acceptedPartial = partialBridge.accept({
   ...snapshot,
   ticker: { ...snapshot.ticker, retrievedAtMs: nowMs - 16_000 },
   orderBook: { ...snapshot.orderBook, timestampMs: nowMs - 10_001 },
   fundingRate: { ...snapshot.fundingRate, retrievedAtMs: nowMs - 16_000 },
+  tradeFlow: {
+    retrievedAtMs: nowMs - 6_000,
+    trades: [{ ...snapshot.tradeFlow.trades[0], timestampMs: nowMs - 6_100 }],
+  },
 }, expected, nowMs);
 assert.equal(partialBridge.getLatest(expected, nowMs).candles.length, snapshot.candles.length);
 assert.equal(acceptedPartial.orderBook, null);
 assert.equal(acceptedPartial.ticker, null);
 assert.equal(acceptedPartial.fundingRate, null);
+assert.equal(acceptedPartial.tradeFlow, null);
 expectCode(
   () => validateFreqtradeMarketSnapshot({
     ...snapshot,
@@ -151,9 +183,18 @@ const unavailableOptionalFeeds = validateFreqtradeMarketSnapshot({
   ticker: null,
   orderBook: null,
   fundingRate: null,
+  tradeFlow: null,
 }, expected, nowMs);
 assert.equal(unavailableOptionalFeeds.ticker, null);
 assert.equal(unavailableOptionalFeeds.orderBook, null);
 assert.equal(unavailableOptionalFeeds.fundingRate, null);
+assert.equal(unavailableOptionalFeeds.tradeFlow, null);
+expectCode(
+  () => validateFreqtradeMarketSnapshot({
+    ...snapshot,
+    candles: [snapshot.candles[0], { ...snapshot.candles[1], timestampMs: snapshot.candles[1].timestampMs + 1_000 }],
+  }, expected, nowMs),
+  'INVALID_CANDLES',
+);
 
 console.log('Freqtrade market snapshot contract checks passed.');

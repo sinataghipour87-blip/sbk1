@@ -35,15 +35,15 @@ import { Candle } from '../types/trading';
  */
 
 export interface BayesianEvidenceVector {
-  obiAligned: boolean;
-  candleActionAligned: boolean;
-  momentumAligned: boolean;
-  volatilityCompressionAligned: boolean;
+  obiAligned: boolean | null;
+  candleActionAligned: boolean | null;
+  momentumAligned: boolean | null;
+  volatilityCompressionAligned: boolean | null;
 }
 
 export interface LearnedFeatureLikelihood {
   featureName: string;
-  isAligned: boolean;
+  isAligned: boolean | null;
   pEvidenceGivenWin: number;
   pEvidenceGivenLoss: number;
   bayesFactor: number;
@@ -111,25 +111,55 @@ export class RealBayesianEngine {
     targetDir: 'LONG' | 'SHORT'
   ): BayesianEvidenceVector {
     const isLong = targetDir === 'LONG';
-    const obi = typeof record.features?.obi === 'number' 
-      ? record.features.obi 
-      : (typeof record.orderBookState?.imbalancePct === 'number' ? record.orderBookState.imbalancePct / 100 : 0);
-    const obiAligned = isLong ? obi >= 0.04 : obi <= -0.04;
+    const obi = typeof record.features?.obi === 'number' && Number.isFinite(record.features.obi)
+      ? record.features.obi
+      : typeof record.orderBookState?.imbalancePct === 'number' && Number.isFinite(record.orderBookState.imbalancePct)
+        ? record.orderBookState.imbalancePct / 100
+        : null;
+    const obiAligned = obi === null ? null : (isLong ? obi >= 0.04 : obi <= -0.04);
 
-    const rsi = typeof record.features?.rsi === 'number' ? record.features.rsi : 50;
-    const momentumAligned = isLong ? (rsi >= 44 && rsi <= 68) : (rsi <= 56 && rsi >= 32);
+    const rsi = typeof record.features?.rsi === 'number' && Number.isFinite(record.features.rsi)
+      ? record.features.rsi
+      : null;
+    const momentumAligned = rsi === null ? null : (isLong ? (rsi >= 44 && rsi <= 68) : (rsi <= 56 && rsi >= 32));
 
-    const vol = typeof record.volatility === 'number' ? record.volatility : (typeof record.features?.atr === 'number' ? (record.features.atr / (record.entryPrice || 1)) * 100 : 1.5);
-    const volatilityCompressionAligned = vol >= 0.6 && vol <= 2.8;
+    const entryPrice = typeof record.entryPrice === 'number' && Number.isFinite(record.entryPrice) && record.entryPrice > 0
+      ? record.entryPrice
+      : null;
+    const volatility = typeof record.volatility === 'number' && Number.isFinite(record.volatility)
+      ? record.volatility
+      : typeof record.features?.atr === 'number' && Number.isFinite(record.features.atr) && entryPrice !== null
+        ? (record.features.atr / entryPrice) * 100
+        : null;
+    const volatilityCompressionAligned = volatility === null
+      ? null
+      : volatility >= 0.6 && volatility <= 2.8;
 
-    // Candle / Action alignment from execution features
-    let candleActionAligned = false;
-    if (typeof record.features?.takerRatio === 'number') {
+    let candleActionAligned: boolean | null = null;
+    if (typeof record.features?.takerRatio === 'number' && Number.isFinite(record.features.takerRatio)) {
       candleActionAligned = isLong ? record.features.takerRatio >= 1.05 : record.features.takerRatio <= 0.95;
-    } else if (typeof record.R === 'number') {
-      candleActionAligned = isLong ? record.R > 0.5 : record.R < -0.5;
     } else {
-      candleActionAligned = record.outcome === 'WIN';
+      const candleValues = [
+        record.features?.candleOpen,
+        record.features?.candleHigh,
+        record.features?.candleLow,
+        record.features?.candleClose,
+      ];
+      if (
+        candleValues.every((value): value is number =>
+          typeof value === 'number' && Number.isFinite(value)
+        ) &&
+        candleValues[2] <= Math.min(candleValues[0], candleValues[3]) &&
+        candleValues[1] >= Math.max(candleValues[0], candleValues[3])
+      ) {
+        const [open, high, low, close] = candleValues;
+        const body = Math.abs(close - open);
+        const lowerWick = Math.min(open, close) - low;
+        const upperWick = high - Math.max(open, close);
+        candleActionAligned = isLong
+          ? close >= open || lowerWick > body * 1.2
+          : close <= open || upperWick > body * 1.2;
+      }
     }
 
     return {
@@ -197,28 +227,37 @@ export class RealBayesianEngine {
 
     // 2. Extract Live Evidence Vector from Current Market State
     const isLong = direction === 'LONG';
-    const obiAligned = isLong ? obi >= 0.04 : obi <= -0.04;
+    const obiAligned = Number.isFinite(obi) ? (isLong ? obi >= 0.04 : obi <= -0.04) : null;
 
-    let candleActionAligned = false;
+    let candleActionAligned: boolean | null = null;
     if (candles && candles.length >= 3) {
       const last = candles[candles.length - 1];
-      const close = Array.isArray(last) ? (last[3] ?? last[4]) : (last.close ?? 0);
-      const open = Array.isArray(last) ? (last[0] ?? last[1]) : (last.open ?? 0);
-      const high = Array.isArray(last) ? last[1] : (last.high ?? close);
-      const low = Array.isArray(last) ? last[2] : (last.low ?? close);
-      const body = Math.abs(close - open);
-      const lowerWick = Math.min(open, close) - low;
-      const upperWick = high - Math.max(open, close);
+      const values = Array.isArray(last)
+        ? last.length >= 6
+          ? { open: last[1], high: last[2], low: last[3], close: last[4] }
+          : { open: last[0], high: last[1], low: last[2], close: last[3] }
+        : { open: last.open, high: last.high, low: last.low, close: last.close };
+      if (
+        [values.open, values.high, values.low, values.close].every((value) =>
+          typeof value === 'number' && Number.isFinite(value)
+        )
+      ) {
+        const body = Math.abs(values.close - values.open);
+        const lowerWick = Math.min(values.open, values.close) - values.low;
+        const upperWick = values.high - Math.max(values.open, values.close);
 
-      if (isLong) {
-        candleActionAligned = close >= open || lowerWick > body * 1.2;
-      } else {
-        candleActionAligned = close <= open || upperWick > body * 1.2;
+        candleActionAligned = isLong
+          ? values.close >= values.open || lowerWick > body * 1.2
+          : values.close <= values.open || upperWick > body * 1.2;
       }
     }
 
-    const momentumAligned = isLong ? (rsi >= 44 && rsi <= 68) : (rsi <= 56 && rsi >= 32);
-    const volatilityCompressionAligned = volatilityPct >= 0.6 && volatilityPct <= 2.8;
+    const momentumAligned = Number.isFinite(rsi)
+      ? (isLong ? (rsi >= 44 && rsi <= 68) : (rsi <= 56 && rsi >= 32))
+      : null;
+    const volatilityCompressionAligned = Number.isFinite(volatilityPct)
+      ? volatilityPct >= 0.6 && volatilityPct <= 2.8
+      : null;
 
     const liveEvidenceVector: BayesianEvidenceVector = {
       obiAligned,
@@ -278,27 +317,40 @@ export class RealBayesianEngine {
     const learnedFeatures: Record<string, LearnedFeatureLikelihood> = {};
     let totalLikelihoodWin = 1.0;
     let totalLikelihoodLoss = 1.0;
+    const trainingEvidence = trainRecords.map((record) => ({
+      record,
+      vector: this.evaluateRecordFeatureAlignment(record, direction),
+    }));
 
     for (const feat of featuresList) {
       let winFeatureCount = 0;
       let lossFeatureCount = 0;
+      let knownWinCount = 0;
+      let knownLossCount = 0;
 
-      for (const rec of trainRecords) {
-        const recVector = this.evaluateRecordFeatureAlignment(rec, direction);
-        if (recVector[feat]) {
-          if (rec.outcome === 'WIN') winFeatureCount++;
-          else if (rec.outcome === 'LOSS') lossFeatureCount++;
+      for (const { record, vector } of trainingEvidence) {
+        const featureValue = vector[feat];
+        if (featureValue !== null) {
+          if (record.outcome === 'WIN') {
+            knownWinCount++;
+            if (featureValue) winFeatureCount++;
+          } else if (record.outcome === 'LOSS') {
+            knownLossCount++;
+            if (featureValue) lossFeatureCount++;
+          }
         }
       }
 
-      // Bayesian Laplace Smoothing: (count + 1) / (total_class + 2)
-      const pFeatGivenWin = (winFeatureCount + 1) / (trainWins + 2);
-      const pFeatGivenLoss = (lossFeatureCount + 1) / (trainLosses + 2);
+      const pFeatGivenWin = (winFeatureCount + 1) / (knownWinCount + 2);
+      const pFeatGivenLoss = (lossFeatureCount + 1) / (knownLossCount + 2);
 
       const isFeatAligned = liveEvidenceVector[feat];
-      // If feature is aligned, likelihood ratio is P(E=1|Win)/P(E=1|Loss); if not aligned, (1 - P(E=1|Win))/(1 - P(E=1|Loss))
-      const featLikelihoodWin = isFeatAligned ? pFeatGivenWin : Math.max(0.01, 1 - pFeatGivenWin);
-      const featLikelihoodLoss = isFeatAligned ? pFeatGivenLoss : Math.max(0.01, 1 - pFeatGivenLoss);
+      const featLikelihoodWin = isFeatAligned === null
+        ? 1
+        : isFeatAligned ? pFeatGivenWin : Math.max(0.01, 1 - pFeatGivenWin);
+      const featLikelihoodLoss = isFeatAligned === null
+        ? 1
+        : isFeatAligned ? pFeatGivenLoss : Math.max(0.01, 1 - pFeatGivenLoss);
       const featBf = Number((featLikelihoodWin / Math.max(0.001, featLikelihoodLoss)).toFixed(3));
 
       learnedFeatures[feat] = {
@@ -358,8 +410,10 @@ export class RealBayesianEngine {
         for (const feat of featuresList) {
           const lFeat = learnedFeatures[feat];
           const isAligned = oosVector[feat];
-          recLikeWin *= isAligned ? lFeat.pEvidenceGivenWin : Math.max(0.01, 1 - lFeat.pEvidenceGivenWin);
-          recLikeLoss *= isAligned ? lFeat.pEvidenceGivenLoss : Math.max(0.01, 1 - lFeat.pEvidenceGivenLoss);
+          if (isAligned !== null) {
+            recLikeWin *= isAligned ? lFeat.pEvidenceGivenWin : Math.max(0.01, 1 - lFeat.pEvidenceGivenWin);
+            recLikeLoss *= isAligned ? lFeat.pEvidenceGivenLoss : Math.max(0.01, 1 - lFeat.pEvidenceGivenLoss);
+          }
         }
 
         const oosPEvidence = (recLikeWin * priorProbability) + (recLikeLoss * (1.0 - priorProbability));

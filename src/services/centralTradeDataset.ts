@@ -585,7 +585,11 @@ export class CentralTradeDatasetService {
     if (!isObjectRecord(payload) || !Array.isArray(payload.records)) {
       throw new Error('پاسخ آرشیو سروری ساختار معتبری ندارد.');
     }
-    this.serverPredictions = payload.records
+    return this.replaceTrainingArchiveRecords(payload.records);
+  }
+
+  public replaceTrainingArchiveRecords(records: readonly unknown[]): number {
+    this.serverPredictions = records
       .map(predictionFromArchive)
       .filter((record): record is PredictionDatasetRecord => record !== null);
     return this.serverPredictions.length;

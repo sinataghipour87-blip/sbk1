@@ -146,6 +146,13 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
                 "fundingTimestamp": now_ms + 3_600_000,
             }),
         )
+        self.strategy.dp._exchange = SimpleNamespace(_api=SimpleNamespace(
+            has={"fetchTrades": True},
+            fetch_trades=Mock(return_value=[
+                {"id": "t1", "timestamp": now_ms - 500, "side": "buy", "price": 60_150, "amount": 0.01},
+                {"id": "t2", "timestamp": now_ms - 200, "side": "sell", "price": 60_149, "amount": 0.005},
+            ]),
+        ))
         response = Mock()
         response.raise_for_status.return_value = None
         poll_response = Mock()
@@ -178,6 +185,9 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["ticker"]["indexPrice"], 60_153)
         self.assertEqual(payload["orderBook"]["bids"][0]["price"], 60_149)
         self.assertEqual(payload["fundingRate"]["rate"], -0.0001)
+        self.assertEqual(payload["contractVersion"], "sbk1.freqtrade.market-snapshot.v4")
+        self.assertEqual(len(payload["tradeFlow"]["trades"]), 2)
+        self.assertEqual(payload["tradeFlow"]["trades"][0]["side"], "buy")
         self.assertEqual(set(payload["additionalCandles"]), {"1m", "5m", "1h", "4h"})
 
     def test_market_snapshot_is_not_published_in_backtest(self):

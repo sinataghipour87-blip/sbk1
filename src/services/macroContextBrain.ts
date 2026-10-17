@@ -11,17 +11,17 @@ export type MetricDataStatus = 'LIVE' | 'UNKNOWN' | 'UNAVAILABLE';
 
 export interface BitcoinNewsItem {
   id: string;
-  headlineFa: string;
+  headline: string;
   source: string;
-  sentiment: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
-  impactScore: number;
-  timeAgoFa: string;
+  url: string;
+  publishedAt: string;
 }
 
 export interface MacroCorrelationData {
   overallDataStatus: MetricDataStatus;
   lastUpdatedTime: number | null;
   lastUpdatedStr: string;
+  provenance: Record<string, unknown>;
 
   // 1. S&P 500
   sp500Status: MetricDataStatus;
@@ -49,6 +49,7 @@ export interface MacroCorrelationData {
   // 6. News Sentiment
   newsSentimentStatus: MetricDataStatus;
   newsSentimentScore: number | null;
+  newsHeadlinesStatus: MetricDataStatus;
   recentHeadlines: BitcoinNewsItem[];
 
   // 7. Whale Flow
@@ -76,6 +77,7 @@ function createDefaultUnavailableState(): MacroCorrelationData {
     overallDataStatus: 'UNAVAILABLE',
     lastUpdatedTime: null,
     lastUpdatedStr: 'در دسترس نیست (UNAVAILABLE)',
+    provenance: {},
 
     sp500Status: 'UNAVAILABLE',
     sp500Price: null,
@@ -97,6 +99,7 @@ function createDefaultUnavailableState(): MacroCorrelationData {
 
     newsSentimentStatus: 'UNAVAILABLE',
     newsSentimentScore: null,
+    newsHeadlinesStatus: 'UNAVAILABLE',
     recentHeadlines: [],
 
     whaleFlowStatus: 'UNKNOWN',
@@ -159,31 +162,89 @@ export class MacroContextBrainService {
       this.lastFetchTimestamp = now;
 
       // Extract and validate all 7 metrics with zero fallback to hardcoded mock values
-      const sp500Status: MetricDataStatus = json.sp500Status === 'LIVE' ? 'LIVE' : 'UNAVAILABLE';
-      const sp500Price = sp500Status === 'LIVE' && typeof json.sp500Price === 'number' ? json.sp500Price : null;
-      const sp500DailyChangePct = sp500Status === 'LIVE' && typeof json.sp500DailyChangePct === 'number' ? json.sp500DailyChangePct : null;
+      const sp500Status: MetricDataStatus = json.sp500Status === 'LIVE' &&
+        typeof json.sp500Price === 'number' &&
+        Number.isFinite(json.sp500Price) &&
+        json.sp500Price > 0 &&
+        typeof json.sp500DailyChangePct === 'number' &&
+        Number.isFinite(json.sp500DailyChangePct)
+        ? 'LIVE'
+        : 'UNAVAILABLE';
+      const sp500Price = sp500Status === 'LIVE' ? json.sp500Price : null;
+      const sp500DailyChangePct = sp500Status === 'LIVE' ? json.sp500DailyChangePct : null;
 
-      const dxyStatus: MetricDataStatus = json.dxyStatus === 'LIVE' ? 'LIVE' : 'UNAVAILABLE';
-      const dxyIndex = dxyStatus === 'LIVE' && typeof json.dxyIndex === 'number' ? json.dxyIndex : null;
-      const dxyDailyChangePct = dxyStatus === 'LIVE' && typeof json.dxyDailyChangePct === 'number' ? json.dxyDailyChangePct : null;
+      const dxyStatus: MetricDataStatus = json.dxyStatus === 'LIVE' &&
+        typeof json.dxyIndex === 'number' &&
+        Number.isFinite(json.dxyIndex) &&
+        json.dxyIndex > 0 &&
+        typeof json.dxyDailyChangePct === 'number' &&
+        Number.isFinite(json.dxyDailyChangePct)
+        ? 'LIVE'
+        : 'UNAVAILABLE';
+      const dxyIndex = dxyStatus === 'LIVE' ? json.dxyIndex : null;
+      const dxyDailyChangePct = dxyStatus === 'LIVE' ? json.dxyDailyChangePct : null;
 
-      const fearAndGreedStatus: MetricDataStatus = json.fearAndGreedStatus === 'LIVE' ? 'LIVE' : 'UNAVAILABLE';
-      const fearAndGreedIndex = fearAndGreedStatus === 'LIVE' && typeof json.fearAndGreedIndex === 'number' ? json.fearAndGreedIndex : null;
+      const fearAndGreedStatus: MetricDataStatus = json.fearAndGreedStatus === 'LIVE' &&
+        typeof json.fearAndGreedIndex === 'number' &&
+        Number.isInteger(json.fearAndGreedIndex) &&
+        json.fearAndGreedIndex >= 0 &&
+        json.fearAndGreedIndex <= 100
+        ? 'LIVE'
+        : 'UNAVAILABLE';
+      const fearAndGreedIndex = fearAndGreedStatus === 'LIVE' ? json.fearAndGreedIndex : null;
       const fearAndGreedLabelFa = fearAndGreedStatus === 'LIVE' ? (json.fearAndGreedLabelFa || `${fearAndGreedIndex}`) : 'UNAVAILABLE';
 
-      const etfFlowStatus: MetricDataStatus = json.etfFlowStatus === 'LIVE' ? 'LIVE' : 'UNAVAILABLE';
-      const spotEtfNetInflowMillionUsd = etfFlowStatus === 'LIVE' && typeof json.spotEtfNetInflowMillionUsd === 'number' ? json.spotEtfNetInflowMillionUsd : null;
+      const etfFlowStatus: MetricDataStatus = json.etfFlowStatus === 'LIVE' &&
+        typeof json.spotEtfNetInflowMillionUsd === 'number' &&
+        Number.isFinite(json.spotEtfNetInflowMillionUsd)
+        ? 'LIVE'
+        : 'UNAVAILABLE';
+      const spotEtfNetInflowMillionUsd = etfFlowStatus === 'LIVE' ? json.spotEtfNetInflowMillionUsd : null;
 
-      const fedExpectationsStatus: MetricDataStatus = json.fedExpectationsStatus === 'LIVE' ? 'LIVE' : 'UNAVAILABLE';
-      const fedRateCutExpectationPct = fedExpectationsStatus === 'LIVE' && typeof json.fedRateCutExpectationPct === 'number' ? json.fedRateCutExpectationPct : null;
+      const fedExpectationsStatus: MetricDataStatus = json.fedExpectationsStatus === 'LIVE' &&
+        typeof json.fedRateCutExpectationPct === 'number' &&
+        Number.isFinite(json.fedRateCutExpectationPct) &&
+        json.fedRateCutExpectationPct >= 0 &&
+        json.fedRateCutExpectationPct <= 100
+        ? 'LIVE'
+        : 'UNAVAILABLE';
+      const fedRateCutExpectationPct = fedExpectationsStatus === 'LIVE' ? json.fedRateCutExpectationPct : null;
 
-      const newsSentimentStatus: MetricDataStatus = json.newsSentimentStatus === 'LIVE' ? 'LIVE' : 'UNAVAILABLE';
-      const newsSentimentScore = newsSentimentStatus === 'LIVE' && typeof json.newsSentimentScore === 'number' ? json.newsSentimentScore : null;
-      const recentHeadlines: BitcoinNewsItem[] = newsSentimentStatus === 'LIVE' && Array.isArray(json.recentHeadlines) ? json.recentHeadlines : [];
+      const recentHeadlines: BitcoinNewsItem[] = Array.isArray(json.recentHeadlines)
+        ? json.recentHeadlines.filter((item: unknown): item is BitcoinNewsItem =>
+          typeof item === 'object' && item !== null &&
+          'id' in item && typeof item.id === 'string' &&
+          'headline' in item && typeof item.headline === 'string' &&
+          'source' in item && typeof item.source === 'string' &&
+          'url' in item && typeof item.url === 'string' &&
+          'publishedAt' in item && typeof item.publishedAt === 'string' &&
+          Number.isFinite(Date.parse(item.publishedAt)) &&
+          (() => {
+            try {
+              return new URL(item.url).protocol === 'https:';
+            } catch {
+              return false;
+            }
+          })()
+        )
+        : [];
+      const newsHeadlinesStatus: MetricDataStatus =
+        json.newsHeadlinesStatus === 'LIVE' && recentHeadlines.length > 0 ? 'LIVE' : 'UNAVAILABLE';
+      const newsSentimentStatus: MetricDataStatus = 'UNAVAILABLE';
+      const newsSentimentScore = null;
 
-      const whaleFlowStatus: MetricDataStatus = json.whaleFlowStatus === 'LIVE' ? 'LIVE' : 'UNKNOWN';
-      const whaleNetflowBtc = whaleFlowStatus === 'LIVE' && typeof json.whaleNetflowBtc === 'number' ? json.whaleNetflowBtc : null;
-      const whalePressureIndex = whaleFlowStatus === 'LIVE' && typeof json.whalePressureIndex === 'number' ? json.whalePressureIndex : null;
+      const whaleFlowStatus: MetricDataStatus = json.whaleFlowStatus === 'LIVE' &&
+        typeof json.whaleNetflowBtc === 'number' &&
+        Number.isFinite(json.whaleNetflowBtc) &&
+        typeof json.whalePressureIndex === 'number' &&
+        Number.isFinite(json.whalePressureIndex) &&
+        json.whalePressureIndex >= 0 &&
+        json.whalePressureIndex <= 100 &&
+        ['ACCUMULATION', 'DISTRIBUTION', 'NEUTRAL'].includes(json.whaleSentiment)
+        ? 'LIVE'
+        : 'UNKNOWN';
+      const whaleNetflowBtc = whaleFlowStatus === 'LIVE' ? json.whaleNetflowBtc : null;
+      const whalePressureIndex = whaleFlowStatus === 'LIVE' ? json.whalePressureIndex : null;
       const whaleSentiment = whaleFlowStatus === 'LIVE' ? json.whaleSentiment : 'UNKNOWN';
 
       // Overall status: LIVE if at least 2 key macro indicators are LIVE, else UNAVAILABLE
@@ -206,9 +267,6 @@ export class MacroContextBrainService {
       let isTradeApprovedByMacro = false;
 
       if (sp500Status === 'LIVE' && dxyStatus === 'LIVE' && sp500DailyChangePct !== null && dxyDailyChangePct !== null) {
-        btcCorrelationWithSP500 = 0.74;
-        btcCorrelationWithDXY = -0.81;
-
         const isSP500Bullish = sp500DailyChangePct > 0;
         const isDXYBearish = dxyDailyChangePct < 0;
 
@@ -239,9 +297,16 @@ export class MacroContextBrainService {
       let emergencyDefensiveShield = false;
       let runnerExpansionBoost = false;
 
-      if (newsSentimentStatus === 'LIVE' && newsSentimentScore !== null) {
-        const fgScore = fearAndGreedIndex !== null ? fearAndGreedIndex : 50;
-        const etfScore = spotEtfNetInflowMillionUsd !== null ? (spotEtfNetInflowMillionUsd > 0 ? 30 : 5) : 15;
+      if (
+        newsSentimentStatus === 'LIVE' &&
+        newsSentimentScore !== null &&
+        fearAndGreedStatus === 'LIVE' &&
+        fearAndGreedIndex !== null &&
+        etfFlowStatus === 'LIVE' &&
+        spotEtfNetInflowMillionUsd !== null
+      ) {
+        const fgScore = fearAndGreedIndex;
+        const etfScore = spotEtfNetInflowMillionUsd > 0 ? 30 : 5;
         fundamentalScorePct = Math.round((newsSentimentScore * 0.4) + (fgScore * 0.3) + etfScore);
         fundamentalBias = fundamentalScorePct >= 65 ? 'BULLISH' : fundamentalScorePct <= 40 ? 'BEARISH' : 'NEUTRAL';
 
@@ -263,6 +328,7 @@ export class MacroContextBrainService {
         overallDataStatus,
         lastUpdatedTime: now,
         lastUpdatedStr: json.lastUpdated || new Date().toLocaleTimeString('fa-IR'),
+        provenance: typeof json.provenance === 'object' && json.provenance !== null ? json.provenance : {},
 
         sp500Status,
         sp500Price,
@@ -284,6 +350,7 @@ export class MacroContextBrainService {
 
         newsSentimentStatus,
         newsSentimentScore,
+        newsHeadlinesStatus,
         recentHeadlines,
 
         whaleFlowStatus,
@@ -315,4 +382,3 @@ export class MacroContextBrainService {
 }
 
 export const macroContextBrainService = MacroContextBrainService.getInstance();
-
