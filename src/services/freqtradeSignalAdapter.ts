@@ -3,7 +3,8 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
-export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v1';
+export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v2';
+export const SBK_ENTRY_AUTHORIZATION_VERSION = 'sbk1.entry.authorization.v1';
 export const DRY_RUN_FIXTURE_SETUP_PREFIX = 'DRY_RUN_E2E_FIXTURE_';
 
 export type SbkSignalDirection = 'LONG' | 'SHORT';
@@ -20,6 +21,37 @@ export type SbkSignalStatus =
   | 'ERROR'
   | 'UNKNOWN_IN_FLIGHT';
 
+export interface SbkEntryAuthorization {
+  contractVersion: typeof SBK_ENTRY_AUTHORIZATION_VERSION;
+  decision: 'APPROVE_ENTRY' | 'DRY_RUN_TEST_ONLY';
+  decisionId: string;
+  snapshotId: string;
+  snapshotTimestampMs: number;
+  evaluatedAtMs: number;
+  timeframe: string;
+  direction: SbkSignalDirection;
+  gates: Array<{
+    id: string;
+    status: 'PASSED' | 'FAILED' | 'UNAVAILABLE' | 'SKIPPED';
+    reason: string;
+  }>;
+  models: Array<{
+    id: string;
+    status: 'HEALTHY' | 'DEGRADED' | 'SUSPENDED' | 'RETIRED' | 'UNAVAILABLE' | 'UNVALIDATED';
+    calibrated: boolean;
+    independenceValidated: boolean;
+    direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+    probabilityPct: number | null;
+    sampleSize: number;
+    oosPrecisionPct: number | null;
+    effectiveWeight: number;
+  }>;
+  disagreementVeto: boolean;
+  ensembleProbabilityPct: number | null;
+  riskRewardRatio: number;
+  allocatedRiskUsd: number;
+}
+
 export interface SbkFreqtradeSignal {
   contractVersion: typeof SBK_SIGNAL_CONTRACT_VERSION;
   decisionId: string;
@@ -33,7 +65,7 @@ export interface SbkFreqtradeSignal {
   expiresAtMs: number;
   referencePrice: number;
   engineScore: number | null;
-  evidenceLevel?: 'UNCALIBRATED_HEURISTIC';
+  authorization: SbkEntryAuthorization;
   dataQuality: {
     status: 'LIVE';
     source: string;
@@ -340,9 +372,6 @@ export function validateSbkFreqtradeSignal(
   ) {
     throw new SbkSignalValidationError('The analysis engine score must be null or between 0 and 100.', 'INVALID_ENGINE_SCORE');
   }
-  if (signal.evidenceLevel !== undefined && signal.evidenceLevel !== 'UNCALIBRATED_HEURISTIC') {
-    throw new SbkSignalValidationError('Unsupported signal evidence level.', 'INVALID_EVIDENCE_LEVEL');
-  }
   const stopValid = signal.direction === 'LONG'
     ? signal.entryConditions.stopLoss < signal.entryConditions.entryPrice && signal.entryConditions.takeProfit > signal.entryConditions.entryPrice
     : signal.entryConditions.stopLoss > signal.entryConditions.entryPrice && signal.entryConditions.takeProfit < signal.entryConditions.entryPrice;
@@ -365,9 +394,149 @@ export function validateSbkFreqtradeSignal(
   ) {
     throw new SbkSignalValidationError('Position sizing exceeds configured risk limits.', 'INVALID_RISK_LIMITS');
   }
+  const authorization = signal.authorization;
+  if (
+    !isRecord(authorization) ||
+    authorization.contractVersion !== SBK_ENTRY_AUTHORIZATION_VERSION ||
+    !['APPROVE_ENTRY', 'DRY_RUN_TEST_ONLY'].includes(String(authorization.decision)) ||
+    authorization.decisionId !== signal.decisionId ||
+    typeof authorization.snapshotId !== 'string' ||
+    !/^SNP_[A-Za-z0-9:_-]{1,128}$/.test(authorization.snapshotId) ||
+    !Number.isSafeInteger(authorization.snapshotTimestampMs) ||
+    !Number.isSafeInteger(authorization.evaluatedAtMs) ||
+    authorization.timeframe !== signal.timeframe ||
+    authorization.direction !== signal.direction ||
+    !Array.isArray(authorization.gates) ||
+    !Array.isArray(authorization.models) ||
+    typeof authorization.disagreementVeto !== 'boolean' ||
+    !Number.isFinite(authorization.riskRewardRatio) ||
+    !finitePositive(authorization.allocatedRiskUsd)
+  ) {
+    throw new SbkSignalValidationError('A complete entry-decision authorization is required.', 'INVALID_AUTHORIZATION');
+  }
+  const maxAuthorizationAgeMs = isDryRunFixture ? 55_000 : 15_000;
+  if (
+    authorization.snapshotTimestampMs !== signal.dataQuality.observedAtMs ||
+    authorization.snapshotTimestampMs > nowMs + 1_000 ||
+    nowMs - authorization.snapshotTimestampMs < 0 ||
+    nowMs - authorization.snapshotTimestampMs > maxAuthorizationAgeMs ||
+    authorization.evaluatedAtMs < authorization.snapshotTimestampMs ||
+    authorization.evaluatedAtMs > nowMs + 1_000 ||
+    nowMs - authorization.evaluatedAtMs < 0 ||
+    nowMs - authorization.evaluatedAtMs > maxAuthorizationAgeMs
+  ) {
+    throw new SbkSignalValidationError('Authorization snapshot or evaluation time is stale or inconsistent.', 'STALE_AUTHORIZATION');
+  }
+
+  const isTestOnly = authorization.decision === 'DRY_RUN_TEST_ONLY';
+  if (isTestOnly) {
+    if (!isDryRunFixture || authorization.models.length !== 0 || authorization.disagreementVeto) {
+      throw new SbkSignalValidationError('Test-only authorization is restricted to isolated dry-run fixtures.', 'INVALID_TEST_AUTHORIZATION');
+    }
+  } else {
+    const requiredGateIds = new Set([
+      'STAGE_1_MARKET_DATA',
+      'STAGE_2_DATA_QUALITY',
+      'STAGE_3_MARKET_REGIME',
+      'STAGE_4_HTF_STRUCTURE',
+      'STAGE_5_SETUP_DETECTION',
+      'STAGE_6_LIQUIDITY_ANALYSIS',
+      'STAGE_7_ORDER_FLOW',
+      'STAGE_8_ENTRY_TRIGGER',
+      'STAGE_9_ENTRY_PRICE',
+      'STAGE_10_STOP_INVALIDATION',
+      'STAGE_11_TP_TARGETS',
+      'STAGE_12_EXPECTED_VALUE',
+      'STAGE_13_POSITION_SIZE',
+      'STAGE_14_EXECUTION',
+    ]);
+    const seenGates = new Set<string>();
+    for (const gate of authorization.gates) {
+      if (
+        !isRecord(gate) ||
+        typeof gate.id !== 'string' ||
+        !gate.id ||
+        gate.status !== 'PASSED' ||
+        typeof gate.reason !== 'string' ||
+        !gate.reason.trim() ||
+        seenGates.has(gate.id)
+      ) {
+        throw new SbkSignalValidationError('Every authorization gate must be uniquely identified and passed with a reason.', 'INVALID_AUTHORIZATION_GATES');
+      }
+      seenGates.add(gate.id);
+    }
+    if ([...requiredGateIds].some((id) => !seenGates.has(id))) {
+      throw new SbkSignalValidationError('The complete 14-stage decision pipeline is required for entry.', 'INCOMPLETE_AUTHORIZATION_GATES');
+    }
+    const eligibleModels = authorization.models.filter((model) =>
+      isRecord(model) &&
+      model.status === 'HEALTHY' &&
+      model.calibrated === true &&
+      model.independenceValidated === true &&
+      model.probabilityPct !== null &&
+      model.effectiveWeight > 0
+    );
+    if (
+      authorization.disagreementVeto ||
+      eligibleModels.length < 2 ||
+      eligibleModels.some((model) =>
+        (model.direction !== signal.direction) ||
+        !Number.isFinite(model.probabilityPct) ||
+        model.probabilityPct < 0 ||
+        model.probabilityPct > 100 ||
+        !Number.isSafeInteger(model.sampleSize) ||
+        model.sampleSize < 35 ||
+        !Number.isFinite(model.oosPrecisionPct) ||
+        model.oosPrecisionPct < 55 ||
+        !Number.isFinite(model.effectiveWeight) ||
+        model.effectiveWeight <= 0
+      ) ||
+      typeof authorization.ensembleProbabilityPct !== 'number' ||
+      !Number.isFinite(authorization.ensembleProbabilityPct) ||
+      authorization.ensembleProbabilityPct < 55 ||
+      authorization.ensembleProbabilityPct > 100
+    ) {
+      throw new SbkSignalValidationError('Two or more healthy, calibrated, agreeing models without a veto are required.', 'INVALID_MODEL_ENSEMBLE');
+    }
+    for (const model of authorization.models) {
+      if (
+        !isRecord(model) ||
+        typeof model.id !== 'string' ||
+        !model.id ||
+        !['HEALTHY', 'DEGRADED', 'SUSPENDED', 'RETIRED', 'UNAVAILABLE', 'UNVALIDATED'].includes(String(model.status)) ||
+        typeof model.calibrated !== 'boolean' ||
+        typeof model.independenceValidated !== 'boolean' ||
+        !['LONG', 'SHORT', 'NEUTRAL'].includes(String(model.direction)) ||
+        !Number.isSafeInteger(model.sampleSize) ||
+        model.sampleSize < 0 ||
+        !Number.isFinite(model.effectiveWeight) ||
+        model.effectiveWeight < 0 ||
+        (model.probabilityPct !== null && (
+          !Number.isFinite(model.probabilityPct) ||
+          model.probabilityPct < 0 ||
+          model.probabilityPct > 100
+        )) ||
+        (model.oosPrecisionPct !== null && (
+          !Number.isFinite(model.oosPrecisionPct) ||
+          model.oosPrecisionPct < 0 ||
+          model.oosPrecisionPct > 100
+        )) ||
+        ((model.status !== 'HEALTHY' || !model.calibrated || !model.independenceValidated) && model.effectiveWeight !== 0)
+      ) {
+        throw new SbkSignalValidationError('Model evidence is malformed or assigns weight to an unavailable model.', 'INVALID_MODEL_EVIDENCE');
+      }
+    }
+  }
+  const calculatedRiskRewardRatio = rewardDistance / riskDistance;
+  if (
+    Math.abs(authorization.riskRewardRatio - calculatedRiskRewardRatio) > 0.01 ||
+    authorization.riskRewardRatio < 1 ||
+    authorization.allocatedRiskUsd > signal.riskLimits.maxStakeQuote * signal.riskLimits.riskBudgetPct / 100 + 0.01
+  ) {
+    throw new SbkSignalValidationError('Authorization risk, target, or risk/reward does not match the signal contract.', 'AUTHORIZATION_RISK_MISMATCH');
+  }
   return {
     ...signal,
-    evidenceLevel: signal.evidenceLevel ?? 'UNCALIBRATED_HEURISTIC',
   };
 }
 
@@ -577,7 +746,11 @@ export class FreqtradeSignalAdapter {
       }
       if (changed) await this.persist();
       return [...this.exitRecordsById.values()]
-        .filter((record) => record.status === 'PENDING' && record.signal.pair === pair)
+        .filter((record) =>
+          (record.status === 'PENDING' || record.status === 'CONFIRMED') &&
+          record.signal.pair === pair &&
+          record.signal.expiresAtMs > nowMs
+        )
         .map((record) => structuredClone(record.signal));
     });
   }

@@ -1,3 +1,5 @@
+import type { OpenSourceAdvisoryReport } from '../services/openSourceAdvisoryService';
+
 export type Candle = [number, number, number, number, number, number?]; // [timestamp?, open, high, low, close, volume] or [open, high, low, close, volume]
 
 export type FeedStatus = 'LIVE' | 'SIMULATED' | 'STALE' | 'DATA_UNAVAILABLE' | 'UNAVAILABLE' | 'VERIFIED_REALTIME';
@@ -115,7 +117,7 @@ export interface MarketFeedQuality {
   timestamp: number; // UTC ms
   ageMs: number;
   maxAgeMs?: number;
-  latencyMs: number;
+  latencyMs: number | null;
   score: number; // 0 - 100
   detailsFa: string;
 }
@@ -147,7 +149,7 @@ export interface RealOrderBookImbalance {
   error?: string;
   timestamp: number;
   ageMs: number;
-  latencyMs: number;
+  latencyMs: number | null;
   source: string;
   obiVelocity?: number | null; // Rate of change of OBI (Item 12)
   obiAcceleration?: number | null; // Second derivative of OBI (Item 12)
@@ -183,7 +185,7 @@ export interface OrderFlowFeatures {
   status?: FeedStatus; // LIVE / UNAVAILABLE (Item 11)
   timestampUtc?: number;
   ageMs?: number;
-  latencyMs?: number;
+  latencyMs?: number | null;
   source?: string;
   error?: string;
 }
@@ -203,7 +205,7 @@ export interface CanonicalExchangeFeed {
   spreadUsd?: number;
   spreadBps?: number;
   volume24hUsd?: number;
-  latencyMs: number;
+  latencyMs: number | null;
   status: FeedStatus;
   depth?: {
     bidDepthUsd0_1pct: number;
@@ -253,7 +255,7 @@ export interface FuturesPrices {
   receivedTimestampMs: number;
   isoTimeUtc: string;
   ageMs: number;
-  latencyMs: number;
+  latencyMs: number | null;
   source: string;
   status: FeedStatus;
   systemLastPrice?: number | null;
@@ -676,6 +678,7 @@ export interface SmcZone {
 }
 
 export interface AnalysisResult {
+  openSourceAdvisories?: OpenSourceAdvisoryReport;
   price: number;
   lastPrice?: number;        // Executable fill price (Last Price)
   markPrice?: number;        // Stop Loss & Liquidation Benchmark (Mark Price)
@@ -1043,7 +1046,7 @@ export interface EntryOpportunityReport {
   checkedAt: number;
 }
 
-export type MetaModelHealthState = 'HEALTHY' | 'DEGRADED' | 'SUSPENDED' | 'RETIRED';
+export type MetaModelHealthState = 'HEALTHY' | 'DEGRADED' | 'SUSPENDED' | 'RETIRED' | 'UNVALIDATED';
 export type HunterMode = 'HUNT' | 'AMBUSH' | 'EXECUTE';
 
 export interface EntryOpportunitySurfacePoint {

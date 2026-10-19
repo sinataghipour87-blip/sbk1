@@ -15,6 +15,40 @@ interface Props {
   currentPrice?: number;
 }
 
+function sourceHealthText(provenance: Record<string, unknown>, key: string): string {
+  const source = provenance[key];
+  if (typeof source !== 'object' || source === null || Array.isArray(source)) {
+    return 'جزئیات provenance موجود نیست';
+  }
+
+  const fields: string[] = [];
+  if ('status' in source && typeof source.status === 'string') fields.push(source.status);
+  if ('observedAtMs' in source && typeof source.observedAtMs === 'number' && Number.isSafeInteger(source.observedAtMs)) {
+    const ageMs = Date.now() - source.observedAtMs;
+    fields.push(ageMs >= 0 ? `سن داده: ${Math.round(ageMs / 60_000)} دقیقه` : 'زمان مشاهده نامعتبر');
+  }
+  if ('retrievedAtMs' in source && typeof source.retrievedAtMs === 'number' && Number.isSafeInteger(source.retrievedAtMs)) {
+    fields.push(`دریافت: ${new Date(source.retrievedAtMs).toLocaleTimeString('fa-IR')}`);
+  }
+  if ('latencyMs' in source && typeof source.latencyMs === 'number' && Number.isFinite(source.latencyMs)) {
+    fields.push(`تأخیر: ${Math.round(source.latencyMs)} ms`);
+  }
+  if ('error' in source && typeof source.error === 'string') fields.push(source.error);
+  if ('sources' in source && Array.isArray(source.sources)) {
+    const feeds = source.sources.flatMap((feed: unknown) => {
+      if (typeof feed !== 'object' || feed === null || Array.isArray(feed)) return [];
+      if (!('publisher' in feed) || typeof feed.publisher !== 'string' ||
+        !('status' in feed) || typeof feed.status !== 'string') return [];
+      const count = 'headlineCount' in feed && typeof feed.headlineCount === 'number'
+        ? ` (${feed.headlineCount})`
+        : '';
+      return [`${feed.publisher}: ${feed.status}${count}`];
+    });
+    if (feeds.length > 0) fields.push(feeds.join(' / '));
+  }
+  return fields.join(' · ') || 'وضعیت منبع نامشخص';
+}
+
 export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) => {
   const [data, setData] = useState<MacroCorrelationData>(() =>
     macroContextBrainService.getMacroContext(currentPrice)
@@ -29,6 +63,8 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
     macroContextBrainService.refreshLiveMacroContext().then((res) => {
       setData(res);
       setFirewallReport(newsShockFirewallService.evaluateNewsShockFirewall(null));
+    }).catch((error) => {
+      console.error('[MacroContextBrainWidget] Initial refresh failed:', error);
     });
 
     const timer = setInterval(() => {
@@ -44,8 +80,8 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
       const freshData = await macroContextBrainService.refreshLiveMacroContext();
       setData(freshData);
       setFirewallReport(newsShockFirewallService.evaluateNewsShockFirewall(null));
-    } catch {
-      // ignore
+    } catch (error) {
+      console.error('[MacroContextBrainWidget] Manual refresh failed:', error);
     } finally {
       setIsRefreshing(false);
     }
@@ -247,23 +283,29 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
                   <span className="text-[9px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">UNAVAILABLE</span>
                 )}
               </div>
+              <span className="text-[9px] text-slate-500">FRED · قیمت پایانی روزانه</span>
+              <span className="text-[9px] text-slate-600">{sourceHealthText(data.provenance, 'sp500Price')}</span>
             </div>
 
-            {/* 2. DXY */}
+            {/* 2. Dollar index proxy */}
             <div className="bg-[#041124] p-2.5 rounded-xl border border-teal-950/80 space-y-1">
-              <span className="text-[10px] text-slate-400 block font-sans">۲. شاخص دلار آمریکا (DXY):</span>
+              <span className="text-[10px] text-slate-400 block font-sans">۲. دلار گسترده (proxy؛ نه DXY):</span>
               <div className="flex items-center justify-between">
-                <span className="font-bold text-slate-100">
-                  {data.dxyStatus === 'LIVE' && data.dxyIndex !== null ? data.dxyIndex : 'UNAVAILABLE'}
+                <span className="font-bold text-amber-200">
+                  {data.broadDollarProxyStatus === 'PROXY' && data.broadDollarProxyIndex !== null
+                    ? data.broadDollarProxyIndex.toFixed(2)
+                    : 'UNAVAILABLE'}
                 </span>
-                {data.dxyStatus === 'LIVE' && data.dxyDailyChangePct !== null ? (
-                  <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold ${data.dxyDailyChangePct < 0 ? 'bg-emerald-950 text-emerald-400' : 'bg-rose-950 text-rose-400'}`}>
-                    {data.dxyDailyChangePct}%
+                {data.broadDollarProxyStatus === 'PROXY' && data.broadDollarProxyDailyChangePct !== null ? (
+                  <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold ${data.broadDollarProxyDailyChangePct < 0 ? 'bg-emerald-950 text-emerald-400' : 'bg-rose-950 text-rose-400'}`}>
+                    {data.broadDollarProxyDailyChangePct.toFixed(2)}%
                   </span>
                 ) : (
-                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">UNAVAILABLE</span>
+                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">DXY دقیق ناموجود</span>
                 )}
               </div>
+              <span className="text-[9px] text-slate-500">FRED DTWEXBGS · شاخص broad-dollar روزانه</span>
+              <span className="text-[9px] text-slate-600">{sourceHealthText(data.provenance, 'broadDollarProxy')}</span>
             </div>
 
             {/* 3. Fear & Greed */}
@@ -277,6 +319,8 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
                   {data.fearAndGreedStatus === 'LIVE' ? data.fearAndGreedLabelFa : 'قطع منبع'}
                 </span>
               </div>
+              <span className="text-[9px] text-slate-500">Alternative.me · شاخص روزانه</span>
+              <span className="text-[9px] text-slate-600">{sourceHealthText(data.provenance, 'fearAndGreedIndex')}</span>
             </div>
 
             {/* 4. ETF Flow */}
@@ -287,22 +331,31 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
                   {data.etfFlowStatus === 'LIVE' && data.spotEtfNetInflowMillionUsd !== null ? `${data.spotEtfNetInflowMillionUsd > 0 ? '+' : ''}$${data.spotEtfNetInflowMillionUsd}M` : 'UNAVAILABLE'}
                 </span>
                 <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-300">
-                  {data.etfFlowStatus === 'LIVE' ? 'جریان نهادی' : 'منبع مستقیم متصل نیست'}
+                  {data.etfFlowStatus === 'LIVE' ? 'جریان نهادی' : 'API تجمیعی رایگانِ پایدار تأیید نشده'}
                 </span>
               </div>
+              <span className="text-[9px] text-slate-600">{sourceHealthText(data.provenance, 'spotEtfNetInflowMillionUsd')}</span>
             </div>
 
-            {/* 5. Fed Expectations */}
+            {/* 5. Published Fed rate, not a rate-cut probability */}
             <div className="bg-[#041124] p-2.5 rounded-xl border border-teal-950/80 space-y-1">
-              <span className="text-[10px] text-slate-400 block font-sans">۵. احتمال کاهش نرخ بهره فدرال:</span>
+              <span className="text-[10px] text-slate-400 block font-sans">۵. نرخ منتشرشدهٔ فدرال (نه احتمال کاهش):</span>
               <div className="flex items-center justify-between">
                 <span className="font-bold text-indigo-300">
-                  {data.fedExpectationsStatus === 'LIVE' && data.fedRateCutExpectationPct !== null ? `${data.fedRateCutExpectationPct}%` : 'UNAVAILABLE'}
+                  {data.fedPublishedRateStatus === 'LIVE' && data.fedEffectiveRatePct !== null
+                    ? `${data.fedEffectiveRatePct.toFixed(2)}%`
+                    : 'UNAVAILABLE'}
                 </span>
                 <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-950 text-indigo-300">
-                  {data.fedExpectationsStatus === 'LIVE' ? 'CME FedWatch' : 'منبع مستقیم متصل نیست'}
+                  FRED · DFF
                 </span>
               </div>
+              <span className="text-[9px] text-slate-500">
+                {data.fedPublishedRateStatus === 'LIVE' && data.fedTargetUpperBoundPct !== null
+                  ? `سقف دامنهٔ هدف: ${data.fedTargetUpperBoundPct.toFixed(2)}%`
+                  : 'احتمال آیندهٔ FedWatch از API رایگان تأیید نشده'}
+              </span>
+              <span className="text-[9px] text-slate-600">{sourceHealthText(data.provenance, 'fedEffectiveRatePct')}</span>
             </div>
 
             {/* 6. News Sentiment */}
@@ -316,19 +369,26 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
                   {data.newsSentimentStatus === 'LIVE' ? 'News Engine' : 'امتیاز معتبر موجود نیست'}
                 </span>
               </div>
+              <span className="text-[9px] text-slate-600">{sourceHealthText(data.provenance, 'recentHeadlines')}</span>
             </div>
 
-            {/* 7. Whale Flow */}
+            {/* 7. On-chain activity, not labeled whale flow */}
             <div className="bg-[#041124] p-2.5 rounded-xl border border-teal-950/80 space-y-1 col-span-2">
-              <span className="text-[10px] text-slate-400 block font-sans">۷. جریان خالص نهنگ‌ها (Whale Flow):</span>
+              <span className="text-[10px] text-slate-400 block font-sans">۷. فعالیت خام شبکهٔ بیت‌کوین (نه جریان نهنگ):</span>
               <div className="flex items-center justify-between">
                 <span className="font-bold text-slate-200">
-                  {data.whaleFlowStatus === 'LIVE' && data.whaleNetflowBtc !== null ? `${data.whaleNetflowBtc > 0 ? '+' : ''}${data.whaleNetflowBtc} BTC` : 'UNAVAILABLE'}
+                  {data.bitcoinActiveAddressesStatus === 'LIVE' && data.bitcoinActiveAddresses !== null
+                    ? `${data.bitcoinActiveAddresses.toLocaleString()} آدرس فعال`
+                    : 'UNAVAILABLE'}
                 </span>
                 <span className="text-[9px] px-2 py-0.2 rounded bg-slate-800 text-slate-300 font-sans">
-                  {data.whaleFlowStatus === 'LIVE' ? (data.whaleSentiment === 'ACCUMULATION' ? 'انباشت نهنگ' : 'فشار عرضه') : 'منبع در دسترس نیست'}
+                  Coin Metrics · روزانه
                 </span>
               </div>
+              <span className="text-[9px] text-slate-500">
+                جریان خالص/انتساب نهنگ: UNAVAILABLE؛ شمارش آدرس، مالکیت صرافی را مشخص نمی‌کند.
+              </span>
+              <span className="text-[9px] text-slate-600">{sourceHealthText(data.provenance, 'bitcoinActiveAddresses')}</span>
             </div>
           </div>
 

@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+TA-Lib>=0.6,<0.7
+numpy>=1.26,<3
+pandas>=2,<4
+scikit-learn>=1.5,<2
+statsmodels>=0.14,<0.15
+lightgbm>=4.5,<5
+xgboost>=2.1,<4
+shap>=0.46,<1
+transformers>=4.45,<5
+torch>=2.5,<3

@@ -39,6 +39,7 @@ import { RootCauseAnalysisWidget } from './components/RootCauseAnalysisWidget';
 import { MacroContextBrainWidget } from './components/MacroContextBrainWidget';
 import { WhaleSignalStatisticalProofWidget } from './components/WhaleSignalStatisticalProofWidget';
 import { WhaleOnChainRadarWidget } from './components/WhaleOnChainRadarWidget';
+import { OpenSourceAdvisoryPanel } from './components/OpenSourceAdvisoryPanel';
 import { GarchRealtimeRiskWidget } from './components/GarchRealtimeRiskWidget';
 import { CrossExchangeCorrelationWidget } from './components/CrossExchangeCorrelationWidget';
 import { CvdOiMatrixWidget } from './components/CvdOiMatrixWidget';
@@ -2218,6 +2219,7 @@ export default function App() {
               {/* Tab 1: Brains */}
               {systemHubTab === 'brains' && (
                 <div className="flex flex-col gap-3">
+                  <OpenSourceAdvisoryPanel />
                   <MtfStructuralWidget analysis={analysis} />
                   <SbFiveModelsPanel
                     analysis={analysis}

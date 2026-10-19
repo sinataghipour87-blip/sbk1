@@ -252,7 +252,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                   <div>احتمال خام: <strong className="text-cyan-300">{m.rawProbabilityPct !== null ? `${m.rawProbabilityPct}٪` : 'نامشخص'}</strong></div>
                   <div>دقت OOS: <strong className="text-emerald-300">{m.historicalPrecisionPct !== null ? `${m.historicalPrecisionPct}٪` : 'UNVALIDATED'}</strong></div>
                   <div>حجم نمونه: <strong className="text-indigo-300">{m.sampleSize}</strong></div>
-                  <div>ضریب استقلال (Decorrelation): <strong className="text-amber-300">{(1 - m.correlationWithOtherModels).toFixed(2)}</strong></div>
+                  <div>ضریب استقلال (Decorrelation): <strong className="text-amber-300">{m.correlationWithOtherModels === null ? 'UNVALIDATED' : (1 - m.correlationWithOtherModels).toFixed(2)}</strong></div>
                   <div>سلامت مدل: <strong className={m.healthState === 'HEALTHY' ? 'text-emerald-300' : 'text-rose-300'}>{m.healthState}</strong></div>
                   <div>وزن پیکربندی‌شده Ensemble: <strong className="text-cyan-300">{m.healthState === 'HEALTHY' ? `${(m.effectiveWeight * 100).toFixed(1)}٪` : '۰٪ · خارج از Ensemble'}</strong></div>
                 </div>
@@ -396,12 +396,12 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                     className="flex items-center justify-between cursor-pointer"
                   >
                     <div className="flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <CheckCircle2 className={`w-4 h-4 shrink-0 ${prop.status === 'BLOCKED_UNVALIDATED' ? 'text-rose-400' : 'text-emerald-400'}`} />
                       <h5 className="text-xs font-bold text-slate-100">{prop.titleFa}</h5>
                     </div>
 
                     <div className="flex items-center gap-2">
-                      <span className="text-[9.5px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/80">
+                      <span className={`text-[9.5px] font-mono px-2 py-0.5 rounded ${prop.status === 'BLOCKED_UNVALIDATED' ? 'bg-rose-950 text-rose-300 border border-rose-800/80' : 'bg-emerald-950 text-emerald-300 border border-emerald-800/80'}`}>
                         {prop.status}
                       </span>
                       {isExpanded ? <ChevronUp className="w-3.5 h-3.5 text-slate-400" /> : <ChevronDown className="w-3.5 h-3.5 text-slate-400" />}

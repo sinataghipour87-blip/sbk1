@@ -9,7 +9,9 @@ import {
   ServerSignalRunner,
   toCandleTuple,
   type ServerSignalAuditRecord,
+  type ServerSignalRunnerDependencies,
 } from '../src/services/serverSignalRunner';
+import { SBK_ENTRY_AUTHORIZATION_VERSION } from '../src/services/freqtradeSignalAdapter';
 import type { FreqtradeMarketSnapshot } from '../src/services/freqtradeMarketDataBridge';
 import { OperationalTradeArchive } from '../src/services/operationalTradeArchive';
 import type { OperationalTradeArchiveMetadata } from '../src/services/operationalTradeArchive';
@@ -71,7 +73,7 @@ assert.equal(
 const timeframeMs = 15 * 60_000;
 let currentNowMs = candle.timestampMs + timeframeMs + 1_000;
 const snapshot: FreqtradeMarketSnapshot = {
-  contractVersion: 'sbk1.freqtrade.market-snapshot.v4',
+  contractVersion: 'sbk1.freqtrade.market-snapshot.v5',
   source: 'freqtrade.dataprovider',
   exchange: 'bybit',
   market: 'futures',
@@ -83,6 +85,7 @@ const snapshot: FreqtradeMarketSnapshot = {
   ticker: null,
   orderBook: null,
   fundingRate: null,
+  openInterest: null,
   tradeFlow: null,
 };
 const status = {
@@ -125,7 +128,7 @@ try {
   ): Promise<void> {
     await archive.recordSignalLifecycle(record, metadata);
   }
-  const dependencies = {
+  const dependencies: ServerSignalRunnerDependencies = {
     getFreqtradeStatus: async () => status,
     getOpenTrades: () => mockFreqtradeRpc.getOpenTrades(),
     getFreqtradeBalance: async () => ({ equity: 1_000, available: 100, currency: 'USDT' }),
@@ -154,6 +157,58 @@ try {
           takeProfit: candle.low,
           engineScore: 75,
           setupType: 'CONTRACT_TEST_ONLY',
+        },
+        authorization: {
+          contractVersion: SBK_ENTRY_AUTHORIZATION_VERSION,
+          decision: 'APPROVE_ENTRY',
+          snapshotId: `SNP_${snapshot.generatedAtMs}_${candle.timestampMs}`,
+          snapshotTimestampMs: snapshot.generatedAtMs,
+          evaluatedAtMs: currentNowMs,
+          timeframe: snapshot.timeframe,
+          direction: 'SHORT',
+          gates: [
+            'STAGE_1_MARKET_DATA',
+            'STAGE_2_DATA_QUALITY',
+            'STAGE_3_MARKET_REGIME',
+            'STAGE_4_HTF_STRUCTURE',
+            'STAGE_5_SETUP_DETECTION',
+            'STAGE_6_LIQUIDITY_ANALYSIS',
+            'STAGE_7_ORDER_FLOW',
+            'STAGE_8_ENTRY_TRIGGER',
+            'STAGE_9_ENTRY_PRICE',
+            'STAGE_10_STOP_INVALIDATION',
+            'STAGE_11_TP_TARGETS',
+            'STAGE_12_EXPECTED_VALUE',
+            'STAGE_13_POSITION_SIZE',
+            'STAGE_14_EXECUTION',
+          ].map((id) => ({ id, status: 'PASSED' as const, reason: 'CONTRACT_TEST_ONLY isolated authorization.' })),
+          models: [
+            {
+              id: 'M1_TEST',
+              status: 'HEALTHY' as const,
+              calibrated: true,
+              independenceValidated: true,
+              direction: 'SHORT' as const,
+              probabilityPct: 70,
+              sampleSize: 40,
+              oosPrecisionPct: 60,
+              effectiveWeight: 0.4,
+            },
+            {
+              id: 'M2_TEST',
+              status: 'HEALTHY' as const,
+              calibrated: true,
+              independenceValidated: true,
+              direction: 'SHORT' as const,
+              probabilityPct: 68,
+              sampleSize: 40,
+              oosPrecisionPct: 60,
+              effectiveWeight: 0.3,
+            },
+          ],
+          disagreementVeto: false,
+          ensembleProbabilityPct: 69.14,
+          riskRewardRatio: Math.abs(candle.close - candle.low) / Math.abs(candle.high - candle.close),
         },
         reason: 'CONTRACT_TEST_ONLY decision candidate.',
       };
@@ -308,7 +363,7 @@ try {
     now: () => currentNowMs,
   });
   await liveEnabledRunner.runOnce();
-  assert.equal(liveSubmissions, 1, 'explicitly enabled live mode can queue signals with guarded Freqtrade settings');
+  assert.equal(liveSubmissions, 0, 'the server must reject live mode even when a legacy enable flag is set');
 
   rpcOpenTrades.splice(0);
   status.openTradesCount = 0;

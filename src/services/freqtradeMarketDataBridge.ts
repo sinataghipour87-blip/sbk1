@@ -1,4 +1,4 @@
-export const FREQTRADE_MARKET_SNAPSHOT_VERSION = 'sbk1.freqtrade.market-snapshot.v4';
+export const FREQTRADE_MARKET_SNAPSHOT_VERSION = 'sbk1.freqtrade.market-snapshot.v5';
 export const FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS = 15_000;
 export const FREQTRADE_TICKER_MAX_AGE_MS = 5_000;
 export const FREQTRADE_TRADE_FLOW_MAX_AGE_MS = 5_000;

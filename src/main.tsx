@@ -49,7 +49,12 @@ if (typeof window !== 'undefined') {
 
   const interceptedFetch = async function (input: RequestInfo | URL, init?: RequestInit) {
     const url = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url);
-    if (url.includes('/api/exchange') || url.includes('/api/live') || url.includes('/api/hunter')) {
+    if (
+      url.includes('/api/exchange') ||
+      url.includes('/api/live') ||
+      url.includes('/api/hunter') ||
+      url.includes('/api/open-source-advisories')
+    ) {
         const token = localStorage.getItem('admin_token') || '';
         init = init || {};
         init.headers = init.headers || {};

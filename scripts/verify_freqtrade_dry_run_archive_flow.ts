@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   deriveSbkSignalIds,
+  SBK_ENTRY_AUTHORIZATION_VERSION,
   FreqtradeSignalAdapter,
   SBK_SIGNAL_CONTRACT_VERSION,
 } from '../src/services/freqtradeSignalAdapter';
@@ -180,6 +181,22 @@ const ids = deriveSbkSignalIds({
   stopLoss: 59_000,
   takeProfit: 62_000,
 });
+const authorizationGateIds = [
+  'STAGE_1_MARKET_DATA',
+  'STAGE_2_DATA_QUALITY',
+  'STAGE_3_MARKET_REGIME',
+  'STAGE_4_HTF_STRUCTURE',
+  'STAGE_5_SETUP_DETECTION',
+  'STAGE_6_LIQUIDITY_ANALYSIS',
+  'STAGE_7_ORDER_FLOW',
+  'STAGE_8_ENTRY_TRIGGER',
+  'STAGE_9_ENTRY_PRICE',
+  'STAGE_10_STOP_INVALIDATION',
+  'STAGE_11_TP_TARGETS',
+  'STAGE_12_EXPECTED_VALUE',
+  'STAGE_13_POSITION_SIZE',
+  'STAGE_14_EXECUTION',
+];
 const signal = {
   contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
   ...ids,
@@ -206,6 +223,29 @@ const signal = {
     maxPriceDeviationBps: 100,
   },
   riskLimits: { riskBudgetPct: 0.1, maxStakeQuote: 100, maxLeverage: 1 },
+  authorization: {
+    contractVersion: SBK_ENTRY_AUTHORIZATION_VERSION,
+    decision: 'APPROVE_ENTRY',
+    decisionId: ids.decisionId,
+    snapshotId: `SNP_${nowMs}_archive`,
+    snapshotTimestampMs: nowMs,
+    evaluatedAtMs: nowMs,
+    timeframe,
+    direction: 'LONG',
+    gates: authorizationGateIds.map((id) => ({
+      id,
+      status: 'PASSED',
+      reason: 'CONTRACT_E2E_TEST_ONLY isolated authorization.',
+    })),
+    models: [
+      { id: 'M1_TEST', status: 'HEALTHY', calibrated: true, independenceValidated: true, direction: 'LONG', probabilityPct: 70, sampleSize: 40, oosPrecisionPct: 60, effectiveWeight: 0.4 },
+      { id: 'M2_TEST', status: 'HEALTHY', calibrated: true, independenceValidated: true, direction: 'LONG', probabilityPct: 68, sampleSize: 40, oosPrecisionPct: 60, effectiveWeight: 0.3 },
+    ],
+    disagreementVeto: false,
+    ensembleProbabilityPct: 69.14,
+    riskRewardRatio: 2,
+    allocatedRiskUsd: 0.1,
+  },
 };
 
 async function startSbk1(): Promise<ChildProcess> {

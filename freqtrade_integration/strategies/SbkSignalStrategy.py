@@ -26,6 +26,7 @@ MARKET_SNAPSHOT_PUBLISH_INTERVAL_MS = 1_000
 class SbkSignalStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = os.getenv("SBK1_FREQTRADE_TIMEFRAME", "15m")
+    startup_candle_count = 300
     can_short = True
     process_only_new_candles = False
 
@@ -73,7 +74,7 @@ class SbkSignalStrategy(IStrategy):
         self._signals_by_pair = {}
         self._exit_signals = {}
         runmode = getattr(self.config.get("runmode"), "value", self.config.get("runmode"))
-        if runmode in ("dry_run", "live"):
+        if runmode == "dry_run":
             self._publish_market_snapshot(current_time)
         if not is_signal_runtime(runmode):
             return
@@ -91,7 +92,7 @@ class SbkSignalStrategy(IStrategy):
             )
             response.raise_for_status()
             payload = response.json()
-            if not isinstance(payload, dict) or payload.get("contractVersion") != "sbk1.freqtrade.signal.v1":
+            if not isinstance(payload, dict) or payload.get("contractVersion") != "sbk1.freqtrade.signal.v2":
                 logger.error("SBK1 signal bridge returned an unsupported contract response.")
                 return
             records = payload.get("signals")
@@ -965,6 +966,22 @@ class SbkSignalStrategy(IStrategy):
         trade_id = getattr(trade, "id", None)
         direction = "SHORT" if getattr(trade, "is_short", False) else "LONG"
         now_ms = int(current_time.timestamp() * 1000)
+        entry_signal = trade.get_custom_data("sbk_signal")
+        if not isinstance(entry_signal, dict):
+            entry_signal = self._signals.get(entry_tag or "")
+        entry_conditions = entry_signal.get("entryConditions") if isinstance(entry_signal, dict) else None
+        take_profit = entry_conditions.get("takeProfit") if isinstance(entry_conditions, dict) else None
+        if (
+            isinstance(take_profit, (int, float))
+            and not isinstance(take_profit, bool)
+            and math.isfinite(take_profit)
+            and take_profit > 0
+            and math.isfinite(current_rate)
+            and current_rate > 0
+            and ((direction == "LONG" and current_rate >= take_profit)
+                 or (direction == "SHORT" and current_rate <= take_profit))
+        ):
+            return "sbk_take_profit"
         for exit_id, signal in self._exit_signals.items():
             if (
                 exit_id not in self._consumed_exit_ids
@@ -991,6 +1008,22 @@ class SbkSignalStrategy(IStrategy):
     ) -> bool:
         if exit_reason in ("stop_loss", "stoploss_on_exchange", "emergency_exit", "force_exit"):
             return True
+        if exit_reason == "sbk_take_profit":
+            entry_signal = trade.get_custom_data("sbk_signal")
+            entry_conditions = entry_signal.get("entryConditions") if isinstance(entry_signal, dict) else None
+            take_profit = entry_conditions.get("takeProfit") if isinstance(entry_conditions, dict) else None
+            return (
+                isinstance(take_profit, (int, float))
+                and not isinstance(take_profit, bool)
+                and math.isfinite(take_profit)
+                and take_profit > 0
+                and math.isfinite(rate)
+                and rate > 0
+                and (
+                    (not trade.is_short and rate >= take_profit)
+                    or (trade.is_short and rate <= take_profit)
+                )
+            )
         if not exit_reason.startswith("sbk_exit_") and exit_reason != "exit_signal":
             return False
         entry_tag = getattr(trade, "enter_tag", None)

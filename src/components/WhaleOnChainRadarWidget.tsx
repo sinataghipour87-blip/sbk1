@@ -13,6 +13,8 @@ export interface WhaleTransfer {
 
 export interface WhaleRadarData {
   status?: 'LIVE' | 'UNAVAILABLE';
+  bitcoinActiveAddresses?: number | null;
+  bitcoinActiveAddressesStatus?: 'LIVE' | 'UNAVAILABLE';
   exchangeNetflowBtc: number | null;
   exchangeReserveBtc: number | null;
   reserveStatus: string;
@@ -33,9 +35,23 @@ export const WhaleOnChainRadarWidget: React.FC = () => {
       if (res.ok) {
         const json = await res.json();
         setData(json);
+      } else {
+        throw new Error(`Whale radar returned HTTP ${res.status}.`);
       }
-    } catch {
-      // ignore
+    } catch (error) {
+      console.error('[WhaleOnChainRadarWidget] Could not load on-chain activity:', error);
+      setData({
+        status: 'UNAVAILABLE',
+        bitcoinActiveAddresses: null,
+        bitcoinActiveAddressesStatus: 'UNAVAILABLE',
+        exchangeNetflowBtc: null,
+        exchangeReserveBtc: null,
+        reserveStatus: 'UNAVAILABLE',
+        whalePressureIndex: null,
+        whaleSentiment: null,
+        summary: 'دریافت دادهٔ شبکه ناموفق بود؛ اطلاعات نهنگ/جریان صرافی در دسترس نیست.',
+        recentWhaleTransfers: [],
+      });
     } finally {
       setLoading(false);
     }
@@ -57,8 +73,8 @@ export const WhaleOnChainRadarWidget: React.FC = () => {
             <Waves className="w-5 h-5 animate-pulse" />
           </div>
           <div>
-            <h3 className="text-base font-bold text-slate-100">رادار آن‌چین و ردپای نهنگ‌ها (Whale & Netflow Radar)</h3>
-            <p className="text-xs text-slate-400 mt-0.5">پایش جریان خروجی/ورودی بیت‌کوین صرافی‌ها و جابه‌جایی‌های بالای ۱۰ میلیون دلار</p>
+            <h3 className="text-base font-bold text-slate-100">فعالیت شبکهٔ بیت‌کوین و وضعیت دادهٔ نهنگ</h3>
+            <p className="text-xs text-slate-400 mt-0.5">آدرس‌های فعال دادهٔ شبکه‌اند؛ مالکیت صرافی یا جریان نهنگ را اثبات نمی‌کنند.</p>
           </div>
         </div>
 
@@ -77,16 +93,25 @@ export const WhaleOnChainRadarWidget: React.FC = () => {
           <div className="p-4 rounded-xl bg-slate-950/80 border border-amber-500/30 text-center space-y-2">
             <div className="flex items-center justify-center gap-2 text-amber-400 font-bold text-sm">
               <AlertCircle className="w-4 h-4" />
-              <span>وضعیت داده‌های آن‌چین: UNAVAILABLE</span>
+              <span>وضعیت داده‌های شبکه: UNAVAILABLE</span>
             </div>
             <p className="text-xs text-slate-400">
-              ارتباط با منبع زنده رادار آن‌چین و ردیاب نهنگ‌ها در دسترس نیست. جهت حفظ سلامت تصمیم‌گیری، هیچ داده فرضی یا ساختگی نمایش داده نمی‌شود.
+              شمارش آدرس‌های فعال از منبع فعلی در دسترس نیست. جریان صرافی/نهنگ نیز بدون انتساب آدرس معتبر، ناموجود باقی می‌ماند.
             </p>
           </div>
         ) : (
           <>
             {/* Top Summary Metric Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+              <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-1">
+                <span className="text-[11px] font-medium text-slate-400">آدرس‌های فعال روزانهٔ BTC</span>
+                <div className="text-lg font-bold text-cyan-300">
+                  {data?.bitcoinActiveAddressesStatus === 'LIVE' && typeof data.bitcoinActiveAddresses === 'number'
+                    ? data.bitcoinActiveAddresses.toLocaleString()
+                    : 'UNAVAILABLE'}
+                </div>
+                <div className="text-[10px] text-slate-500">Coin Metrics Community · فعالیت خام شبکه</div>
+              </div>
               {/* Netflow Card */}
               <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-1">
                 <span className="text-[11px] font-medium text-slate-400">جریان خالص صرافی‌ها (Netflow)</span>

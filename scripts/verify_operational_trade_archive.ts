@@ -6,6 +6,7 @@ import { OperationalTradeArchive } from '../src/services/operationalTradeArchive
 import {
   deriveSbkSignalIds,
   DRY_RUN_FIXTURE_SETUP_PREFIX,
+  SBK_ENTRY_AUTHORIZATION_VERSION,
   SBK_SIGNAL_CONTRACT_VERSION,
   validateSbkFreqtradeSignal,
   type SbkFreqtradeSignalRecord,
@@ -26,6 +27,7 @@ function makeSignal(nowMs: number, setupType = 'AUDITABLE_SETUP') {
     stopLoss: 59_000,
     takeProfit: 62_000,
   });
+  const isFixture = setupType.startsWith(DRY_RUN_FIXTURE_SETUP_PREFIX);
   return validateSbkFreqtradeSignal({
     contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
     ...ids,
@@ -52,6 +54,42 @@ function makeSignal(nowMs: number, setupType = 'AUDITABLE_SETUP') {
       maxPriceDeviationBps: 100,
     },
     riskLimits: { riskBudgetPct: 0.1, maxStakeQuote: 100, maxLeverage: 1 },
+    authorization: {
+      contractVersion: SBK_ENTRY_AUTHORIZATION_VERSION,
+      decision: isFixture ? 'DRY_RUN_TEST_ONLY' : 'APPROVE_ENTRY',
+      decisionId: ids.decisionId,
+      snapshotId: `SNP_${nowMs}_archive`,
+      snapshotTimestampMs: nowMs,
+      evaluatedAtMs: nowMs,
+      timeframe: '15m',
+      direction: 'LONG',
+      gates: isFixture
+        ? [{ id: 'DRY_RUN_FIXTURE', status: 'PASSED', reason: 'Isolated archive fixture.' }]
+        : [
+          'STAGE_1_MARKET_DATA',
+          'STAGE_2_DATA_QUALITY',
+          'STAGE_3_MARKET_REGIME',
+          'STAGE_4_HTF_STRUCTURE',
+          'STAGE_5_SETUP_DETECTION',
+          'STAGE_6_LIQUIDITY_ANALYSIS',
+          'STAGE_7_ORDER_FLOW',
+          'STAGE_8_ENTRY_TRIGGER',
+          'STAGE_9_ENTRY_PRICE',
+          'STAGE_10_STOP_INVALIDATION',
+          'STAGE_11_TP_TARGETS',
+          'STAGE_12_EXPECTED_VALUE',
+          'STAGE_13_POSITION_SIZE',
+          'STAGE_14_EXECUTION',
+        ].map((id) => ({ id, status: 'PASSED', reason: 'Isolated archive contract evidence.' })),
+      models: isFixture ? [] : [
+        { id: 'M1', status: 'HEALTHY', calibrated: true, independenceValidated: true, direction: 'LONG', probabilityPct: 70, sampleSize: 40, oosPrecisionPct: 60, effectiveWeight: 0.4 },
+        { id: 'M2', status: 'HEALTHY', calibrated: true, independenceValidated: true, direction: 'LONG', probabilityPct: 68, sampleSize: 40, oosPrecisionPct: 60, effectiveWeight: 0.3 },
+      ],
+      disagreementVeto: false,
+      ensembleProbabilityPct: isFixture ? null : 69.14,
+      riskRewardRatio: 2,
+      allocatedRiskUsd: 0.1,
+    },
   }, { nowMs });
 }
 

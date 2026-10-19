@@ -11,6 +11,9 @@ export interface DirectNewsSourceStatus {
   endpoint: string;
   status: 'LIVE' | 'UNAVAILABLE';
   retrievedAtMs: number | null;
+  latencyMs: number | null;
+  ageMs: number | null;
+  headlineCount: number;
   error?: string;
 }
 
@@ -103,6 +106,7 @@ export async function fetchDirectNewsHeadlines(
     sourceStatus: DirectNewsSourceStatus;
     headlines: DirectNewsHeadline[];
   }> => {
+    const startedAtMs = Date.now();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -115,12 +119,16 @@ export async function fetchDirectNewsHeadlines(
       const xml = await response.text();
       if (!/<rss\b|<rdf:RDF\b/i.test(xml)) throw new Error('Response is not an RSS or RDF feed.');
       const headlines = parseHeadlines(xml, source, nowMs);
+      const retrievedAtMs = Date.now();
       return {
         sourceStatus: {
           publisher: source.publisher,
           endpoint: source.endpoint,
           status: 'LIVE',
-          retrievedAtMs: Date.now(),
+          retrievedAtMs,
+          latencyMs: Math.max(0, retrievedAtMs - startedAtMs),
+          ageMs: 0,
+          headlineCount: headlines.length,
         },
         headlines,
       };
@@ -131,6 +139,9 @@ export async function fetchDirectNewsHeadlines(
           endpoint: source.endpoint,
           status: 'UNAVAILABLE',
           retrievedAtMs: null,
+          latencyMs: Math.max(0, Date.now() - startedAtMs),
+          ageMs: null,
+          headlineCount: 0,
           error: error instanceof Error ? error.message : String(error),
         },
         headlines: [],
@@ -152,6 +163,11 @@ export async function fetchDirectNewsHeadlines(
     status: uniqueHeadlines.length > 0 ? 'LIVE' : 'UNAVAILABLE',
     retrievedAtMs,
     headlines: uniqueHeadlines,
-    sources: results.map((result) => result.sourceStatus),
+    sources: results.map((result) => ({
+      ...result.sourceStatus,
+      ageMs: result.sourceStatus.retrievedAtMs === null
+        ? null
+        : Math.max(0, Date.now() - result.sourceStatus.retrievedAtMs),
+    })),
   };
 }

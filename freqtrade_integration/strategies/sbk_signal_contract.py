@@ -1,11 +1,13 @@
 import ipaddress
 import math
+import os
 import re
 from typing import Any
 from urllib.parse import urlsplit
 
 
-SIGNAL_CONTRACT_VERSION = "sbk1.freqtrade.signal.v1"
+SIGNAL_CONTRACT_VERSION = "sbk1.freqtrade.signal.v2"
+ENTRY_AUTHORIZATION_VERSION = "sbk1.entry.authorization.v1"
 DRY_RUN_FIXTURE_SETUP_PREFIX = "DRY_RUN_E2E_FIXTURE_"
 _SIGNAL_ID_PATTERN = re.compile(r"^sbk1_[a-f0-9]{32}$")
 _EXIT_SIGNAL_ID_PATTERN = re.compile(r"^sbk1_exit_[a-f0-9]{32}$")
@@ -56,7 +58,7 @@ def validate_bridge_url(value: str) -> str:
 
 
 def is_signal_runtime(runmode: str) -> bool:
-    return runmode in ("dry_run", "live")
+    return runmode == "dry_run"
 
 
 def is_valid_sbk_exit_signal(
@@ -136,7 +138,8 @@ def is_valid_sbk_signal(
     data_quality = signal.get("dataQuality")
     entry_conditions = signal.get("entryConditions")
     risk_limits = signal.get("riskLimits")
-    if not all(isinstance(section, dict) for section in (data_quality, entry_conditions, risk_limits)):
+    authorization = signal.get("authorization")
+    if not all(isinstance(section, dict) for section in (data_quality, entry_conditions, risk_limits, authorization)):
         return False
     is_dry_run_fixture = (
         isinstance(entry_conditions.get("setupType"), str)
@@ -159,14 +162,35 @@ def is_valid_sbk_signal(
     expires_at_ms = signal.get("expiresAtMs")
     observed_at_ms = data_quality.get("observedAtMs")
     max_age_ms = data_quality.get("maxAgeMs")
+    snapshot_timestamp_ms = authorization.get("snapshotTimestampMs")
+    evaluated_at_ms = authorization.get("evaluatedAtMs")
     if any(
         not isinstance(value, int) or isinstance(value, bool)
-        for value in (generated_at_ms, expires_at_ms, observed_at_ms, max_age_ms)
+        for value in (
+            generated_at_ms,
+            expires_at_ms,
+            observed_at_ms,
+            max_age_ms,
+            snapshot_timestamp_ms,
+            evaluated_at_ms,
+        )
     ):
         return False
 
     if (
         signal.get("contractVersion") != SIGNAL_CONTRACT_VERSION
+        or authorization.get("contractVersion") != ENTRY_AUTHORIZATION_VERSION
+        or authorization.get("decisionId") != decision_id
+        or authorization.get("timeframe") != signal.get("timeframe")
+        or authorization.get("direction") != signal.get("direction")
+        or authorization.get("snapshotTimestampMs") != observed_at_ms
+        or snapshot_timestamp_ms > now_ms + 1_000
+        or (require_fresh and now_ms - snapshot_timestamp_ms > maximum_data_age_ms)
+        or evaluated_at_ms < snapshot_timestamp_ms
+        or evaluated_at_ms > now_ms + 1_000
+        or (require_fresh and now_ms - evaluated_at_ms > maximum_signal_age_ms)
+        or not isinstance(authorization.get("snapshotId"), str)
+        or not re.fullmatch(r"SNP_[A-Za-z0-9:_-]{1,128}", authorization["snapshotId"])
         or not isinstance(signal.get("exchange"), str)
         or signal["exchange"].lower() != expected_exchange.lower()
         or signal.get("market") != expected_market
@@ -238,6 +262,126 @@ def is_valid_sbk_signal(
     reward_distance = abs(take_profit - entry_price)
     entry_deviation_bps = abs(entry_price - reference_price) / reference_price * 10_000
     if reward_distance < risk_distance or entry_deviation_bps > max_price_deviation_bps:
+        return False
+
+    calculated_risk_reward = reward_distance / risk_distance
+    allocated_risk = authorization.get("allocatedRiskUsd")
+    if (
+        not _positive_number(authorization.get("riskRewardRatio"))
+        or abs(authorization["riskRewardRatio"] - calculated_risk_reward) > 0.01
+        or authorization["riskRewardRatio"] < 1
+        or not _positive_number(allocated_risk)
+        or allocated_risk > max_stake_quote * risk_budget_pct / 100 + 0.01
+    ):
+        return False
+
+    authorization_decision = authorization.get("decision")
+    models = authorization.get("models")
+    gates = authorization.get("gates")
+    if not isinstance(models, list) or not isinstance(gates, list):
+        return False
+    if authorization_decision == "DRY_RUN_TEST_ONLY":
+        return (
+            is_dry_run_fixture
+            and os.getenv("SBK1_DRY_RUN_FIXTURE_ENABLED") == "true"
+            and models == []
+            and authorization.get("disagreementVeto") is False
+            and authorization.get("ensembleProbabilityPct") is None
+        )
+    if authorization_decision != "APPROVE_ENTRY" or is_dry_run_fixture:
+        return False
+
+    required_gate_ids = {
+        "STAGE_1_MARKET_DATA",
+        "STAGE_2_DATA_QUALITY",
+        "STAGE_3_MARKET_REGIME",
+        "STAGE_4_HTF_STRUCTURE",
+        "STAGE_5_SETUP_DETECTION",
+        "STAGE_6_LIQUIDITY_ANALYSIS",
+        "STAGE_7_ORDER_FLOW",
+        "STAGE_8_ENTRY_TRIGGER",
+        "STAGE_9_ENTRY_PRICE",
+        "STAGE_10_STOP_INVALIDATION",
+        "STAGE_11_TP_TARGETS",
+        "STAGE_12_EXPECTED_VALUE",
+        "STAGE_13_POSITION_SIZE",
+        "STAGE_14_EXECUTION",
+    }
+    gate_ids = []
+    for gate in gates:
+        if (
+            not isinstance(gate, dict)
+            or not isinstance(gate.get("id"), str)
+            or not gate["id"]
+            or gate.get("status") != "PASSED"
+            or not isinstance(gate.get("reason"), str)
+            or not gate["reason"].strip()
+        ):
+            return False
+        gate_ids.append(gate["id"])
+    if len(gate_ids) != len(set(gate_ids)) or not required_gate_ids.issubset(set(gate_ids)):
+        return False
+
+    if authorization.get("disagreementVeto") is not False:
+        return False
+    model_ids = []
+    eligible_models = []
+    for model in models:
+        if not isinstance(model, dict):
+            return False
+        model_id = model.get("id")
+        status = model.get("status")
+        calibrated = model.get("calibrated")
+        independence_validated = model.get("independenceValidated")
+        direction = model.get("direction")
+        probability = model.get("probabilityPct")
+        sample_size = model.get("sampleSize")
+        precision = model.get("oosPrecisionPct")
+        weight = model.get("effectiveWeight")
+        if (
+            not isinstance(model_id, str)
+            or not model_id
+            or status not in ("HEALTHY", "DEGRADED", "SUSPENDED", "RETIRED", "UNAVAILABLE", "UNVALIDATED")
+            or not isinstance(calibrated, bool)
+            or not isinstance(independence_validated, bool)
+            or direction not in ("LONG", "SHORT", "NEUTRAL")
+            or not isinstance(sample_size, int)
+            or isinstance(sample_size, bool)
+            or sample_size < 0
+            or not _finite_number(weight)
+            or weight < 0
+            or (probability is not None and (
+                not _finite_number(probability) or not 0 <= probability <= 100
+            ))
+            or (precision is not None and (
+                not _finite_number(precision) or not 0 <= precision <= 100
+            ))
+            or ((status != "HEALTHY" or not calibrated or not independence_validated) and weight != 0)
+        ):
+            return False
+        model_ids.append(model_id)
+        if (
+            status == "HEALTHY"
+            and calibrated
+            and independence_validated
+            and direction == signal["direction"]
+            and _finite_number(probability)
+            and isinstance(sample_size, int)
+            and sample_size >= 35
+            and _finite_number(precision)
+            and precision >= 55
+            and weight > 0
+        ):
+            eligible_models.append(model)
+    if len(model_ids) != len(set(model_ids)) or len(eligible_models) < 2:
+        return False
+
+    ensemble_probability = authorization.get("ensembleProbabilityPct")
+    if (
+        not _finite_number(ensemble_probability)
+        or not 55 <= ensemble_probability <= 100
+        or authorization.get("direction") != signal["direction"]
+    ):
         return False
 
     return True

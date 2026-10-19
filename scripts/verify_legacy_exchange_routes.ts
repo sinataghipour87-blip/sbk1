@@ -88,13 +88,18 @@ try {
     status?: string;
     exchangeNetflowBtc?: number | null;
     whalePressureIndex?: number | null;
-    provenance?: { retrievedAtMs?: number | null; sources?: unknown[] };
+    bitcoinActiveAddressesStatus?: string;
+    provenance?: {
+      exchangeNetflowBtc?: { status?: string; provider?: string };
+      bitcoinActiveAddresses?: { status?: string; retrievedAtMs?: number | null };
+    };
   };
   assert.equal(whale.status, 'UNAVAILABLE');
   assert.equal(whale.exchangeNetflowBtc, null);
   assert.equal(whale.whalePressureIndex, null);
-  assert.equal(whale.provenance?.retrievedAtMs, null);
-  assert.deepEqual(whale.provenance?.sources, []);
+  assert.equal(whale.bitcoinActiveAddressesStatus, 'UNAVAILABLE');
+  assert.equal(whale.provenance?.exchangeNetflowBtc?.status, 'UNAVAILABLE');
+  assert.equal(whale.provenance?.bitcoinActiveAddresses?.retrievedAtMs, null);
 
   const macroResponse = await fetch(`${baseUrl}/api/macro-context`);
   const macro = await macroResponse.json() as {
@@ -111,7 +116,7 @@ try {
     newsSentimentScore?: number | null;
     whaleFlowStatus?: string;
     whaleNetflowBtc?: number | null;
-    provenance?: Record<string, { status?: string; provider?: string; retrievedAtMs?: number | null }>;
+    provenance?: Record<string, { status?: string; provider?: string; retrievedAtMs?: number | null; reason?: string }>;
   };
   assert.equal(macro.sourceGrounding, 'UNAVAILABLE');
   assert.equal(macro.sp500Status, 'UNAVAILABLE');
@@ -128,8 +133,10 @@ try {
   assert.equal(macro.whaleNetflowBtc, null);
   assert.equal(macro.provenance?.sp500Price.status, 'UNAVAILABLE');
   assert.equal(macro.provenance?.sp500Price.retrievedAtMs, null);
-  assert.equal(macro.provenance?.newsSentimentScore.provider, 'NOT_CONFIGURED');
-  assert.equal(macro.provenance?.whaleNetflowBtc.provider, 'NOT_CONFIGURED');
+  assert.equal(macro.provenance?.newsSentimentScore.provider, 'DERIVED_SENTIMENT_NOT_CONFIGURED');
+  assert.equal(macro.provenance?.whaleNetflowBtc.provider, 'NO_VERIFIED_FREE_EXCHANGE_WALLET_ATTRIBUTION');
+  assert.equal(macro.provenance?.dxyIndex?.status, 'UNAVAILABLE');
+  assert.equal(macro.provenance?.broadDollarProxy?.provider, 'FRED');
 
   const sentimentResponse = await fetch(`${baseUrl}/api/sentiment`, { method: 'POST' });
   const sentiment = await sentimentResponse.json() as {
@@ -160,6 +167,32 @@ try {
   assert.match(unknownApiResponse.headers.get('content-type') || '', /application\/json/);
   const unknownApiBody = await unknownApiResponse.json() as { code?: string };
   assert.equal(unknownApiBody.code, 'API_ROUTE_NOT_FOUND');
+
+  const manualEntryResponse = await fetch(`${baseUrl}/api/hunter/execute`, {
+    method: 'POST',
+    headers: {
+      'x-admin-token': adminToken,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ signal: { direction: 'LONG' } }),
+  });
+  assert.equal(manualEntryResponse.status, 410);
+  const manualEntry = await manualEntryResponse.json() as { accepted?: boolean; code?: string };
+  assert.equal(manualEntry.accepted, false);
+  assert.equal(manualEntry.code, 'LEGACY_ENTRY_PATH_DISABLED');
+
+  const liveModeResponse = await fetch(`${baseUrl}/api/execution/mode`, {
+    method: 'POST',
+    headers: {
+      'x-admin-token': adminToken,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ mode: 'LIVE' }),
+  });
+  assert.equal(liveModeResponse.status, 409);
+  const liveMode = await liveModeResponse.json() as { success?: boolean; error?: string };
+  assert.equal(liveMode.success, false);
+  assert.match(liveMode.error || '', /LIVE.*غیرفعال/);
 
   const blockedRequests: Array<{ method: string; path: string; body?: object }> = [
     { method: 'POST', path: '/api/exchange/credentials', body: { apiKey: 'test', apiSecret: 'test' } },

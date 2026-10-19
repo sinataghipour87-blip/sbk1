@@ -47,6 +47,7 @@ const snapshot = {
     asks: [{ price: 60_101, amount: 1 }],
   },
   fundingRate: { retrievedAtMs: nowMs - 500, rate: -0.0001, nextFundingAtMs: nowMs + 3_600_000 },
+  openInterest: null,
   tradeFlow: {
     retrievedAtMs: nowMs - 100,
     trades: [{ timestampMs: nowMs - 200, side: 'buy', price: 60_100, amount: 0.01 }],

@@ -1,4 +1,4 @@
-#!/workspaces/sbk1/.venv/bin/python
+#!/workspaces/sbk1/freqtrade/../.venv/bin/python
 import sys
 from freqtrade.main import main
 if __name__ == '__main__':

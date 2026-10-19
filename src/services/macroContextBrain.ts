@@ -7,7 +7,7 @@
  * وضعیت دقیقاً UNAVAILABLE نمایش داده می‌شود و از هرگونه داده ساختگی جلوگیری به عمل می‌آید.
  */
 
-export type MetricDataStatus = 'LIVE' | 'UNKNOWN' | 'UNAVAILABLE';
+export type MetricDataStatus = 'LIVE' | 'PROXY' | 'UNKNOWN' | 'UNAVAILABLE';
 
 export interface BitcoinNewsItem {
   id: string;
@@ -32,6 +32,9 @@ export interface MacroCorrelationData {
   dxyStatus: MetricDataStatus;
   dxyIndex: number | null;
   dxyDailyChangePct: number | null;
+  broadDollarProxyStatus: MetricDataStatus;
+  broadDollarProxyIndex: number | null;
+  broadDollarProxyDailyChangePct: number | null;
 
   // 3. Fear & Greed
   fearAndGreedStatus: MetricDataStatus;
@@ -45,6 +48,9 @@ export interface MacroCorrelationData {
   // 5. Fed Expectations
   fedExpectationsStatus: MetricDataStatus;
   fedRateCutExpectationPct: number | null;
+  fedPublishedRateStatus: MetricDataStatus;
+  fedEffectiveRatePct: number | null;
+  fedTargetUpperBoundPct: number | null;
 
   // 6. News Sentiment
   newsSentimentStatus: MetricDataStatus;
@@ -57,6 +63,8 @@ export interface MacroCorrelationData {
   whaleNetflowBtc: number | null;
   whalePressureIndex: number | null;
   whaleSentiment: 'ACCUMULATION' | 'DISTRIBUTION' | 'NEUTRAL' | 'UNKNOWN' | null;
+  bitcoinActiveAddressesStatus: MetricDataStatus;
+  bitcoinActiveAddresses: number | null;
 
   // Macro & Correlation Filters
   btcCorrelationWithSP500: number | null;
@@ -86,6 +94,9 @@ function createDefaultUnavailableState(): MacroCorrelationData {
     dxyStatus: 'UNAVAILABLE',
     dxyIndex: null,
     dxyDailyChangePct: null,
+    broadDollarProxyStatus: 'UNAVAILABLE',
+    broadDollarProxyIndex: null,
+    broadDollarProxyDailyChangePct: null,
 
     fearAndGreedStatus: 'UNAVAILABLE',
     fearAndGreedIndex: null,
@@ -96,6 +107,9 @@ function createDefaultUnavailableState(): MacroCorrelationData {
 
     fedExpectationsStatus: 'UNAVAILABLE',
     fedRateCutExpectationPct: null,
+    fedPublishedRateStatus: 'UNAVAILABLE',
+    fedEffectiveRatePct: null,
+    fedTargetUpperBoundPct: null,
 
     newsSentimentStatus: 'UNAVAILABLE',
     newsSentimentScore: null,
@@ -106,6 +120,8 @@ function createDefaultUnavailableState(): MacroCorrelationData {
     whaleNetflowBtc: null,
     whalePressureIndex: null,
     whaleSentiment: 'UNKNOWN',
+    bitcoinActiveAddressesStatus: 'UNAVAILABLE',
+    bitcoinActiveAddresses: null,
 
     btcCorrelationWithSP500: null,
     btcCorrelationWithDXY: null,
@@ -138,7 +154,9 @@ export class MacroContextBrainService {
     // Automatically trigger background refresh if stale (> 60s)
     const now = Date.now();
     if (!this.isFetching && now - this.lastFetchTimestamp > 60000) {
-      this.refreshLiveMacroContext().catch(() => {});
+      this.refreshLiveMacroContext().catch((error) => {
+        console.error('[MacroContextBrain] Background refresh failed:', error);
+      });
     }
     return this.currentData;
   }
@@ -153,6 +171,7 @@ export class MacroContextBrainService {
       });
 
       if (!res.ok) {
+        console.error(`[MacroContextBrain] /api/macro-context returned HTTP ${res.status}.`);
         this.currentData = createDefaultUnavailableState();
         return this.currentData;
       }
@@ -160,6 +179,21 @@ export class MacroContextBrainService {
       const json = await res.json();
       const now = Date.now();
       this.lastFetchTimestamp = now;
+      const provenance = typeof json.provenance === 'object' && json.provenance !== null
+        ? json.provenance as Record<string, unknown>
+        : {};
+      const hasFreshMetricProvenance = (key: string, maxAgeMs: number): boolean => {
+        const item = provenance[key];
+        if (typeof item !== 'object' || item === null || !('status' in item) || item.status !== 'LIVE') return false;
+        const timestampMs = 'observedAtMs' in item && typeof item.observedAtMs === 'number'
+          ? item.observedAtMs
+          : 'retrievedAtMs' in item && typeof item.retrievedAtMs === 'number'
+            ? item.retrievedAtMs
+            : null;
+        if (timestampMs === null || !Number.isSafeInteger(timestampMs)) return false;
+        const ageMs = now - timestampMs;
+        return ageMs >= 0 && ageMs <= maxAgeMs;
+      };
 
       // Extract and validate all 7 metrics with zero fallback to hardcoded mock values
       const sp500Status: MetricDataStatus = json.sp500Status === 'LIVE' &&
@@ -167,7 +201,8 @@ export class MacroContextBrainService {
         Number.isFinite(json.sp500Price) &&
         json.sp500Price > 0 &&
         typeof json.sp500DailyChangePct === 'number' &&
-        Number.isFinite(json.sp500DailyChangePct)
+        Number.isFinite(json.sp500DailyChangePct) &&
+        hasFreshMetricProvenance('sp500Price', 5 * 24 * 60 * 60_000)
         ? 'LIVE'
         : 'UNAVAILABLE';
       const sp500Price = sp500Status === 'LIVE' ? json.sp500Price : null;
@@ -178,17 +213,32 @@ export class MacroContextBrainService {
         Number.isFinite(json.dxyIndex) &&
         json.dxyIndex > 0 &&
         typeof json.dxyDailyChangePct === 'number' &&
-        Number.isFinite(json.dxyDailyChangePct)
+        Number.isFinite(json.dxyDailyChangePct) &&
+        hasFreshMetricProvenance('dxyIndex', 5 * 24 * 60 * 60_000)
         ? 'LIVE'
         : 'UNAVAILABLE';
       const dxyIndex = dxyStatus === 'LIVE' ? json.dxyIndex : null;
       const dxyDailyChangePct = dxyStatus === 'LIVE' ? json.dxyDailyChangePct : null;
+      const broadDollarProxyStatus: MetricDataStatus = json.broadDollarProxyStatus === 'LIVE' &&
+        typeof json.broadDollarProxyIndex === 'number' &&
+        Number.isFinite(json.broadDollarProxyIndex) &&
+        json.broadDollarProxyIndex > 0 &&
+        typeof json.broadDollarProxyDailyChangePct === 'number' &&
+        Number.isFinite(json.broadDollarProxyDailyChangePct) &&
+        hasFreshMetricProvenance('broadDollarProxy', 5 * 24 * 60 * 60_000)
+        ? 'PROXY'
+        : 'UNAVAILABLE';
+      const broadDollarProxyIndex = broadDollarProxyStatus === 'PROXY' ? json.broadDollarProxyIndex : null;
+      const broadDollarProxyDailyChangePct = broadDollarProxyStatus === 'PROXY'
+        ? json.broadDollarProxyDailyChangePct
+        : null;
 
       const fearAndGreedStatus: MetricDataStatus = json.fearAndGreedStatus === 'LIVE' &&
         typeof json.fearAndGreedIndex === 'number' &&
         Number.isInteger(json.fearAndGreedIndex) &&
         json.fearAndGreedIndex >= 0 &&
-        json.fearAndGreedIndex <= 100
+        json.fearAndGreedIndex <= 100 &&
+        hasFreshMetricProvenance('fearAndGreedIndex', 36 * 60 * 60_000)
         ? 'LIVE'
         : 'UNAVAILABLE';
       const fearAndGreedIndex = fearAndGreedStatus === 'LIVE' ? json.fearAndGreedIndex : null;
@@ -196,7 +246,8 @@ export class MacroContextBrainService {
 
       const etfFlowStatus: MetricDataStatus = json.etfFlowStatus === 'LIVE' &&
         typeof json.spotEtfNetInflowMillionUsd === 'number' &&
-        Number.isFinite(json.spotEtfNetInflowMillionUsd)
+        Number.isFinite(json.spotEtfNetInflowMillionUsd) &&
+        hasFreshMetricProvenance('spotEtfNetInflowMillionUsd', 3 * 24 * 60 * 60_000)
         ? 'LIVE'
         : 'UNAVAILABLE';
       const spotEtfNetInflowMillionUsd = etfFlowStatus === 'LIVE' ? json.spotEtfNetInflowMillionUsd : null;
@@ -205,10 +256,24 @@ export class MacroContextBrainService {
         typeof json.fedRateCutExpectationPct === 'number' &&
         Number.isFinite(json.fedRateCutExpectationPct) &&
         json.fedRateCutExpectationPct >= 0 &&
-        json.fedRateCutExpectationPct <= 100
+        json.fedRateCutExpectationPct <= 100 &&
+        hasFreshMetricProvenance('fedRateCutExpectationPct', 24 * 60 * 60_000)
         ? 'LIVE'
         : 'UNAVAILABLE';
       const fedRateCutExpectationPct = fedExpectationsStatus === 'LIVE' ? json.fedRateCutExpectationPct : null;
+      const fedPublishedRateStatus: MetricDataStatus = json.fedPublishedRateStatus === 'LIVE' &&
+        typeof json.fedEffectiveRatePct === 'number' &&
+        Number.isFinite(json.fedEffectiveRatePct) &&
+        hasFreshMetricProvenance('fedEffectiveRatePct', 5 * 24 * 60 * 60_000)
+        ? 'LIVE'
+        : 'UNAVAILABLE';
+      const fedEffectiveRatePct = fedPublishedRateStatus === 'LIVE' ? json.fedEffectiveRatePct : null;
+      const fedTargetUpperBoundPct = fedPublishedRateStatus === 'LIVE' &&
+        typeof json.fedTargetUpperBoundPct === 'number' &&
+        Number.isFinite(json.fedTargetUpperBoundPct) &&
+        hasFreshMetricProvenance('fedTargetUpperBoundPct', 5 * 24 * 60 * 60_000)
+        ? json.fedTargetUpperBoundPct
+        : null;
 
       const recentHeadlines: BitcoinNewsItem[] = Array.isArray(json.recentHeadlines)
         ? json.recentHeadlines.filter((item: unknown): item is BitcoinNewsItem =>
@@ -229,7 +294,11 @@ export class MacroContextBrainService {
         )
         : [];
       const newsHeadlinesStatus: MetricDataStatus =
-        json.newsHeadlinesStatus === 'LIVE' && recentHeadlines.length > 0 ? 'LIVE' : 'UNAVAILABLE';
+        json.newsHeadlinesStatus === 'LIVE' &&
+        recentHeadlines.length > 0 &&
+        hasFreshMetricProvenance('recentHeadlines', 24 * 60 * 60_000)
+          ? 'LIVE'
+          : 'UNAVAILABLE';
       const newsSentimentStatus: MetricDataStatus = 'UNAVAILABLE';
       const newsSentimentScore = null;
 
@@ -240,21 +309,32 @@ export class MacroContextBrainService {
         Number.isFinite(json.whalePressureIndex) &&
         json.whalePressureIndex >= 0 &&
         json.whalePressureIndex <= 100 &&
-        ['ACCUMULATION', 'DISTRIBUTION', 'NEUTRAL'].includes(json.whaleSentiment)
+        ['ACCUMULATION', 'DISTRIBUTION', 'NEUTRAL'].includes(json.whaleSentiment) &&
+        hasFreshMetricProvenance('whaleNetflowBtc', 10 * 60_000)
         ? 'LIVE'
         : 'UNKNOWN';
       const whaleNetflowBtc = whaleFlowStatus === 'LIVE' ? json.whaleNetflowBtc : null;
       const whalePressureIndex = whaleFlowStatus === 'LIVE' ? json.whalePressureIndex : null;
       const whaleSentiment = whaleFlowStatus === 'LIVE' ? json.whaleSentiment : 'UNKNOWN';
+      const bitcoinActiveAddressesStatus: MetricDataStatus = json.bitcoinActiveAddressesStatus === 'LIVE' &&
+        typeof json.bitcoinActiveAddresses === 'number' &&
+        Number.isSafeInteger(json.bitcoinActiveAddresses) &&
+        json.bitcoinActiveAddresses > 0 &&
+        hasFreshMetricProvenance('bitcoinActiveAddresses', 3 * 24 * 60 * 60_000)
+        ? 'LIVE'
+        : 'UNAVAILABLE';
+      const bitcoinActiveAddresses = bitcoinActiveAddressesStatus === 'LIVE'
+        ? json.bitcoinActiveAddresses
+        : null;
 
-      // Overall status: LIVE if at least 2 key macro indicators are LIVE, else UNAVAILABLE
+      // Overall status describes verified feeds, not a trading approval.
       const liveMetricsCount = [
         sp500Status === 'LIVE',
-        dxyStatus === 'LIVE',
+        broadDollarProxyStatus === 'PROXY',
         fearAndGreedStatus === 'LIVE',
-        etfFlowStatus === 'LIVE',
-        newsSentimentStatus === 'LIVE',
-        whaleFlowStatus === 'LIVE',
+        fedPublishedRateStatus === 'LIVE',
+        newsHeadlinesStatus === 'LIVE',
+        bitcoinActiveAddressesStatus === 'LIVE',
       ].filter(Boolean).length;
 
       const overallDataStatus: MetricDataStatus = liveMetricsCount >= 2 ? 'LIVE' : 'UNAVAILABLE';
@@ -297,38 +377,11 @@ export class MacroContextBrainService {
       let emergencyDefensiveShield = false;
       let runnerExpansionBoost = false;
 
-      if (
-        newsSentimentStatus === 'LIVE' &&
-        newsSentimentScore !== null &&
-        fearAndGreedStatus === 'LIVE' &&
-        fearAndGreedIndex !== null &&
-        etfFlowStatus === 'LIVE' &&
-        spotEtfNetInflowMillionUsd !== null
-      ) {
-        const fgScore = fearAndGreedIndex;
-        const etfScore = spotEtfNetInflowMillionUsd > 0 ? 30 : 5;
-        fundamentalScorePct = Math.round((newsSentimentScore * 0.4) + (fgScore * 0.3) + etfScore);
-        fundamentalBias = fundamentalScorePct >= 65 ? 'BULLISH' : fundamentalScorePct <= 40 ? 'BEARISH' : 'NEUTRAL';
-
-        if (newsSentimentScore >= 70) {
-          breakingNewsImpactLevel = 'STRONG_BULLISH_CATALYST';
-          breakingNewsActionDirectiveFa = '🔥 محرک خبری سنگین صعودی: پتانسیل جهش قیمت و اتساع تارگت‌ها.';
-          runnerExpansionBoost = true;
-        } else if (newsSentimentScore <= -60) {
-          breakingNewsImpactLevel = 'SEVERE_BEARISH_THREAT';
-          breakingNewsActionDirectiveFa = '🛑 تهدید خبری شدید: فعال‌سازی شیلد دفاعی و محافظت فوری از استاپ‌ها.';
-          emergencyDefensiveShield = true;
-        } else {
-          breakingNewsImpactLevel = 'NORMAL_NEWS_FLOW';
-          breakingNewsActionDirectiveFa = 'جریان اخبار در محدوده نرمال بازار.';
-        }
-      }
-
       this.currentData = {
         overallDataStatus,
         lastUpdatedTime: now,
         lastUpdatedStr: json.lastUpdated || new Date().toLocaleTimeString('fa-IR'),
-        provenance: typeof json.provenance === 'object' && json.provenance !== null ? json.provenance : {},
+        provenance,
 
         sp500Status,
         sp500Price,
@@ -337,6 +390,9 @@ export class MacroContextBrainService {
         dxyStatus,
         dxyIndex,
         dxyDailyChangePct,
+        broadDollarProxyStatus,
+        broadDollarProxyIndex,
+        broadDollarProxyDailyChangePct,
 
         fearAndGreedStatus,
         fearAndGreedIndex,
@@ -347,6 +403,9 @@ export class MacroContextBrainService {
 
         fedExpectationsStatus,
         fedRateCutExpectationPct,
+        fedPublishedRateStatus,
+        fedEffectiveRatePct,
+        fedTargetUpperBoundPct,
 
         newsSentimentStatus,
         newsSentimentScore,
@@ -357,6 +416,8 @@ export class MacroContextBrainService {
         whaleNetflowBtc,
         whalePressureIndex,
         whaleSentiment,
+        bitcoinActiveAddressesStatus,
+        bitcoinActiveAddresses,
 
         btcCorrelationWithSP500,
         btcCorrelationWithDXY,
@@ -372,7 +433,8 @@ export class MacroContextBrainService {
       };
 
       return this.currentData;
-    } catch {
+    } catch (error) {
+      console.error('[MacroContextBrain] Could not refresh direct macro data:', error);
       this.currentData = createDefaultUnavailableState();
       return this.currentData;
     } finally {

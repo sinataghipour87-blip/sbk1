@@ -18,6 +18,7 @@ export interface IndicatorScoreBreakdown {
   weight: number;
   score: number;
   passed: boolean;
+  available?: boolean;
   details: string;
   category: 'AI_NEURAL' | 'HTF_TREND' | 'SMC_PRICE_ACTION' | 'MOMENTUM_INDICATORS' | 'TREND_RIBBON' | 'ORDER_BOOK_DERIVATIVES' | 'VOLATILITY_REGIME' | 'RISK_ANTI_TILT' | 'FUNDAMENTAL_MACRO_NEWS';
 }
@@ -37,15 +38,9 @@ export interface SignalToExecutionResult {
 
 /**
  * Full-System Holistic AI Confluence Engine
- * Evaluates the 8 Interconnected System Pillars:
- * 1. AI Neural / ML Prediction Model (Weight: 15%)
- * 2. Multi-Timeframe Alignment (15m, 1h, 4h) (Weight: 15%)
- * 3. Smart Money Concepts (SMC Order Blocks, FVG) (Weight: 15%)
- * 4. Technical Momentum Matrix (RSI, MACD, StochRSI) (Weight: 15%)
- * 5. Trend Ribbon & Supertrend (EMA 20/50/200, Supertrend, VWAP) (Weight: 15%)
- * 6. Order Book Depth & Derivatives (OBI, Funding Rate, L/S Ratio) (Weight: 10%)
- * 7. Trend Strength & Volatility Filter (ADX > 20, ATR / GARCH) (Weight: 10%)
- * 8. Anti-Tilt & Capital Protection Guard (Pass/Fail Safety Gate) (Weight: 5%)
+ * Evaluates 8 weighted analysis pillars; the anti-tilt control is a separate veto gate:
+ * The weighted pillars are AI, order book, HTF, SMC, macro/news, trend, volatility, and momentum.
+ * Their weights vary by regime and recent trade history. Anti-tilt is a separate zero-weight veto gate.
  */
 export function evaluateSignalToExecution(
   analysis: AnalysisResult,
@@ -66,7 +61,7 @@ export function evaluateSignalToExecution(
       executionQuality: 'NOISY_REJECTED',
       allSystemsPassed: false,
       totalPillarsPassed: 0,
-      totalPillarsCount: 9,
+      totalPillarsCount: 8,
       executionThreshold: 70,
     };
   }
@@ -82,27 +77,41 @@ export function evaluateSignalToExecution(
       executionQuality: 'NOISY_REJECTED',
       allSystemsPassed: false,
       totalPillarsPassed: 0,
-      totalPillarsCount: 9,
+      totalPillarsCount: 8,
       executionThreshold: 70,
     };
   }
   const isLong = dir === 'LONG';
 
-  const price = analysis.price || 0;
-  const htf1h = analysis.mtf1h || 'NEUTRAL';
-  const htf4h = analysis.mtf4h || 'NEUTRAL';
-  const htf15m = analysis.mtf15m || 'NEUTRAL';
-  const htf5m = analysis.mtf5m || 'NEUTRAL';
-  const obi = analysis.obi || 0;
-  const rsi = analysis.rsi || 50;
-  const macdH = analysis.macdH && analysis.macdH.length > 0 ? analysis.macdH[analysis.macdH.length - 1] : 0;
-  const ema20 = analysis.ema20 && analysis.ema20.length > 0 ? analysis.ema20[analysis.ema20.length - 1] : price;
-  const ema50 = analysis.ema50 && analysis.ema50.length > 0 ? analysis.ema50[analysis.ema50.length - 1] : price;
-  const ema200 = analysis.ema200 && analysis.ema200.length > 0 ? analysis.ema200[analysis.ema200.length - 1] : price;
-  const supertrend = typeof analysis.supertrend === 'string' ? analysis.supertrend : isLong ? 'BULLISH' : 'BEARISH';
-  const adx = analysis.adx || 25;
-  const vwap = analysis.vwap || price;
-  const stochK = analysis.stoch ?? 50;
+  const isFiniteNumber = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isFinite(value);
+  const isDirection = (value: unknown): value is 'BULLISH' | 'BEARISH' | 'NEUTRAL' =>
+    value === 'BULLISH' || value === 'BEARISH' || value === 'NEUTRAL';
+  const price = isFiniteNumber(analysis.price) && analysis.price > 0 ? analysis.price : 0;
+  const htf1h = analysis.mtf1h;
+  const htf4h = analysis.mtf4h;
+  const htf15m = analysis.mtf15m;
+  const htf5m = analysis.mtf5m;
+  const obi = analysis.realObiData?.status === 'LIVE' && isFiniteNumber(analysis.realObiData.obi)
+    ? analysis.realObiData.obi
+    : null;
+  const rsi = isFiniteNumber(analysis.rsi) ? analysis.rsi : null;
+  const macdH = Array.isArray(analysis.macdH) && isFiniteNumber(analysis.macdH.at(-1))
+    ? analysis.macdH.at(-1)!
+    : null;
+  const ema20 = Array.isArray(analysis.ema20) && isFiniteNumber(analysis.ema20.at(-1))
+    ? analysis.ema20.at(-1)!
+    : null;
+  const ema50 = Array.isArray(analysis.ema50) && isFiniteNumber(analysis.ema50.at(-1))
+    ? analysis.ema50.at(-1)!
+    : null;
+  const ema200 = Array.isArray(analysis.ema200) && isFiniteNumber(analysis.ema200.at(-1))
+    ? analysis.ema200.at(-1)!
+    : null;
+  const supertrend = analysis.supertrend;
+  const adx = isFiniteNumber(analysis.adx) ? analysis.adx : null;
+  const vwap = isFiniteNumber(analysis.vwap) ? analysis.vwap : null;
+  const stochK = isFiniteNumber(analysis.stoch) ? analysis.stoch : null;
 
   // -------------------------------------------------------------
   // QUANTUM DYNAMIC ADAPTIVE WEIGHT MATRIX (Total Weight: 100%)
@@ -110,7 +119,8 @@ export function evaluateSignalToExecution(
   // 1. High Volatility Regime: Increases responsive pillars (AI + OBI)
   // 2. 50-Trade Empirical Pillar Win-Rate Boost: Pillars with higher win rate in last 50 trades receive dynamic confidence boost
   // -------------------------------------------------------------
-  const isHighVol = (analysis.volatilityPct && analysis.volatilityPct > 0.45) || adx > 25;
+  const isHighVol = (isFiniteNumber(analysis.volatilityPct) && analysis.volatilityPct > 0.45) ||
+    (adx !== null && adx > 25);
   
   // Base weights harmonized with Pillar Correlation Matrix recommendations
   // Prioritizes leading indicators (SMC, AI, OBI, Fundamental News) to maximize predictive edge and minimize false entries
@@ -170,12 +180,14 @@ export function evaluateSignalToExecution(
   
   // 🎯 فیلتر اسنایپر ممانعت از تعقیب قیمت در انتهای کشش کندل (Anti-Chasing Sniper Entry):
   // ممانعت از خرید در سقف کندل یا فروش در کف کندل؛ ورود فقط در سقف/کف پولبک انجام می‌شود تا معامله فورا وارد سود شود
-  const isChasingTop = isLong && (rsi >= 72 || (analysis.pullbackLimitPrice ? price > analysis.pullbackLimitPrice * 1.008 : false));
-  const isChasingBottom = !isLong && (rsi <= 28 || (analysis.pullbackLimitPrice ? price < analysis.pullbackLimitPrice * 0.992 : false));
-  const isRsiExhausted = isLong ? (rsi >= 75 && !isWaveGenesis) : (rsi <= 25 && !isWaveGenesis);
+  const isChasingTop = isLong && ((rsi !== null && rsi >= 72) || (analysis.pullbackLimitPrice ? price > analysis.pullbackLimitPrice * 1.008 : false));
+  const isChasingBottom = !isLong && ((rsi !== null && rsi <= 28) || (analysis.pullbackLimitPrice ? price < analysis.pullbackLimitPrice * 0.992 : false));
+  const isRsiExhausted = rsi !== null &&
+    (isLong ? rsi >= 75 && !isWaveGenesis : rsi <= 25 && !isWaveGenesis);
   const isExhaustedWave = !timing15m.isOptimalTiming || timing15m.lifecyclePhase === 'LATE_EXHAUSTION_GUARD' || isRsiExhausted || isChasingTop || isChasingBottom;
-  const isDirectObiConflict = isLong ? (obi < -0.15) : (obi > 0.15);
-  const hasWaveHeadroom = isLong ? (rsi < 68 && obi > -0.06) : (rsi > 32 && obi < 0.06);
+  const isDirectObiConflict = obi !== null && (isLong ? obi < -0.15 : obi > 0.15);
+  const hasWaveHeadroom = rsi !== null && obi !== null &&
+    (isLong ? rsi < 68 && obi > -0.06 : rsi > 32 && obi < 0.06);
 
   // -------------------------------------------------------------
   // 1. AI Ensemble & Neural ML Prediction (Dynamic Weight: wAi)
@@ -185,13 +197,16 @@ export function evaluateSignalToExecution(
     typeof aiPrediction?.calibratedWinProbability === 'number' &&
     Number.isFinite(aiPrediction.calibratedWinProbability) &&
     aiPrediction.calibratedWinProbability >= 0 &&
-    aiPrediction.calibratedWinProbability <= 1;
+    aiPrediction.calibratedWinProbability <= 1 &&
+    (aiPrediction.trend === 'BULLISH' || aiPrediction.trend === 'BEARISH');
   const predTrend = calibratedPrediction &&
     (aiPrediction.trend === 'BULLISH' || aiPrediction.trend === 'BEARISH')
     ? aiPrediction.trend
     : 'NEUTRAL';
   const predConf = calibratedPrediction ? aiPrediction.calibratedWinProbability * 100 : 0;
-  if (isExhaustedWave || isDivergenceTrap) {
+  if (!calibratedPrediction) {
+    aiScore = 0;
+  } else if (isExhaustedWave || isDivergenceTrap) {
     aiScore = Math.round(wAi * 0.15); // موج تمام شده یا تله واگرایی؛ هوش مصنوعی نمره ورود نمی‌دهد
   } else if ((isWaveGenesis || isPullbackSniper) && ((isLong && predTrend === 'BULLISH') || (!isLong && predTrend === 'BEARISH'))) {
     aiScore = wAi; // شلیک موج نوظهور یا پرتاب پولبک؛ حداکثر امتیاز هوش مصنوعی
@@ -204,7 +219,7 @@ export function evaluateSignalToExecution(
   } else {
     aiScore = 0; // تضاد مستقیم با مدل هوش مصنوعی -> امتیاز صفر قطعی
   }
-  const aiPassed = aiScore >= Math.round(wAi * 0.65);
+  const aiPassed = calibratedPrediction && aiScore >= Math.round(wAi * 0.65);
 
   // -------------------------------------------------------------
   // 2. Order Book Imbalance (OBI), Whale CVD Delta & Funding Rate Squeeze Buffer (Dynamic Weight: wObi)
@@ -220,7 +235,9 @@ export function evaluateSignalToExecution(
     else if (fundingRate < -0.03) fundingBoost = -3; // Short crowd trap hazard
   }
 
-  if (isDirectObiConflict) {
+  if (obi === null) {
+    obiScore = 0;
+  } else if (isDirectObiConflict) {
     obiScore = 0; // دیوار سفارشات سنگین نهنگ در خلاف جهت معامله -> امتیاز صفر
   } else if (isLong) {
     if (obi > 0.10) obiScore = wObi;
@@ -234,23 +251,24 @@ export function evaluateSignalToExecution(
     else obiScore = 0;
   }
   obiScore = Math.max(0, Math.min(wObi, obiScore + fundingBoost));
-  const obiPassed = obiScore >= Math.round(wObi * 0.65) && !isDirectObiConflict;
+  const obiPassed = obi !== null && obiScore >= Math.round(wObi * 0.65) && !isDirectObiConflict;
 
   // -------------------------------------------------------------
   // 3. Multi-Timeframe Alignment (5M / 15M / 1H / 4H) (Dynamic Weight: wHtf)
   // -------------------------------------------------------------
   let htfScore = 0;
   const expectedHtf = isLong ? 'BULLISH' : 'BEARISH';
+  const htfDataAvailable = [htf15m, htf1h, htf4h, htf5m].every(isDirection);
   let htfMatches = 0;
-  if (htf15m === expectedHtf) htfMatches += 1.8; // محوریت اصلی تایم‌فریم ۱۵ دقیقه لحظه‌ای
-  if (htf1h === expectedHtf) htfMatches += 1.2;
-  if (htf4h === expectedHtf) htfMatches += 1.0;
-  if (htf5m === expectedHtf) htfMatches += 0.5;
+  if (htfDataAvailable && htf15m === expectedHtf) htfMatches += 1.8; // محوریت اصلی تایم‌فریم ۱۵ دقیقه لحظه‌ای
+  if (htfDataAvailable && htf1h === expectedHtf) htfMatches += 1.2;
+  if (htfDataAvailable && htf4h === expectedHtf) htfMatches += 1.0;
+  if (htfDataAvailable && htf5m === expectedHtf) htfMatches += 0.5;
   htfScore = Math.min(wHtf, Math.round((htfMatches / 4.5) * wHtf));
   if (isDivergenceTrap) {
     htfScore = Math.round(htfScore * 0.25); // واگرایی در خلاف جهت، همگرایی ساختاری تایم‌فریم را باطل می‌کند
   }
-  const htfPassed = htfScore >= Math.round(wHtf * 0.65) && !isDivergenceTrap;
+  const htfPassed = htfDataAvailable && htfScore >= Math.round(wHtf * 0.65) && !isDivergenceTrap;
 
   // -------------------------------------------------------------
   // 4. Smart Money Concepts (SMC) & Price Action (Dynamic Weight: wSmc)
@@ -278,13 +296,20 @@ export function evaluateSignalToExecution(
   // -------------------------------------------------------------
   let trendScore = 0;
   let trendMatches = 0;
-  if (isLong) {
+  const trendDataAvailable = price > 0 &&
+    ema20 !== null && ema20 > 0 &&
+    ema50 !== null && ema50 > 0 &&
+    ema200 !== null && ema200 > 0 &&
+    vwap !== null && vwap > 0 &&
+    (supertrend === 'BULLISH' || supertrend === 'BEARISH') &&
+    isFiniteNumber(analysis.atr) && analysis.atr > 0;
+  if (trendDataAvailable && isLong) {
     if (price >= ema20) trendMatches += 1;
     if (ema20 >= ema50) trendMatches += 1;
     if (price >= ema200) trendMatches += 1;
     if (supertrend === 'BULLISH') trendMatches += 1;
     if (price >= vwap) trendMatches += 0.5;
-  } else {
+  } else if (trendDataAvailable) {
     if (price <= ema20) trendMatches += 1;
     if (ema20 <= ema50) trendMatches += 1;
     if (price <= ema200) trendMatches += 1;
@@ -292,22 +317,33 @@ export function evaluateSignalToExecution(
     if (price <= vwap) trendMatches += 0.5;
   }
   trendScore = Math.min(wTrend, Math.round((trendMatches / 4.5) * wTrend));
-  
+
   // اگر قیمت بیش از حد از EMA20 کشیده شده باشد، سود موج قبلاً انجام شده و خطر بازگشت وجود دارد
-  const isExtendedFromEma = Math.abs(price - ema20) > (1.8 * (analysis.atr || 150));
-  if (isExtendedFromEma) {
+  const isExtendedFromEma = trendDataAvailable &&
+    Math.abs(price - ema20) > (1.8 * analysis.atr);
+  if (!trendDataAvailable) {
+    trendScore = 0;
+  } else if (isExtendedFromEma) {
     trendScore = Math.round(trendScore * 0.35);
   }
-  const trendPassed = trendScore >= Math.round(wTrend * 0.65) && !isExtendedFromEma;
+  const trendPassed = trendDataAvailable && trendScore >= Math.round(wTrend * 0.65) && !isExtendedFromEma;
 
   // -------------------------------------------------------------
   // 6. Range Breakout & Volatility Filter (ADX & ATR) (Dynamic Weight: wVol)
   // -------------------------------------------------------------
-  const isRangeBound = analysis.isRangeBound ?? (adx < 14 && (analysis.volatilityPct !== undefined && analysis.volatilityPct < 0.18));
+  const volatilityDataAvailable = adx !== null &&
+    isFiniteNumber(analysis.volatilityPct) &&
+    isFiniteNumber(analysis.atr) &&
+    analysis.atr > 0;
+  const isRangeBound = analysis.isRangeBound ??
+    (volatilityDataAvailable && adx < 14 && analysis.volatilityPct < 0.18);
   let volScore = 0;
   let volDetailsFa = '';
 
-  if (isRangeBound) {
+  if (!volatilityDataAvailable) {
+    volScore = 0;
+    volDetailsFa = 'دادهٔ معتبر ADX، نوسان و ATR برای این رکن کامل نیست؛ امتیاز محاسبه نشد.';
+  } else if (isRangeBound) {
     volScore = 0;
     volDetailsFa = `بازار در فاز رنج بدون روند است (ADX: ${adx.toFixed(1)}) - ورود مسدود شد`;
   } else if (isExhaustedWave) {
@@ -321,12 +357,12 @@ export function evaluateSignalToExecution(
     else if (adx >= 18) volScore += Math.round(wVol * 0.4);
     else volScore += Math.round(wVol * 0.2);
 
-    if (analysis.volatilityPct && analysis.volatilityPct >= 0.35) volScore += Math.round(wVol * 0.4);
+    if (analysis.volatilityPct >= 0.35) volScore += Math.round(wVol * 0.4);
     else if (analysis.atr > 0) volScore += Math.round(wVol * 0.3);
     volScore = Math.min(wVol, volScore);
-    volDetailsFa = `شکست رنج تایید شد (ADX: ${adx.toFixed(1)} | نوسان فعال: ${(analysis.volatilityPct || 0.4).toFixed(2)}٪)`;
+    volDetailsFa = `شکست رنج تایید شد (ADX: ${adx.toFixed(1)} | نوسان فعال: ${analysis.volatilityPct.toFixed(2)}٪)`;
   }
-  const volPassed = volScore >= Math.round(wVol * 0.65) && !isRangeBound && !isExhaustedWave;
+  const volPassed = volatilityDataAvailable && volScore >= Math.round(wVol * 0.65) && !isRangeBound && !isExhaustedWave;
 
   // -------------------------------------------------------------
   // 7. Technical Momentum Matrix (RSI, MACD, StochRSI) (Dynamic Weight: wMom)
@@ -334,7 +370,13 @@ export function evaluateSignalToExecution(
   let momScore = 0;
   let momDetailsFa = '';
 
-  if (isDivergenceTrap) {
+  const momentumDataAvailable = rsi !== null && rsi >= 0 && rsi <= 100 &&
+    macdH !== null &&
+    stochK !== null && stochK >= 0 && stochK <= 100;
+  if (!momentumDataAvailable) {
+    momScore = 0;
+    momDetailsFa = 'دادهٔ معتبر RSI، MACD یا Stoch برای این رکن موجود نیست؛ امتیاز محاسبه نشد.';
+  } else if (isDivergenceTrap) {
     momScore = 0; // تله واگرایی معکوس -> امتیاز صفر قطعی
     momDetailsFa = isLong ? '🛑 تله واگرایی نزولی در ۱ ساعته؛ خطر ریزش حتمی' : '🛑 تله واگرایی صعودی در ۱ ساعته؛ خطر جهش قیمت';
   } else if (isRsiExhausted) {
@@ -359,7 +401,10 @@ export function evaluateSignalToExecution(
     momScore = Math.min(wMom, momScore);
     momDetailsFa = `RSI: ${rsi.toFixed(1)} | RSI 1H: ${(analysis.rsi1h || rsi).toFixed(1)} [پایدار] | MACD: ${macdH.toFixed(2)}`;
   }
-  const momPassed = momScore >= Math.round(wMom * 0.65) && !isDivergenceTrap && !isRsiExhausted;
+  const momPassed = momentumDataAvailable &&
+    momScore >= Math.round(wMom * 0.65) &&
+    !isDivergenceTrap &&
+    !isRsiExhausted;
 
   // -------------------------------------------------------------
   // 8. Bitcoin Fundamental & Macro News Sentiment (Dynamic Weight: wMacroNews)
@@ -367,9 +412,11 @@ export function evaluateSignalToExecution(
   const macroContext = macroContextBrainService.getMacroContext(price);
   let macroNewsScore = 0;
 
-  if (macroContext.fundamentalBias === 'UNAVAILABLE' || macroContext.overallDataStatus === 'UNAVAILABLE') {
-    // When real live data is UNAVAILABLE, assign neutral baseline with zero fake bias
-    macroNewsScore = Math.round(wMacroNews * 0.50);
+  const macroDataAvailable =
+    (macroContext.overallDataStatus === 'LIVE' || macroContext.overallDataStatus === 'PROXY') &&
+    macroContext.fundamentalBias !== 'UNAVAILABLE';
+  if (!macroDataAvailable) {
+    macroNewsScore = 0;
   } else if (isLong) {
     if (macroContext.breakingNewsImpactLevel === 'SEVERE_BEARISH_THREAT') {
       macroNewsScore = 0; // ریزش شدید با اخبار تهدیدآمیز؛ صفر کردن امتیاز فاندامنتال لانگ
@@ -397,10 +444,11 @@ export function evaluateSignalToExecution(
       macroNewsScore = Math.min(wMacroNews, macroNewsScore + 1);
     }
   }
-  const macroNewsPassed = macroNewsScore >= Math.round(wMacroNews * 0.60);
+  const macroNewsPassed = macroDataAvailable &&
+    macroNewsScore >= Math.round(wMacroNews * 0.60);
 
   // -------------------------------------------------------------
-  // 9. Anti-Tilt & Capital Protection Guard (Hard Safety Check)
+  // Anti-Tilt & Capital Protection Guard (separate hard-veto gate)
   // -------------------------------------------------------------
   const antiTilt = getAntiTiltStatus(tradeHistoryList || []);
   const riskPassed = !antiTilt.isLocked;
@@ -408,9 +456,25 @@ export function evaluateSignalToExecution(
   // -------------------------------------------------------------
   // Total Weighted Harmonic Score (Sum of 100% harmonized weights)
   // -------------------------------------------------------------
-  const totalScorePct = Math.min(100, Math.max(0,
-    aiScore + obiScore + htfScore + smcScore + macroNewsScore + trendScore + volScore + momScore
-  ));
+  const weightedPillars = [
+    { weight: wAi, score: aiScore, available: calibratedPrediction },
+    { weight: wObi, score: obiScore, available: obi !== null },
+    { weight: wHtf, score: htfScore, available: htfDataAvailable },
+    { weight: wSmc, score: smcScore, available: ob?.type !== undefined || fvg?.type !== undefined },
+    { weight: wMacroNews, score: macroNewsScore, available: macroDataAvailable },
+    { weight: wTrend, score: trendScore, available: trendDataAvailable },
+    { weight: wVol, score: volScore, available: volatilityDataAvailable },
+    { weight: wMom, score: momScore, available: momentumDataAvailable },
+  ];
+  const availableWeight = weightedPillars
+    .filter((pillar) => pillar.available)
+    .reduce((total, pillar) => total + pillar.weight, 0);
+  const availableWeightedScore = weightedPillars
+    .filter((pillar) => pillar.available)
+    .reduce((total, pillar) => total + pillar.score, 0);
+  const totalScorePct = availableWeight > 0
+    ? Math.min(100, Math.max(0, (availableWeightedScore / availableWeight) * 100))
+    : 0;
 
   const breakdown: IndicatorScoreBreakdown[] = [
     {
@@ -420,21 +484,27 @@ export function evaluateSignalToExecution(
       weight: wAi,
       score: aiScore,
       passed: aiPassed,
+      available: calibratedPrediction,
       details: isExhaustedWave
         ? '⚠️ پتانسیل پیشروی موج سود تمام شده؛ در انتظار چرخه نوظهور'
-        : `جهت: ${predTrend === 'BULLISH' ? 'صعودی' : predTrend === 'BEARISH' ? 'نزولی' : 'خنثی'} | اطمینان: ${predConf.toFixed(0)}%`,
+        : calibratedPrediction
+          ? `جهت: ${predTrend === 'BULLISH' ? 'صعودی' : 'نزولی'} | احتمال کالیبره‌شده: ${predConf.toFixed(0)}%`
+          : 'مدل جهت‌دار با کالیبراسیون معتبر در دسترس نیست؛ این رکن امتیاز نمی‌دهد.',
       category: 'AI_NEURAL',
     },
     {
       id: 'order_book_derivatives',
-      name: 'Order Book Depth & Whale OBI',
-      nameFa: `رکن 2: عدم تقارن دفتر سفارشات و جریان نهنگ (${wObi}%)`,
+      name: 'Order Book Imbalance & Funding',
+      nameFa: `رکن وزنی دفتر سفارش و مشتقات (${wObi}%)`,
       weight: wObi,
       score: obiScore,
       passed: obiPassed,
+      available: obi !== null,
       details: isDirectObiConflict
-        ? `🛑 تضاد با دیوار سنگین سفارشات نهنگ‌ها (OBI: ${(obi * 100).toFixed(1)}%)`
-        : `عدم تقارن OBI: ${(obi * 100).toFixed(1)}% | دلتای CVD: ${typeof analysis.cvdDelta === 'number' ? analysis.cvdDelta.toFixed(1) : 'UNKNOWN'}`,
+        ? `🛑 تضاد با عدم‌توازن دفتر سفارش (OBI: ${(obi * 100).toFixed(1)}%)`
+        : obi !== null
+          ? `عدم تقارن دفتر سفارش: ${(obi * 100).toFixed(1)}% | دلتای معاملات: ${analysis.orderFlowFeatures?.isRealTradeFlow === true && isFiniteNumber(analysis.orderFlowFeatures.cvdDeltaUsd) ? analysis.orderFlowFeatures.cvdDeltaUsd.toFixed(1) : 'UNAVAILABLE'}`
+          : 'دفتر سفارش زنده و معتبر در دسترس نیست؛ این رکن امتیاز نمی‌دهد.',
       category: 'ORDER_BOOK_DERIVATIVES',
     },
     {
@@ -444,9 +514,10 @@ export function evaluateSignalToExecution(
       weight: wMacroNews,
       score: macroNewsScore,
       passed: macroNewsPassed,
-      details: macroContext.overallDataStatus === 'UNAVAILABLE'
-        ? `وضعیت داده‌ها: UNAVAILABLE (قطع منبع زنده) | بدون پیش‌فرض کاذب`
-        : `سنتیمنت اخبار: ${macroContext.newsSentimentScore !== null && macroContext.newsSentimentScore > 0 ? '+' : ''}${macroContext.newsSentimentScore ?? 'N/A'} | ورود ETF: ${macroContext.spotEtfNetInflowMillionUsd !== null ? '+$' + macroContext.spotEtfNetInflowMillionUsd + 'M' : 'N/A'} | وضعیت: ${macroContext.macroFilterStatusFa}`,
+      available: macroDataAvailable,
+      details: !macroDataAvailable
+        ? `وضعیت داده‌ها: ${macroContext.overallDataStatus} | امتیاز این رکن محاسبه نمی‌شود.`
+        : `وضعیت ${macroContext.overallDataStatus} | سنتیمنت اخبار: ${macroContext.newsSentimentScore !== null && macroContext.newsSentimentScore > 0 ? '+' : ''}${macroContext.newsSentimentScore ?? 'N/A'} | ورود ETF: ${macroContext.spotEtfNetInflowMillionUsd !== null ? '+$' + macroContext.spotEtfNetInflowMillionUsd + 'M' : 'N/A'} | وضعیت: ${macroContext.macroFilterStatusFa}`,
       category: 'FUNDAMENTAL_MACRO_NEWS',
     },
     {
@@ -456,7 +527,10 @@ export function evaluateSignalToExecution(
       weight: wHtf,
       score: htfScore,
       passed: htfPassed,
-      details: `1H: ${htf1h} | 4H: ${htf4h} | 5M: ${htf5m}`,
+      available: htfDataAvailable,
+      details: htfDataAvailable
+        ? `15M: ${htf15m} | 1H: ${htf1h} | 4H: ${htf4h} | 5M: ${htf5m}`
+        : 'دادهٔ معتبر همهٔ تایم‌فریم‌های 5M/15M/1H/4H موجود نیست؛ این رکن امتیاز نمی‌دهد.',
       category: 'HTF_TREND',
     },
     {
@@ -466,6 +540,7 @@ export function evaluateSignalToExecution(
       weight: wSmc,
       score: smcScore,
       passed: smcPassed,
+      available: ob?.type !== undefined || fvg?.type !== undefined,
       details: ob ? ob.label : 'نواحی تقاضای سازمانی و FVG',
       category: 'SMC_PRICE_ACTION',
     },
@@ -476,9 +551,12 @@ export function evaluateSignalToExecution(
       weight: wTrend,
       score: trendScore,
       passed: trendPassed,
+      available: trendDataAvailable,
       details: isExtendedFromEma
         ? '⚠️ کشیدگی بیش از حد قیمت از EMA20 (خطر اصلاح قبل از سود)'
-        : `سوپرترند: ${supertrend} | هم‌جهتی EMA 20/50/200`,
+        : trendDataAvailable
+          ? `سوپرترند: ${supertrend} | هم‌جهتی EMA 20/50/200`
+          : 'قیمت/EMA/سوپرترند/VWAP/ATR معتبر کامل نیست؛ این رکن امتیاز نمی‌دهد.',
       category: 'TREND_RIBBON',
     },
     {
@@ -488,6 +566,7 @@ export function evaluateSignalToExecution(
       weight: wVol,
       score: volScore,
       passed: volPassed,
+      available: volatilityDataAvailable,
       details: volDetailsFa,
       category: 'VOLATILITY_REGIME',
     },
@@ -498,23 +577,26 @@ export function evaluateSignalToExecution(
       weight: wMom,
       score: momScore,
       passed: momPassed,
+      available: momentumDataAvailable,
       details: momDetailsFa,
       category: 'MOMENTUM_INDICATORS',
     },
     {
       id: 'risk_anti_tilt',
       name: 'Anti-Tilt & Kelly Risk Guard',
-      nameFa: 'رکن 9: گارد محافظتی آنتی‌تیلت و خنک‌کننده',
+      nameFa: 'گیت مستقل ریسک: آنتی‌تیلت و محافظت سرمایه',
       weight: 0,
       score: riskPassed ? 100 : 0,
       passed: riskPassed,
+      available: true,
       details: antiTilt.isLocked ? `قفل موقت (${antiTilt.consecutiveLosses} زیان متوالی)` : 'امن و فعال (بدون قفل)',
       category: 'RISK_ANTI_TILT',
     },
   ];
 
-  const totalPillarsCount = 9;
-  const totalPillarsPassed = breakdown.filter((b) => b.passed).length;
+  const scoreBearingPillars = breakdown.filter((pillar) => pillar.weight > 0);
+  const totalPillarsCount = scoreBearingPillars.length;
+  const totalPillarsPassed = scoreBearingPillars.filter((pillar) => pillar.passed).length;
 
   const isUltra90Mode = minWinProbGate >= 90;
   // 🎯 آستانه شکارچی واقعی (Elite Hunter Sniper Gate):
@@ -523,9 +605,9 @@ export function evaluateSignalToExecution(
   const MIN_PILLARS_REQUIRED = 6;
 
   // 🛡️ ارکان حیاتی چهارگانه که بدون تایید آن‌ها معامله ابداً باز نمی‌شود:
-  // ۱. هوش مصنوعی (aiPassed)
-  // ۲. ساختار تایم‌فریم‌های کلان (htfPassed)
-  // ۳. جریان سفارشات و نهنگ‌ها (obiPassed)
+  // ۱. مدل کالیبره‌شده (aiPassed)
+  // ۲. ساختار تایم‌فریم‌ها (htfPassed)
+  // ۳. دفتر سفارش (obiPassed)
   // ۴. روند و میانگین‌های متحرک (trendPassed)
   const corePillarsPassed = aiPassed && htfPassed && obiPassed && trendPassed;
 
@@ -613,7 +695,7 @@ export function evaluateSignalToExecution(
   } else if (canExecute) {
     if (isPullbackSniper) {
       executionQuality = 'INSTITUTIONAL_PRIME';
-      reasonFa = `🎯 شکار اسنایپری درجه یک (Pullback Sniper Rejection): ورود در بهترین تخفیف موج ۱۵ دقیقه با تایید ${totalPillarsPassed}/۹ رکن و امتیاز فوق‌العاده ${totalScorePct}٪!`;
+      reasonFa = `🎯 شکار اسنایپری درجه یک (Pullback Sniper Rejection): ورود در بهترین تخفیف موج ۱۵ دقیقه با تایید ${totalPillarsPassed}/${totalPillarsCount} رکن وزنی و امتیاز ${totalScorePct}٪!`;
     } else if (isWaveGenesis) {
       executionQuality = 'INSTITUTIONAL_PRIME';
       reasonFa = `🏄‍♂️ ورود طلایی موج‌سواری (Wave Genesis Prime): سوار شدن بر شروع موج سود با امتیاز اجماع ${totalScorePct}٪ و تایید ${totalPillarsPassed} رکن!`;

@@ -400,7 +400,10 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   // =========================================================================
   const obi = analysis?.obi ?? 0;
   const spreadBps = analysis?.canonicalSnapshot?.basisSpreadBps;
-  const isSpreadAcceptable = typeof spreadBps === 'number' && spreadBps <= 8.0; // Avoid abnormal spread slippage
+  const isSpreadAcceptable = typeof spreadBps === 'number' &&
+    Number.isFinite(spreadBps) &&
+    spreadBps >= 0 &&
+    spreadBps <= 8.0; // Avoid abnormal spread slippage
   const isObiFavorable = isLong ? obi >= -0.30 : obi <= 0.30;
   const stage6Passed = !pipelineHalted && isSpreadAcceptable && isObiFavorable;
 
@@ -410,7 +413,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     nameFa: '۶. عمق نقدینگی و عدم تعادل سفارشات (OBI)',
     passed: stage6Passed,
     status: pipelineHalted ? 'SKIPPED' : stage6Passed ? 'PASSED' : 'FAILED',
-    value: `OBI: ${(obi * 100).toFixed(1)}% | Spread: ${spreadBps.toFixed(2)} bps`,
+    value: `OBI: ${(obi * 100).toFixed(1)}% | Spread: ${isSpreadAcceptable ? spreadBps.toFixed(2) : 'UNKNOWN'} bps`,
     threshold: isLong ? 'OBI >= -30% و اسپرد <= 8 bps' : 'OBI <= +30% و اسپرد <= 8 bps',
     reasonFa: stage6Passed
       ? 'عمق نقدینگی دوطرفه کافی بوده و اسپرد بازار در محدوده ایمن قرار دارد.'

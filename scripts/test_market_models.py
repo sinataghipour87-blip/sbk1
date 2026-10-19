@@ -1,6 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from freqtrade_integration.strategies.sbk_signal_contract import (
+    ENTRY_AUTHORIZATION_VERSION,
+    SIGNAL_CONTRACT_VERSION,
     is_signal_runtime,
     is_valid_sbk_exit_signal,
     is_valid_sbk_signal,
@@ -15,8 +18,25 @@ def flat_candles(count=25):
 
 
 def valid_sbk_signal(now_ms=1_800_000_000_000):
+    observed_at_ms = now_ms - 500
+    required_gate_ids = (
+        "STAGE_1_MARKET_DATA",
+        "STAGE_2_DATA_QUALITY",
+        "STAGE_3_MARKET_REGIME",
+        "STAGE_4_HTF_STRUCTURE",
+        "STAGE_5_SETUP_DETECTION",
+        "STAGE_6_LIQUIDITY_ANALYSIS",
+        "STAGE_7_ORDER_FLOW",
+        "STAGE_8_ENTRY_TRIGGER",
+        "STAGE_9_ENTRY_PRICE",
+        "STAGE_10_STOP_INVALIDATION",
+        "STAGE_11_TP_TARGETS",
+        "STAGE_12_EXPECTED_VALUE",
+        "STAGE_13_POSITION_SIZE",
+        "STAGE_14_EXECUTION",
+    )
     return {
-        "contractVersion": "sbk1.freqtrade.signal.v1",
+        "contractVersion": SIGNAL_CONTRACT_VERSION,
         "decisionId": "sbk1_" + "a" * 32,
         "signalId": "sbk1_" + "a" * 32,
         "exchange": "bybit",
@@ -31,7 +51,7 @@ def valid_sbk_signal(now_ms=1_800_000_000_000):
         "dataQuality": {
             "status": "LIVE",
             "source": "Bybit Linear Futures Ticker (BTCUSDT)",
-            "observedAtMs": now_ms - 500,
+            "observedAtMs": observed_at_ms,
             "maxAgeMs": 5_000,
         },
         "entryConditions": {
@@ -46,20 +66,62 @@ def valid_sbk_signal(now_ms=1_800_000_000_000):
             "maxStakeQuote": 100,
             "maxLeverage": 1,
         },
+        "authorization": {
+            "contractVersion": ENTRY_AUTHORIZATION_VERSION,
+            "decision": "APPROVE_ENTRY",
+            "decisionId": "sbk1_" + "a" * 32,
+            "snapshotId": f"SNP_{observed_at_ms}_test",
+            "snapshotTimestampMs": observed_at_ms,
+            "evaluatedAtMs": observed_at_ms,
+            "timeframe": "15m",
+            "direction": "LONG",
+            "gates": [
+                {"id": gate_id, "status": "PASSED", "reason": "Isolated contract test evidence."}
+                for gate_id in required_gate_ids
+            ],
+            "models": [
+                {
+                    "id": "M1_TEST",
+                    "status": "HEALTHY",
+                    "calibrated": True,
+                    "independenceValidated": True,
+                    "direction": "LONG",
+                    "probabilityPct": 70,
+                    "sampleSize": 40,
+                    "oosPrecisionPct": 60,
+                    "effectiveWeight": 0.4,
+                },
+                {
+                    "id": "M2_TEST",
+                    "status": "HEALTHY",
+                    "calibrated": True,
+                    "independenceValidated": True,
+                    "direction": "LONG",
+                    "probabilityPct": 68,
+                    "sampleSize": 40,
+                    "oosPrecisionPct": 60,
+                    "effectiveWeight": 0.3,
+                },
+            ],
+            "disagreementVeto": False,
+            "ensembleProbabilityPct": 69,
+            "riskRewardRatio": 2,
+            "allocatedRiskUsd": 1,
+        },
     }
 
 
 class MarketModelFailClosedTests(unittest.TestCase):
-    def test_signal_runtime_accepts_dry_run_and_live_only(self):
+    def test_signal_runtime_accepts_dry_run_only(self):
         self.assertTrue(is_signal_runtime("dry_run"))
-        self.assertTrue(is_signal_runtime("live"))
+        self.assertFalse(is_signal_runtime("live"))
         self.assertFalse(is_signal_runtime("backtest"))
         self.assertFalse(is_signal_runtime(""))
 
     def test_exit_signal_contract_requires_target_direction_reason_and_expiry(self):
         now_ms = 1_800_000_000_000
         signal = {
-            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "contractVersion": SIGNAL_CONTRACT_VERSION,
             "signalType": "EXIT",
             "exitId": "sbk1_exit_" + "b" * 32,
             "pair": "BTC/USDT:USDT",
@@ -101,16 +163,25 @@ class MarketModelFailClosedTests(unittest.TestCase):
         signal["entryConditions"]["setupType"] = "DRY_RUN_E2E_FIXTURE_TEST"
         signal["dataQuality"]["maxAgeMs"] = 55_000
         signal["dataQuality"]["observedAtMs"] = now_ms - 40_000
-        self.assertTrue(
-            is_valid_sbk_signal(
-                signal,
-                now_ms=now_ms,
-                expected_exchange="bybit",
-                expected_market="futures",
-                expected_pair="BTC/USDT:USDT",
-                expected_timeframe="15m",
+        signal["authorization"]["snapshotTimestampMs"] = now_ms - 40_000
+        signal["authorization"]["evaluatedAtMs"] = now_ms - 40_000
+        signal["authorization"]["snapshotId"] = f"SNP_{now_ms - 40_000}_test"
+        signal["authorization"].update({
+            "decision": "DRY_RUN_TEST_ONLY",
+            "models": [],
+            "ensembleProbabilityPct": None,
+        })
+        with patch.dict("os.environ", {"SBK1_DRY_RUN_FIXTURE_ENABLED": "true"}):
+            self.assertTrue(
+                is_valid_sbk_signal(
+                    signal,
+                    now_ms=now_ms,
+                    expected_exchange="bybit",
+                    expected_market="futures",
+                    expected_pair="BTC/USDT:USDT",
+                    expected_timeframe="15m",
+                )
             )
-        )
 
     def test_predictor_marks_missing_candles_unavailable(self):
         result = calculate_prediction({})
@@ -160,7 +231,7 @@ class MarketModelFailClosedTests(unittest.TestCase):
         self.assertIsNone(result["expansionProbability"])
         self.assertIsNone(result["targetMultiplier"])
 
-    def test_python_consumer_accepts_the_versioned_node_signal_contract(self):
+    def test_python_consumer_accepts_the_versioned_authorized_signal_contract(self):
         now_ms = 1_800_000_000_000
 
         self.assertTrue(
@@ -191,6 +262,48 @@ class MarketModelFailClosedTests(unittest.TestCase):
         )
 
         signal["evidenceLevel"] = "CALIBRATED"
+        self.assertFalse(
+            is_valid_sbk_signal(
+                signal,
+                now_ms=now_ms,
+                expected_exchange="bybit",
+                expected_market="futures",
+                expected_pair="BTC/USDT:USDT",
+                expected_timeframe="15m",
+            )
+        )
+
+    def test_python_consumer_rejects_missing_calibration_or_failed_gate(self):
+        now_ms = 1_800_000_000_000
+        missing_model = valid_sbk_signal(now_ms)
+        missing_model["authorization"]["models"][1].update({
+            "status": "SUSPENDED",
+            "calibrated": False,
+            "effectiveWeight": 0,
+        })
+        failed_gate = valid_sbk_signal(now_ms)
+        failed_gate["authorization"]["gates"][0]["status"] = "FAILED"
+
+        for signal in (missing_model, failed_gate):
+            with self.subTest(signal=signal):
+                self.assertFalse(
+                    is_valid_sbk_signal(
+                        signal,
+                        now_ms=now_ms,
+                        expected_exchange="bybit",
+                        expected_market="futures",
+                        expected_pair="BTC/USDT:USDT",
+                        expected_timeframe="15m",
+                    )
+                )
+
+    def test_python_consumer_rejects_unvalidated_model_independence(self):
+        now_ms = 1_800_000_000_000
+        signal = valid_sbk_signal(now_ms)
+        for model in signal["authorization"]["models"]:
+            model["independenceValidated"] = False
+            model["effectiveWeight"] = 0
+
         self.assertFalse(
             is_valid_sbk_signal(
                 signal,

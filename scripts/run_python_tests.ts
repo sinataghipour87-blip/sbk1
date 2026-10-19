@@ -18,6 +18,7 @@ if (!existsSync(python)) {
       '-m',
       'unittest',
       'scripts.test_market_models',
+      'scripts.test_open_source_advisory_worker',
       'scripts.test_sbk_signal_strategy',
       'scripts.test_realistic_backtester',
       'scripts.test_init_sbk1_config',

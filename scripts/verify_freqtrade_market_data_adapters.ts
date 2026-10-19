@@ -14,7 +14,7 @@ const makeCandles = (timeframeMs: number, count: number) => {
 };
 
 const marketSnapshot = {
-  contractVersion: 'sbk1.freqtrade.market-snapshot.v4',
+  contractVersion: 'sbk1.freqtrade.market-snapshot.v5',
   source: 'freqtrade.dataprovider',
   exchange: 'bybit',
   market: 'futures',
@@ -49,6 +49,7 @@ const marketSnapshot = {
     ],
   },
   fundingRate: { retrievedAtMs: nowMs - 500, rate: -0.0001, nextFundingAtMs: null },
+  openInterest: null,
   tradeFlow: null,
 };
 

@@ -10,7 +10,7 @@
 - **مرز اتصال صرافی**: Freqtrade تنها جزء مجاز برای ارتباط مستقیم با API صرافی است؛ SBK1 دادهٔ بازار و وضعیت/اجرای صرافی را از Freqtrade یا adapter محدود و احراز هویت‌شدهٔ آن دریافت می‌کند، نه از connector موازی در React/Node.
 - **مرز تصمیم و اجرا**: SBK1 تصمیم جهت‌دار ورود و خروج عادی را می‌سازد؛ Freqtrade سفارش را اجرا می‌کند. Freqtrade می‌تواند سیگنال ناسازگار را رد کند و hard stop یا حفاظت اضطراری مستقل اعمال کند، اما استراتژی جهت‌دار/پیش‌بینی موازی نمی‌سازد.
 
-اتصال پایه در پروژه وجود دارد: راه‌انداز مدیریت‌شدهٔ محلی، API/RPC احراز هویت‌شده، قرارداد سیگنال `sbk1.freqtrade.signal.v1`، صف سیگنال، استراتژی `SbkSignalStrategy` و تنظیم Dry-run. یک اجرای read-only مدیریت‌شده با Freqtrade `2026.10-dev-90ec2a5`، Bybit futures و کیف پول مجازی Dry-run تأیید شد: RPC آماده بود و snapshot شامل ۵۰۰ کندل تکمیل‌شده، order book و funding دریافت شد. بررسی جداگانهٔ ticker از همان connector در CCXT `4.5.85` مقدار مثبت `last` داشت ولی `timestamp` و `datetime` نرمال‌شده و زمان سطح‌بالای پاسخ خام Bybit تهی بودند. قرارداد v3 زمان event را تهی نگه می‌دارد و زمان دریافت/بازیابی توسط Freqtrade را جداگانه ثبت می‌کند؛ freshness فقط در معنای «پاسخ تازه دریافت شد» قابل بررسی است، نه timestamp صرافی. مسیر ورود production نیز با `CALIBRATED_CONFIDENCE_UNAVAILABLE` بسته است. بنابراین ادغام هنوز **آمادهٔ تولید نیست**: پروفایل فعلی تنها پروفایل بررسی‌شده است، شواهد OOS/آرشیو تصمیم و نتیجه کافی وجود ندارد، ذخیرهٔ سیگنال فایل‌محور و تک‌نویسنده است، و fill/recovery/lifecycle کامل و همهٔ exchangeها گواهی نشده‌اند. هیچ fixture یا سفارشی در این بررسی ساخته/ارسال نشد. جزئیات در [README](./README.md) ثبت شده‌اند.
+سورس فعلی قرارداد سیگنال `sbk1.freqtrade.signal.v2` را میان Node و strategy پایتون به‌کار می‌برد. مسیر خودکار، پایپ‌لاین کامل تصمیم را اجرا می‌کند و adapter/strategy بدون مجوز نسخه‌دار، گیت‌های لازم، دادهٔ تازه، سقف ریسک، و دست‌کم دو مدل هم‌جهت با کالیبراسیون و استقلال اعتبارسنجی‌شده ورود را نمی‌پذیرند. در وضعیت فعلی استقلال خطای مدل‌ها اندازه‌گیری نشده، وزن مؤثر مدل‌ها صفر است و ensemble ورود را veto می‌کند؛ بنابراین ورود خودکار fail-closed است. `dry_run=true` در RPC Freqtrade شرط اجباری runner، endpoint صف و strategy است؛ پرچم legacy به‌تنهایی مسیر LIVE را فعال نمی‌کند. `/api/hunter/execute` غیرفعال است و fixture آزمایشی مسیر جداگانهٔ `DRY_RUN_TEST_ONLY` دارد. در این تغییر، فقط تست‌های محلی/ایزولهٔ mock و fixture اجرا شده‌اند؛ هیچ اتصال RPC/صرافی یا سفارش واقعی انجام نشده است. این شواهد **آمادگی تولید یا LIVE را اثبات نمی‌کنند**: اعتبار کالیبراسیون واقعی و OOS، استقلال خطای مدل‌ها، رفتار سرویس Freqtrade واقعی، و آشتی وضعیت پس از restart در deployment واقعی همچنان نیازمند آزمون مستقل‌اند. جزئیات قرارداد و مالکیت وضعیت در [README](./README.md) آمده است.
 
 هدف پوشش مهندسی **تمام قابلیت‌های مرتبط Freqtrade و تمام صرافی‌های پشتیبانی‌شده در نسخهٔ نصب‌شده** است؛ نه روشن‌کردن بی‌تمایز همهٔ تنظیمات، و نه ادعای سازگاری یک صرافی بدون آزمون. شروع روی محیط محلی است؛ استقرار خصوصی مرحلهٔ جداگانه خواهد بود. معاملات واقعی فقط پس از عبور از دروازه‌های مستقل و تأیید صریح می‌توانند بررسی شوند.
 
@@ -28,7 +28,7 @@
 | hard stop اضطراری، trailing حفاظتی و veto ریسک | Freqtrade | `stoploss`/`custom_stoploss`, و `stoploss_on_exchange` فقط برای profile آزموده‌شده؛ trailing native و `Protections` پس از تعیین و آزمون سیاست ریسک فعال شوند. |
 | stake و محدودیت سرمایه | Freqtrade | `stake_amount`, `tradable_balance_ratio`, `max_open_trades` و `custom_stake_amount`; `adjust_trade_position` فقط در صورت نیاز و با سقف مشخص. |
 | ثبت معامله/آمار/کنترل اجرایی | Freqtrade | DB و RPC خصوصی؛ UI فارسی SBK1 باقی بماند و از backend مجاز، lifecycle authoritative را نمایش دهد. |
-| بک‌تست و بهینه‌سازی | Freqtrade | backtesting/Hyperopt فقط با strategy/replay قابل‌بازتولید از تصمیم‌های SBK1؛ FreqAI اختیاری و فقط اگر تصمیم گرفته شود بخشی از مدل را به Freqtrade واگذار کنیم. |
+| بک‌تست و بهینه‌سازی | Freqtrade | backtesting/Hyperopt فقط با strategy/replay قابل‌بازتولید از تصمیم‌های SBK1؛ تحلیل‌گرهای متن‌باز فعلی بیرون از مجوز تصمیم اجرا می‌شوند. |
 
 **قاعدهٔ عدم تداخل:** یک معامله فقط یک hard-stop owner دارد. خروج حفاظتی متعلق به Freqtrade است؛ تصمیم عادی خروج متعلق به SBK1 است. `minimal_roi`, `custom_exit`, exit signal و trailing نباید همزمان منطق‌های متناقض اعمال کنند؛ پیش از فعال‌سازی هر ترکیب، ترتیب و precedence در config/strategy و تست‌ها باید روشن باشد. فعال‌بودن قابلیت در Freqtrade به معنی نیاز به روشن‌کردن همهٔ قابلیت‌ها نیست.
 
@@ -76,12 +76,12 @@
 | الزامی برای پژوهش | Historical data، backtesting و lookahead-analysis | replay تصمیم‌های واقعی/آرشیوشدهٔ SBK1 بر دادهٔ واقعی و قابل‌بازتولید. صف زنده به‌تنهایی strategy قابل‌بک‌تست نمی‌سازد؛ خروجی صفر معامله یا دادهٔ ساختگی، مدرک عملکرد نیست. |
 | مشروط به نیاز و venue | Order book، ticker، funding، open interest، mark/index | فقط اگر DataProvider نسخهٔ نصب‌شده در exchange/market موردنظر فیلد را واقعاً پشتیبانی کند و مغز SBK1 نیاز داشته باشد. semantics، تازگی و provenance هر فیلد آزموده شود؛ فقدان آن fail-closed است. |
 | مشروط | Hyperopt | فقط برای پارامترهای strategy تاریخی پس از جداسازی train/validation و حفاظت از out-of-sample؛ جایگزین مدل/تصمیم SBK1 و مجوز live نیست. |
-| بعدی/مشروط | FreqAI | برای نسخهٔ نخست لازم نیست چون مدل و پیش‌بینی مالکیت SBK1 است. فقط برای نیاز ML مکمل، بدون دو تصمیم‌گیر مستقل و با کنترل leakage/drift/versioning/rollback ارزیابی شود. |
+| پیاده‌سازی‌شده و فقط advisory | تحلیل‌گرهای متن‌باز SBK1 | worker محلی OHLCV و تیترهای RSS را به TA-Lib، Markov regime، Isolation Forest، LightGBM، XGBoost/SHAP و مدل sentiment می‌دهد؛ خروجی از API فقط‌خواندنی و پنل مغزها دیده می‌شود و اختیار تصمیم یا سفارش ندارد. |
 | مشروط | Dynamic pairlists، چند bot و Producer-Consumer | فقط برای universe پویا یا نیاز واقعی به چند worker/bot؛ شروع با پروفایل‌های محدود و processهای مجزا ساده‌تر و امن‌تر است. |
 | اختیاری | Telegram، webhook، Freqtrade UI و plotting | اعلان و عملیات برحسب نیاز؛ مرجع تصمیم SBK1 یا راه دورزدن کنترل دسترسی/ریسک نشوند. |
 | خاموش مگر تصویب و آزمون مستقل | `force_entry`, DCA/`position_adjustment` و entry signal جهت‌دار داخلی Freqtrade | ممکن است تصمیم یا سقف ریسک SBK1 را دور بزنند؛ پیش‌فرض خاموش، و مسیر force-entry محصول غیرفعال بماند. |
 
-راهنمای مرجع در سورس vendored: [DataProvider و informative data](./freqtrade/docs/strategy-customization.md)، [strategy callbacks](./freqtrade/docs/strategy-callbacks.md)، [configuration](./freqtrade/docs/configuration.md)، [protections](./freqtrade/docs/includes/protections.md)، [REST/RPC](./freqtrade/docs/rest-api.md)، [backtesting](./freqtrade/docs/backtesting.md)، [Hyperopt](./freqtrade/docs/hyperopt.md) و [FreqAI](./freqtrade/docs/freqai.md). قابلیت دقیق باید با نسخهٔ Freqtrade نصب‌شده تطبیق داده شود.
+راهنمای مرجع در سورس vendored: [DataProvider و informative data](./freqtrade/docs/strategy-customization.md)، [strategy callbacks](./freqtrade/docs/strategy-callbacks.md)، [configuration](./freqtrade/docs/configuration.md)، [protections](./freqtrade/docs/includes/protections.md)، [REST/RPC](./freqtrade/docs/rest-api.md)، [backtesting](./freqtrade/docs/backtesting.md) و [Hyperopt](./freqtrade/docs/hyperopt.md). قابلیت دقیق باید با نسخهٔ Freqtrade نصب‌شده تطبیق داده شود.
 
 ### جریان مالکیت تصمیم و داده
 
@@ -164,17 +164,21 @@
 - استراتژی‌ها و callbackهای اجرا، stop/exit و position sizing.
 - دانلود و نگهداری دادهٔ تاریخی و backtesting با fee/slippage/funding و زمان‌بندی واقعی بازار.
 - Hyperopt، فقط برای جست‌وجوی پارامتر در دادهٔ آموزشی/اعتبارسنجی و نه به‌عنوان اثبات سودآوری.
-- FreqAI: feature/label، train/inference، بازآموزی، تشخیص outlier/drift، نسخه‌بندی مدل و rollback.
+- پایش drift و کیفیت خروجی تحلیل‌گرهای advisory، ثبت نسخهٔ وابستگی/مدل و قابلیت بازتولید نتایج.
 - Pairlists و protections، informative timeframes و pluginهای مرتبط.
 - REST/RPC و در صورت نیاز Telegram/webhook/Producer-Consumer؛ هر سطح دسترسی جدا و با مرز اعتماد روشن.
 
 **کارها و پذیرش**
 - strategy تاریخی SBK1 باید از تصمیم/featureهای آرشیوشده بازتولید شود؛ صف سیگنال زنده جای بک‌تست تاریخی نیست.
 - تعریف پروتکل پژوهش پیش از اجرا: دادهٔ واقعی، بازه‌های train/validation/out-of-sample، walk-forward، هزینه‌های معاملاتی، معیارهای قبولی و عدم‌قطعیت.
-- برای Hyperopt و FreqAI، جلوگیری از leakage و انتخاب پسینی بهترین نتیجه اثبات شود؛ مدل صرفاً پس از مقایسهٔ مستقل می‌تواند ورودی تصمیم باشد.
+- برای Hyperopt و تحلیل‌گرهای یادگیری ماشین، جلوگیری از leakage و انتخاب پسینی بهترین نتیجه بررسی شود؛ خروجی فعلی صرفاً evidence کمکی می‌ماند.
 - هر plugin/قابلیت تنها در صورت نیاز روشن، ورودی قابل‌اعتماد، آزمون بازار هدف و runbook عملیاتی پذیرفته شود. وجود قابلیت در Freqtrade به‌تنهایی دلیل استفاده نیست.
 - بک‌تست بدون تصمیم‌های تاریخی SBK1 یا بدون دادهٔ لازم صریحاً نامعتبر/غیرقابل‌اجرا گزارش شود، نه با خروجی ساختگی جایگزین گردد.
-- Hyperopt و FreqAI قابلیت‌های اختیاری Freqtrade هستند، نه پیش‌نیاز اتصال execution؛ فقط در صورت تصمیم معماری و وجود داده/معیار معتبر فعال شوند. امتیازدهی موجود SBK1 برای اتصال اولیه بیرون از Freqtrade می‌ماند.
+- تحلیل‌گرهای متن‌باز SBK1 در `freqtrade_integration/advisory/open_source_advisory_worker.py` به‌صورت worker محلی JSON-lines اجرا می‌شوند؛ خروجی TA-Lib، Markov regime، Isolation Forest، LightGBM/XGBoost و sentiment تیترها از API فقط‌خواندنی احراز هویت‌شده و پنل مغزها قابل مشاهده است.
+- inference مدل sentiment در فرایند فرزند جداگانه و پیش از بارگذاری مدل‌های بازار اجرا می‌شود تا حافظهٔ Torch با مدل‌های آماری/درختی در یک فرایند جمع نشود؛ زمان آن به ۶۰ ثانیه محدود است و شکست یا timeout فقط همان ماژول را `UNAVAILABLE` می‌کند.
+- وابستگی‌های این تحلیل‌ها جدا از Freqtrade در `freqtrade_integration/requirements-analysis.txt` تعریف شده‌اند. مدل خبر با revision ثابت و cache محلی بارگذاری می‌شود؛ نبود هر dependency یا وزن مدل باید همان ماژول را `UNAVAILABLE` کند.
+- آماده‌سازی محلی: `./.venv/bin/python -m pip install -r freqtrade_integration/requirements-analysis.txt` و سپس `./.venv/bin/python -m scripts.download_advisory_model`. cache در `.cache/sbk1/open-source-models` است و وارد Git نمی‌شود.
+- همهٔ خروجی‌ها فقط `ADVISORY_ONLY` هستند؛ نه وارد consensus یا گیت‌ها می‌شوند، نه مجوز ورود/سایز ریسک/مدیریت موقعیت را تغییر می‌دهند. FreqAI در یکپارچه‌سازی SBK1 استفاده نمی‌شود؛ قابلیت upstream آن در سورس vendored Freqtrade بخشی از پروژهٔ SBK1 نیست.
 
 ### مرحلهٔ ۴ — سیاست ریسک واحد و چرخهٔ کامل معامله
 

@@ -13,7 +13,71 @@ sys.path.insert(0, str(ROOT / "freqtrade_integration" / "strategies"))
 
 import requests
 from SbkSignalStrategy import SbkSignalStrategy
-from sbk_signal_contract import unresolved_inflight_signal_ids
+from sbk_signal_contract import is_signal_runtime, unresolved_inflight_signal_ids
+
+
+AUTHORIZATION_GATE_IDS = (
+    "STAGE_1_MARKET_DATA",
+    "STAGE_2_DATA_QUALITY",
+    "STAGE_3_MARKET_REGIME",
+    "STAGE_4_HTF_STRUCTURE",
+    "STAGE_5_SETUP_DETECTION",
+    "STAGE_6_LIQUIDITY_ANALYSIS",
+    "STAGE_7_ORDER_FLOW",
+    "STAGE_8_ENTRY_TRIGGER",
+    "STAGE_9_ENTRY_PRICE",
+    "STAGE_10_STOP_INVALIDATION",
+    "STAGE_11_TP_TARGETS",
+    "STAGE_12_EXPECTED_VALUE",
+    "STAGE_13_POSITION_SIZE",
+    "STAGE_14_EXECUTION",
+)
+
+
+def make_authorization(signal_id, timestamp_ms, timeframe, direction):
+    model_direction = direction
+    return {
+        "contractVersion": "sbk1.entry.authorization.v1",
+        "decision": "APPROVE_ENTRY",
+        "decisionId": signal_id,
+        "snapshotId": f"SNP_{timestamp_ms}_python_test",
+        "snapshotTimestampMs": timestamp_ms,
+        "evaluatedAtMs": timestamp_ms,
+        "timeframe": timeframe,
+        "direction": direction,
+        "gates": [
+            {"id": gate_id, "status": "PASSED", "reason": "Isolated contract test evidence."}
+            for gate_id in AUTHORIZATION_GATE_IDS
+        ],
+        "models": [
+            {
+                "id": "M1_TEST",
+                "status": "HEALTHY",
+                "calibrated": True,
+                "independenceValidated": True,
+                "direction": model_direction,
+                "probabilityPct": 70,
+                "sampleSize": 40,
+                "oosPrecisionPct": 60,
+                "effectiveWeight": 0.4,
+            },
+            {
+                "id": "M2_TEST",
+                "status": "HEALTHY",
+                "calibrated": True,
+                "independenceValidated": True,
+                "direction": model_direction,
+                "probabilityPct": 68,
+                "sampleSize": 40,
+                "oosPrecisionPct": 60,
+                "effectiveWeight": 0.3,
+            },
+        ],
+        "disagreementVeto": False,
+        "ensembleProbabilityPct": 69.14,
+        "riskRewardRatio": 2,
+        "allocatedRiskUsd": 1,
+    }
 
 
 class InflightSignalReconciliationTests(unittest.TestCase):
@@ -57,7 +121,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.now_ms = int(datetime.now(UTC).timestamp() * 1000)
         self.signal_id = "sbk1_" + "a" * 32
         self.signal = {
-            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "contractVersion": "sbk1.freqtrade.signal.v2",
             "decisionId": self.signal_id,
             "signalId": self.signal_id,
             "exchange": "bybit",
@@ -88,10 +152,16 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
                 "maxLeverage": 1,
             },
         }
+        self.signal["authorization"] = make_authorization(
+            self.signal_id,
+            self.now_ms - 1_000,
+            self.signal["timeframe"],
+            self.signal["direction"],
+        )
         self.response = Mock()
         self.response.raise_for_status.return_value = None
         self.response.json.return_value = {
-            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "contractVersion": "sbk1.freqtrade.signal.v2",
             "signals": [{"signal": self.signal, "status": "STRATEGY_ACCEPTED"}],
         }
 
@@ -124,8 +194,8 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "close": [60_050, 60_100, 60_150],
             "volume": [1.0, 2.0, 3.0],
         })
-        self.strategy.config["dry_run"] = False
-        self.strategy.config["runmode"] = SimpleNamespace(value="live")
+        self.strategy.config["dry_run"] = True
+        self.strategy.config["runmode"] = SimpleNamespace(value="dry_run")
         self.strategy.dp = SimpleNamespace(
             get_pair_dataframe=Mock(return_value=dataframe),
             ticker=Mock(return_value={
@@ -158,7 +228,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         poll_response = Mock()
         poll_response.raise_for_status.return_value = None
         poll_response.json.return_value = {
-            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "contractVersion": "sbk1.freqtrade.signal.v2",
             "signals": [],
         }
 
@@ -185,7 +255,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["ticker"]["indexPrice"], 60_153)
         self.assertEqual(payload["orderBook"]["bids"][0]["price"], 60_149)
         self.assertEqual(payload["fundingRate"]["rate"], -0.0001)
-        self.assertEqual(payload["contractVersion"], "sbk1.freqtrade.market-snapshot.v4")
+        self.assertEqual(payload["contractVersion"], "sbk1.freqtrade.market-snapshot.v5")
         self.assertEqual(len(payload["tradeFlow"]["trades"]), 2)
         self.assertEqual(payload["tradeFlow"]["trades"][0]["side"], "buy")
         self.assertEqual(set(payload["additionalCandles"]), {"1m", "5m", "1h", "4h"})
@@ -240,49 +310,45 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.assertIn("trace-123", captured.output[0])
         self.assertEqual(self.strategy._signals, {})
 
-    def test_production_signal_is_available_for_entry_in_dry_run_and_live(self):
-        for runmode, dry_run in (("dry_run", True), ("live", False)):
-            with self.subTest(runmode=runmode):
-                self.strategy.config["dry_run"] = dry_run
-                self.strategy.config["runmode"] = SimpleNamespace(value=runmode)
-                self.response.json.return_value = {
-                    "contractVersion": "sbk1.freqtrade.signal.v1",
-                    "signals": [{"signal": self.signal, "status": "ACCEPTED"}],
-                }
-                with patch("SbkSignalStrategy.requests.get", return_value=self.response) as get:
-                    self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+    def test_production_signal_is_available_only_in_dry_run(self):
+        self.response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v2",
+            "signals": [{"signal": self.signal, "status": "ACCEPTED"}],
+        }
+        with patch("SbkSignalStrategy.requests.get", return_value=self.response) as get:
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+        get.assert_called_once()
+        self.assertEqual(self.strategy._signals[self.signal_id], self.signal)
+        self.assertEqual(self.strategy._signal_statuses[self.signal_id], "ACCEPTED")
 
-                get.assert_called_once()
-                self.assertEqual(self.strategy._signals[self.signal_id], self.signal)
-                self.assertEqual(self.strategy._signal_statuses[self.signal_id], "ACCEPTED")
-                self.assertEqual(self.strategy._signals_by_pair[self.signal["pair"]], self.signal)
+        dataframe = pd.DataFrame({
+            "date": [datetime.fromtimestamp((self.now_ms - 60_000) / 1000, UTC)],
+            "close": [self.signal["referencePrice"]],
+        })
+        entries = self.strategy.populate_entry_trend(dataframe, {"pair": self.signal["pair"]})
+        self.assertEqual(entries.iloc[-1]["enter_long"], 1)
+        self.assertEqual(entries.iloc[-1]["enter_tag"], self.signal_id)
+        with patch.object(self.strategy, "_post_status", return_value=True):
+            accepted = self.strategy.confirm_trade_entry(
+                self.signal["pair"],
+                "limit",
+                0.001,
+                self.signal["referencePrice"],
+                "gtc",
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                self.signal_id,
+                "long",
+            )
+        self.assertTrue(accepted)
+        self.assertEqual(self.strategy._signal_statuses[self.signal_id], "STRATEGY_ACCEPTED")
 
-                dataframe = pd.DataFrame(
-                    {
-                        "date": [datetime.fromtimestamp((self.now_ms - 60_000) / 1000, UTC)],
-                        "close": [self.signal["referencePrice"]],
-                    }
-                )
-                entries = self.strategy.populate_entry_trend(
-                    dataframe,
-                    {"pair": self.signal["pair"]},
-                )
-                self.assertEqual(entries.iloc[-1]["enter_long"], 1)
-                self.assertEqual(entries.iloc[-1]["enter_tag"], self.signal_id)
-
-                with patch.object(self.strategy, "_post_status", return_value=True):
-                    accepted = self.strategy.confirm_trade_entry(
-                        self.signal["pair"],
-                        "limit",
-                        0.001,
-                        self.signal["referencePrice"],
-                        "gtc",
-                        datetime.fromtimestamp(self.now_ms / 1000, UTC),
-                        self.signal_id,
-                        "long",
-                    )
-                self.assertTrue(accepted)
-                self.assertEqual(self.strategy._signal_statuses[self.signal_id], "STRATEGY_ACCEPTED")
+        self.strategy.config["dry_run"] = False
+        self.strategy.config["runmode"] = SimpleNamespace(value="live")
+        with patch("SbkSignalStrategy.requests.get") as live_get:
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+        live_get.assert_not_called()
+        self.assertFalse(is_signal_runtime("live"))
+        self.assertTrue(is_signal_runtime("dry_run"))
 
     def test_stake_uses_signal_risk_and_never_exceeds_configured_cap(self):
         self.strategy._signals = {self.signal_id: self.signal}
@@ -389,7 +455,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         exit_id = "sbk1_exit_" + "b" * 32
         self.strategy._exit_signals = {
             exit_id: {
-                "contractVersion": "sbk1.freqtrade.signal.v1",
+                "contractVersion": "sbk1.freqtrade.signal.v2",
                 "signalType": "EXIT",
                 "exitId": exit_id,
                 "pair": self.signal["pair"],
@@ -416,7 +482,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         exit_id = "sbk1_exit_" + "b" * 32
         self.strategy._exit_signals = {
             exit_id: {
-                "contractVersion": "sbk1.freqtrade.signal.v1",
+                "contractVersion": "sbk1.freqtrade.signal.v2",
                 "signalType": "EXIT",
                 "exitId": exit_id,
                 "pair": self.signal["pair"],
@@ -432,6 +498,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             id=42,
             enter_tag=self.signal_id,
             is_short=False,
+            get_custom_data=Mock(return_value=self.signal),
             set_custom_data=Mock(),
         )
         current_time = datetime.fromtimestamp(self.now_ms / 1000, UTC)
@@ -462,16 +529,85 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             self.strategy.custom_exit(self.signal["pair"], trade, current_time, 62_100, 0)
         )
 
-    def test_take_profit_does_not_create_an_exit_without_an_sbk1_exit_signal(self):
-        trade = SimpleNamespace(id=42, enter_tag=self.signal_id, is_short=False)
+    def test_confirmed_exit_signal_is_reloaded_after_strategy_restart(self):
+        exit_id = "sbk1_exit_" + "b" * 32
+        exit_signal = {
+            "contractVersion": "sbk1.freqtrade.signal.v2",
+            "signalType": "EXIT",
+            "exitId": exit_id,
+            "pair": self.signal["pair"],
+            "tradeId": 42,
+            "entryTag": self.signal_id,
+            "direction": "LONG",
+            "reason": "CONTRACT_TEST_ONLY restart replay",
+            "generatedAtMs": self.now_ms,
+            "expiresAtMs": self.now_ms + 30_000,
+        }
+        self.response.json.return_value = {
+            "contractVersion": "sbk1.freqtrade.signal.v2",
+            "signals": [],
+            "exitSignals": [exit_signal],
+        }
+        self.strategy._exit_signals = {}
+        with patch("SbkSignalStrategy.requests.get", return_value=self.response):
+            self.strategy.bot_loop_start(datetime.fromtimestamp(self.now_ms / 1000, UTC))
+
+        trade = SimpleNamespace(
+            id=42,
+            enter_tag=self.signal_id,
+            is_short=False,
+            get_custom_data=Mock(return_value=self.signal),
+            set_custom_data=Mock(),
+        )
+        self.assertEqual(
+            self.strategy.custom_exit(
+                self.signal["pair"],
+                trade,
+                datetime.fromtimestamp(self.now_ms / 1000, UTC),
+                62_100,
+                0,
+            ),
+            f"sbk_exit_{exit_id}",
+        )
+
+    def test_take_profit_maps_to_freqtrade_exit_without_an_sbk1_exit_signal(self):
+        trade = SimpleNamespace(
+            id=42,
+            enter_tag=self.signal_id,
+            is_short=False,
+            get_custom_data=Mock(return_value=self.signal),
+        )
+        current_time = datetime.fromtimestamp(self.now_ms / 1000, UTC)
 
         self.assertIsNone(
             self.strategy.custom_exit(
                 self.signal["pair"],
                 trade,
-                datetime.fromtimestamp(self.now_ms / 1000, UTC),
-                self.signal["entryConditions"]["takeProfit"] + 1,
+                current_time,
+                self.signal["entryConditions"]["takeProfit"] - 1,
                 0.01,
+            )
+        )
+        self.assertEqual(
+            self.strategy.custom_exit(
+                self.signal["pair"],
+                trade,
+                current_time,
+                self.signal["entryConditions"]["takeProfit"],
+                0.01,
+            ),
+            "sbk_take_profit",
+        )
+        self.assertTrue(
+            self.strategy.confirm_trade_exit(
+                self.signal["pair"],
+                trade,
+                "market",
+                0.001,
+                self.signal["entryConditions"]["takeProfit"],
+                "gtc",
+                "sbk_take_profit",
+                current_time,
             )
         )
 
@@ -519,7 +655,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         unknown_response = Mock()
         unknown_response.raise_for_status.return_value = None
         unknown_response.json.return_value = {
-            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "contractVersion": "sbk1.freqtrade.signal.v2",
             "signals": [{"signal": self.signal, "status": "UNKNOWN_IN_FLIGHT"}],
         }
         with (
@@ -536,7 +672,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         unknown_response = Mock()
         unknown_response.raise_for_status.return_value = None
         unknown_response.json.return_value = {
-            "contractVersion": "sbk1.freqtrade.signal.v1",
+            "contractVersion": "sbk1.freqtrade.signal.v2",
             "signals": [{"signal": self.signal, "status": "UNKNOWN_IN_FLIGHT"}],
         }
         order = SimpleNamespace(ft_order_side="buy", safe_filled=0)

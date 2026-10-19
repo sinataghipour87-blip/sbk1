@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   deriveSbkExitSignalId,
   deriveSbkSignalIds,
+  SBK_ENTRY_AUTHORIZATION_VERSION,
   FreqtradeSignalAdapter,
   isValidBridgeToken,
   SBK_SIGNAL_CONTRACT_VERSION,
@@ -25,6 +26,22 @@ const ids = deriveSbkSignalIds({
   stopLoss: 61_800,
   takeProfit: 62_700,
 });
+const requiredGateIds = [
+  'STAGE_1_MARKET_DATA',
+  'STAGE_2_DATA_QUALITY',
+  'STAGE_3_MARKET_REGIME',
+  'STAGE_4_HTF_STRUCTURE',
+  'STAGE_5_SETUP_DETECTION',
+  'STAGE_6_LIQUIDITY_ANALYSIS',
+  'STAGE_7_ORDER_FLOW',
+  'STAGE_8_ENTRY_TRIGGER',
+  'STAGE_9_ENTRY_PRICE',
+  'STAGE_10_STOP_INVALIDATION',
+  'STAGE_11_TP_TARGETS',
+  'STAGE_12_EXPECTED_VALUE',
+  'STAGE_13_POSITION_SIZE',
+  'STAGE_14_EXECUTION',
+];
 const signal = {
   contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
   ...ids,
@@ -55,6 +72,45 @@ const signal = {
     maxStakeQuote: 100,
     maxLeverage: 1,
   },
+  authorization: {
+    contractVersion: SBK_ENTRY_AUTHORIZATION_VERSION,
+    decision: 'APPROVE_ENTRY',
+    decisionId: ids.decisionId,
+    snapshotId: `SNP_${nowMs}_1`,
+    snapshotTimestampMs: nowMs,
+    evaluatedAtMs: nowMs,
+    timeframe: '15m',
+    direction: 'LONG',
+    gates: requiredGateIds.map((id) => ({ id, status: 'PASSED', reason: 'CONTRACT_TEST_ONLY named isolated policy evidence.' })),
+    models: [
+      {
+        id: 'M1_CENTRAL_CALIBRATED',
+        status: 'HEALTHY',
+        calibrated: true,
+        independenceValidated: true,
+        direction: 'LONG',
+        probabilityPct: 70,
+        sampleSize: 40,
+        oosPrecisionPct: 60,
+        effectiveWeight: 0.4,
+      },
+      {
+        id: 'M2_BAYESIAN_MICRO',
+        status: 'HEALTHY',
+        calibrated: true,
+        independenceValidated: true,
+        direction: 'LONG',
+        probabilityPct: 68,
+        sampleSize: 40,
+        oosPrecisionPct: 60,
+        effectiveWeight: 0.3,
+      },
+    ],
+    disagreementVeto: false,
+    ensembleProbabilityPct: 69.14,
+    riskRewardRatio: 2,
+    allocatedRiskUsd: 1,
+  },
 } as const;
 
 const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'sbk1-freqtrade-signal-'));
@@ -68,13 +124,13 @@ try {
     expectedTimeframe: '15m',
   });
   assert.equal(validated.signalId, ids.signalId);
-  assert.equal(validated.evidenceLevel, 'UNCALIBRATED_HEURISTIC');
+  assert.equal(validated.authorization.decision, 'APPROVE_ENTRY');
   const unscoredSignal = validateSbkFreqtradeSignal({
     ...signal,
     engineScore: null,
   }, { nowMs });
   assert.equal(unscoredSignal.engineScore, null, 'an unavailable heuristic score must stay explicitly unavailable');
-  assert.equal(unscoredSignal.evidenceLevel, 'UNCALIBRATED_HEURISTIC');
+  assert.equal(unscoredSignal.authorization.decision, 'APPROVE_ENTRY');
   assert.equal(isValidBridgeToken('a'.repeat(32), 'a'.repeat(32)), true);
   assert.equal(isValidBridgeToken('a'.repeat(31), 'a'.repeat(32)), false);
   assert.equal(isValidBridgeToken('a'.repeat(32), 'short'), false);
@@ -114,8 +170,49 @@ try {
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_RISK_REWARD',
   );
   assert.throws(
-    () => validateSbkFreqtradeSignal({ ...signal, evidenceLevel: 'CALIBRATED' }, { nowMs }),
-    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_EVIDENCE_LEVEL',
+    () => validateSbkFreqtradeSignal({ ...signal, authorization: undefined }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_AUTHORIZATION',
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      authorization: {
+        ...signal.authorization,
+        models: signal.authorization.models.map((model) => ({
+          ...model,
+          status: 'SUSPENDED',
+          effectiveWeight: 0.4,
+        })),
+      },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError &&
+      ['INVALID_MODEL_ENSEMBLE', 'INVALID_MODEL_EVIDENCE'].includes(error.code),
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      authorization: {
+        ...signal.authorization,
+        models: signal.authorization.models.map((model) => ({
+          ...model,
+          independenceValidated: false,
+        })),
+      },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError &&
+      error.code === 'INVALID_MODEL_ENSEMBLE',
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      authorization: {
+        ...signal.authorization,
+        gates: signal.authorization.gates.map((gate) => gate.id === 'STAGE_7_ORDER_FLOW'
+          ? { ...gate, status: 'UNAVAILABLE' }
+          : gate),
+      },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_AUTHORIZATION_GATES',
   );
   const exitSignal = {
     contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
@@ -198,6 +295,11 @@ try {
     'CONTRACT_TEST_ONLY accepted by named RPC mock',
   );
   assert.equal(confirmedExit.status, 'CONFIRMED');
+  assert.deepEqual(
+    (await new FreqtradeSignalAdapter().getPendingExitSignals(signal.pair)).map((pending) => pending.exitId),
+    [exitSignal.exitId],
+    'confirmed exit intent is replayable from persisted adapter state after restart',
+  );
   const closedExit = await adapter.updateExitSignalStatus(exitSignal.exitId, 'CLOSED');
   assert.equal(closedExit.status, 'CLOSED');
   assert.equal((await adapter.getPendingExitSignals(signal.pair)).length, 0);
@@ -217,7 +319,11 @@ try {
     stopLoss: signal.entryConditions.stopLoss,
     takeProfit: signal.entryConditions.takeProfit,
   });
-  const lateLink = await adapter.submit({ ...signal, ...lateLinkIds }, { nowMs, expectedPair: signal.pair });
+  const lateLink = await adapter.submit({
+    ...signal,
+    ...lateLinkIds,
+    authorization: { ...signal.authorization, decisionId: lateLinkIds.decisionId },
+  }, { nowMs, expectedPair: signal.pair });
   await adapter.updateStatus(lateLink.signal.signalId, { status: 'STRATEGY_ACCEPTED' });
   await adapter.updateStatus(lateLink.signal.signalId, { status: 'ORDER_SUBMITTED' });
   await adapter.updateStatus(lateLink.signal.signalId, { status: 'FILLED' });
@@ -241,6 +347,7 @@ try {
     ...signal,
     ...uncertainIds,
     entryConditions: { ...signal.entryConditions, setupType: 'DRY_RUN_E2E_FIXTURE_UNCERTAIN' },
+    authorization: { ...signal.authorization, decisionId: uncertainIds.decisionId },
   }, { nowMs, expectedPair: signal.pair });
   await adapter.updateStatus(uncertain.signal.signalId, { status: 'STRATEGY_ACCEPTED' });
   const quarantined = await adapter.updateStatus(uncertain.signal.signalId, {
@@ -275,6 +382,7 @@ try {
     ...signal,
     ...cancelledIds,
     entryConditions: { ...signal.entryConditions, setupType: 'DRY_RUN_E2E_FIXTURE_CANCELLED' },
+    authorization: { ...signal.authorization, decisionId: cancelledIds.decisionId },
   }, { nowMs, expectedPair: signal.pair });
   await adapter.updateStatus(cancellable.signal.signalId, { status: 'STRATEGY_ACCEPTED' });
   await adapter.updateStatus(cancellable.signal.signalId, { status: 'ORDER_SUBMITTED', tradeId: 43 });
@@ -310,6 +418,7 @@ for case in cases:
 print("Python signal contract checks passed.")
 `], {
     cwd: process.cwd(),
+    env: { ...process.env, SBK1_DRY_RUN_FIXTURE_ENABLED: 'true' },
     input: JSON.stringify([
       { name: 'valid', signal, nowMs, valid: true },
       { name: 'explicitly unscored heuristic signal', signal: { ...signal, engineScore: null }, nowMs, valid: true },
@@ -342,6 +451,15 @@ print("Python signal contract checks passed.")
           expiresAtMs: nowMs + 20_000,
           entryConditions: { ...signal.entryConditions, setupType: 'DRY_RUN_E2E_FIXTURE_TEST' },
           dataQuality: { ...signal.dataQuality, observedAtMs: nowMs - 40_000, maxAgeMs: 55_000 },
+          authorization: {
+            ...signal.authorization,
+            decision: 'DRY_RUN_TEST_ONLY',
+            snapshotId: `SNP_${nowMs - 40_000}_test`,
+            snapshotTimestampMs: nowMs - 40_000,
+            evaluatedAtMs: nowMs - 40_000,
+            models: [],
+            ensembleProbabilityPct: null,
+          },
         },
         nowMs,
         valid: true,

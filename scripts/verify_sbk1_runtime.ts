@@ -59,6 +59,10 @@ assert.equal(settings.market, 'futures');
 assert.equal(settings.apiBaseUrl, 'http://127.0.0.1:8080/api/v1');
 assert.equal(settings.bridgeBaseUrl, 'http://127.0.0.1:3000');
 assert.throws(
+  () => validateRuntimeSettings({ ...config, freqai: { enabled: true } }, environment),
+  /FreqAI integration was removed from SBK1/,
+);
+assert.throws(
   () => validateRuntimeSettings({
     ...config,
     internals: { process_throttle_secs: 5 },
@@ -87,21 +91,21 @@ assert.equal(
 
 assert.throws(
   () => validateRuntimeSettings({ ...config, dry_run: false }, environment),
-  /SBK1_LIVE_ENABLED=true/,
+  /LIVE در این یکپارچه‌سازی غیرفعال است/,
 );
 const liveEnabledEnvironment = { ...environment, SBK1_LIVE_ENABLED: 'true' };
 assert.throws(
   () => validateRuntimeSettings({ ...config, dry_run: false }, liveEnabledEnvironment),
-  /کلید و secret صرافی/,
+  /LIVE در این یکپارچه‌سازی غیرفعال است/,
 );
 const liveConfigWithNamedCredentials = {
   ...config,
   dry_run: false,
   exchange: { ...config.exchange, key: 'private-test-key', secret: 'private-test-secret' },
 };
-assert.equal(
-  validateRuntimeSettings(liveConfigWithNamedCredentials, liveEnabledEnvironment).liveEnabled,
-  true,
+assert.throws(
+  () => validateRuntimeSettings(liveConfigWithNamedCredentials, liveEnabledEnvironment),
+  /LIVE در این یکپارچه‌سازی غیرفعال است/,
 );
 assert.throws(
   () => validateRuntimeSettings({

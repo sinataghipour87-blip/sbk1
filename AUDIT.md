@@ -119,7 +119,7 @@ Commands and observed outcomes (secrets intentionally omitted):
 
 ## Execution ownership and legacy paths
 
-Freqtrade is the sole order/fill/position authority in the active integration. The TypeScript RPC bridge uses authentication and reads status, trades, balances and whitelist. The TypeScript signal adapter and Python strategy share `sbk1.freqtrade.signal.v1`; both enforce pair/exchange/timeframe, freshness/expiry and risk fields. The adapter persists signal lifecycle metadata and prevents duplicate IDs; it is not the official trade database.
+Freqtrade is the sole order/fill/position authority in the active integration. The TypeScript RPC bridge uses authentication and reads status, trades, balances and whitelist. The TypeScript signal adapter and Python strategy share `sbk1.freqtrade.signal.v2`, including versioned entry authorization, freshness/expiry and risk fields. The server runner uses the full decision pipeline; the raw UI entry endpoint is disabled, and the automatic bridge/launcher require `dry_run=true`. The adapter persists signal lifecycle metadata and prevents duplicate IDs; it is not the official trade database.
 
 `server.ts` no longer contains direct Bybit REST/signing/credential-vault code, private order/position handlers, the old execution daemon, or the parallel exchange WebSocket. A default-deny API middleware allows only `GET /api/exchange/status` and an explicit safe `/api/live` allowlist. The HTTP integration test blocks non-loopback fetches while exercising legacy paths. Old local JSON position/history files are preserved but are no longer read or written by the server. The SBK1 kill switch blocks SBK1 signal delivery; it does not represent Freqtrade's live order/position state.
 

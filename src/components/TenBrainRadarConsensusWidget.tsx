@@ -182,7 +182,7 @@ export const TenBrainRadarConsensusWidget: React.FC<Props> = ({
                 <div key={prop.id} className="bg-[#041124] p-3 rounded-xl border border-cyan-950/80 space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-white font-sans">{prop.titleFa}</span>
-                    <span className="px-2 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-500/40 text-[10px] font-mono">
+                    <span className={`px-2 py-0.5 rounded ${prop.status === 'BLOCKED_UNVALIDATED' ? 'bg-rose-950 text-rose-300 border border-rose-500/40' : 'bg-cyan-950 text-cyan-300 border border-cyan-500/40'} text-[10px] font-mono`}>
                       {prop.status}
                     </span>
                   </div>

@@ -89,6 +89,11 @@ export const PillarsStatusWidget: React.FC<PillarsStatusWidgetProps> = ({
 
   const passedCount = totalPillarsPassed;
   const isReady = canExecute;
+  const pillarNumbers = new Map<string, number>();
+  let scorePillarNumber = 0;
+  for (const item of breakdown) {
+    if (item.weight > 0) pillarNumbers.set(item.id, ++scorePillarNumber);
+  }
 
   return (
     <div className="bg-[#0e1117] border border-slate-800 rounded-xl p-4 shadow-lg space-y-3.5 text-right font-sans">
@@ -234,10 +239,14 @@ export const PillarsStatusWidget: React.FC<PillarsStatusWidgetProps> = ({
         </div>
       </div>
 
-      {/* 8-Pillar Interactive Grid */}
+      {/* Eight weighted pillars plus the separate risk veto gate */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2.5">
-        {breakdown.map((item, idx) => {
+        {breakdown.map((item) => {
           const isPassed = item.passed;
+          const isScorePillar = item.weight > 0;
+          const pillarLabel = isScorePillar
+            ? `رکن ${pillarNumbers.get(item.id)} | وزن ${item.weight}%`
+            : 'گیت وتو | بدون وزن امتیازی';
           return (
             <div
               key={item.id}
@@ -258,7 +267,7 @@ export const PillarsStatusWidget: React.FC<PillarsStatusWidgetProps> = ({
                       {item.nameFa}
                     </div>
                     <div className="text-[9px] text-slate-400 font-mono">
-                      رکن {idx + 1} | وزن {item.weight}%
+                      {pillarLabel}
                     </div>
                   </div>
                 </div>
@@ -269,7 +278,9 @@ export const PillarsStatusWidget: React.FC<PillarsStatusWidgetProps> = ({
                     className={`h-2 w-2 rounded-full ${
                       isPassed
                         ? 'bg-emerald-400'
-                        : 'bg-rose-500'
+                        : item.available === false
+                          ? 'bg-amber-400'
+                          : 'bg-rose-500'
                     }`}
                   />
                 </div>
@@ -284,11 +295,17 @@ export const PillarsStatusWidget: React.FC<PillarsStatusWidgetProps> = ({
               {/* Bottom Row: Score & Barrier / Catalyst Tag */}
               <div className="flex items-center justify-between pt-1 border-t border-slate-800 text-[10px]">
                 <div className="font-mono text-slate-300">
-                  امتیاز: <span className={isPassed ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>{item.score}</span> / {item.weight}
+                  {isScorePillar
+                    ? <>امتیاز: <span className={isPassed ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>{item.score}</span> / {item.weight}</>
+                    : <>وضعیت گیت: <span className={isPassed ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>{isPassed ? 'مجاز' : 'مسدود'}</span></>}
                 </div>
 
                 {/* Explicit Barrier or Catalyst Badge */}
-                {isPassed ? (
+                {item.available === false ? (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-950/60 text-amber-300 border border-amber-800/50 text-[9px] font-medium">
+                    داده ناموجود
+                  </span>
+                ) : isPassed ? (
                   <span className="px-1.5 py-0.5 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-800/50 text-[9px] font-medium flex items-center gap-1">
                     <CheckCircle2 className="w-3 h-3 text-emerald-400" />
                     <span>مشوق ورود</span>

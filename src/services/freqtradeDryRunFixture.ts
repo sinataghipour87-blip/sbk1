@@ -1,5 +1,6 @@
 import {
   deriveSbkSignalIds,
+  SBK_ENTRY_AUTHORIZATION_VERSION,
   DRY_RUN_FIXTURE_SETUP_PREFIX,
   SBK_SIGNAL_CONTRACT_VERSION,
   validateSbkFreqtradeSignal,
@@ -107,6 +108,26 @@ export function createDryRunFixtureSignal(input: {
         maxPriceDeviationBps: 100,
       },
       riskLimits: input.riskLimits,
+      authorization: {
+        contractVersion: SBK_ENTRY_AUTHORIZATION_VERSION,
+        decision: 'DRY_RUN_TEST_ONLY',
+        decisionId: ids.decisionId,
+        snapshotId: `SNP_${input.observedAtMs}_${input.nowMs}`,
+        snapshotTimestampMs: input.observedAtMs,
+        evaluatedAtMs: input.nowMs,
+        timeframe: input.timeframe,
+        direction: 'LONG',
+        gates: [{
+          id: 'DRY_RUN_FIXTURE',
+          status: 'PASSED',
+          reason: 'Explicit isolated dry-run fixture; not a trading authorization.',
+        }],
+        models: [],
+        disagreementVeto: false,
+        ensembleProbabilityPct: null,
+        riskRewardRatio: 2,
+        allocatedRiskUsd: input.riskLimits.maxStakeQuote * input.riskLimits.riskBudgetPct / 100,
+      },
     },
     {
       nowMs: input.nowMs,

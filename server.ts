@@ -9,7 +9,6 @@ import { rateLimit } from 'express-rate-limit';
 import { TradePosition, TradeHistory, ExecutionSettings } from './src/types/trading';
 import { freqtradeBridge } from './src/services/freqtradeBridge';
 import {
-    deriveSbkSignalIds,
     freqtradeSignalAdapter,
     isValidBridgeToken,
     SBK_SIGNAL_CONTRACT_VERSION,
@@ -28,6 +27,8 @@ import {
 import { createServerSignalRunner, type ServerSignalRunner } from './src/services/serverSignalRunner';
 import { operationalTradeArchive } from './src/services/operationalTradeArchive';
 import { fetchDirectNewsHeadlines } from './src/services/directNewsFeeds';
+import { fetchFreeMacroData } from './src/services/freeMacroData';
+import { openSourceAdvisoryService } from './src/services/openSourceAdvisoryService';
 
 dotenv.config();
 
@@ -368,7 +369,7 @@ let executionSettings: ExecutionSettings = {
 };
 
 function isLiveExecutionEnabled(): boolean {
-    return process.env.SBK1_LIVE_ENABLED?.trim().toLowerCase() === 'true';
+    return false;
 }
 
 const executionModeLimiter: express.RequestHandler = (req, res, next) => {
@@ -420,7 +421,7 @@ app.get('/api/execution/dashboard', requireAdminAuth, async (_req, res) => {
     const marketStatus = snapshot?.ticker ? 'LIVE' : 'UNAVAILABLE';
     const selectedLive = executionSettings.mode === 'LIVE';
     const liveBlockers = [
-        ...(!isLiveExecutionEnabled() ? ['اجرای زنده غیرفعال است؛ مالک باید SBK1_LIVE_ENABLED=true را در محیط سرور تنظیم کند.'] : []),
+        'اجرای LIVE در یکپارچه‌سازی SBK1 غیرفعال است.',
         ...(!rpcConnected ? ['اتصال احراز‌شده و فعال Freqtrade در دسترس نیست.'] : []),
         ...(bot?.dryRun !== false ? ['برای لایو، Freqtrade باید با dry_run=false اجرا شود.'] : []),
         ...(bot?.demoTrading !== false ? ['برای لایو، demo_trading در Freqtrade باید false باشد.'] : []),
@@ -513,12 +514,12 @@ app.get('/api/execution/dashboard', requireAdminAuth, async (_req, res) => {
 
 app.post('/api/execution/mode', executionModeLimiter, requireAdminAuth, (req, res) => {
     const { mode, liveCapitalCeilingPct } = req.body || {};
-    const supportedModes = ['BACKTEST', 'DRY_RUN', 'TESTNET', 'PAPER', ...(isLiveExecutionEnabled() ? ['LIVE'] : [])] as const;
+    const supportedModes = ['BACKTEST', 'DRY_RUN', 'TESTNET', 'PAPER'] as const;
     if (mode !== undefined && !supportedModes.includes(mode)) {
         return res.status(409).json({
             success: false,
             error: mode === 'LIVE'
-                ? 'حالت LIVE پذیرفته نشد؛ مالک باید SBK1_LIVE_ENABLED=true را در محیط سرور فعال کند.'
+                ? 'حالت LIVE در یکپارچه‌سازی SBK1 غیرفعال است؛ فقط dry_run=true پذیرفته می‌شود.'
                 : 'حالت اجرای درخواستی پشتیبانی نمی‌شود.',
         });
     }
@@ -644,7 +645,7 @@ app.post('/api/freqtrade/market-snapshot', requireFreqtradeBridgeAuth, async (re
         }
         if (
             botState.status !== 'running' ||
-            (botState.dryRun !== true && !(botState.dryRun === false && isLiveExecutionEnabled())) ||
+            botState.dryRun !== true ||
             botState.demoTrading ||
             botState.forceEntryEnabled ||
             botState.exchange?.toLowerCase() !== exchange ||
@@ -677,6 +678,16 @@ app.post('/api/freqtrade/market-snapshot', requireFreqtradeBridgeAuth, async (re
             error: error instanceof Error ? error.message : String(error),
         });
     }
+});
+
+app.get('/api/open-source-advisories', requireAdminAuth, (_req, res) => {
+    const report = openSourceAdvisoryService.getLatest();
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+        status: report?.status ?? 'NOT_RUN',
+        decisionInfluence: 'ADVISORY_ONLY',
+        report,
+    });
 });
 
 app.get('/api/market/freqtrade-snapshot', (req, res) => {
@@ -819,8 +830,7 @@ app.get('/api/exchange/status', async (req, res) => {
                 botState.demoTrading === false &&
                 botState.forceEntryEnabled === false &&
                 botState.market === 'futures',
-            executionAllowed: (botState.dryRun || (!botState.dryRun && isLiveExecutionEnabled())) &&
-                botState.forceEntryEnabled === false,
+            executionAllowed: botState.dryRun && botState.forceEntryEnabled === false,
             executionAuthority: 'freqtrade',
             keyMasked: null,
             isTestnet: null,
@@ -1079,24 +1089,49 @@ app.get('/api/btc-fundamental-grounding', (_req, res) => {
   });
 });
 
-app.get('/api/whale-onchain-radar', (_req, res) => {
+app.get('/api/whale-onchain-radar', async (_req, res) => {
+  const { bitcoinActiveAddresses } = await fetchFreeMacroData();
+  const activeAddressesLive = bitcoinActiveAddresses.status === 'LIVE';
   res.json({
-    status: 'UNAVAILABLE', exchangeNetflowBtc: null, exchangeReserveBtc: null,
-    reserveStatus: 'UNAVAILABLE', whalePressureIndex: null, whaleSentiment: null,
-    summary: 'منبع مستقیم دادهٔ آن‌چین پیکربندی نشده است.', recentWhaleTransfers: [],
-    sourceGrounding: 'UNAVAILABLE',
-    provenance: { provider: 'NOT_CONFIGURED', retrievedAtMs: null, sources: [] },
+    status: activeAddressesLive ? 'LIVE' : 'UNAVAILABLE',
+    exchangeNetflowBtc: null,
+    exchangeReserveBtc: null,
+    reserveStatus: 'UNAVAILABLE',
+    whalePressureIndex: null,
+    whaleSentiment: null,
+    bitcoinActiveAddresses: bitcoinActiveAddresses.value,
+    bitcoinActiveAddressesStatus: bitcoinActiveAddresses.status,
+    summary: activeAddressesLive
+      ? 'فعالیت روزانهٔ شبکه از Coin Metrics دریافت شد؛ این metric جریان صرافی یا تراکنش نهنگ‌ها را نشان نمی‌دهد.'
+      : 'دادهٔ معتبر فعالیت شبکه در دسترس نیست؛ جریان صرافی و انتساب نهنگ نیز منبع تأییدشده ندارد.',
+    recentWhaleTransfers: [],
+    sourceGrounding: activeAddressesLive ? 'DIRECT_NETWORK_METRIC' : 'UNAVAILABLE',
+    provenance: {
+      exchangeNetflowBtc: {
+        status: 'UNAVAILABLE',
+        provider: 'NO_VERIFIED_FREE_EXCHANGE_WALLET_ATTRIBUTION',
+        retrievedAtMs: null,
+        sources: [],
+      },
+      bitcoinActiveAddresses: bitcoinActiveAddresses,
+    },
   });
 });
 
 app.get('/api/macro-context', async (_req, res) => {
-  const newsHeadlinesPromise = fetchDirectNewsHeadlines();
+  const [newsHeadlines, macroData] = await Promise.all([
+    fetchDirectNewsHeadlines(),
+    fetchFreeMacroData(),
+  ]);
   const endpoint = 'https://api.alternative.me/fng/?limit=1&format=json';
   let fearAndGreedStatus: 'LIVE' | 'UNAVAILABLE' = 'UNAVAILABLE';
   let fearAndGreedIndex: number | null = null;
   let fearAndGreedLabelFa = 'UNAVAILABLE';
   let fearAndGreedRetrievedAtMs: number | null = null;
+  let fearAndGreedObservedAtMs: number | null = null;
+  let fearAndGreedLatencyMs: number | null = null;
   try {
+    const startedAtMs = Date.now();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 4_000);
     let response: Response;
@@ -1118,6 +1153,8 @@ app.get('/api/macro-context', async (_req, res) => {
           fearAndGreedIndex = value;
           fearAndGreedStatus = 'LIVE';
           fearAndGreedRetrievedAtMs = nowMs;
+          fearAndGreedObservedAtMs = sourceTimestampMs;
+          fearAndGreedLatencyMs = Math.max(0, nowMs - startedAtMs);
           fearAndGreedLabelFa = 'value_classification' in latest && typeof latest.value_classification === 'string'
             ? `${latest.value_classification} (${value})` : String(value);
         }
@@ -1127,21 +1164,47 @@ app.get('/api/macro-context', async (_req, res) => {
     console.warn('[MarketData] Alternative.me Fear & Greed unavailable:', error);
   }
 
-  const newsHeadlines = await newsHeadlinesPromise;
   for (const source of newsHeadlines.sources) {
     if (source.status === 'UNAVAILABLE') {
       console.warn(`[NewsData] ${source.publisher} RSS unavailable: ${source.error}`);
     }
   }
-  const unavailable = { status: 'UNAVAILABLE', provider: 'NOT_CONFIGURED', retrievedAtMs: null, sources: [] };
+  let hasUnconfiguredFred = false;
+  for (const metric of Object.values(macroData)) {
+    if (metric.error === 'FRED_API_KEY_NOT_CONFIGURED') {
+      hasUnconfiguredFred = true;
+    } else if (metric.status === 'UNAVAILABLE') {
+      console.warn(`[MacroData] ${metric.provider} ${metric.metric} unavailable: ${metric.error}`);
+    }
+  }
+  if (hasUnconfiguredFred) {
+    console.warn('[MacroData] FRED_API_KEY is not configured; FRED series are unavailable.');
+  }
+  const unavailable = {
+    status: 'UNAVAILABLE',
+    provider: 'NO_VERIFIED_FREE_DIRECT_PROVIDER',
+    retrievedAtMs: null,
+    observedAt: null,
+    sources: [],
+  };
   const fearAndGreedProvenance = fearAndGreedStatus === 'LIVE'
-    ? { status: 'LIVE', provider: 'Alternative.me', endpoint, retrievedAtMs: fearAndGreedRetrievedAtMs, sources: [] }
+    ? {
+      status: 'LIVE',
+      provider: 'Alternative.me',
+      endpoint,
+      retrievedAtMs: fearAndGreedRetrievedAtMs,
+      observedAtMs: fearAndGreedObservedAtMs,
+      ageMs: fearAndGreedObservedAtMs === null ? null : Math.max(0, Date.now() - fearAndGreedObservedAtMs),
+      latencyMs: fearAndGreedLatencyMs,
+      sources: [],
+    }
     : { ...unavailable, provider: 'Alternative.me', endpoint };
   const newsHeadlinesProvenance = newsHeadlines.status === 'LIVE'
     ? {
       status: 'LIVE',
       provider: 'Direct RSS feeds',
       retrievedAtMs: newsHeadlines.retrievedAtMs,
+      ageMs: newsHeadlines.retrievedAtMs === null ? null : Math.max(0, Date.now() - newsHeadlines.retrievedAtMs),
       sources: newsHeadlines.sources,
     }
     : {
@@ -1150,23 +1213,93 @@ app.get('/api/macro-context', async (_req, res) => {
       retrievedAtMs: null,
       sources: newsHeadlines.sources,
     };
+  const directMetric = (metric: typeof macroData.sp500) => ({
+    status: metric.status,
+    provider: metric.provider,
+    endpoint: metric.endpoint,
+    metric: metric.metric,
+    retrievedAtMs: metric.retrievedAtMs,
+    observedAt: metric.observedAt,
+    observedAtMs: metric.observedAtMs,
+    ageMs: metric.observedAtMs === null ? null : Math.max(0, Date.now() - metric.observedAtMs),
+    latencyMs: metric.latencyMs,
+    ...(metric.error ? { error: metric.error } : {}),
+  });
+  const unavailableExactDxy = {
+    ...unavailable,
+    provider: 'ICE DXY',
+    reason: 'No verified free direct DXY API is configured; the Federal Reserve broad-dollar index is exposed separately as a proxy.',
+  };
+  const sourceRetrievedAtMs = [
+    fearAndGreedRetrievedAtMs,
+    newsHeadlines.retrievedAtMs,
+    ...Object.values(macroData).map((metric) => metric.retrievedAtMs),
+  ].filter((timestamp): timestamp is number => typeof timestamp === 'number' && Number.isSafeInteger(timestamp));
+  const lastUpdatedAtMs = sourceRetrievedAtMs.length > 0 ? Math.max(...sourceRetrievedAtMs) : null;
   res.json({
     fearAndGreedStatus, fearAndGreedIndex, fearAndGreedLabelFa,
     provenance: {
       fearAndGreedIndex: fearAndGreedProvenance,
-      spotEtfNetInflowMillionUsd: unavailable, dxyIndex: unavailable, dxyDailyChangePct: unavailable,
-      sp500Price: unavailable, sp500DailyChangePct: unavailable, fedRateCutExpectationPct: unavailable,
-      newsSentimentScore: unavailable, recentHeadlines: newsHeadlinesProvenance, whaleNetflowBtc: unavailable,
-      whalePressureIndex: unavailable, whaleSentiment: unavailable,
+      spotEtfNetInflowMillionUsd: {
+        ...unavailable,
+        provider: 'NO_STABLE_FREE_AGGREGATE_API',
+        reason: 'Issuer holdings and public aggregate tables are not treated as a verified consolidated net-flow API.',
+        sources: [
+          { provider: 'Farside Investors', endpoint: 'https://farside.co.uk/btc/', type: 'AGGREGATED_HTML_REFERENCE_ONLY' },
+          { provider: 'BlackRock iShares', endpoint: 'https://www.ishares.com/us/products/333011/ishares-bitcoin-trust-etf', type: 'ISSUER_FUND_DATA_NOT_AGGREGATE_FLOW' },
+        ],
+      },
+      dxyIndex: unavailableExactDxy,
+      dxyDailyChangePct: unavailableExactDxy,
+      broadDollarProxy: directMetric(macroData.broadDollar),
+      sp500Price: directMetric(macroData.sp500),
+      sp500DailyChangePct: directMetric(macroData.sp500),
+      fedRateCutExpectationPct: {
+        ...unavailable,
+        provider: 'CME FedWatch',
+        reason: 'No verified free programmatic probability API is configured. Published rates are reported separately.',
+      },
+      fedEffectiveRatePct: directMetric(macroData.fedEffectiveRate),
+      fedTargetUpperBoundPct: directMetric(macroData.fedTargetUpperBound),
+      newsSentimentScore: {
+        ...unavailable,
+        provider: 'DERIVED_SENTIMENT_NOT_CONFIGURED',
+        reason: 'Headlines are direct publisher data; no validated sentiment model is configured.',
+      },
+      recentHeadlines: newsHeadlinesProvenance,
+      whaleNetflowBtc: {
+        ...unavailable,
+        provider: 'NO_VERIFIED_FREE_EXCHANGE_WALLET_ATTRIBUTION',
+        reason: 'Raw network activity does not establish exchange-wallet ownership or whale net flow.',
+        sources: [
+          { provider: 'Bitcoin Core', endpoint: 'https://bitcoincore.org/en/doc/', type: 'SELF_HOSTED_RAW_CHAIN' },
+          { provider: 'mempool.space', endpoint: 'https://mempool.space/docs/api', type: 'RAW_CHAIN_AND_MEMPOOL' },
+          { provider: 'Coin Metrics Community API', endpoint: 'https://docs.coinmetrics.io/api/v4/', type: 'PUBLIC_NETWORK_METRICS' },
+        ],
+      },
+      whalePressureIndex: unavailable,
+      whaleSentiment: unavailable,
+      bitcoinActiveAddresses: directMetric(macroData.bitcoinActiveAddresses),
     },
     etfFlowStatus: 'UNAVAILABLE', spotEtfNetInflowMillionUsd: null,
     dxyStatus: 'UNAVAILABLE', dxyIndex: null, dxyDailyChangePct: null,
-    sp500Status: 'UNAVAILABLE', sp500Price: null, sp500DailyChangePct: null,
+    broadDollarProxyStatus: macroData.broadDollar.status,
+    broadDollarProxyIndex: macroData.broadDollar.value,
+    broadDollarProxyDailyChangePct: macroData.broadDollar.changePct,
+    sp500Status: macroData.sp500.status,
+    sp500Price: macroData.sp500.value,
+    sp500DailyChangePct: macroData.sp500.changePct,
     fedExpectationsStatus: 'UNAVAILABLE', fedRateCutExpectationPct: null,
+    fedPublishedRateStatus: macroData.fedEffectiveRate.status,
+    fedEffectiveRatePct: macroData.fedEffectiveRate.value,
+    fedTargetUpperBoundPct: macroData.fedTargetUpperBound.value,
     newsSentimentStatus: 'UNAVAILABLE', newsSentimentScore: null,
     newsHeadlinesStatus: newsHeadlines.status, recentHeadlines: newsHeadlines.headlines,
     whaleFlowStatus: 'UNAVAILABLE', whaleNetflowBtc: null, whalePressureIndex: null, whaleSentiment: null,
-    lastUpdated: fearAndGreedRetrievedAtMs, sourceGrounding: 'UNAVAILABLE',
+    bitcoinActiveAddressesStatus: macroData.bitcoinActiveAddresses.status,
+    bitcoinActiveAddresses: macroData.bitcoinActiveAddresses.value,
+    lastUpdated: lastUpdatedAtMs,
+    sourceGrounding: sourceRetrievedAtMs.length > 0 ? 'DIRECT_SOURCES' : 'UNAVAILABLE',
   });
 });
 
@@ -1446,220 +1579,12 @@ app.get('/api/orderflow/snapshot', async (req, res) => {
 });
 
 app.post('/api/hunter/execute', liveOperationLimiter, requireAdminAuth, async (req, res) => {
-    try {
-        if (liveTradingState.killSwitchActive) {
-            return res.status(423).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'KILL_SWITCH_ACTIVE',
-                error: 'SBK1 kill switch is active; signal submission is blocked.',
-            });
-        }
-        const signal = req.body?.signal;
-        if (!signal || typeof signal !== 'object' || Array.isArray(signal)) {
-            return res.status(422).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'INVALID_SIGNAL',
-                error: 'A directional signal is required.',
-            });
-        }
-        const botState = await freqtradeBridge.getStatus();
-        const configuredPair = freqtradeBridge.getConfiguredPair();
-        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || configuredPair;
-        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim() ||
-            process.env.FREQTRADE_EXCHANGE?.trim() ||
-            botState.exchange;
-        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
-            process.env.FREQTRADE_TIMEFRAME?.trim() ||
-            botState.timeframe;
-        if (!pair || !exchange || !timeframe || !process.env.SBK1_FREQTRADE_BRIDGE_TOKEN) {
-            return res.status(503).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'SIGNAL_BRIDGE_NOT_CONFIGURED',
-                error: 'Signal bridge requires FREQTRADE_PAIR, SBK1_SIGNAL_EXCHANGE, SBK1_FREQTRADE_TIMEFRAME, and a server-side bridge token.',
-            });
-        }
-        if (
-            configuredPair !== pair ||
-            botState.status !== 'running' ||
-            (botState.dryRun !== true && !(botState.dryRun === false && isLiveExecutionEnabled())) ||
-            botState.forceEntryEnabled ||
-            botState.strategy !== 'SbkSignalStrategy' ||
-            botState.market === undefined ||
-            botState.exchange?.toLowerCase() !== exchange.toLowerCase() ||
-            botState.timeframe !== timeframe
-        ) {
-            return res.status(422).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'FREQTRADE_CONFIGURATION_MISMATCH',
-                error: 'Freqtrade must be running in dry-run mode or explicitly enabled live mode, with force_entry_enable=false and matching market configuration.',
-            });
-        }
-        const whitelist = await freqtradeBridge.getWhitelist();
-        if (!whitelist.includes(pair)) {
-            return res.status(422).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'PAIR_NOT_WHITELISTED',
-                error: 'The configured signal pair is not enabled in Freqtrade.',
-            });
-        }
-
-        const nowMs = Date.now();
-        const snapshot = freqtradeMarketDataBridge.getLatestConfigured({
-            exchange,
-            pair,
-            timeframe,
-        }, nowMs);
-        const marketDataTimestamp = req.body?.marketData?.dataTimestamp;
-        if (
-            snapshot.market !== botState.market ||
-            nowMs - snapshot.generatedAtMs < 0 ||
-            nowMs - snapshot.generatedAtMs > FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS ||
-            !snapshot.ticker ||
-            !Number.isSafeInteger(marketDataTimestamp) ||
-            nowMs - marketDataTimestamp < 0 ||
-            nowMs - marketDataTimestamp > FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS ||
-            Math.abs(snapshot.generatedAtMs - marketDataTimestamp) > FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
-        ) {
-            return res.status(409).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'STALE_MARKET_DATA',
-                error: 'A fresh, matching Freqtrade snapshot and analysis timestamp are required.',
-            });
-        }
-        const signalAgeMs = nowMs - Number(signal.timestamp);
-        if (!Number.isSafeInteger(signal.timestamp) || signalAgeMs < 0 || signalAgeMs > 15_000) {
-            return res.status(409).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'STALE_SIGNAL',
-                error: 'Signal timestamp is stale or invalid.',
-            });
-        }
-        if (
-            signal.direction !== 'LONG' && signal.direction !== 'SHORT' ||
-            typeof signal.setupType !== 'string' ||
-            !signal.setupType.trim() ||
-            signal.setupType === 'NONE'
-        ) {
-            return res.status(422).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'INVALID_DIRECTION',
-                error: 'Signal requires a directional setup.',
-            });
-        }
-        const configuredBase = pair.split('/')[0]?.replace(/[^A-Z0-9]/gi, '').toUpperCase();
-        const signalSymbol = typeof signal.symbol === 'string'
-            ? signal.symbol.replace(/[^A-Z0-9]/gi, '').toUpperCase()
-            : '';
-        if (!configuredBase || !signalSymbol.startsWith(configuredBase)) {
-            return res.status(422).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'PAIR_MISMATCH',
-                error: 'Signal symbol does not match the configured Freqtrade pair.',
-            });
-        }
-
-        const referencePrice = snapshot.ticker.last;
-        const entryPrice = Number(signal.entryPrice);
-        const stopLoss = Number(signal.invalidationStopLoss);
-        const takeProfit = Number(signal.takeProfitTarget1);
-        const sweptLevelPrice = Number(signal.sweptLevelPrice);
-        const ttlSeconds = Number(process.env.SBK1_SIGNAL_TTL_SECONDS ?? 120);
-        const maxPriceDeviationBps = Number(process.env.SBK1_SIGNAL_MAX_DEVIATION_BPS ?? 100);
-        const riskBudgetPct = Number(process.env.SBK1_SIGNAL_RISK_BUDGET_PCT ?? 0.1);
-        const maxStakeQuote = Number(process.env.SBK1_SIGNAL_MAX_STAKE_QUOTE ?? 100);
-        const maxLeverage = Number(process.env.SBK1_SIGNAL_MAX_LEVERAGE ?? 1);
-        if (
-            !Number.isFinite(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > 120 ||
-            !Number.isFinite(maxPriceDeviationBps) || maxPriceDeviationBps <= 0 || maxPriceDeviationBps > 100 ||
-            !Number.isFinite(riskBudgetPct) || riskBudgetPct <= 0 || riskBudgetPct > 1.5 ||
-            !Number.isFinite(maxStakeQuote) || maxStakeQuote <= 0 ||
-            !Number.isFinite(maxLeverage) || maxLeverage < 1 || maxLeverage > 20
-        ) {
-            return res.status(503).json({
-                accepted: false,
-                status: 'REJECTED',
-                code: 'SIGNAL_CONFIGURATION_INVALID',
-                error: 'Signal expiry, deviation, or risk-limit configuration is invalid.',
-            });
-        }
-        const engineScore = typeof signal.signalConfidencePct === 'number' &&
-            Number.isFinite(signal.signalConfidencePct)
-            ? signal.signalConfidencePct
-            : null;
-        const setupType = `${signal.setupType}:${signal.timestamp}`;
-        const ids = deriveSbkSignalIds({
-            pair,
-            direction: signal.direction,
-            setupType,
-            generatedAtMs: signal.timestamp,
-            sweptLevelPrice,
-            referencePrice,
-            stopLoss,
-            takeProfit,
-        });
-        const queued = await freqtradeSignalAdapter.submit({
-            contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
-            ...ids,
-            exchange,
-            market: botState.market,
-            pair,
-            direction: signal.direction,
-            timeframe,
-            generatedAtMs: nowMs,
-            expiresAtMs: nowMs + ttlSeconds * 1_000,
-            referencePrice,
-            engineScore,
-            evidenceLevel: 'UNCALIBRATED_HEURISTIC',
-            dataQuality: {
-                status: 'LIVE',
-                source: snapshot.source,
-                observedAtMs: snapshot.generatedAtMs,
-                maxAgeMs: FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS,
-            },
-            entryConditions: {
-                setupType,
-                entryPrice,
-                stopLoss,
-                takeProfit,
-                maxPriceDeviationBps,
-            },
-            riskLimits: {
-                riskBudgetPct,
-                maxStakeQuote,
-                maxLeverage,
-            },
-        }, {
-            nowMs,
-            expectedPair: pair,
-            expectedExchange: exchange,
-            expectedTimeframe: timeframe,
-        });
-        return res.status(queued.duplicate ? 200 : 201).json({
-            accepted: true,
-            status: queued.status,
-            signalId: queued.signal.signalId,
-            decisionId: queued.signal.decisionId,
-            evidenceLevel: queued.signal.evidenceLevel,
-            reason: queued.duplicate
-                ? 'An identical signal for this decision was already queued.'
-                : 'Directional signal accepted into the Freqtrade queue.',
-            duplicate: queued.duplicate === true,
-        });
-    } catch (error) {
-        const statusCode = error instanceof SbkSignalValidationError ? 422 : 503;
-        const code = error instanceof SbkSignalValidationError ? error.code : 'SIGNAL_BRIDGE_UNAVAILABLE';
-        const message = error instanceof Error ? error.message : String(error);
-        res.status(statusCode).json({ accepted: false, status: 'REJECTED', code, error: message });
-    }
+    return res.status(410).json({
+        accepted: false,
+        status: 'REJECTED',
+        code: 'LEGACY_ENTRY_PATH_DISABLED',
+        error: 'Manual UI signals cannot authorize entries. Only the server decision runner can create an approved Freqtrade contract.',
+    });
 });
 
 app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdminAuth, async (_req, res) => {
@@ -1788,7 +1713,7 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
         const whitelist = await freqtradeBridge.getWhitelist();
         if (
             botState.status !== 'running' ||
-            (!botState.dryRun && !isLiveExecutionEnabled()) ||
+            !botState.dryRun ||
             botState.forceEntryEnabled ||
             botState.strategy !== 'SbkSignalStrategy' ||
             botState.market === undefined ||
@@ -2118,6 +2043,7 @@ async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
   try {
     await Promise.all([
       serverSignalRunner?.stop(),
+      openSourceAdvisoryService.stop(),
       new Promise<void>((resolve, reject) => {
         if (!httpServer?.listening) {
           resolve();

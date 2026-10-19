@@ -20,6 +20,7 @@ database_kill_switch.json
 database_kill_switch.json.tmp
 node_modules
 dist/
+/.cache/
 bun.lock
 *.log
 .codegraphy/*

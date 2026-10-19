@@ -3,6 +3,8 @@ import path from 'node:path';
 import type {
   Candle,
   DataQualityReport,
+  DecisionPipelineResult,
+  DerivativesData,
   DirectionalSignalCandidate,
   FearAndGreed,
   FuturesPrices,
@@ -29,10 +31,16 @@ import {
   type SbkFreqtradeExitSignal,
   type SbkFreqtradeSignal,
   type SbkFreqtradeSignalRecord,
+  type SbkEntryAuthorization,
 } from './freqtradeSignalAdapter';
 import { freqtradeBridge } from './freqtradeBridge';
 import { operationalTradeArchive, type OperationalTradeArchiveMetadata } from './operationalTradeArchive';
 import { centralTradeDatasetService } from './centralTradeDataset';
+import { fetchDirectNewsHeadlines } from './directNewsFeeds';
+import {
+  openSourceAdvisoryService,
+  type OpenSourceAdvisoryReport,
+} from './openSourceAdvisoryService';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MINIMUM_CANDLES_FOR_ANALYSIS = 300;
@@ -46,9 +54,11 @@ export interface ServerSignalAuditRecord {
   candleTimestampMs: number | null;
   decision: 'NO TRADE' | 'LONG' | 'SHORT';
   reason: string;
+  eventType?: 'ADVISORY_REPORT';
   signalId?: string;
   duplicate?: boolean;
   unavailableInputs?: string[];
+  openSourceAdvisories?: OpenSourceAdvisoryReport;
 }
 
 export interface ServerSignalRunnerDependencies {
@@ -83,9 +93,11 @@ export interface ServerSignalRunnerDependencies {
   ) => Promise<{
     candidate: DirectionalSignalCandidate | null;
     reason: string;
+    authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
     featureSnapshot?: OperationalTradeArchiveMetadata['featureSnapshot'];
     featureVersion?: string;
     modelVersion?: string;
+    openSourceAdvisories?: OpenSourceAdvisoryReport;
   }>;
   appendAudit?: (record: ServerSignalAuditRecord) => Promise<void>;
   now?: () => number;
@@ -163,7 +175,7 @@ function createMarketFeedQuality(input: {
 }) {
   return {
     ...input,
-    latencyMs: 0,
+    latencyMs: null,
   };
 }
 
@@ -174,7 +186,7 @@ function makeSnapshotAnalysisInputs(
 ): {
   fearAndGreed: FearAndGreed;
   sentiment: SentimentData;
-  derivatives: { funding: number | null; oi: null; status: 'UNAVAILABLE'; timestampUtc: number; ageMs: number; source: string };
+  derivatives: DerivativesData;
   dataQuality: DataQualityReport;
   orderBook?: RealOrderBookImbalance;
   futuresPrices?: FuturesPrices;
@@ -202,7 +214,7 @@ function makeSnapshotAnalysisInputs(
       status: 'LIVE',
       timestamp: orderBookSnapshot.timestampMs,
       ageMs: nowMs - orderBookSnapshot.timestampMs,
-      latencyMs: 0,
+      latencyMs: null,
       source: 'freqtrade.dataprovider',
     }
     : undefined;
@@ -229,7 +241,7 @@ function makeSnapshotAnalysisInputs(
       receivedTimestampMs: ticker.retrievedAtMs,
       isoTimeUtc: new Date(ticker.retrievedAtMs).toISOString(),
       ageMs: nowMs - ticker.retrievedAtMs,
-      latencyMs: 0,
+      latencyMs: null,
       source: 'freqtrade.dataprovider',
       status: 'LIVE',
     }
@@ -277,7 +289,7 @@ function makeSnapshotAnalysisInputs(
     status: hasFreshTradeFlow ? 'LIVE' : 'UNAVAILABLE',
     timestampUtc: latestTradeTimestampMs ?? snapshot.generatedAtMs,
     ageMs: latestTradeTimestampMs === null ? Number.POSITIVE_INFINITY : nowMs - latestTradeTimestampMs,
-    latencyMs: hasFreshTradeFlow ? tradeFlowAgeMs : Number.POSITIVE_INFINITY,
+    latencyMs: null,
     source: hasFreshTradeFlow ? `${snapshot.source}.ccxt.fetch_trades` : snapshot.source,
     ...(hasFreshTradeFlow ? {} : { error: 'Fresh trade-level flow is missing from the Freqtrade snapshot.' }),
   };
@@ -441,6 +453,7 @@ async function analyzeSnapshotData(
   candles: Candle[],
   nowMs: number,
   balance: number,
+  requestAdvisories = false,
 ): Promise<AnalysisResult> {
   const inputs = makeSnapshotAnalysisInputs(snapshot, candles, nowMs);
   const { analyzePro } = await import('./analysisEngine');
@@ -467,6 +480,22 @@ async function analyzeSnapshotData(
     inputs.futuresPrices,
     inputs.orderFlow,
   );
+  const candleTimestampMs = snapshot.candles.at(-1)?.timestampMs ?? snapshot.generatedAtMs;
+  if (requestAdvisories && !openSourceAdvisoryService.isStopped()) {
+    void fetchDirectNewsHeadlines()
+      .then((newsResult) => openSourceAdvisoryService.analyze(snapshot.candles, newsResult.headlines))
+      .then((report) => appendAdvisoryReport(report))
+      .catch(async (error: unknown) => {
+        console.error('[SBK1_ADVISORIES] Local open-source analysis failed; decision analysis continues without advisory output:', error);
+        const reason = error instanceof Error ? error.message : String(error);
+        const report = openSourceAdvisoryService.publishUnavailable(reason, candleTimestampMs, Date.now());
+        await appendAdvisoryReport(report);
+      });
+  }
+  const latestAdvisory = openSourceAdvisoryService.getLatest();
+  if (latestAdvisory?.sourceTimestampMs === candleTimestampMs) {
+    analysis.openSourceAdvisories = latestAdvisory;
+  }
   return analysis;
 }
 
@@ -478,20 +507,105 @@ async function analyzeSnapshot(
 ): Promise<{
   candidate: DirectionalSignalCandidate | null;
   reason: string;
+  authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
   featureSnapshot: OperationalTradeArchiveMetadata['featureSnapshot'];
   featureVersion: string;
   modelVersion: string;
+  openSourceAdvisories?: OpenSourceAdvisoryReport;
 }> {
-  const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance);
+  const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance, true);
   const { runUnifiedDecisionPipeline } = await import('./decisionPipeline');
+  const { runUnifiedMultiBrainEnsemble } = await import('./multiBrainEnsemble');
+  const multiBrainReport = runUnifiedMultiBrainEnsemble(analysis, null, analysis.price);
   const decision = runUnifiedDecisionPipeline({
     analysis,
-    signalCandidateMode: true,
+    targetDirection: analysis.direction,
+    multiBrainReport,
+    balance,
+    userLeverage: 1,
+    minWinProbability: 68,
+    isAutoTrade: true,
   });
+  const tradeContract = decision.tradeContract;
+  const approved = decision.decision === 'EXECUTE_APPROVED' &&
+    decision.masterDecision?.executionPermitted === true &&
+    tradeContract?.contractStatus === 'APPROVED_EXECUTABLE';
   const latestCandle = analysis.candles.at(-1);
   return {
-    candidate: decision.signalCandidate ?? null,
-    reason: decision.waitReasonFa || 'No directional signal candidate was returned.',
+    candidate: approved && tradeContract
+      ? {
+        direction: tradeContract.direction,
+        entryPrice: tradeContract.entryZone.target,
+        stopLoss: tradeContract.stop,
+        takeProfit: tradeContract.tp1,
+        engineScore: tradeContract.confidenceScore,
+        setupType: analysis.setupContext?.setupType ?? '',
+      }
+      : null,
+    reason: approved ? 'The complete decision pipeline approved the entry.' : decision.waitReasonFa,
+    openSourceAdvisories: analysis.openSourceAdvisories,
+    ...(approved && tradeContract ? {
+      authorization: {
+        contractVersion: 'sbk1.entry.authorization.v1',
+        decision: 'APPROVE_ENTRY' as const,
+        snapshotId: `SNP_${snapshot.generatedAtMs}_${latestCandle?.[0] ?? 0}`,
+        snapshotTimestampMs: snapshot.generatedAtMs,
+        evaluatedAtMs: nowMs,
+        timeframe: snapshot.timeframe,
+        direction: tradeContract.direction,
+        gates: decision.stages.map((stage, index) => ({
+          id: decision.stages.findIndex((candidate) => candidate.id === stage.id) === index
+            ? stage.id
+            : `${stage.id}_${index}`,
+          status: stage.status === 'PASSED' ? 'PASSED' as const : 'FAILED' as const,
+          reason: stage.reasonFa,
+        })),
+        models: multiBrainReport.independentModels.map((model) => ({
+          id: model.modelId,
+          status: model.independenceValidated ? model.healthState : 'UNVALIDATED',
+          calibrated: model.calibrationFactor > 0 &&
+            model.rawProbabilityPct !== null &&
+            model.historicalPrecisionPct !== null,
+          independenceValidated: model.independenceValidated,
+          direction: model.prediction === 'BULLISH'
+            ? 'LONG' as const
+            : model.prediction === 'BEARISH'
+              ? 'SHORT' as const
+              : 'NEUTRAL' as const,
+          probabilityPct: model.rawProbabilityPct,
+          sampleSize: model.sampleSize,
+          oosPrecisionPct: model.historicalPrecisionPct,
+          effectiveWeight: model.independenceValidated &&
+            model.healthState === 'HEALTHY' &&
+            model.calibrationFactor > 0 &&
+            model.rawProbabilityPct !== null &&
+            model.historicalPrecisionPct !== null
+            ? model.effectiveWeight
+            : 0,
+        })),
+        disagreementVeto: multiBrainReport.modelDisagreement.vetoTriggered,
+        ensembleProbabilityPct: (() => {
+          const eligibleModels = multiBrainReport.independentModels.filter((model) =>
+            model.healthState === 'HEALTHY' &&
+            model.independenceValidated &&
+            model.calibrationFactor > 0 &&
+            model.rawProbabilityPct !== null &&
+            model.historicalPrecisionPct !== null &&
+            model.prediction === (tradeContract.direction === 'LONG' ? 'BULLISH' : 'BEARISH') &&
+            model.effectiveWeight > 0
+          );
+          const totalWeight = eligibleModels.reduce((total, model) => total + model.effectiveWeight, 0);
+          return totalWeight > 0
+            ? eligibleModels.reduce(
+              (total, model) => total + (model.rawProbabilityPct ?? 0) * model.effectiveWeight,
+              0,
+            ) / totalWeight
+            : null;
+        })(),
+        riskRewardRatio: Math.abs(tradeContract.tp1 - tradeContract.entryZone.target) /
+          Math.abs(tradeContract.entryZone.target - tradeContract.stop),
+      },
+    } : {}),
     featureSnapshot: {
       price: analysis.price,
       rsi: analysis.rsi ?? null,
@@ -513,6 +627,8 @@ async function analyzeSnapshot(
       candleLow: latestCandle?.[2] ?? null,
       candleClose: latestCandle?.[3] ?? null,
       candleVolume: latestCandle?.[4] ?? null,
+      openSourceAdvisoryStatus: analysis.openSourceAdvisories?.status ?? 'UNAVAILABLE',
+      openSourceAdvisoryTimestampMs: analysis.openSourceAdvisories?.generatedAtMs ?? null,
     },
     featureVersion: 'server-signal-features-v1',
     modelVersion: analysis.calibratedMetadata?.modelVersion ?? 'analysis-engine-current',
@@ -588,6 +704,21 @@ async function appendAudit(record: ServerSignalAuditRecord): Promise<void> {
   const filePath = path.resolve('data/sbk1-execution-audit.jsonl');
   await mkdir(path.dirname(filePath), { recursive: true });
   await appendFile(filePath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+async function appendAdvisoryReport(report: OpenSourceAdvisoryReport): Promise<void> {
+  try {
+    await appendAudit({
+      at: new Date(report.generatedAtMs).toISOString(),
+      candleTimestampMs: report.sourceTimestampMs,
+      decision: 'NO TRADE',
+      reason: 'ADVISORY_REPORT: analysis output only; no trade decision was made.',
+      eventType: 'ADVISORY_REPORT',
+      openSourceAdvisories: report,
+    });
+  } catch (error) {
+    console.error('[SBK1_ADVISORIES] Could not persist advisory report:', error);
+  }
 }
 
 function runtimeExpectation(status: FreqtradeBotState): FreqtradeMarketSnapshotExpectation {
@@ -676,7 +807,7 @@ export class ServerSignalRunner {
       if (
         status.status !== 'running' ||
         status.forceEntryEnabled !== false ||
-        (!status.dryRun && process.env.SBK1_LIVE_ENABLED?.trim().toLowerCase() !== 'true')
+        !status.dryRun
       ) {
         await this.record({
           candleTimestampMs: null,
@@ -684,7 +815,7 @@ export class ServerSignalRunner {
           reason: status.forceEntryEnabled !== false
             ? 'Freqtrade force_entry_enable must remain false.'
             : !status.dryRun
-              ? 'Live signal generation is disabled until SBK1_LIVE_ENABLED=true is explicitly set on the server.'
+              ? 'SBK1 automatic entry signals are disabled unless Freqtrade RPC confirms dry_run=true.'
               : 'Freqtrade RPC reports that the execution engine is not running.',
         });
         return;
@@ -832,6 +963,23 @@ export class ServerSignalRunner {
           decision: 'NO TRADE',
           reason: result.reason,
           unavailableInputs: makeSnapshotAnalysisInputs(snapshot, completedCandles, nowMs).unavailableInputs,
+          openSourceAdvisories: result.openSourceAdvisories,
+        });
+        return;
+      }
+      if (
+        !result.authorization ||
+        result.authorization.decision !== 'APPROVE_ENTRY' ||
+        result.authorization.direction !== candidate.direction ||
+        result.authorization.timeframe !== expected.timeframe ||
+        result.authorization.snapshotTimestampMs !== snapshot.generatedAtMs ||
+        result.authorization.gates.length === 0
+      ) {
+        await this.record({
+          candleTimestampMs,
+          decision: 'NO TRADE',
+          reason: 'The complete decision pipeline did not provide an entry authorization.',
+          openSourceAdvisories: result.openSourceAdvisories,
         });
         return;
       }
@@ -843,6 +991,7 @@ export class ServerSignalRunner {
           candleTimestampMs,
           decision: 'NO TRADE',
           reason: `Technical entry is ${entryDeviationBps.toFixed(2)} bps from the completed candle close, above the configured ${settings.maxDeviationBps} bps limit.`,
+          openSourceAdvisories: result.openSourceAdvisories,
         });
         return;
       }
@@ -866,6 +1015,7 @@ export class ServerSignalRunner {
           reason: 'This completed candle already has a persisted Freqtrade signal.',
           signalId: ids.signalId,
           duplicate: true,
+          openSourceAdvisories: result.openSourceAdvisories,
         });
         return;
       }
@@ -899,6 +1049,12 @@ export class ServerSignalRunner {
           riskBudgetPct: settings.riskBudgetPct,
           maxStakeQuote: Math.min(settings.maxStakeQuote, balance.available),
           maxLeverage: settings.maxLeverage,
+        },
+        authorization: {
+          ...result.authorization,
+          decisionId: ids.decisionId,
+          allocatedRiskUsd:
+            Math.min(settings.maxStakeQuote, balance.available) * settings.riskBudgetPct / 100,
         },
       }, {
         nowMs,
@@ -945,6 +1101,7 @@ export class ServerSignalRunner {
         signalId: signal.signalId,
         duplicate: submitted.duplicate === true,
         unavailableInputs: makeSnapshotAnalysisInputs(snapshot, completedCandles, nowMs).unavailableInputs,
+        openSourceAdvisories: result.openSourceAdvisories,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

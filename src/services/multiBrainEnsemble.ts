@@ -80,7 +80,7 @@ export interface Brain5FloatingRiskHedging {
   riskBreakevenTriggerPrice: number;
   feeBufferPct: number;
   hedgingAllocationRatio: number;
-  floatingSystemHarmonized: boolean;
+  floatingSystemHarmonized: boolean | null;
   rationaleFa: string;
 }
 
@@ -159,11 +159,11 @@ export interface Brain12RealWorldExecutionSniper {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  exchangeLatencyMs: number;
+  exchangeLatencyMs: number | null;
   slippageTolerancePct: number;
-  makerTakerOptimized: boolean;
-  spreadBtcUsd: number;
-  realWorldExecutionScore: number;
+  makerTakerOptimized: boolean | null;
+  spreadBtcUsd: number | null;
+  realWorldExecutionScore: number | null;
   rationaleFa: string;
   isEmpiricalMetric?: boolean;
   isLiveMeasured?: boolean;
@@ -184,10 +184,10 @@ export interface Brain14LossToBreakevenEscaper {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  escapeSpeedMs: number;
-  activeLossEvacuationProtocol: boolean;
-  breakevenOffsetBufferUsd: number;
-  rawEvidenceScore: number;
+  escapeSpeedMs: number | null;
+  activeLossEvacuationProtocol: boolean | null;
+  breakevenOffsetBufferUsd: number | null;
+  rawEvidenceScore: number | null;
   rationaleFa: string;
 }
 
@@ -196,8 +196,8 @@ export interface Brain15TradeFrequencyPreserver {
   role: BrainRoleType;
   nameFa: string;
   dailyOpportunitiesTarget: number;
-  detectedMicroOpportunities: number;
-  frequencyPreserved: boolean;
+  detectedMicroOpportunities: number | null;
+  frequencyPreserved: boolean | null;
   microChopScalpActive: boolean;
   isPassiveMonitorOnly: boolean;
   rationaleFa: string;
@@ -207,10 +207,10 @@ export interface Brain16DrawdownLockoutGuardian {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  activeLockState: boolean;
-  lockedPositionsCount: number;
-  divertedComputingPowerToRecoveryPct: number;
-  isNewTradeBlocked: boolean;
+  activeLockState: boolean | null;
+  lockedPositionsCount: number | null;
+  divertedComputingPowerToRecoveryPct: number | null;
+  isNewTradeBlocked: boolean | null;
   rationaleFa: string;
 }
 
@@ -231,7 +231,7 @@ export interface Brain18StagnantTimeDecayLiquidator {
   nameFa: string;
   maxTradeDurationMinutes: number;
   breakevenLiquidateTriggered: boolean;
-  capitalLiberatedPct: number;
+  capitalLiberatedPct: number | null;
   stagnationEvacuationActive: boolean;
   rationaleFa: string;
 }
@@ -240,9 +240,9 @@ export interface Brain19LoadReallocator {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  underperformingBrainsPrunedCount: number;
-  reallocatedCapacityPct: number;
-  pruningActive: boolean;
+  underperformingBrainsPrunedCount: number | null;
+  reallocatedCapacityPct: number | null;
+  pruningActive: boolean | null;
   rationaleFa: string;
 }
 
@@ -250,9 +250,9 @@ export interface Brain20LatencyArbitrage {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  bboSpreadCaptureUsd: number;
-  subSecondExecutionMs: number;
-  arbitrageShieldActive: boolean;
+  bboSpreadCaptureUsd: number | null;
+  subSecondExecutionMs: number | null;
+  arbitrageShieldActive: boolean | null;
   rationaleFa: string;
 }
 
@@ -260,10 +260,10 @@ export interface Brain21StrategicRecovery {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  globalFreezeActive: boolean;
+  globalFreezeActive: boolean | null;
   microAtrUsd: number;
-  exactCounterVolumeUsd: number;
-  targetBreakevenSeconds: number;
+  exactCounterVolumeUsd: number | null;
+  targetBreakevenSeconds: number | null;
   recoveryStatusFa: string;
   rationaleFa: string;
 }
@@ -278,7 +278,8 @@ export interface IndependentModelPrediction {
   calibrationFactor: number;
   regimePerformancePct: number | null;
   healthState: MetaModelHealthState;
-  correlationWithOtherModels: number; // 0 تا 1 (عدد کمتر = استقلال بیشتر)
+  independenceValidated: boolean;
+  correlationWithOtherModels: number | null;
   effectiveWeight: number;
 }
 
@@ -339,7 +340,7 @@ export interface MultiBrainConsensusReport {
     id: string;
     category: 'PREDICTION_ACCURACY' | 'SCENARIO_READINESS' | 'FLOATING_HARMONY' | 'REAL_WORLD_EXECUTION';
     titleFa: string;
-    status: 'ACTIVE_CALIBRATED' | 'READY_FOR_DEPLOYMENT';
+    status: 'ACTIVE_CALIBRATED' | 'READY_FOR_DEPLOYMENT' | 'BLOCKED_UNVALIDATED';
     descriptionFa: string;
     impactFa: string;
   }>;
@@ -504,8 +505,8 @@ export function runUnifiedMultiBrainEnsemble(
     riskBreakevenTriggerPrice: breakevenTriggerPrice,
     feeBufferPct,
     hedgingAllocationRatio: 0.25,
-    floatingSystemHarmonized: true,
-    rationaleFa: `پارامتر خروج/بافر کارمزد به‌شکل محاسباتی نمایش داده می‌شود؛ این پنل سفارش صرافی را تغییر نمی‌دهد و پوشش واقعی کارمزد را تأیید نمی‌کند.`
+    floatingSystemHarmonized: null,
+    rationaleFa: 'هماهنگی پوزیشن/هج و پوشش واقعی کارمزد از فریکترید دریافت نمی‌شود؛ نسبت و trigger صرفاً پارامترهای نمایشی‌اند.'
   };
 
   // ۶. مغز ۶: پردازشگر ویژگی آن‌چین (Feature Processor)
@@ -661,22 +662,22 @@ export function runUnifiedMultiBrainEnsemble(
   const hasLiveExecutionMetrics = exchangeLatencyMs !== null && exchangeLatencyMs > 0 && spreadBtcUsd !== null;
   const executionScore = hasLiveExecutionMetrics
     ? Math.max(0, Math.min(95, Math.round(90 - (exchangeLatencyMs * 0.4) - (spreadBtcUsd * 5))))
-    : 0;
+    : null;
 
   const brain12ExecutionSniper: Brain12RealWorldExecutionSniper = {
     brainType: 'EXECUTION_CONTROLLER',
     role: 'EXECUTION_CONTROLLER',
     nameFa: 'مغز ۱۲: پردازشگر سنجش اسپرد و تاخیر صرافی (Execution Metrics Processor)',
-    exchangeLatencyMs: exchangeLatencyMs ?? 0,
+    exchangeLatencyMs,
     slippageTolerancePct: 0.02,
-    makerTakerOptimized: true,
-    spreadBtcUsd: spreadBtcUsd ?? 0,
+    makerTakerOptimized: null,
+    spreadBtcUsd,
     realWorldExecutionScore: executionScore,
     isEmpiricalMetric: false, // مدل محاسباتی شرایط بازار، نه تضمین تجربی کیفیت اجرای سفارش بروکر
     isLiveMeasured: hasLiveExecutionMetrics,
     rationaleFa: hasLiveExecutionMetrics
       ? `تاخیر ${exchangeLatencyMs}ms و اسپرد $${spreadBtcUsd} از دادهٔ موجود استخراج شد؛ امتیاز ${executionScore}/100 تضمین کیفیت اجرای سفارش نیست.`
-      : 'تاخیر و اسپرد بین‌صرافی قابل‌اندازه‌گیری نیست؛ امتیاز اجرای واقعی صفر است.'
+      : 'تاخیر و اسپرد معتبر موجود نیست؛ سنجه‌ها و امتیاز اجرای واقعی UNAVAILABLE هستند.'
   };
 
   // ۱۳. مغز ۱۳: کنترل‌کننده قوانین حد سود (Risk Controller - Item 5)
@@ -697,11 +698,11 @@ export function runUnifiedMultiBrainEnsemble(
     brainType: 'RISK_CONTROLLER',
     role: 'RISK_CONTROLLER',
     nameFa: 'مغز ۱۴: پردازشگر خروج بی‌زیان در نوسان مخالف (Loss Mitigation Processor)',
-    escapeSpeedMs: 120,
-    activeLossEvacuationProtocol: true,
-    breakevenOffsetBufferUsd: Math.round(p * 0.0005 * 10) / 10,
-    rawEvidenceScore: 75,
-    rationaleFa: 'اجرای دستورات اصلاح پوزیشن در نوسان شدید بدون تحمیل خسارت غیرضروری.'
+    escapeSpeedMs: null,
+    activeLossEvacuationProtocol: null,
+    breakevenOffsetBufferUsd: null,
+    rawEvidenceScore: null,
+    rationaleFa: 'سرعت، فعال‌بودن پروتکل و بافر سربه‌سر از lifecycle واقعی فریکترید در این گزارش اندازه‌گیری نمی‌شوند.'
   };
 
   // ۱۵. مغز ۱۵: پایشگر غیرفعال فرکانس معامله (Execution Controller - Item 5)
@@ -710,8 +711,8 @@ export function runUnifiedMultiBrainEnsemble(
     role: 'EXECUTION_CONTROLLER',
     nameFa: 'مغز ۱۵: پایشگر آماری فرکانس معاملات (Passive Trade Frequency Monitor)',
     dailyOpportunitiesTarget: 0,
-    detectedMicroOpportunities: 0,
-    frequencyPreserved: false,
+    detectedMicroOpportunities: null,
+    frequencyPreserved: null,
     microChopScalpActive: false,
     isPassiveMonitorOnly: true,
     rationaleFa: 'پایشگر کاملاً منفعل: هیچگونه دخل و تصرفی در تصمیم ورود ندارد. اگر لبه آماری وجود نداشته باشد، نتیجه NO TRADE خواهد بود.'
@@ -722,11 +723,11 @@ export function runUnifiedMultiBrainEnsemble(
     brainType: 'RISK_CONTROLLER',
     role: 'RISK_CONTROLLER',
     nameFa: 'مغز ۱۶: پردازشگر فیلتر قفل معاملات جدید در زمان وجود ضرر (Drawdown Freeze Guardian)',
-    activeLockState: true,
-    lockedPositionsCount: 1,
-    divertedComputingPowerToRecoveryPct: 100,
-    isNewTradeBlocked: true,
-    rationaleFa: 'قفل معاملات جدید هنگام وجود ضرر باز جهت تمرکز بر مدیریت ریسک موجود.'
+    activeLockState: null,
+    lockedPositionsCount: null,
+    divertedComputingPowerToRecoveryPct: null,
+    isNewTradeBlocked: null,
+    rationaleFa: 'وضعیت drawdown و تعداد position باید از فریکترید/ریسک‌سرویس بیاید؛ در این گزارش به‌عنوان UNAVAILABLE باقی می‌ماند.'
   };
 
   // ۱۷. مغز ۱۷: کنترل‌کننده قوانین پولبک (Risk Controller - Item 5)
@@ -737,8 +738,8 @@ export function runUnifiedMultiBrainEnsemble(
     microPivotPrice: Math.round((p * 0.9985) * 10) / 10,
     recoveryDistancePct: 0.15,
     targetBreakevenSpeedSec: 180,
-    turnaroundActive: true,
-    rationaleFa: 'محاسبه ریاضی نقطه عطف برای خروج متوازن از معامله.'
+    turnaroundActive: false,
+    rationaleFa: 'نقطه عطف یک مقدار مشتق‌شده است؛ هیچ گردش/هج معکوسی در این مغز اجرا نمی‌شود.'
   };
 
   // ۱۸. مغز ۱۸: کنترل‌کننده تایمر فرسایش زمان (Risk Controller - Item 5)
@@ -748,9 +749,9 @@ export function runUnifiedMultiBrainEnsemble(
     nameFa: 'مغز ۱۸: پردازشگر فرسایش زمانی پوزیشن‌های رکودی (Time Decay Liquidator)',
     maxTradeDurationMinutes: 180,
     breakevenLiquidateTriggered: false,
-    capitalLiberatedPct: 100,
-    stagnationEvacuationActive: true,
-    rationaleFa: 'تایمر خروج از پوزیشن‌های بدون حرکت برای آزادسازی مارجین.'
+    capitalLiberatedPct: null,
+    stagnationEvacuationActive: false,
+    rationaleFa: 'مدت پوزیشن و خروج زمان‌محور در این گزارش به چرخه واقعی Freqtrade وصل نیست.'
   };
 
   // ۱۹. مغز ۱۹: کنترل‌کننده تخصیص بار پردازشی (Execution Controller - Item 5)
@@ -758,10 +759,10 @@ export function runUnifiedMultiBrainEnsemble(
     brainType: 'EXECUTION_CONTROLLER',
     role: 'EXECUTION_CONTROLLER',
     nameFa: 'مغز ۱۹: پردازشگر تخصیص بار پردازشی (Load Reallocator)',
-    underperformingBrainsPrunedCount: 1,
-    reallocatedCapacityPct: 5,
-    pruningActive: true,
-    rationaleFa: 'تخصیص ظرفیت پردازشی به ماژول‌های فعال.'
+    underperformingBrainsPrunedCount: null,
+    reallocatedCapacityPct: null,
+    pruningActive: null,
+    rationaleFa: 'هیچ pruning یا تخصیص ظرفیت زنده instrument نشده است؛ مقادیر UNAVAILABLE هستند.'
   };
 
   // ۲۰. مغز ۲۰: کنترل‌کننده BBO (Execution Controller - Item 5)
@@ -769,10 +770,10 @@ export function runUnifiedMultiBrainEnsemble(
     brainType: 'EXECUTION_CONTROLLER',
     role: 'EXECUTION_CONTROLLER',
     nameFa: 'مغز ۲۰: پردازشگر سنجش اسپرد BBO (BBO Spread Monitor)',
-    bboSpreadCaptureUsd: 1.8,
-    subSecondExecutionMs: 2.1,
-    arbitrageShieldActive: true,
-    rationaleFa: 'سنجش تفاضل بید و اسک برای ورود بدون لغزش.'
+    bboSpreadCaptureUsd: null,
+    subSecondExecutionMs: null,
+    arbitrageShieldActive: null,
+    rationaleFa: 'BBO capture، زمان اجرای زیرثانیه و shield در این سامانه اندازه‌گیری/اجرا نشده‌اند.'
   };
 
   // ۲۱. مغز ۲۱: کنترل‌کننده مدیریت هجینگ معکوس (Risk Controller - Item 5)
@@ -780,12 +781,12 @@ export function runUnifiedMultiBrainEnsemble(
     brainType: 'RISK_CONTROLLER',
     role: 'RISK_CONTROLLER',
     nameFa: 'مغز ۲۱: پردازشگر مدیریت هجینگ معکوس (Strategic Recovery Guard)',
-    globalFreezeActive: false,
+    globalFreezeActive: null,
     microAtrUsd: Math.round(p * 0.0012 * 100) / 100,
-    exactCounterVolumeUsd: 25.0,
-    targetBreakevenSeconds: 160,
-    recoveryStatusFa: 'آماده‌باش فعال برای کنترل و کاهش ریسک پوزیشن.',
-    rationaleFa: 'محاسبه پارامترهای هج معکوس جهت خروج سربه‌سر در نوسان ناگهانی.'
+    exactCounterVolumeUsd: null,
+    targetBreakevenSeconds: null,
+    recoveryStatusFa: 'وضعیت بازیابی واقعی متصل نیست (UNAVAILABLE).',
+    rationaleFa: 'فقط ATR مشتق‌شده از قیمت گزارش می‌شود؛ حجم counter و اجرای بازیابی به منبع/مسیر سفارش معتبر متصل نیست.'
   };
 
   // =========================================================================
@@ -814,18 +815,20 @@ export function runUnifiedMultiBrainEnsemble(
     candles: analysis?.candles || []
   });
 
-  const model1HealthState = evaluateModelHealthState(
+  const model1CalibrationState = evaluateModelHealthState(
     centralCalib.isCalibrationVerified,
     centralCalib.calibratedWinProbability !== null,
     centralCalib.sampleSize,
     centralCalib.outOfSamplePrecision === null ? null : centralCalib.outOfSamplePrecision * 100
   );
-  const model2HealthState = evaluateModelHealthState(
+  const model2CalibrationState = evaluateModelHealthState(
     bayesResult.status === 'CALIBRATED',
     bayesResult.posteriorProbability !== null,
     bayesResult.sampleSize,
     bayesResult.status === 'CALIBRATED' ? bayesResult.calibrationMetrics.oosAccuracyPct : null
   );
+  const model1HealthState = model1CalibrationState === 'SUSPENDED' ? 'SUSPENDED' : 'UNVALIDATED';
+  const model2HealthState = model2CalibrationState === 'SUSPENDED' ? 'SUSPENDED' : 'UNVALIDATED';
   const model1Central: IndependentModelPrediction = {
     modelId: 'M1_CENTRAL_CALIBRATED',
     nameFa: 'مدل کالیبره‌شده آماری مرکزی (Platt Scaling Engine)',
@@ -842,8 +845,9 @@ export function runUnifiedMultiBrainEnsemble(
     calibrationFactor: centralCalib.isCalibrationVerified ? 1.0 : 0.0,
     regimePerformancePct: null,
     healthState: model1HealthState,
-    correlationWithOtherModels: 0.10, // مستقل
-    effectiveWeight: model1HealthState === 'HEALTHY' ? 0.40 : 0.0,
+    independenceValidated: false,
+    correlationWithOtherModels: null,
+    effectiveWeight: 0,
   };
 
   const model2Bayesian: IndependentModelPrediction = {
@@ -860,8 +864,9 @@ export function runUnifiedMultiBrainEnsemble(
     calibrationFactor: bayesResult.status === 'CALIBRATED' ? 1.0 : 0.0,
     regimePerformancePct: null,
     healthState: model2HealthState,
-    correlationWithOtherModels: 0.20,
-    effectiveWeight: model2HealthState === 'HEALTHY' ? 0.30 : 0.0,
+    independenceValidated: false,
+    correlationWithOtherModels: null,
+    effectiveWeight: 0,
   };
 
   const model3Pattern: IndependentModelPrediction = {
@@ -876,7 +881,8 @@ export function runUnifiedMultiBrainEnsemble(
     calibrationFactor: 0,
     regimePerformancePct: null,
     healthState: 'SUSPENDED',
-    correlationWithOtherModels: 0.25,
+    independenceValidated: false,
+    correlationWithOtherModels: null,
     effectiveWeight: 0,
   };
 
@@ -890,13 +896,15 @@ export function runUnifiedMultiBrainEnsemble(
     calibrationFactor: garchResult.status === 'AVAILABLE' ? 1.0 : 0.0,
     regimePerformancePct: null,
     healthState: 'SUSPENDED',
-    correlationWithOtherModels: 0.10,
+    independenceValidated: false,
+    correlationWithOtherModels: null,
     effectiveWeight: 0,
   };
 
   const independentModels = [model1Central, model2Bayesian, model3Pattern, model4Garch];
   const activeModels = independentModels.filter(model =>
     model.effectiveWeight > 0 &&
+    model.independenceValidated &&
     model.calibrationFactor > 0 &&
     model.healthState === 'HEALTHY' &&
     model.rawProbabilityPct !== null &&
@@ -907,7 +915,9 @@ export function runUnifiedMultiBrainEnsemble(
     nameFa: model.nameFa,
     direction: model.prediction === 'BULLISH' ? 'LONG' : model.prediction === 'BEARISH' ? 'SHORT' : 'NEUTRAL',
     confidencePct: model.rawProbabilityPct,
-    effectiveWeightPct: model.effectiveWeight * (1 - model.correlationWithOtherModels * 0.5) * model.calibrationFactor * 100,
+    effectiveWeightPct: model.correlationWithOtherModels === null
+      ? 0
+      : model.effectiveWeight * (1 - model.correlationWithOtherModels * 0.5) * model.calibrationFactor * 100,
   })));
   const consensusScorePct = activeModels.length >= 2 && !modelDisagreement.vetoTriggered
     ? 100 - modelDisagreement.disagreementIndex
@@ -931,25 +941,25 @@ export function runUnifiedMultiBrainEnsemble(
     featureProcessorsCount: 17,
     statisticalModelsCount: activeModels.length,
     calibrationMethod: 'TIME_ORDERED_OOS_AND_DIRECTIONAL_DISAGREEMENT',
-    pipelineFlowFa: 'LIVE FEATURES → OOS-VALIDATED MODELS → DIRECTIONAL DISAGREEMENT RISK → WAIT ON VETO'
+    pipelineFlowFa: 'FEATURES → VALIDATED MODEL ELIGIBILITY → DIRECTIONAL DISAGREEMENT RISK → WAIT ON VETO'
   };
 
   const proposalsListFa: MultiBrainConsensusReport['proposalsListFa'] = [
     {
       id: 'prop_independent_models_consensus',
       category: 'PREDICTION_ACCURACY',
-      titleFa: '۱. ساختار اجماع بر پایه ۴ مدل آماری مستقل (Decorrelated Model Consensus)',
-      status: 'READY_FOR_DEPLOYMENT',
-      descriptionFa: 'اجماع فقط از مدل‌های دارای احتمال و دقت OOS استفاده می‌کند؛ اختلاف جهت‌ها جداگانه اندازه‌گیری می‌شود و GARCH/الگو بدون اعتبارسنجی در رأی جهت‌دار وارد نمی‌شوند.',
-      impactFa: 'وضعیت پیشنهادی در گزارش تحلیلی است؛ این proposal اجرای زندهٔ سفارش را اثبات نمی‌کند.'
+      titleFa: '۱. اجماع مدل‌های مستقل (اعتبارسنجی استقلال انجام نشده)',
+      status: 'BLOCKED_UNVALIDATED',
+      descriptionFa: 'همبستگی خطای خارج‌ازنمونه اندازه‌گیری نشده است؛ خروجی مدل‌ها رأی مستقل محسوب نمی‌شود و وزن مؤثرشان صفر است. ورود تا اعتبارسنجی مستقل مدل‌ها مسدود می‌ماند.',
+      impactFa: 'این وضعیت عمداً fail-closed است؛ هیچ آمادگی سفارش یا کیفیت پیش‌بینی را اثبات نمی‌کند.'
     },
     {
       id: 'prop_transparent_pipeline',
       category: 'SCENARIO_READINESS',
       titleFa: '۲. شفاف‌سازی لایه‌های پردازشی (RAW DATA → FEATURE → MODEL → CALIBRATION)',
       status: 'READY_FOR_DEPLOYMENT',
-      descriptionFa: 'تفکیک صریح ۱۷ ماژول پردازشگر ویژگی از ۴ مدل پیش‌بینی آماری جهت سوءتعبیر نشدن قوانین ساده به‌عنوان هوش مصنوعی/کوانتوم.',
-      impactFa: 'توضیح معماری پیشنهادی؛ شمار ماژول‌ها به‌معنای فید مستقل یا اعتبارسنجی زنده نیست.'
+      descriptionFa: 'تفکیک ۱۷ پردازشگر ویژگی از ۴ پیاده‌سازی کاندید مدل آماری؛ در حال حاضر هیچ‌کدام به دلیل استقلال/کالیبراسیون اثبات‌نشده رأی مؤثر ندارند.',
+      impactFa: 'تعداد پیاده‌سازی‌ها به‌معنای استقلال داده، اعتبارسنجی یا آمادگی زنده نیست.'
     },
     {
       id: 'prop_risk_protection_guard',
@@ -996,7 +1006,7 @@ export function runUnifiedMultiBrainEnsemble(
       brain9BayesianWeight: 0.1,
       brain10AutoPilotWeight: 0.0,
       brain11WhaleSentimentWeight: 0.0,
-      brain12ExecutionSniperWeight: 0.1,
+      brain12ExecutionSniperWeight: hasLiveExecutionMetrics ? 0.1 : 0.0,
     },
     pipelineArchitecture,
     independentModels,

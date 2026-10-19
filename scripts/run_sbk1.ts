@@ -46,6 +46,9 @@ interface FreqtradeConfig {
   };
   initial_state?: string;
   force_entry_enable?: boolean;
+  freqai?: {
+    enabled?: boolean;
+  };
   exchange?: {
     name?: string;
     key?: string;
@@ -71,7 +74,6 @@ interface RuntimeSettings {
   apiPort: number;
   apiHost: string;
   nodePort: number;
-  liveEnabled: boolean;
 }
 
 interface SignalStoreLock {
@@ -148,17 +150,17 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   if (config.force_entry_enable !== false) {
     throw new Error('برای اجرا، force_entry_enable باید false باشد؛ ورودها فقط از مسیر سیگنال SBK1 انجام می‌شوند.');
   }
-  const liveEnabled = env.SBK1_LIVE_ENABLED?.trim().toLowerCase() === 'true';
-  if (config.dry_run !== true && config.dry_run !== false) {
-    throw new Error('مقدار dry_run در تنظیم خصوصی Freqtrade باید صریحاً true یا false باشد.');
+  if (config.dry_run !== true) {
+    throw new Error('اجرای SBK1 فقط در حالت dry_run=true پشتیبانی می‌شود؛ LIVE در این یکپارچه‌سازی غیرفعال است.');
   }
-  if (config.dry_run === false) {
-    if (!liveEnabled) {
-      throw new Error('اجرای لایو مسدود است؛ مالک باید ابتدا SBK1_LIVE_ENABLED=true را صریحاً در محیط سرور تنظیم کند.');
-    }
-    if (!config.exchange?.key?.trim() || !config.exchange?.secret?.trim()) {
-      throw new Error('اجرای لایو مسدود است؛ کلید و secret صرافی باید در تنظیم خصوصی Freqtrade پر باشند.');
-    }
+  if (
+    config.freqai !== undefined &&
+    (typeof config.freqai !== 'object' || config.freqai === null || typeof config.freqai.enabled !== 'boolean')
+  ) {
+    throw new Error('Freqtrade freqai.enabled must be an explicit boolean when FreqAI is configured.');
+  }
+  if (config.freqai?.enabled === true) {
+    throw new Error('FreqAI integration was removed from SBK1; disable freqai.enabled in the Freqtrade config.');
   }
   if (
     config.exchange?.name?.toLowerCase() !== exchange ||
@@ -283,7 +285,6 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
     apiPort: api.listen_port,
     apiHost: api.listen_ip_address,
     nodePort,
-    liveEnabled,
   };
 }
 
