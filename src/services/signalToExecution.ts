@@ -1,7 +1,7 @@
 import { AnalysisResult, TradeHistory, TradePosition } from '../types/trading';
 import { calculateDynamicKellyMargin, getAntiTiltStatus, evaluateCognitiveConviction, calculatePrecisionEngineeredLeverage } from './kellyRisk';
 import { calculateGarchMacroConfidenceWeight, evaluateDynamicScenarioMatrix, runQuantumProcessingBrain, evaluate15mTimingAndLifecycle, evaluateSniperWaveRidingBlueprint } from './predictiveEngine';
-import { macroContextBrainService } from './macroContextBrain';
+import { macroContextBrainService, type MacroCorrelationData } from './macroContextBrain';
 import { runUnifiedDecisionPipeline } from './decisionPipeline';
 import { newsShockFirewallService } from './newsShockFirewall';
 import { orderExecutionLifecycleService } from './orderExecutionLifecycleEngine';
@@ -47,7 +47,8 @@ export function evaluateSignalToExecution(
   targetDirection?: 'LONG' | 'SHORT',
   aiPrediction?: any,
   tradeHistoryList?: TradeHistory[],
-  minWinProbGate: number = 70
+  minWinProbGate: number = 70,
+  macroContextOverride?: MacroCorrelationData,
 ): SignalToExecutionResult {
   const requestedDirection = targetDirection ??
     (analysis.direction === 'LONG' || analysis.direction === 'SHORT' ? analysis.direction : undefined);
@@ -409,7 +410,7 @@ export function evaluateSignalToExecution(
   // -------------------------------------------------------------
   // 8. Bitcoin Fundamental & Macro News Sentiment (Dynamic Weight: wMacroNews)
   // -------------------------------------------------------------
-  const macroContext = macroContextBrainService.getMacroContext(price);
+  const macroContext = macroContextOverride ?? macroContextBrainService.getMacroContext(price);
   let macroNewsScore = 0;
 
   const macroDataAvailable =

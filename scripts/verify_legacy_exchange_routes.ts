@@ -136,7 +136,7 @@ try {
   assert.equal(macro.provenance?.newsSentimentScore.provider, 'DERIVED_SENTIMENT_NOT_CONFIGURED');
   assert.equal(macro.provenance?.whaleNetflowBtc.provider, 'NO_VERIFIED_FREE_EXCHANGE_WALLET_ATTRIBUTION');
   assert.equal(macro.provenance?.dxyIndex?.status, 'UNAVAILABLE');
-  assert.equal(macro.provenance?.broadDollarProxy?.provider, 'FRED');
+  assert.equal(macro.provenance?.broadDollarProxy?.provider, 'FRED public CSV');
 
   const sentimentResponse = await fetch(`${baseUrl}/api/sentiment`, { method: 'POST' });
   const sentiment = await sentimentResponse.json() as {

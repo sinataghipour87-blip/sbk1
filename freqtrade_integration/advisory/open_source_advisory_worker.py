@@ -218,11 +218,16 @@ def analyze_regime(candles: list[dict[str, float]], timestamp_ms: int) -> dict[s
         or probabilities.shape[0] != len(returns)
         or probabilities.shape[1] != 2
         or not np.isfinite(probabilities).all()
-        or np.any(probabilities < 0)
-        or np.any(probabilities > 1)
+        or np.any(probabilities < -1e-8)
+        or np.any(probabilities > 1 + 1e-8)
         or not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-4)
     ):
         return unavailable("Model returned an invalid smoothed probability matrix.", timestamp_ms)
+    probabilities = np.clip(probabilities, 0.0, 1.0)
+    row_totals = probabilities.sum(axis=1, keepdims=True)
+    if np.any(row_totals <= 0):
+        return unavailable("Model returned an empty smoothed probability row.", timestamp_ms)
+    probabilities /= row_totals
     weighted_variances = [
         float(np.average((returns - np.average(returns, weights=probabilities[:, index])) ** 2,
                          weights=probabilities[:, index]))

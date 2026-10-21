@@ -1169,16 +1169,10 @@ app.get('/api/macro-context', async (_req, res) => {
       console.warn(`[NewsData] ${source.publisher} RSS unavailable: ${source.error}`);
     }
   }
-  let hasUnconfiguredFred = false;
   for (const metric of Object.values(macroData)) {
-    if (metric.error === 'FRED_API_KEY_NOT_CONFIGURED') {
-      hasUnconfiguredFred = true;
-    } else if (metric.status === 'UNAVAILABLE') {
+    if (metric.status === 'UNAVAILABLE') {
       console.warn(`[MacroData] ${metric.provider} ${metric.metric} unavailable: ${metric.error}`);
     }
-  }
-  if (hasUnconfiguredFred) {
-    console.warn('[MacroData] FRED_API_KEY is not configured; FRED series are unavailable.');
   }
   const unavailable = {
     status: 'UNAVAILABLE',

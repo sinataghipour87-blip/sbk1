@@ -1,0 +1,311 @@
+import type { CouncilWhaleFlowData, CouncilWhaleTransfer } from './eightMemberCouncil';
+import { fetchEtherscanWhaleTransfers } from './etherscanWhaleData';
+import { fetchWhaleAlertFlow } from './whaleAlertFlow';
+
+const MEMPOOL_API = 'https://mempool.space/api';
+const CACHE_TTL_MS = 60_000;
+const DEFAULT_TIMEOUT_MS = 5_000;
+const DEFAULT_MAX_AGE_MS = 20 * 60_000;
+const DEFAULT_BTC_THRESHOLD = 10;
+const DEFAULT_BLOCK_SAMPLE_COUNT = 3;
+const RETRIES = 2;
+const MIN_REQUEST_INTERVAL_MS = 100;
+
+interface MempoolBlock {
+  id: string;
+  height: number;
+  timestamp: number;
+  tx_count: number;
+}
+
+interface MempoolOutput {
+  value: number;
+}
+
+interface MempoolTransaction {
+  txid: string;
+  status: {
+    confirmed: boolean;
+    block_height?: number;
+    block_time?: number;
+  };
+  vout: MempoolOutput[];
+}
+
+let cachedAtMs = 0;
+let cachedResult: CouncilWhaleFlowData | null = null;
+let lastRequestStartedAtMs = 0;
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isBlock(value: unknown): value is MempoolBlock {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.id === 'string' && /^[0-9a-f]{64}$/i.test(item.id) &&
+    Number.isSafeInteger(item.height) && (item.height as number) > 0 &&
+    Number.isSafeInteger(item.timestamp) && (item.timestamp as number) > 0 &&
+    Number.isSafeInteger(item.tx_count) && (item.tx_count as number) >= 0;
+}
+
+function isTransaction(value: unknown): value is MempoolTransaction {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  if (typeof item.txid !== 'string' || !/^[0-9a-f]{64}$/i.test(item.txid) || typeof item.status !== 'object' ||
+      item.status === null || Array.isArray(item.status) || !Array.isArray(item.vout)) return false;
+  const status = item.status as Record<string, unknown>;
+  return typeof status.confirmed === 'boolean' &&
+    (status.block_height === undefined || (Number.isSafeInteger(status.block_height) && (status.block_height as number) > 0)) &&
+    (status.block_time === undefined || (Number.isSafeInteger(status.block_time) && (status.block_time as number) > 0)) &&
+    item.vout.every((output) => typeof output === 'object' && output !== null &&
+      !Array.isArray(output) && Number.isSafeInteger((output as Record<string, unknown>).value) &&
+      ((output as Record<string, unknown>).value as number) >= 0);
+}
+
+function unavailable(
+  reason: string,
+  status: CouncilWhaleFlowData['status'] = 'UNAVAILABLE',
+): CouncilWhaleFlowData {
+  return {
+    status,
+    provider: 'mempool.space public REST API',
+    timestampMs: null,
+    ageMs: null,
+    qualityPct: 0,
+    coverageStatus: 'UNAVAILABLE',
+    unavailableReason: reason,
+    largeTransfers: [],
+    exchangeInflowsBtc: null,
+    exchangeOutflowsBtc: null,
+    netExchangeFlowBtc: null,
+    transactionCount: 0,
+    windowStartHeight: null,
+    windowEndHeight: null,
+  };
+}
+
+function readPositiveEnv(name: string, fallback: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0 || value > max) {
+    throw new Error(`${name} must be a positive number no greater than ${max}.`);
+  }
+  return value;
+}
+
+async function requestJson(
+  url: string,
+  fetcher: typeof fetch,
+  timeoutMs: number,
+  sleep: (ms: number) => Promise<void>,
+): Promise<unknown> {
+  for (let attempt = 0; attempt <= RETRIES; attempt += 1) {
+    const requestWaitMs = Math.max(
+      0,
+      MIN_REQUEST_INTERVAL_MS - (Date.now() - lastRequestStartedAtMs),
+    );
+    if (requestWaitMs > 0) await sleep(requestWaitMs);
+    lastRequestStartedAtMs = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetcher(url, {
+        signal: controller.signal,
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      });
+      if (response.status === 429 || response.status >= 500) {
+        if (attempt < RETRIES) {
+          const retryAfter = Number(response.headers.get('retry-after'));
+          await sleep(Number.isFinite(retryAfter) && retryAfter > 0
+            ? Math.min(retryAfter * 1_000, 5_000)
+            : 250 * (2 ** attempt));
+          continue;
+        }
+      }
+      if (!response.ok) throw new Error(`mempool.space returned HTTP ${response.status}.`);
+      return await response.json();
+    } catch (error) {
+      if (attempt < RETRIES && !(error instanceof Error && error.message.startsWith('mempool.space returned HTTP'))) {
+        await sleep(250 * (2 ** attempt));
+        continue;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw new Error('mempool.space retries were exhausted.');
+}
+
+export async function fetchPublicBitcoinWhaleData(options: {
+  nowMs?: number;
+  btcPriceUsd?: number | null;
+  fetcher?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  forceRefresh?: boolean;
+} = {}): Promise<CouncilWhaleFlowData> {
+  const nowMs = options.nowMs ?? Date.now();
+  if (!options.forceRefresh && cachedResult && nowMs >= cachedAtMs && nowMs - cachedAtMs < CACHE_TTL_MS) {
+    return { ...cachedResult, largeTransfers: (cachedResult.largeTransfers ?? []).map((transfer) => ({
+      ...transfer,
+      estimatedUsd: finiteNumber(options.btcPriceUsd) && options.btcPriceUsd > 0
+        ? transfer.amount * options.btcPriceUsd
+        : null,
+    })),
+      ageMs: cachedResult.timestampMs === null ? null : nowMs - cachedResult.timestampMs };
+  }
+  const fetcher = options.fetcher ?? fetch;
+  const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+  try {
+    const timeoutMs = readPositiveEnv('SBK1_WHALE_REQUEST_TIMEOUT_MS', DEFAULT_TIMEOUT_MS, 30_000);
+    const maxAgeMs = readPositiveEnv('SBK1_WHALE_MAX_AGE_MS', DEFAULT_MAX_AGE_MS, 20 * 60_000);
+    const thresholdBtc = readPositiveEnv('SBK1_WHALE_MIN_TRANSFER_BTC', DEFAULT_BTC_THRESHOLD, 1_000_000);
+    const blockSampleCount = Math.floor(readPositiveEnv(
+      'SBK1_WHALE_BLOCK_SAMPLE_COUNT', DEFAULT_BLOCK_SAMPLE_COUNT, 10,
+    ));
+    const rawBlocks = await requestJson(`${MEMPOOL_API}/v1/blocks`, fetcher, timeoutMs, sleep);
+    if (!Array.isArray(rawBlocks) || rawBlocks.length < blockSampleCount ||
+        rawBlocks.some((block) => !isBlock(block))) {
+      throw new Error('mempool.space block response is malformed or incomplete.');
+    }
+    const blocks = (rawBlocks as MempoolBlock[]).slice(0, blockSampleCount);
+    const transfers: CouncilWhaleTransfer[] = [];
+    const seen = new Set<string>();
+    for (const block of blocks) {
+      const rawTransactions = await requestJson(
+        `${MEMPOOL_API}/block/${encodeURIComponent(block.id)}/txs`,
+        fetcher,
+        timeoutMs,
+        sleep,
+      );
+      if (!Array.isArray(rawTransactions) || rawTransactions.some((transaction) => !isTransaction(transaction))) {
+        throw new Error(`mempool.space transactions for block ${block.height} are malformed.`);
+      }
+      for (const transaction of rawTransactions as MempoolTransaction[]) {
+        if (!transaction.status.confirmed) continue;
+        const timestampMs = (transaction.status.block_time ?? block.timestamp) * 1_000;
+        if (timestampMs > nowMs || nowMs - timestampMs > maxAgeMs) continue;
+        transaction.vout.forEach((output, index) => {
+          const amount = output.value / 100_000_000;
+          if (amount < thresholdBtc) return;
+          const key = `bitcoin:${transaction.txid}:${index}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          transfers.push({
+            transactionHash: transaction.txid,
+            blockchain: 'bitcoin',
+            blockHeight: transaction.status.block_height ?? block.height,
+            timestampMs,
+            sourceProvider: 'mempool.space',
+            asset: 'BTC',
+            amount,
+            estimatedUsd: finiteNumber(options.btcPriceUsd) && options.btcPriceUsd > 0
+              ? amount * options.btcPriceUsd
+              : null,
+            confirmationStatus: 'CONFIRMED',
+            transferId: `vout:${index}`,
+          });
+        });
+      }
+    }
+
+    const latestBlock = blocks[0];
+    const timestampMs = latestBlock.timestamp * 1_000;
+    const ageMs = nowMs - timestampMs;
+    if (ageMs < 0 || ageMs > maxAgeMs) {
+      cachedAtMs = nowMs;
+      cachedResult = unavailable('mempool.space latest sampled block is stale or has a future timestamp.', 'STALE');
+      return cachedResult;
+    }
+    cachedResult = {
+      status: 'LIVE',
+      provider: 'mempool.space public REST API (sampled confirmed BTC outputs)',
+      timestampMs,
+      ageMs,
+      qualityPct: 85,
+      coverageStatus: 'SAMPLED',
+      largeTransfers: transfers,
+      exchangeInflowsBtc: null,
+      exchangeOutflowsBtc: null,
+      netExchangeFlowBtc: null,
+      transactionCount: transfers.length,
+      windowStartHeight: blocks[blocks.length - 1].height,
+      windowEndHeight: latestBlock.height,
+    };
+    cachedAtMs = nowMs;
+    return { ...cachedResult, largeTransfers: [...transfers] };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Unknown mempool.space provider error.';
+    console.error('[PublicBitcoinWhaleData] Source unavailable:', reason);
+    cachedResult = unavailable(reason);
+    cachedAtMs = nowMs;
+    return cachedResult;
+  }
+}
+
+export async function fetchOnChainWhaleData(options: {
+  nowMs?: number;
+  btcPriceUsd?: number | null;
+  ethPriceUsd?: number | null;
+  fetcher?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  forceRefresh?: boolean;
+} = {}): Promise<CouncilWhaleFlowData> {
+  const primary = await fetchPublicBitcoinWhaleData(options);
+  let ethTransfers: CouncilWhaleTransfer[] = [];
+  try {
+    ethTransfers = await fetchEtherscanWhaleTransfers({
+      nowMs: options.nowMs ?? Date.now(),
+      ethPriceUsd: options.ethPriceUsd,
+      fetcher: options.fetcher,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Unknown Etherscan provider error.';
+    console.error('[PublicBitcoinWhaleData] Optional Etherscan source unavailable:', reason);
+  }
+  if (primary.status === 'LIVE' || ethTransfers.length > 0) {
+    const combined = new Map<string, CouncilWhaleTransfer>();
+    for (const transfer of [...(primary.largeTransfers ?? []), ...ethTransfers]) {
+      combined.set(`${transfer.blockchain}:${transfer.transactionHash}:${transfer.transferId ?? ''}`, transfer);
+    }
+    const transfers = [...combined.values()];
+    const timestampMs = primary.timestampMs ?? Math.max(...ethTransfers.map((item) => item.timestampMs));
+    return {
+      ...primary,
+      status: 'LIVE',
+      provider: ethTransfers.length > 0
+        ? `${primary.status === 'LIVE' ? primary.provider : 'Etherscan configured address watchlist'} + Etherscan`
+        : primary.provider,
+      timestampMs,
+      ageMs: (options.nowMs ?? Date.now()) - timestampMs,
+      qualityPct: Math.min(primary.status === 'LIVE' ? primary.qualityPct : 80, 85),
+      coverageStatus: 'SAMPLED',
+      unavailableReason: primary.status === 'LIVE' ? undefined : primary.unavailableReason,
+      largeTransfers: transfers,
+      transactionCount: transfers.length,
+    };
+  }
+  const alert = await fetchWhaleAlertFlow({
+    apiKey: process.env.WHALE_ALERT_API_KEY,
+    nowMs: options.nowMs,
+    fetcher: options.fetcher,
+  });
+  if (alert.status === 'LIVE') {
+    return {
+      ...alert,
+      provider: `Optional fallback: ${alert.provider}`,
+      unavailableReason: primary.unavailableReason,
+    };
+  }
+  return primary;
+}
+
+export function resetPublicBitcoinWhaleDataCacheForTests(): void {
+  cachedAtMs = 0;
+  cachedResult = null;
+  lastRequestStartedAtMs = 0;
+}

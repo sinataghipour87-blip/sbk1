@@ -13,6 +13,7 @@ __pycache__/
 /data/sbk1-operational-trade-archive.json
 /data/sbk1-operational-trade-archive.json.*.tmp
 /data/sbk1-execution-audit.jsonl
+/data/council-members/
 /tradesv3.dryrun.sqlite*
 /freqtrade/user_data/*.sqlite*
 /freqtrade/user_data/logs/

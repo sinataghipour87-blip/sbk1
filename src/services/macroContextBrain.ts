@@ -161,6 +161,10 @@ export class MacroContextBrainService {
     return this.currentData;
   }
 
+  public getCachedMacroContext(): MacroCorrelationData {
+    return this.currentData;
+  }
+
   public async refreshLiveMacroContext(): Promise<MacroCorrelationData> {
     if (this.isFetching) return this.currentData;
     this.isFetching = true;

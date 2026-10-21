@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface, type Interface as ReadLineInterface } from 'node:readline';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { FreqtradeMarketCandle } from './freqtradeMarketDataBridge';
@@ -19,6 +20,8 @@ export interface OpenSourceAdvisoryReport {
   sourceTimestampMs: number;
   status: 'AVAILABLE' | 'PARTIAL' | 'UNAVAILABLE';
   decisionInfluence: 'ADVISORY_ONLY';
+  sourceHeadlines?: DirectNewsHeadline[];
+  newsHeadlinesRetrievedAtMs?: number | null;
   modules: {
     candlestickPatterns: AdvisoryModuleResult;
     marketRegime: AdvisoryModuleResult;
@@ -164,11 +167,17 @@ class OpenSourceAdvisoryService {
     if (this.stopped) throw new Error('Local advisory worker is stopping and cannot start.');
     if (this.child && !this.child.killed) return this.child;
 
-    const python = process.env.SBK1_PYTHON?.trim() || (
-      process.platform === 'win32'
-        ? path.resolve('.venv', 'Scripts', 'python.exe')
-        : path.resolve('.venv', 'bin', 'python')
-    );
+    const virtualEnvPython = (directory: string) => process.platform === 'win32'
+      ? path.resolve(directory, 'Scripts', 'python.exe')
+      : path.resolve(directory, 'bin', 'python');
+    const isolatedAnalysisPython = virtualEnvPython(path.resolve(
+      '.cache',
+      'sbk1',
+      'open-source-analysis-venv',
+    ));
+    const projectPython = virtualEnvPython('.venv');
+    const python = process.env.SBK1_PYTHON?.trim() ||
+      (existsSync(isolatedAnalysisPython) ? isolatedAnalysisPython : projectPython);
     const workerPath = path.resolve('freqtrade_integration/advisory/open_source_advisory_worker.py');
     const child = spawn(python, ['-u', workerPath], {
       cwd: process.cwd(),

@@ -57,6 +57,33 @@ class OpenSourceAdvisoryWorkerTests(unittest.TestCase):
         self.assertEqual(result["status"], "AVAILABLE")
         self.assertEqual(result["observations"], len(candles) - 1)
 
+    def test_regime_model_accepts_floating_point_probability_roundoff(self) -> None:
+        candles = self.make_candles()
+
+        class FakeMarkovRegression:
+            def __init__(self, endog: np.ndarray, **_kwargs: object) -> None:
+                self.observation_count = len(endog)
+
+            def fit(self, **_kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    mle_retvals={"converged": True},
+                    smoothed_marginal_probabilities=np.tile(
+                        np.array([1.0000000000000036, 1e-12]),
+                        (self.observation_count, 1),
+                    ),
+                )
+
+        with patch(
+            "statsmodels.tsa.regime_switching.markov_regression.MarkovRegression",
+            FakeMarkovRegression,
+        ):
+            result = worker.analyze_regime(candles, int(candles[-1]["timestampMs"]))
+
+        self.assertEqual(result["status"], "AVAILABLE")
+        probabilities = result["regimes"]
+        self.assertTrue(all(0 <= probability <= 1 for probability in probabilities.values()))
+        self.assertAlmostEqual(sum(probabilities.values()), 1.0)
+
     def test_request_returns_only_advisory_contract(self) -> None:
         candles = self.make_candles(4)
         request = {"requestId": "test-1", "candles": candles, "headlines": []}

@@ -40,6 +40,22 @@ const sources = [
     endpoint: 'https://www.federalreserve.gov/feeds/press_all.xml',
     hostname: 'federalreserve.gov',
   },
+  {
+    publisher: 'U.S. Securities and Exchange Commission',
+    endpoint: 'https://www.sec.gov/news/pressreleases.rss',
+    hostname: 'sec.gov',
+    relevance: /\b(bitcoin|crypto(?:currency|currencies)?|digital assets?|blockchain|tokens?|tokenization|spot etfs?)\b/i,
+  },
+  {
+    publisher: 'The Block',
+    endpoint: 'https://www.theblock.co/rss.xml',
+    hostname: 'theblock.co',
+  },
+  {
+    publisher: 'Bitcoin Magazine',
+    endpoint: 'https://bitcoinmagazine.com/.rss/full/',
+    hostname: 'bitcoinmagazine.com',
+  },
 ] as const;
 
 function decodeXmlText(value: string): string {
@@ -70,6 +86,7 @@ function parseHeadlines(
     const rawUrl = readXmlElement(item, 'link');
     const publishedAt = readXmlElement(item, 'pubDate');
     if (!headline || !rawUrl || !publishedAt) return [];
+    if ('relevance' in source && !source.relevance.test(headline)) return [];
 
     let parsedUrl: URL;
     try {

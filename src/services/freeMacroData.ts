@@ -24,7 +24,7 @@ export interface FreeMacroDataResult {
   bitcoinActiveAddresses: DirectMetricResult;
 }
 
-const FRED_BASE_URL = 'https://api.stlouisfed.org/fred/series/observations';
+const FRED_CSV_ENDPOINT = 'https://fred.stlouisfed.org/graph/fredgraph.csv';
 const COINMETRICS_ENDPOINT =
   'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=AdrActCnt&limit_per_asset=1&pretty=false';
 const FRED_MAX_AGE_MS = 5 * 24 * 60 * 60_000;
@@ -57,10 +57,11 @@ function unavailable(
   };
 }
 
-async function fetchJson(
+async function fetchResponse(
   endpoint: string,
   fetcher: typeof fetch,
-): Promise<{ value: unknown; retrievedAtMs: number; latencyMs: number }> {
+  accept = 'application/json',
+): Promise<{ response: Response; retrievedAtMs: number; latencyMs: number }> {
   const startedAtMs = Date.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -68,12 +69,11 @@ async function fetchJson(
     const response = await fetcher(endpoint, {
       signal: controller.signal,
       cache: 'no-store',
-      headers: { Accept: 'application/json' },
+      headers: { Accept: accept },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const value = await response.json();
     const retrievedAtMs = Date.now();
-    return { value, retrievedAtMs, latencyMs: Math.max(0, retrievedAtMs - startedAtMs) };
+    return { response, retrievedAtMs, latencyMs: Math.max(0, retrievedAtMs - startedAtMs) };
   } finally {
     clearTimeout(timeout);
   }
@@ -108,47 +108,63 @@ async function fetchFredSeries(
   metric: string,
   nowMs: number,
   fetcher: typeof fetch,
-  apiKey = process.env.FRED_API_KEY?.trim(),
 ): Promise<DirectMetricResult> {
   const cached = cachedResult(`fred:${seriesId}`, nowMs);
   if (cached) return cached;
 
-  const endpointUrl = new URL(FRED_BASE_URL);
-  endpointUrl.searchParams.set('series_id', seriesId);
-  endpointUrl.searchParams.set('api_key', apiKey ?? '');
-  endpointUrl.searchParams.set('file_type', 'json');
-  endpointUrl.searchParams.set('sort_order', 'desc');
-  endpointUrl.searchParams.set('limit', '10');
-  const endpoint = `https://api.stlouisfed.org/fred/series/observations?series_id=${seriesId}`;
-  if (!apiKey) {
-    return unavailable('FRED', endpoint, metric, 'FRED_API_KEY_NOT_CONFIGURED');
-  }
-
+  const endpointUrl = new URL(FRED_CSV_ENDPOINT);
+  const endDate = new Date(nowMs).toISOString().slice(0, 10);
+  const startDate = new Date(nowMs - 14 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+  endpointUrl.searchParams.set('id', seriesId);
+  endpointUrl.searchParams.set('cosd', startDate);
+  endpointUrl.searchParams.set('coed', endDate);
+  const endpoint = endpointUrl.toString();
   try {
-    const { value, retrievedAtMs, latencyMs } = await fetchJson(endpointUrl.toString(), fetcher);
-    if (
-      typeof value !== 'object' ||
-      value === null ||
-      !('observations' in value) ||
-      !Array.isArray(value.observations)
-    ) throw new Error('FRED returned a malformed observations response.');
+    const { response, retrievedAtMs, latencyMs } = await fetchResponse(
+      endpoint,
+      fetcher,
+      'text/csv, application/csv;q=0.9',
+    );
+    const rows = (await response.text()).trim().split(/\r?\n/);
+    const expectedHeader = `observation_date,${seriesId}`;
+    if (rows.length < 2 || rows[0].replace(/^\uFEFF/, '').trim() !== expectedHeader) {
+      throw new Error('FRED returned a malformed CSV response.');
+    }
 
-    const observations = value.observations.flatMap((item: unknown) => {
-      if (typeof item !== 'object' || item === null || !('date' in item) || !('value' in item)) return [];
-      if (typeof item.date !== 'string' || typeof item.value !== 'string') return [];
-      const numericValue = Number(item.value);
-      return Number.isFinite(numericValue) ? [{ date: item.date, value: numericValue }] : [];
-    });
-    const latest = observations[0];
-    const previous = observations[1];
+    const observations = rows.slice(1).flatMap((row) => {
+      const separator = row.indexOf(',');
+      if (separator < 0) return [];
+      const date = row.slice(0, separator).trim();
+      const rawValue = row.slice(separator + 1).trim();
+      if (rawValue.length === 0 || rawValue === '.') return [];
+      const value = Number(rawValue);
+      return Number.isFinite(value) ? [{ date, value }] : [];
+    }).sort((left, right) => left.date.localeCompare(right.date));
+    const latest = observations.at(-1);
+    const previous = observations.at(-2);
     const observedAtMs = latest ? validObservedAt(latest.date, nowMs, FRED_MAX_AGE_MS) : null;
     if (!latest || observedAtMs === null) {
-      throw new Error(`${seriesId} has no finite, fresh observation.`);
+      if (!latest) {
+        throw new Error(`${seriesId} returned no finite observations in the requested date range.`);
+      }
+      const latestDateMs = /^\d{4}-\d{2}-\d{2}$/.test(latest.date)
+        ? Date.parse(`${latest.date}T00:00:00.000Z`)
+        : Number.NaN;
+      const ageMs = Number.isFinite(latestDateMs) ? nowMs - latestDateMs : Number.NaN;
+      if (Number.isFinite(ageMs) && ageMs < 0) {
+        throw new Error(`${seriesId} latest observation ${latest.date} is future-dated.`);
+      }
+      if (Number.isFinite(ageMs)) {
+        throw new Error(
+          `${seriesId} latest finite observation is ${latest.date} (${Math.round(ageMs / 60_000)} minutes old), exceeding the ${Math.round(FRED_MAX_AGE_MS / 60_000)}-minute freshness limit.`,
+        );
+      }
+      throw new Error(`${seriesId} latest observation date is malformed.`);
     }
 
     const result: DirectMetricResult = {
       status: 'LIVE',
-      provider: 'FRED',
+      provider: 'FRED public CSV',
       endpoint,
       metric,
       value: latest.value,
@@ -165,7 +181,7 @@ async function fetchFredSeries(
     return storeResult(`fred:${seriesId}`, result, nowMs);
   } catch (error) {
     return unavailable(
-      'FRED',
+      'FRED public CSV',
       endpoint,
       metric,
       error instanceof Error ? error.message : String(error),
@@ -180,7 +196,8 @@ async function fetchBitcoinActiveAddresses(
   const cached = cachedResult('coinmetrics:btc:AdrActCnt', nowMs);
   if (cached) return cached;
   try {
-    const { value, retrievedAtMs, latencyMs } = await fetchJson(COINMETRICS_ENDPOINT, fetcher);
+    const { response, retrievedAtMs, latencyMs } = await fetchResponse(COINMETRICS_ENDPOINT, fetcher);
+    const value: unknown = await response.json();
     if (
       typeof value !== 'object' ||
       value === null ||
@@ -235,14 +252,12 @@ export async function fetchFreeMacroData(
   options: {
     nowMs?: number;
     fetcher?: typeof fetch;
-    fredApiKey?: string;
   } = {},
 ): Promise<FreeMacroDataResult> {
   const nowMs = options.nowMs ?? Date.now();
   const fetcher = options.fetcher ?? fetch;
-  const fredApiKey = options.fredApiKey ?? process.env.FRED_API_KEY?.trim();
   const fred = (seriesId: string, metric: string) =>
-    fetchFredSeries(seriesId, metric, nowMs, fetcher, fredApiKey);
+    fetchFredSeries(seriesId, metric, nowMs, fetcher);
   const [sp500, broadDollar, fedEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses] =
     await Promise.all([
       fred('SP500', 'S&P 500 daily close'),

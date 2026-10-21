@@ -58,7 +58,7 @@ export const TenBrainArchitecturePanel: React.FC<Props> = ({
 
   return (
     <CollapsibleCard
-      title="گزارش پردازشگرها و اجماع مدل‌ها"
+      title="پردازشگرهای داخلی و اجماع مدل‌ها (غیر از رأی اعضای شورا)"
       badge="گزارش تحلیلی"
       badgeColor="text-indigo-300 bg-indigo-950/80 border-indigo-500/40 shadow-[0_0_12px_rgba(99,102,241,0.3)]"
       defaultOpen={true}
@@ -83,7 +83,7 @@ export const TenBrainArchitecturePanel: React.FC<Props> = ({
               </div>
               <div>
                 <span className="text-xs font-bold text-white font-sans block">
-                  گزارش تشخیصی ۱۱ پردازشگر (بدون اجرای زنده):
+                  گزارش تشخیصی زیرماژول‌های پردازشی (بدون رأی مستقل شورا):
                 </span>
                 <span className="text-[10px] text-indigo-300 font-mono mt-0.5 block">
                   ضریب همگرایی: {report.consensusScorePct}٪ | درجه اطمینان: [{report.confidenceGrade}]

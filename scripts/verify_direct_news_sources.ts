@@ -13,20 +13,41 @@ const xml = `<?xml version="1.0"?><rss version="2.0"><channel>
   <item><title>Old article</title><link>https://www.coindesk.com/old</link>
     <pubDate>Fri, 16 Oct 2026 19:00:00 +0000</pubDate></item>
 </channel></rss>`;
+const secXml = `<?xml version="1.0"?><rss version="2.0"><channel>
+  <item><title>SEC Provides Guidance on Digital Assets and Bitcoin ETF Filings</title>
+    <link>https://www.sec.gov/newsroom/press-releases/crypto-guidance</link>
+    <pubDate>Sat, 17 Oct 2026 19:45:00 +0000</pubDate></item>
+  <item><title>SEC Announces an Unrelated Advisory Committee Meeting</title>
+    <link>https://www.sec.gov/newsroom/press-releases/unrelated-meeting</link>
+    <pubDate>Sat, 17 Oct 2026 19:45:00 +0000</pubDate></item>
+</channel></rss>`;
 
 const result = await fetchDirectNewsHeadlines(async (input) => {
   if (String(input).includes('coindesk')) return new Response(xml, { status: 200 });
   if (String(input).includes('cointelegraph')) return new Response('<html>blocked</html>', { status: 200 });
+  if (String(input).includes('sec.gov')) return new Response(secXml, { status: 200 });
   return new Response('upstream unavailable', { status: 503 });
 }, nowMs);
 
 assert.equal(result.status, 'LIVE');
-assert.equal(result.headlines.length, 1);
-assert.equal(result.headlines[0].headline, 'Bitcoin & markets');
-assert.equal(result.headlines[0].publisher, 'CoinDesk');
-assert.equal(result.headlines[0].publishedAt, '2026-10-17T19:30:00.000Z');
-assert.equal(result.headlines[0].url, 'https://www.coindesk.com/markets/article');
-assert.deepEqual(result.sources.map((source) => source.status), ['LIVE', 'UNAVAILABLE', 'UNAVAILABLE']);
+assert.equal(result.headlines.length, 2);
+const coindeskHeadline = result.headlines.find((headline) => headline.publisher === 'CoinDesk');
+assert.ok(coindeskHeadline);
+assert.equal(coindeskHeadline.headline, 'Bitcoin & markets');
+assert.equal(coindeskHeadline.publishedAt, '2026-10-17T19:30:00.000Z');
+assert.equal(coindeskHeadline.url, 'https://www.coindesk.com/markets/article');
+const secHeadlines = result.headlines.filter((headline) =>
+  headline.publisher === 'U.S. Securities and Exchange Commission');
+assert.equal(secHeadlines.length, 1);
+assert.match(secHeadlines[0].headline, /Bitcoin ETF/);
+assert.deepEqual(result.sources.map((source) => source.status), [
+  'LIVE',
+  'UNAVAILABLE',
+  'UNAVAILABLE',
+  'LIVE',
+  'UNAVAILABLE',
+  'UNAVAILABLE',
+]);
 
 const unavailable = await fetchDirectNewsHeadlines(async () => new Response('fail', { status: 503 }), nowMs);
 assert.equal(unavailable.status, 'UNAVAILABLE');

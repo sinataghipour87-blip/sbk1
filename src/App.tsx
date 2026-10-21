@@ -29,7 +29,7 @@ import { EarlyWarningProtocolWidget } from './components/EarlyWarningProtocolWid
 import { BrainLoadBalancerWidget } from './components/BrainLoadBalancerWidget';
 import { BrainSelfEvolutionWidget } from './components/BrainSelfEvolutionWidget';
 import { BrainStrategicBufferWidget } from './components/BrainStrategicBufferWidget';
-import { TenBrainsDashboardWidget } from './components/TenBrainsDashboardWidget';
+import { EightMemberCouncilPanel } from './components/EightMemberCouncilPanel';
 import { HierarchicalDecisionFusionWidget } from './components/HierarchicalDecisionFusionWidget';
 import { DynamicHedgeUnblockerWidget } from './components/DynamicHedgeUnblockerWidget';
 import { HunterOrderFlowDashboardWidget } from './components/HunterOrderFlowDashboardWidget';
@@ -56,7 +56,6 @@ import { BrainPriorityCoordinatorPanel } from './components/BrainPriorityCoordin
 import { ModelChampionChallengerWidget } from './components/ModelChampionChallengerWidget';
 import { AntiSelfDeceptionOnlineLearningWidget } from './components/AntiSelfDeceptionOnlineLearningWidget';
 import { NewsShockFirewallWidget } from './components/NewsShockFirewallWidget';
-import { FinalProductionGateWidget } from './components/FinalProductionGateWidget';
 import { BrainStatisticalEdgeVerifierWidget } from './components/BrainStatisticalEdgeVerifierWidget';
 import { HunterOsDashboardWidget } from './components/HunterOsDashboardWidget';
 import { hunterOsEngine } from './services/hunterOsEngine';
@@ -2233,7 +2232,13 @@ export default function App() {
                     currentPrice={liveEffectivePrice}
                     onShowNotification={showNotification}
                   />
-                  <TenBrainsDashboardWidget />
+                  <EightMemberCouncilPanel
+                    analysis={analysis}
+                    aiPrediction={aiPrediction}
+                    currentPrice={liveEffectivePrice}
+                    activePositions={activePositions}
+                    tradeHistory={getTradeHistory()}
+                  />
                   <CentralDatasetPerformanceMatrixWidget />
                   <WavePredictionEngineWidget
                     analysis={analysis}
@@ -2345,10 +2350,6 @@ export default function App() {
               {/* Tab 3: Volatility, Risk & Video Forecast */}
               {systemHubTab === 'volatility_risk' && (
                 <div className="flex flex-col gap-3">
-                  <FinalProductionGateWidget
-                    analysis={analysis}
-                    activePositions={activePositions}
-                  />
                   <RegimeClassifierWidget
                     currentPrice={liveEffectivePrice}
                     analysis={analysis}

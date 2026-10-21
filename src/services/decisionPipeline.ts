@@ -26,7 +26,12 @@ import { metaModelEnsembleEngine } from './metaModelEnsemble';
 import { realBayesianEngine } from './realBayesianEngine';
 import { realGarchEngine } from './realGarchEngine';
 import { entryOpportunityAndTiming } from './entryOpportunityAndTiming';
-import type { MultiBrainConsensusReport } from './multiBrainEnsemble';
+import { calculateCentralRiskAllocation } from './centralRiskAllocation';
+import type { EightMemberCouncilReport } from './eightMemberCouncil';
+import type {
+  IndependentModelPrediction,
+  MultiBrainConsensusReport,
+} from './multiBrainEnsemble';
 
 
 /**
@@ -47,14 +52,106 @@ function generateContractHash(contractPayload: Record<string, any>): string {
 export interface RunPipelineOptions {
   analysis: AnalysisResult;
   targetDirection?: 'LONG' | 'SHORT';
+  authoritativeDirection?: 'LONG' | 'SHORT';
+  council?: EightMemberCouncilReport;
   prediction?: any;
   multiBrainReport?: MultiBrainConsensusReport | null;
   tradeHistory?: TradeHistory[];
   balance?: number;
   userLeverage?: number;
+  centralRiskControl?: {
+    maxStakeQuote: number;
+    riskBudgetPct: number;
+    maxLeverage: number;
+  };
   minWinProbability?: number;
   isAutoTrade?: boolean;
   signalCandidateMode?: boolean;
+}
+
+const COUNCIL_DELEGATED_STAGE_IDS = new Set<DecisionPipelineStageState['id']>([
+  'STAGE_4_HTF_STRUCTURE',
+  'STAGE_5_SETUP_DETECTION',
+  'STAGE_7_ORDER_FLOW',
+]);
+
+export function isCouncilDelegatedStageId(
+  stageId: DecisionPipelineStageState['id'],
+): boolean {
+  return COUNCIL_DELEGATED_STAGE_IDS.has(stageId);
+}
+
+export function areRequiredDecisionStagesSatisfied(
+  stages: readonly DecisionPipelineStageState[],
+  councilAnalysisComplete: boolean,
+): boolean {
+  return stages.every((stage) =>
+    (stage.status === 'PASSED' && stage.passed) ||
+    (
+      stage.status === 'SKIPPED' &&
+      !stage.passed &&
+      councilAnalysisComplete &&
+      isCouncilDelegatedStageId(stage.id)
+    )
+  );
+}
+
+export function hasValidCouncilDelegationEvidence(
+  council: EightMemberCouncilReport | undefined,
+): boolean {
+  if (!council) return false;
+
+  const votes = council.members.map(({ vote }) => vote);
+  const longVotes = votes.filter((vote) => vote === 'LONG').length;
+  const shortVotes = votes.filter((vote) => vote === 'SHORT').length;
+  const neutralVotes = votes.filter((vote) => vote === 'NEUTRAL').length;
+  const abstentions = votes.filter((vote) => vote === 'ABSTAIN').length;
+  const selectedDirection = longVotes >= 5 ? 'LONG' : shortVotes >= 5 ? 'SHORT' : null;
+  const memberIds = new Set(council.members.map(({ id }) => id));
+
+  return council.quorumRequired === 5 &&
+    council.members.length === 8 &&
+    memberIds.size === 8 &&
+    [1, 2, 3, 4, 5, 6, 7, 8].every((id) => memberIds.has(id)) &&
+    council.longVotes === longVotes &&
+    council.shortVotes === shortVotes &&
+    council.neutralVotes === neutralVotes &&
+    council.abstentions === abstentions &&
+    council.quorumMet === (selectedDirection !== null) &&
+    council.selectedDirection === selectedDirection &&
+    council.quorumMet &&
+    [1, 2, 3].every((memberId) =>
+      council.members.some((member) => member.id === memberId && member.vote !== 'ABSTAIN')
+    );
+}
+
+export function countEligibleIndependentModels(
+  models: readonly IndependentModelPrediction[],
+  direction: 'LONG' | 'SHORT',
+): number {
+  const expectedPrediction = direction === 'LONG' ? 'BULLISH' : 'BEARISH';
+  return models.filter((model) =>
+    model.healthState === 'HEALTHY' &&
+    model.independenceValidated === true &&
+    model.prediction === expectedPrediction &&
+    model.rawProbabilityPct !== null &&
+    Number.isFinite(model.rawProbabilityPct) &&
+    model.rawProbabilityPct > 0 &&
+    model.rawProbabilityPct <= 100 &&
+    model.historicalPrecisionPct !== null &&
+    Number.isFinite(model.historicalPrecisionPct) &&
+    model.historicalPrecisionPct >= 55 &&
+    Number.isSafeInteger(model.sampleSize) &&
+    model.sampleSize >= 35 &&
+    Number.isFinite(model.calibrationFactor) &&
+    model.calibrationFactor > 0 &&
+    model.correlationWithOtherModels !== null &&
+    Number.isFinite(model.correlationWithOtherModels) &&
+    model.correlationWithOtherModels >= -1 &&
+    model.correlationWithOtherModels <= 1 &&
+    Number.isFinite(model.effectiveWeight) &&
+    model.effectiveWeight > 0
+  ).length;
 }
 
 type SignalCandidateAnalysis = Pick<
@@ -125,6 +222,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   const now = new Date();
   const timestampMs = Date.now();
   const timestampIso = now.toISOString();
+  const councilAnalysisComplete = hasValidCouncilDelegationEvidence(options.council);
 
   if (options.signalCandidateMode) {
     const signalCandidate = buildDirectionalSignalCandidate(analysis);
@@ -162,19 +260,22 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   const traceableIds = centralTradeDatasetService.generateTraceableIds();
 
   // Items 61, 62, 63: Evaluate Long & Short independently to eliminate circular reasoning & direction bias
-  const dualOppEvaluation = opportunityRankingEngine.evaluateDualIndependentDirections(
-    analysis,
-    analysis?.candles || []
-  );
-
-  const selectedDirection = dualOppEvaluation.selectedOpportunity?.direction ?? null;
-  const hasDirectionConflict = targetDirection !== undefined &&
+  const dualOppEvaluation = options.authoritativeDirection
+    ? null
+    : opportunityRankingEngine.evaluateDualIndependentDirections(
+      analysis,
+      analysis?.candles || []
+    );
+  const selectedDirection = options.authoritativeDirection ??
+    dualOppEvaluation?.selectedOpportunity?.direction ?? null;
+  const hasDirectionConflict = options.authoritativeDirection === undefined &&
+    targetDirection !== undefined &&
     selectedDirection !== null &&
     targetDirection !== selectedDirection;
   if (selectedDirection === null || hasDirectionConflict) {
     const waitReasonFa = hasDirectionConflict
       ? `تعارض جهت: سیگنال ${targetDirection} با ارزیابی مستقل ${selectedDirection} هم‌راستا نیست؛ اقدام نهایی HOLD است.`
-      : `${dualOppEvaluation.arbitrationVerdictFa} اقدام نهایی HOLD است.`;
+      : `${dualOppEvaluation?.arbitrationVerdictFa ?? 'شورا جهت معتبر انتخاب نکرد.'} اقدام نهایی HOLD است.`;
 
     return {
       decision: 'WAIT_NO_TRADE',
@@ -202,7 +303,8 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     };
   }
 
-  const resolvedDir: 'LONG' | 'SHORT' = targetDirection ?? selectedDirection;
+  const resolvedDir: 'LONG' | 'SHORT' =
+    options.authoritativeDirection ?? targetDirection ?? selectedDirection;
 
   const isLong = resolvedDir === 'LONG';
   const price = analysis?.price || 0;
@@ -218,13 +320,9 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     ) <= 250 &&
     Math.abs(multiBrainReport.currentPrice - price) / Math.max(price, 1) <= 0.0015
   );
-  const healthyBrainModelCount = multiBrainReport?.independentModels.filter(model =>
-    model.healthState === 'HEALTHY' &&
-    model.rawProbabilityPct !== null &&
-    Number.isFinite(model.rawProbabilityPct) &&
-    model.rawProbabilityPct > 0 &&
-    model.rawProbabilityPct <= 100
-  ).length ?? 0;
+  const healthyBrainModelCount = multiBrainReport
+    ? countEligibleIndependentModels(multiBrainReport.independentModels, resolvedDir)
+    : 0;
   const hasHealthyMultiBrainEnsemble = hasCurrentMultiBrainReport && healthyBrainModelCount >= 2;
 
   // Check Selective Activation from Multi-Dimensional Performance Matrix (Items 20 & 67)
@@ -344,22 +442,28 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   const htf4h = analysis?.mtf4h || 'NEUTRAL';
   const expectedTrend = isLong ? 'BULLISH' : 'BEARISH';
   const isHtfAligned = htf1h === expectedTrend || htf4h === expectedTrend || (htf1h === 'NEUTRAL' && htf4h === expectedTrend);
-  const stage4Passed = !pipelineHalted && isHtfAligned;
+  const stage4Passed = !pipelineHalted && !councilAnalysisComplete && isHtfAligned;
 
   stages.push({
     id: 'STAGE_4_HTF_STRUCTURE',
     name: 'HTF Market Structure',
     nameFa: '۴. ساختار و جهت تایم‌فریم‌های بالا (HTF)',
     passed: stage4Passed,
-    status: pipelineHalted ? 'SKIPPED' : stage4Passed ? 'PASSED' : 'FAILED',
-    value: `1H: ${htf1h} | 4H: ${htf4h}`,
-    threshold: `حداقل یکی از تایم‌فریم‌های کلان موافق ${expectedTrend}`,
-    reasonFa: stage4Passed
+    status: pipelineHalted || councilAnalysisComplete ? 'SKIPPED' : stage4Passed ? 'PASSED' : 'FAILED',
+    value: councilAnalysisComplete
+      ? 'Higher-timeframe structure delegated to council'
+      : `1H: ${htf1h} | 4H: ${htf4h}`,
+    threshold: councilAnalysisComplete
+      ? 'ارزیابی تخصصی عضو اول شورا'
+      : `حداقل یکی از تایم‌فریم‌های کلان موافق ${expectedTrend}`,
+    reasonFa: councilAnalysisComplete
+      ? 'تحلیل ساختار HTF به عضو اول شورا واگذار شده و پس از حدنصاب دوباره اجرا نمی‌شود.'
+      : stage4Passed
       ? `ساختار امواج بلندمدت با جهت ${isLong ? 'خرید (LONG)' : 'فروش (SHORT)'} همراستاست.`
       : `تضاد ساختاری با روند کلان: تایم‌فریم‌های ۱ساعته و ۴ساعته موافق معامله نیستند.`,
   });
 
-  if (!pipelineHalted && !stage4Passed) {
+  if (!pipelineHalted && !councilAnalysisComplete && !stage4Passed) {
     pipelineHalted = true;
     activeStage = 'STAGE_4_HTF_STRUCTURE';
     rejectionReasonsFa.push(`عدم همسویی با ساختار HTF (1H: ${htf1h}, 4H: ${htf4h})`);
@@ -373,22 +477,29 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   const hasSetupContext = !!analysis?.setupContext;
   const supertrend = analysis?.supertrend;
   const isSupertrendAligned = isLong ? supertrend === 'BULLISH' : supertrend === 'BEARISH';
-  const stage5Passed = !pipelineHalted && (hasSmc || hasSetupContext || isSupertrendAligned);
+  const stage5Passed = !pipelineHalted && !councilAnalysisComplete &&
+    (hasSmc || hasSetupContext || isSupertrendAligned);
 
   stages.push({
     id: 'STAGE_5_SETUP_DETECTION',
     name: 'Setup Pattern Recognition',
     nameFa: '۵. شناسایی الگو و ستاپ معاملاتی معتبر',
     passed: stage5Passed,
-    status: pipelineHalted ? 'SKIPPED' : stage5Passed ? 'PASSED' : 'FAILED',
-    value: analysis?.setupContext?.setupType || (hasSmc ? 'SMC OrderBlock/FVG' : 'Trend Continuation'),
-    threshold: 'حداقل یک ستاپ ساختاری معتبر SMC/VWAP/Trend',
-    reasonFa: stage5Passed
+    status: pipelineHalted || councilAnalysisComplete ? 'SKIPPED' : stage5Passed ? 'PASSED' : 'FAILED',
+    value: councilAnalysisComplete
+      ? 'Setup analysis delegated to council'
+      : analysis?.setupContext?.setupType || (hasSmc ? 'SMC OrderBlock/FVG' : 'Trend Continuation'),
+    threshold: councilAnalysisComplete
+      ? 'ارزیابی تخصصی عضو اول شورا'
+      : 'حداقل یک ستاپ ساختاری معتبر SMC/VWAP/Trend',
+    reasonFa: councilAnalysisComplete
+      ? 'تحلیل ستاپ به عضو اول شورا واگذار شده و در کنترل مرکزی تکرار نمی‌شود.'
+      : stage5Passed
       ? 'ستاپ معتبر بر اساس ساختار جریان نقدینگی و پرایس‌اکشن شناسایی شد.'
       : 'هیچ ستاپ معاملاتی با الگوهای مشخص پرایس‌اکشن کشف نشد.',
   });
 
-  if (!pipelineHalted && !stage5Passed) {
+  if (!pipelineHalted && !councilAnalysisComplete && !stage5Passed) {
     pipelineHalted = true;
     activeStage = 'STAGE_5_SETUP_DETECTION';
     rejectionReasonsFa.push('نبود ستاپ ورود با پرایس‌اکشن تایید شده');
@@ -405,7 +516,8 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     spreadBps >= 0 &&
     spreadBps <= 8.0; // Avoid abnormal spread slippage
   const isObiFavorable = isLong ? obi >= -0.30 : obi <= 0.30;
-  const stage6Passed = !pipelineHalted && isSpreadAcceptable && isObiFavorable;
+  const stage6Passed = !pipelineHalted && isSpreadAcceptable &&
+    (councilAnalysisComplete || isObiFavorable);
 
   stages.push({
     id: 'STAGE_6_LIQUIDITY_ANALYSIS',
@@ -413,9 +525,17 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     nameFa: '۶. عمق نقدینگی و عدم تعادل سفارشات (OBI)',
     passed: stage6Passed,
     status: pipelineHalted ? 'SKIPPED' : stage6Passed ? 'PASSED' : 'FAILED',
-    value: `OBI: ${(obi * 100).toFixed(1)}% | Spread: ${isSpreadAcceptable ? spreadBps.toFixed(2) : 'UNKNOWN'} bps`,
-    threshold: isLong ? 'OBI >= -30% و اسپرد <= 8 bps' : 'OBI <= +30% و اسپرد <= 8 bps',
-    reasonFa: stage6Passed
+    value: councilAnalysisComplete
+      ? `OBI delegated to council | Spread: ${isSpreadAcceptable ? spreadBps.toFixed(2) : 'UNKNOWN'} bps`
+      : `OBI: ${(obi * 100).toFixed(1)}% | Spread: ${isSpreadAcceptable ? spreadBps.toFixed(2) : 'UNKNOWN'} bps`,
+    threshold: councilAnalysisComplete
+      ? 'اسپرد اجرایی <= 8 bps'
+      : isLong ? 'OBI >= -30% و اسپرد <= 8 bps' : 'OBI <= +30% و اسپرد <= 8 bps',
+    reasonFa: councilAnalysisComplete
+      ? stage6Passed
+        ? 'کنترل مستقل اسپرد برای کیفیت اجرا حفظ شده؛ تحلیل جهت دفتر سفارش به عضو سوم شورا واگذار شده است.'
+        : 'اسپرد اجرایی از حد مجاز بیشتر است؛ جهت‌گیری OBI توسط شورا بررسی شده و دوباره محاسبه نمی‌شود.'
+      : stage6Passed
       ? 'عمق نقدینگی دوطرفه کافی بوده و اسپرد بازار در محدوده ایمن قرار دارد.'
       : 'فشار سنگین نقدینگی مخالف در دفتر سفارشات یا اسپرد بیش از حد مجاز است.',
   });
@@ -423,8 +543,12 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   if (!pipelineHalted && !stage6Passed) {
     pipelineHalted = true;
     activeStage = 'STAGE_6_LIQUIDITY_ANALYSIS';
-    rejectionReasonsFa.push(`عدم تعادل نقدینگی خلاف جهت معامله (OBI: ${(obi * 100).toFixed(1)}%)`);
-    prerequisitesToArmFa.push('تعادل یا برتری سفارشات در جهت معامله در دفتر سفارشات');
+    rejectionReasonsFa.push(councilAnalysisComplete
+      ? `اسپرد اجرایی بیش از حد مجاز است (${isSpreadAcceptable ? spreadBps.toFixed(2) : 'ناموجود'} bps)`
+      : `عدم تعادل نقدینگی خلاف جهت معامله (OBI: ${(obi * 100).toFixed(1)}%)`);
+    prerequisitesToArmFa.push(councilAnalysisComplete
+      ? 'بازگشت اسپرد به محدودهٔ مجاز'
+      : 'تعادل یا برتری سفارشات در جهت معامله در دفتر سفارشات');
   }
 
   // =========================================================================
@@ -443,24 +567,33 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     (isLong
       ? takerRatio >= 0.42 && cvdDelta > 0
       : takerRatio <= 0.58 && cvdDelta < 0);
-  const stage7Passed = !pipelineHalted && isTradeFlowFresh && isTakerFlowAligned;
+  const stage7Passed = !pipelineHalted && !councilAnalysisComplete &&
+    isTradeFlowFresh && isTakerFlowAligned;
 
   stages.push({
     id: 'STAGE_7_ORDER_FLOW',
     name: 'Order Flow & Taker Flow',
     nameFa: '۷. جریان سفارشات و حجم خرید/فروش تیکر',
     passed: stage7Passed,
-    status: pipelineHalted ? 'SKIPPED' : stage7Passed ? 'PASSED' : 'FAILED',
-    value: isTradeFlowFresh ? `Taker Buy Ratio: ${(takerRatio * 100).toFixed(1)}% | CVD: ${cvdDelta.toFixed(1)}` : 'Taker Buy Ratio: UNKNOWN | CVD: UNKNOWN',
-    threshold: isLong ? 'نسبت خریداران اگرسیو >= ۴۲٪' : 'نسبت خریداران اگرسیو <= ۵۸٪',
-    reasonFa: stage7Passed
+    status: pipelineHalted || councilAnalysisComplete ? 'SKIPPED' : stage7Passed ? 'PASSED' : 'FAILED',
+    value: councilAnalysisComplete
+      ? 'Order-flow direction delegated to council'
+      : isTradeFlowFresh
+        ? `Taker Buy Ratio: ${(takerRatio * 100).toFixed(1)}% | CVD: ${cvdDelta.toFixed(1)}`
+        : 'Taker Buy Ratio: UNKNOWN | CVD: UNKNOWN',
+    threshold: councilAnalysisComplete
+      ? 'ارزیابی تخصصی جریان سفارش توسط عضو دوم شورا'
+      : isLong ? 'نسبت خریداران اگرسیو >= ۴۲٪' : 'نسبت خریداران اگرسیو <= ۵۸٪',
+    reasonFa: councilAnalysisComplete
+      ? 'تحلیل جریان سفارش به عضو دوم شورا واگذار شده و در کنترل مرکزی تکرار نمی‌شود.'
+      : stage7Passed
       ? 'جریان معاملات اگرسیو تیکر با جهت معامله هماهنگ است.'
       : !isTradeFlowFresh
         ? 'CVD و جریان تیکر زنده در دسترس نیست؛ ورود Fail-Closed مسدود شد.'
         : 'جریان سفارشات لحظه‌ای مارکت با جهت ورود هم‌راستا نیست.',
   });
 
-  if (!pipelineHalted && !stage7Passed) {
+  if (!pipelineHalted && !councilAnalysisComplete && !stage7Passed) {
     pipelineHalted = true;
     activeStage = 'STAGE_7_ORDER_FLOW';
     rejectionReasonsFa.push(isTradeFlowFresh
@@ -614,6 +747,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   const technicalScore = Math.round(confScore * 20); // 0 - 100 Technical Confluence
   const consensusScore = analysis?.consensusScore ?? 80; // 0 - 100 Multi-Model Consensus
   const confidenceScore = Math.round(Math.min(100, Math.max(0, (technicalScore * 0.6) + (consensusScore * 0.4)))); // Heuristic Conviction
+  const conviction = evaluateCognitiveConviction(analysis, prediction, confidenceScore);
 
   // Strictly empirical calibrated probability (null if unverified or insufficient OOS data)
   const isCalibrationVerified = analysis?.calibratedMetadata?.isCalibrationVerified ?? false;
@@ -637,9 +771,30 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
 
   // Leverage & Margin estimation for EV calculation
   const effectiveBalance = (typeof balance === 'number' && Number.isFinite(balance) && balance > 0) ? balance : 0;
-  const lev = userLeverage ?? analysis?.leverage ?? 10;
-  const initialMarginUsd = effectiveBalance > 0 ? Math.max(10, Math.min(effectiveBalance * 0.15, 100)) : 0;
-  const notionalUsd = initialMarginUsd * lev;
+  let lev = userLeverage ?? analysis?.leverage ?? 10;
+  let initialMarginUsd = effectiveBalance > 0 ? Math.max(10, Math.min(effectiveBalance * 0.15, 100)) : 0;
+  const centralRiskControl = options.centralRiskControl;
+  if (centralRiskControl) {
+    const allocation = calculateCentralRiskAllocation({
+      balance: effectiveBalance,
+      maxStakeQuote: centralRiskControl.maxStakeQuote,
+      maxLeverage: centralRiskControl.maxLeverage,
+      riskBudgetPct: centralRiskControl.riskBudgetPct,
+      stopFraction: riskDist / price,
+    });
+    if (!allocation) {
+      lev = 1;
+      initialMarginUsd = 0;
+    } else {
+      lev = allocation.leverage;
+      initialMarginUsd = allocation.marginUsd;
+    }
+  }
+  const centralPositionMarginUsd = centralRiskControl
+    ? Math.floor(Math.min(initialMarginUsd, initialMarginUsd * Math.min(1, conviction.marginScale || 1)) * 100) / 100
+    : null;
+  const expectedValueMarginUsd = centralPositionMarginUsd ?? initialMarginUsd;
+  const notionalUsd = expectedValueMarginUsd * lev;
 
   // Roundtrip fee in USD (0.055% maker/taker * 2 * notional)
   const roundtripFeeUsd = notionalUsd * 0.0011;
@@ -707,8 +862,9 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   // =========================================================================
   // STAGE 13: DYNAMIC POSITION SIZING & CAPITAL PROTECTION
   // =========================================================================
-  const conviction = evaluateCognitiveConviction(analysis, prediction, confidenceScore);
-  const finalMargin = Math.round(initialMarginUsd * (conviction.marginScale || 1.0));
+  const finalMargin = centralRiskControl
+    ? centralPositionMarginUsd ?? 0
+    : Math.round(initialMarginUsd * (conviction.marginScale || 1.0));
   const finalNotional = finalMargin * lev;
   const btcQty = Math.round((finalNotional / Math.max(1, price)) * 10000) / 10000;
   const stage13Passed = !pipelineHalted && finalMargin >= 5 && effectiveBalance >= finalMargin;
@@ -720,9 +876,13 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     passed: stage13Passed,
     status: pipelineHalted ? 'SKIPPED' : stage13Passed ? 'PASSED' : 'FAILED',
     value: `مارجین: $${finalMargin} (ارزش: $${finalNotional.toFixed(0)} | ${btcQty} BTC)`,
-    threshold: `مارجین >= $۵ و حداکثر ۱۵٪ موجودی ($${effectiveBalance.toFixed(0)})`,
+    threshold: centralRiskControl
+      ? `مارجین >= $۵؛ زیان استاپ در سقف ${centralRiskControl.riskBudgetPct}% بودجه و مارجین <= ${centralRiskControl.maxStakeQuote.toFixed(2)}`
+      : `مارجین >= $۵ و حداکثر ۱۵٪ موجودی ($${effectiveBalance.toFixed(0)})`,
     reasonFa: stage13Passed
-      ? `حجم معامله با مدل شناور کِلی و ضریب جسارت ${conviction.labelFa} کالیبره گردید.`
+      ? centralRiskControl
+        ? `مارجین از موجودی، فاصلهٔ استاپ و بودجهٔ ریسک محاسبه شد؛ اهرم ${lev}x است.`
+        : `حجم معامله با مدل شناور کِلی و ضریب جسارت ${conviction.labelFa} کالیبره گردید.`
       : (effectiveBalance <= 0 ? 'موجودی واقعی کیف پول در دسترس نیست (DATA_UNAVAILABLE / ZERO_BALANCE)؛ تامین مارجین ممکن نیست.' : 'موجودی ناکافی کیف پول برای تامین حداقل مارجین ایمن معامله.'),
   });
 
@@ -1014,7 +1174,8 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     !disagreementReport.vetoTriggered &&
     !predictionStability.isEntryBlockedByInstability &&
     temporalStability.isTemporalStabilityVerified;
-  const allStagesPassed = stages.every((s) => s.passed) && isEnsembleApproved;
+  const allStagesPassed = areRequiredDecisionStagesSatisfied(stages, councilAnalysisComplete) &&
+    isEnsembleApproved;
   const stage14Passed = allStagesPassed;
 
   stages.push({
@@ -1036,7 +1197,9 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
     if (!temporalStability.isTemporalStabilityVerified) rejectionReasonsFa.push(temporalStability.verdictFa);
   }
 
-  const passedCount = stages.filter((s) => s.passed).length;
+  const passedCount = stages.filter((stage) =>
+    areRequiredDecisionStagesSatisfied([stage], councilAnalysisComplete)
+  ).length;
   const totalCount = stages.length;
 
   let tradeContract: TradeContract | undefined;
@@ -1150,7 +1313,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
         nameFa: s.nameFa,
         score: s.passed ? 100 : 0,
         weight: 1,
-        passed: s.passed,
+        passed: areRequiredDecisionStagesSatisfied([s], councilAnalysisComplete),
         details: s.value.toString(),
       })),
       technicalScore,

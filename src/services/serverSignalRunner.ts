@@ -41,6 +41,17 @@ import {
   openSourceAdvisoryService,
   type OpenSourceAdvisoryReport,
 } from './openSourceAdvisoryService';
+import {
+  runEightMemberCouncilRuntime,
+} from './eightMemberCouncilRuntime';
+import { runPostCouncilTradeControl } from './postCouncilTradeController';
+import { isCouncilDelegatedStageId } from './decisionPipeline';
+import { macroContextBrainService } from './macroContextBrain';
+import { sbFiveModelsEngine } from './sbFiveModelsEngine';
+import { fetchFreeMacroData } from './freeMacroData';
+import { fetchDeribitOptionsData } from './deribitOptionsData';
+import { fetchOnChainWhaleData } from './publicBitcoinWhaleData';
+import { fetchPublicMarketFallback } from './publicMarketDataFallback';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MINIMUM_CANDLES_FOR_ANALYSIS = 300;
@@ -90,9 +101,12 @@ export interface ServerSignalRunnerDependencies {
     candles: Candle[],
     nowMs: number,
     balance: number,
+    signalSettings?: ReturnType<typeof readSignalSettings>,
+    availableBalance?: number,
   ) => Promise<{
     candidate: DirectionalSignalCandidate | null;
     reason: string;
+    executionRisk?: { maxStakeQuote: number; maxLeverage: number };
     authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
     featureSnapshot?: OperationalTradeArchiveMetadata['featureSnapshot'];
     featureVersion?: string;
@@ -480,23 +494,296 @@ async function analyzeSnapshotData(
     inputs.futuresPrices,
     inputs.orderFlow,
   );
-  const candleTimestampMs = snapshot.candles.at(-1)?.timestampMs ?? snapshot.generatedAtMs;
+  const completedSnapshotCandles = snapshot.candles
+    .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= nowMs);
+  const candleTimestampMs = completedSnapshotCandles.at(-1)?.timestampMs ?? snapshot.generatedAtMs;
   if (requestAdvisories && !openSourceAdvisoryService.isStopped()) {
-    void fetchDirectNewsHeadlines()
-      .then((newsResult) => openSourceAdvisoryService.analyze(snapshot.candles, newsResult.headlines))
-      .then((report) => appendAdvisoryReport(report))
-      .catch(async (error: unknown) => {
-        console.error('[SBK1_ADVISORIES] Local open-source analysis failed; decision analysis continues without advisory output:', error);
-        const reason = error instanceof Error ? error.message : String(error);
-        const report = openSourceAdvisoryService.publishUnavailable(reason, candleTimestampMs, Date.now());
-        await appendAdvisoryReport(report);
-      });
-  }
-  const latestAdvisory = openSourceAdvisoryService.getLatest();
-  if (latestAdvisory?.sourceTimestampMs === candleTimestampMs) {
-    analysis.openSourceAdvisories = latestAdvisory;
+    const advisoryCandles = completedSnapshotCandles.slice(-500);
+    const advisoryTimestampMs = advisoryCandles.at(-1)?.timestampMs ?? candleTimestampMs;
+    let sourceHeadlines: Awaited<ReturnType<typeof fetchDirectNewsHeadlines>>['headlines'] = [];
+    let newsHeadlinesRetrievedAtMs: number | null = null;
+    try {
+      if (advisoryCandles.length === 0) {
+        throw new Error('No completed candles are available for open-source advisory analysis.');
+      }
+      const newsResult = await fetchDirectNewsHeadlines();
+      sourceHeadlines = newsResult.headlines;
+      newsHeadlinesRetrievedAtMs = newsResult.retrievedAtMs;
+      const report = await openSourceAdvisoryService.analyze(
+        advisoryCandles,
+        newsResult.headlines,
+      );
+      if (report.sourceTimestampMs !== advisoryTimestampMs) {
+        throw new Error('Open-source advisory output does not match the analyzed completed candle.');
+      }
+      report.sourceHeadlines = sourceHeadlines;
+      report.newsHeadlinesRetrievedAtMs = newsHeadlinesRetrievedAtMs;
+      analysis.openSourceAdvisories = report;
+      await appendAdvisoryReport(report);
+    } catch (error: unknown) {
+      console.error('[SBK1_ADVISORIES] Local open-source analysis failed; council receives unavailable evidence:', error);
+      const reason = error instanceof Error ? error.message : String(error);
+      const report = openSourceAdvisoryService.publishUnavailable(
+        reason,
+        advisoryTimestampMs,
+        Date.now(),
+      );
+      report.sourceHeadlines = sourceHeadlines;
+      report.newsHeadlinesRetrievedAtMs = newsHeadlinesRetrievedAtMs;
+      analysis.openSourceAdvisories = report;
+      await appendAdvisoryReport(report);
+    }
   }
   return analysis;
+}
+
+function makeServerFeatureSnapshot(
+  analysis: AnalysisResult,
+): OperationalTradeArchiveMetadata['featureSnapshot'] {
+  const latestCandle = analysis.candles.at(-1);
+  return {
+    price: analysis.price,
+    rsi: analysis.rsi ?? null,
+    adx: analysis.adx ?? null,
+    volatilityPct: analysis.volatilityPct ?? null,
+    ema20: analysis.ema20Val ?? null,
+    ema50: analysis.ema50Val ?? null,
+    ema200: analysis.ema200Val ?? null,
+    scoreLong: analysis.scoreLong ?? null,
+    scoreShort: analysis.scoreShort ?? null,
+    obi: analysis.realObiData?.obi ?? analysis.obi ?? null,
+    atr: analysis.atr ?? null,
+    fundingRate: analysis.fundingRate ?? null,
+    marketRegime: analysis.marketRegime ?? null,
+    timeframe: analysis.timeframe ?? null,
+    setupType: analysis.setupContext?.setupType ?? null,
+    candleOpen: latestCandle?.[0] ?? null,
+    candleHigh: latestCandle?.[1] ?? null,
+    candleLow: latestCandle?.[2] ?? null,
+    candleClose: latestCandle?.[3] ?? null,
+    candleVolume: latestCandle?.[4] ?? null,
+    openSourceAdvisoryStatus: analysis.openSourceAdvisories?.status ?? 'UNAVAILABLE',
+    openSourceAdvisoryTimestampMs: analysis.openSourceAdvisories?.generatedAtMs ?? null,
+  };
+}
+
+export function applyPublicMarketFallbackToCouncilAnalysis(
+  analysis: AnalysisResult,
+  fallback: Awaited<ReturnType<typeof fetchPublicMarketFallback>>,
+  nowMs: number,
+): AnalysisResult {
+  const timeframeMatch = typeof analysis.timeframe === 'string'
+    ? /^(\d+)([mhdw])$/.exec(analysis.timeframe)
+    : null;
+  const timeframeUnitMs: Record<string, number> = {
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+    w: 604_800_000,
+  };
+  const candleFreshnessLimitMs = timeframeMatch
+    ? Number(timeframeMatch[1]) * timeframeUnitMs[timeframeMatch[2]] + 60_000
+    : 15_000;
+  const existingQuality = analysis.dataQualityReport;
+  const existingFeeds = existingQuality?.feeds;
+  const isPrimaryFeedFresh = (
+    feed: DataQualityReport['feeds'][keyof DataQualityReport['feeds']] | undefined,
+    maxAgeMs: number,
+  ): boolean => Boolean(
+    feed &&
+    feed.status === 'LIVE' &&
+    Number.isFinite(feed.timestamp) &&
+    feed.timestamp <= nowMs &&
+    nowMs - feed.timestamp <= Math.min(feed.maxAgeMs ?? maxAgeMs, maxAgeMs),
+  );
+  const candlesFallback = fallback.candles.status === 'LIVE' &&
+    fallback.candles.value !== null &&
+    fallback.candles.sourceTimestampMs !== null;
+  const primaryCandlesUsable = isPrimaryFeedFresh(existingFeeds?.candles, candleFreshnessLimitMs) &&
+    analysis.candles.length >= 30 &&
+    analysis.candles.every((candle) =>
+      Number.isFinite(candle[3]) && candle[3] > 0,
+    );
+  const useFallbackCandles = !primaryCandlesUsable &&
+    candlesFallback &&
+    fallback.candles.value!.length >= 30;
+
+  const tradeFallback = fallback.tradeFlow.status === 'LIVE' &&
+    fallback.tradeFlow.value !== null &&
+    fallback.tradeFlow.sourceTimestampMs !== null;
+  const primaryTrades = analysis.orderFlowFeatures;
+  const primaryTradesUsable = isPrimaryFeedFresh(existingFeeds?.orderFlow, FREQTRADE_TRADE_FLOW_MAX_AGE_MS) &&
+    primaryTrades?.isRealTradeFlow === true &&
+    primaryTrades.status === 'LIVE' &&
+    Number.isFinite(primaryTrades.timestampUtc) &&
+    Number.isFinite(primaryTrades.cvdDeltaUsd ?? primaryTrades.cvdDelta);
+  const useFallbackTrades = !primaryTradesUsable &&
+    tradeFallback;
+
+  const bookFallback = fallback.orderBook.status === 'LIVE' &&
+    fallback.orderBook.value !== null &&
+    fallback.orderBook.sourceTimestampMs !== null;
+  const primaryBook = analysis.realObiData;
+  const primaryBookUsable = isPrimaryFeedFresh(existingFeeds?.orderBook, 5_000) &&
+    primaryBook?.status === 'LIVE' &&
+    Number.isFinite(primaryBook.obi) &&
+    Number.isFinite(primaryBook.bidDepthUsd) &&
+    Number.isFinite(primaryBook.askDepthUsd) &&
+    primaryBook.bidDepthUsd + primaryBook.askDepthUsd > 0 &&
+    primaryBook.levelsCount > 0;
+  const useFallbackBook = !primaryBookUsable &&
+    bookFallback;
+
+  const fundingFallback = fallback.fundingRate.status === 'LIVE' &&
+    fallback.fundingRate.value !== null &&
+    fallback.fundingRate.sourceTimestampMs !== null;
+  const oiFallback = fallback.openInterest.status === 'LIVE' &&
+    fallback.openInterest.value !== null &&
+    fallback.openInterest.sourceTimestampMs !== null;
+  const primaryDerivativesFresh = isPrimaryFeedFresh(existingFeeds?.derivatives, 60_000) &&
+    typeof analysis.fundingRate === 'number' &&
+    Number.isFinite(analysis.fundingRate) &&
+    typeof analysis.oi === 'number' &&
+    Number.isFinite(analysis.oi) &&
+    analysis.oi > 0;
+  const useFallbackDerivatives = !primaryDerivativesFresh && fundingFallback && oiFallback;
+
+  if (!useFallbackCandles && !useFallbackTrades && !useFallbackBook && !useFallbackDerivatives) {
+    return analysis;
+  }
+
+  const feeds = existingFeeds ? { ...existingFeeds } : null;
+  const cloneFeed = (
+    feedName: string,
+    sourceTimestampMs: number,
+    maxAgeMs: number,
+    detailsFa: string,
+  ) => createMarketFeedQuality({
+    feedName,
+    source: fallback.provider,
+    status: 'LIVE',
+    timestamp: sourceTimestampMs,
+    ageMs: Math.max(0, nowMs - sourceTimestampMs),
+    maxAgeMs,
+    score: 90,
+    detailsFa,
+  });
+
+  const fallbackCandles = useFallbackCandles ? fallback.candles.value! : null;
+  const fallbackTrades = useFallbackTrades ? fallback.tradeFlow.value! : null;
+  const fallbackBook = useFallbackBook ? fallback.orderBook.value! : null;
+  const fallbackFunding = useFallbackDerivatives ? fallback.fundingRate.value! : null;
+  const fallbackOi = useFallbackDerivatives ? fallback.openInterest.value! : null;
+  if (feeds && fallbackCandles) {
+    feeds.candles = cloneFeed(
+      `${fallback.provider} completed candles`,
+      fallback.candles.sourceTimestampMs!,
+      candleFreshnessLimitMs,
+      `${fallback.pair} تکمیل‌شده؛ ورودی جایگزین عضو ۱.`,
+    );
+  }
+  if (feeds && fallbackTrades) {
+    feeds.orderFlow = cloneFeed(
+      `${fallback.provider} recent aggregate trades`,
+      fallback.tradeFlow.sourceTimestampMs!,
+      FREQTRADE_TRADE_FLOW_MAX_AGE_MS,
+      `${fallbackTrades.trades.length} معاملهٔ اجراشدهٔ تازه برای محاسبهٔ CVD عضو ۲.`,
+    );
+  }
+  if (feeds && fallbackBook) {
+    feeds.orderBook = cloneFeed(
+      `${fallback.provider} order book`,
+      fallback.orderBook.sourceTimestampMs!,
+      5_000,
+      'دفتر سفارش عمومی تازه برای عضو ۳.',
+    );
+  }
+  if (feeds && fallbackFunding && fallbackOi) {
+    feeds.derivatives = cloneFeed(
+      `${fallback.provider} funding and open interest`,
+      fallback.fundingRate.sourceTimestampMs!,
+      60_000,
+      'Funding و OI معتبر از بازار آتی عمومی برای عضو ۴.',
+    );
+  }
+
+  const buyTrades = fallbackTrades?.trades.filter((trade) => trade.side === 'buy') ?? [];
+  const sellTrades = fallbackTrades?.trades.filter((trade) => trade.side === 'sell') ?? [];
+  const buyVolume = buyTrades.reduce((sum, trade) => sum + trade.amount, 0);
+  const sellVolume = sellTrades.reduce((sum, trade) => sum + trade.amount, 0);
+  const latestTradeTimestampMs = fallbackTrades?.trades.at(-1)?.timestampMs;
+  const bidDepthUsd = fallbackBook?.bids.reduce((sum, level) => sum + level.price * level.amount, 0);
+  const askDepthUsd = fallbackBook?.asks.reduce((sum, level) => sum + level.price * level.amount, 0);
+  const fallbackFundingRate = fallbackFunding?.rate;
+  const fallbackOpenInterest = fallbackOi?.latestAmount;
+  const fallbackCandlesTuple = fallbackCandles?.map((candle) => [
+    candle.open,
+    candle.high,
+    candle.low,
+    candle.close,
+    candle.volume,
+  ] as Candle);
+
+  return {
+    ...analysis,
+    ...(fallbackCandlesTuple ? { candles: fallbackCandlesTuple } : {}),
+    ...(typeof fallbackFundingRate === 'number' ? {
+      funding: fallbackFundingRate,
+      fundingRate: fallbackFundingRate,
+    } : {}),
+    ...(typeof fallbackOpenInterest === 'number' ? { oi: fallbackOpenInterest } : {}),
+    ...(fallbackTrades && typeof latestTradeTimestampMs === 'number' ? {
+      orderFlowFeatures: {
+        cvdDelta: buyVolume - sellVolume,
+        cvdDeltaUsd: buyTrades.reduce((sum, trade) => sum + trade.amount * trade.price, 0) -
+          sellTrades.reduce((sum, trade) => sum + trade.amount * trade.price, 0),
+        cvdDivergence: 'BINANCE_PUBLIC_AGG_TRADES',
+        takerBuyVol: buyVolume,
+        takerSellVol: sellVolume,
+        takerRatio: buyVolume + sellVolume > 0 ? buyVolume / (buyVolume + sellVolume) : null,
+        takerDelta: buyVolume - sellVolume,
+        delta: buyVolume - sellVolume,
+        cumulativeDelta: buyVolume - sellVolume,
+        deltaVelocity: buyVolume - sellVolume,
+        isRealTradeFlow: true,
+        status: 'LIVE',
+        timestampUtc: latestTradeTimestampMs,
+        ageMs: nowMs - latestTradeTimestampMs,
+        latencyMs: null,
+        source: `${fallback.provider} ${fallback.market} aggregate trades (${fallback.pair})`,
+      },
+    } : {}),
+    ...(fallbackBook && bidDepthUsd !== undefined && askDepthUsd !== undefined ? {
+      realObiData: {
+        obi: bidDepthUsd + askDepthUsd > 0
+          ? (bidDepthUsd - askDepthUsd) / (bidDepthUsd + askDepthUsd)
+          : null,
+        bidDepthUsd,
+        askDepthUsd,
+        bestBid: fallbackBook.bids[0]?.price ?? null,
+        bestAsk: fallbackBook.asks[0]?.price ?? null,
+        spreadUsd: fallbackBook.bids[0] && fallbackBook.asks[0]
+          ? fallbackBook.asks[0].price - fallbackBook.bids[0].price
+          : null,
+        levelsCount: Math.min(fallbackBook.bids.length, fallbackBook.asks.length),
+        status: 'LIVE',
+        timestamp: fallbackBook.timestampMs,
+        ageMs: nowMs - fallbackBook.timestampMs,
+        latencyMs: null,
+        source: `${fallback.provider} ${fallback.market} depth (${fallback.pair})`,
+      },
+    } : {}),
+    ...(existingQuality && feeds ? {
+      dataQualityReport: {
+        ...existingQuality,
+        feeds,
+        reasonsFa: [
+          ...existingQuality.reasonsFa,
+          `Fallback council evidence: ${fallback.provider} ${fallback.market} ${fallback.pair}.`,
+        ],
+      },
+    } : analysis.dataQualityReport),
+  };
 }
 
 async function analyzeSnapshot(
@@ -504,9 +791,12 @@ async function analyzeSnapshot(
   candles: Candle[],
   nowMs: number,
   balance: number,
+  signalSettings: ReturnType<typeof readSignalSettings> = readSignalSettings(),
+  availableBalance: number = balance,
 ): Promise<{
   candidate: DirectionalSignalCandidate | null;
   reason: string;
+  executionRisk?: { maxStakeQuote: number; maxLeverage: number };
   authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
   featureSnapshot: OperationalTradeArchiveMetadata['featureSnapshot'];
   featureVersion: string;
@@ -514,22 +804,73 @@ async function analyzeSnapshot(
   openSourceAdvisories?: OpenSourceAdvisoryReport;
 }> {
   const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance, true);
-  const { runUnifiedDecisionPipeline } = await import('./decisionPipeline');
+  const [freeMacroData, optionsData, whaleFlowData] = await Promise.all([
+    fetchFreeMacroData(),
+    fetchDeribitOptionsData({ nowMs }),
+    fetchOnChainWhaleData({ nowMs, btcPriceUsd: analysis.price }),
+  ]);
+  const publicMarketFallback = await fetchPublicMarketFallback({
+    pair: snapshot.pair,
+    timeframe: snapshot.timeframe,
+    market: snapshot.market,
+    nowMs,
+  });
+  const councilEvaluationNowMs = Math.max(nowMs, Date.now());
+  const councilAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
+    analysis,
+    publicMarketFallback,
+    councilEvaluationNowMs,
+  );
+  const macroContext = macroContextBrainService.getCachedMacroContext();
   const { runUnifiedMultiBrainEnsemble } = await import('./multiBrainEnsemble');
   const multiBrainReport = runUnifiedMultiBrainEnsemble(analysis, null, analysis.price);
-  const decision = runUnifiedDecisionPipeline({
-    analysis,
-    targetDirection: analysis.direction,
+  const sbReport = sbFiveModelsEngine.evaluatePentagon(analysis, null, analysis.price);
+  const decisionSnapshotTimestampMs = snapshot.candles
+    .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= nowMs)
+    .at(-1)?.timestampMs;
+  const councilReport = await runEightMemberCouncilRuntime({
+    analysis: councilAnalysis,
+    multiBrainReport,
+    sbReport,
+    macroContext,
+    freeMacroData,
+    optionsData,
+    whaleFlowData,
+    publicMarketFallback,
+    decisionSnapshotTimestampMs,
+    nowMs: councilEvaluationNowMs,
+  });
+
+  if (!councilReport.quorumMet || !councilReport.selectedDirection) {
+    return {
+      candidate: null,
+      reason: `Council quorum not met; no directional pipeline, leverage, margin, or Freqtrade signal was produced. ${councilReport.summaryFa}`,
+      openSourceAdvisories: analysis.openSourceAdvisories,
+      featureSnapshot: makeServerFeatureSnapshot(analysis),
+      featureVersion: 'server-signal-features-v1',
+      modelVersion: analysis.calibratedMetadata?.modelVersion ?? 'analysis-engine-current',
+    };
+  }
+
+  const selectedAnalysis: AnalysisResult = {
+    ...analysis,
+    direction: councilReport.selectedDirection,
+  };
+  const control = runPostCouncilTradeControl({
+    analysis: selectedAnalysis,
+    council: councilReport,
     multiBrainReport,
     balance,
-    userLeverage: 1,
+    maxStakeQuote: Math.min(signalSettings.maxStakeQuote, availableBalance),
+    maxLeverage: signalSettings.maxLeverage,
+    riskBudgetPct: signalSettings.riskBudgetPct,
+    referencePrice: candles.at(-1)?.[3] ?? Number.NaN,
+    maxDeviationBps: signalSettings.maxDeviationBps,
     minWinProbability: 68,
-    isAutoTrade: true,
   });
-  const tradeContract = decision.tradeContract;
-  const approved = decision.decision === 'EXECUTE_APPROVED' &&
-    decision.masterDecision?.executionPermitted === true &&
-    tradeContract?.contractStatus === 'APPROVED_EXECUTABLE';
+  const decision = control.decision;
+  const tradeContract = control.tradeContract;
+  const approved = control.approved;
   const latestCandle = analysis.candles.at(-1);
   return {
     candidate: approved && tradeContract
@@ -542,7 +883,10 @@ async function analyzeSnapshot(
         setupType: analysis.setupContext?.setupType ?? '',
       }
       : null,
-    reason: approved ? 'The complete decision pipeline approved the entry.' : decision.waitReasonFa,
+    ...(approved && control.executionRisk ? { executionRisk: control.executionRisk } : {}),
+    reason: approved
+      ? control.reason
+      : control.reason,
     openSourceAdvisories: analysis.openSourceAdvisories,
     ...(approved && tradeContract ? {
       authorization: {
@@ -553,11 +897,14 @@ async function analyzeSnapshot(
         evaluatedAtMs: nowMs,
         timeframe: snapshot.timeframe,
         direction: tradeContract.direction,
-        gates: decision.stages.map((stage, index) => ({
-          id: decision.stages.findIndex((candidate) => candidate.id === stage.id) === index
+        gates: (decision?.stages ?? []).map((stage, index, stages) => ({
+          id: stages.findIndex((candidate) => candidate.id === stage.id) === index
             ? stage.id
             : `${stage.id}_${index}`,
-          status: stage.status === 'PASSED' ? 'PASSED' as const : 'FAILED' as const,
+          status: stage.status === 'PASSED' ||
+            (stage.status === 'SKIPPED' && isCouncilDelegatedStageId(stage.id))
+            ? 'PASSED' as const
+            : 'FAILED' as const,
           reason: stage.reasonFa,
         })),
         models: multiBrainReport.independentModels.map((model) => ({
@@ -606,30 +953,7 @@ async function analyzeSnapshot(
           Math.abs(tradeContract.entryZone.target - tradeContract.stop),
       },
     } : {}),
-    featureSnapshot: {
-      price: analysis.price,
-      rsi: analysis.rsi ?? null,
-      adx: analysis.adx ?? null,
-      volatilityPct: analysis.volatilityPct ?? null,
-      ema20: analysis.ema20Val ?? null,
-      ema50: analysis.ema50Val ?? null,
-      ema200: analysis.ema200Val ?? null,
-      scoreLong: analysis.scoreLong ?? null,
-      scoreShort: analysis.scoreShort ?? null,
-      obi: analysis.realObiData?.obi ?? analysis.obi ?? null,
-      atr: analysis.atr ?? null,
-      fundingRate: analysis.fundingRate ?? null,
-      marketRegime: analysis.marketRegime ?? null,
-      timeframe: analysis.timeframe ?? null,
-      setupType: analysis.setupContext?.setupType ?? null,
-      candleOpen: latestCandle?.[0] ?? null,
-      candleHigh: latestCandle?.[1] ?? null,
-      candleLow: latestCandle?.[2] ?? null,
-      candleClose: latestCandle?.[3] ?? null,
-      candleVolume: latestCandle?.[4] ?? null,
-      openSourceAdvisoryStatus: analysis.openSourceAdvisories?.status ?? 'UNAVAILABLE',
-      openSourceAdvisoryTimestampMs: analysis.openSourceAdvisories?.generatedAtMs ?? null,
-    },
+    featureSnapshot: makeServerFeatureSnapshot(analysis),
     featureVersion: 'server-signal-features-v1',
     modelVersion: analysis.calibratedMetadata?.modelVersion ?? 'analysis-engine-current',
   };
@@ -955,7 +1279,14 @@ export class ServerSignalRunner {
       if (!this.dependencies.analyze) {
         centralTradeDatasetService.replaceTrainingArchiveRecords(await operationalTradeArchive.getAll());
       }
-      const result = await this.analyze(snapshot, completedCandles, nowMs, balance.equity);
+      const result = await this.analyze(
+        snapshot,
+        completedCandles,
+        nowMs,
+        balance.equity,
+        settings,
+        balance.available,
+      );
       const candidate = result.candidate;
       if (!candidate) {
         await this.record({
@@ -985,16 +1316,6 @@ export class ServerSignalRunner {
       }
 
       const referencePrice = latestCandle[3];
-      const entryDeviationBps = Math.abs(candidate.entryPrice - referencePrice) / referencePrice * 10_000;
-      if (entryDeviationBps > settings.maxDeviationBps) {
-        await this.record({
-          candleTimestampMs,
-          decision: 'NO TRADE',
-          reason: `Technical entry is ${entryDeviationBps.toFixed(2)} bps from the completed candle close, above the configured ${settings.maxDeviationBps} bps limit.`,
-          openSourceAdvisories: result.openSourceAdvisories,
-        });
-        return;
-      }
 
       const setupType = `${candidate.setupType}:${candleTimestampMs}`;
       const ids = deriveSbkSignalIds({
@@ -1020,6 +1341,15 @@ export class ServerSignalRunner {
         return;
       }
 
+      const maxStakeQuote = Math.min(
+        settings.maxStakeQuote,
+        balance.available,
+        result.executionRisk?.maxStakeQuote ?? Number.POSITIVE_INFINITY,
+      );
+      const maxLeverage = Math.min(
+        settings.maxLeverage,
+        result.executionRisk?.maxLeverage ?? settings.maxLeverage,
+      );
       const signal: SbkFreqtradeSignal = validateSbkFreqtradeSignal({
         contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
         ...ids,
@@ -1047,14 +1377,13 @@ export class ServerSignalRunner {
         },
         riskLimits: {
           riskBudgetPct: settings.riskBudgetPct,
-          maxStakeQuote: Math.min(settings.maxStakeQuote, balance.available),
-          maxLeverage: settings.maxLeverage,
+          maxStakeQuote,
+          maxLeverage,
         },
         authorization: {
           ...result.authorization,
           decisionId: ids.decisionId,
-          allocatedRiskUsd:
-            Math.min(settings.maxStakeQuote, balance.available) * settings.riskBudgetPct / 100,
+          allocatedRiskUsd: maxStakeQuote * settings.riskBudgetPct / 100,
         },
       }, {
         nowMs,
