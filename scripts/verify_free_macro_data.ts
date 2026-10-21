@@ -91,4 +91,153 @@ const freshnessBoundary = await fetchFreeMacroData({
 assert.equal(freshnessBoundary.sp500.status, 'LIVE');
 assert.equal(freshnessBoundary.sp500.ageMs, 5 * 24 * 60 * 60_000);
 
-console.log('Free macro provider schema, freshness, provenance, and secret-isolation checks passed.');
+const dxyNowMs = Date.now();
+const dxyTimestampMs = Math.floor(dxyNowMs / 1_000) * 1_000;
+let dxyRequestCount = 0;
+const dxyLive = await fetchFreeMacroData({
+  nowMs: dxyNowMs,
+  massiveApiKey: 'verification-secret',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'api.massive.com') {
+      dxyRequestCount += 1;
+      assert.equal(endpoint.pathname, '/v3/snapshot/indices');
+      assert.equal(endpoint.searchParams.get('ticker'), 'I:DXY');
+      assert.equal(endpoint.searchParams.get('apiKey'), 'verification-secret');
+      return Response.json({
+        results: [{
+          ticker: 'I:DXY',
+          timeframe: 'REAL-TIME',
+          value: 104.25,
+          last_updated: dxyTimestampMs * 1_000_000,
+          session: { previous_close: 104 },
+        }],
+      });
+    }
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      const seriesId = endpoint.searchParams.get('id');
+      const date = new Date(dxyNowMs).toISOString().slice(0, 10);
+      return new Response(`observation_date,${seriesId}\n${date},100.5\n`, {
+        headers: { 'Content-Type': 'text/csv' },
+      });
+    }
+    return Response.json({
+      data: [{
+        asset: 'btc',
+        time: new Date(dxyNowMs - 60 * 60_000).toISOString(),
+        AdrActCnt: '650000',
+      }],
+    });
+  },
+});
+assert.equal(dxyRequestCount, 1);
+assert.equal(dxyLive.dxy.status, 'LIVE');
+assert.equal(dxyLive.dxy.value, 104.25);
+assert.equal(dxyLive.dxy.previousValue, 104);
+assert.equal(dxyLive.dxy.changePct, (0.25 / 104) * 100);
+assert.ok(dxyLive.dxy.observedAtMs !== null &&
+  Math.abs(dxyLive.dxy.observedAtMs - dxyTimestampMs) <= 1);
+assert.equal(dxyLive.dxy.provider, 'Massive Indices Snapshot (I:DXY)');
+assert.ok(!JSON.stringify(dxyLive).includes('verification-secret'));
+
+const dxyStale = await fetchFreeMacroData({
+  nowMs: dxyNowMs + 3 * 60_000,
+  massiveApiKey: 'verification-secret',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'api.massive.com') {
+      return Response.json({
+        results: [{
+          ticker: 'I:DXY',
+          timeframe: 'REAL-TIME',
+          value: 104.25,
+          last_updated: dxyTimestampMs * 1_000_000,
+          session: { previous_close: 104 },
+        }],
+      });
+    }
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      const seriesId = endpoint.searchParams.get('id');
+      const date = new Date(dxyNowMs).toISOString().slice(0, 10);
+      return new Response(`observation_date,${seriesId}\n${date},100.5\n`, {
+        headers: { 'Content-Type': 'text/csv' },
+      });
+    }
+    return Response.json({
+      data: [{
+        asset: 'btc',
+        time: new Date(dxyNowMs).toISOString(),
+        AdrActCnt: '650000',
+      }],
+    });
+  },
+});
+assert.equal(dxyStale.dxy.status, 'UNAVAILABLE');
+assert.match(dxyStale.dxy.error ?? '', /stale/);
+
+const dxyUnavailable = await fetchFreeMacroData({
+  nowMs: dxyNowMs,
+  massiveApiKey: '',
+  fetcher: async () => {
+    throw new Error('DXY must not make a request without a configured key.');
+  },
+});
+assert.equal(dxyUnavailable.dxy.status, 'UNAVAILABLE');
+assert.match(dxyUnavailable.dxy.error ?? '', /MASSIVE_API_KEY is not configured/);
+
+const delayedDxy = await fetchFreeMacroData({
+  nowMs: dxyNowMs + 60_000,
+  massiveApiKey: 'verification-secret',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    assert.equal(endpoint.hostname, 'api.massive.com');
+    return Response.json({
+      results: [{
+        ticker: 'I:DXY',
+        timeframe: 'DELAYED',
+        value: 104.25,
+        last_updated: (dxyTimestampMs + 60_000) * 1_000_000,
+        session: { previous_close: 104 },
+      }],
+    });
+  },
+});
+assert.equal(delayedDxy.dxy.status, 'UNAVAILABLE');
+assert.match(delayedDxy.dxy.error ?? '', /no entitled real-time/);
+
+const dxyRequestFailed = await fetchFreeMacroData({
+  nowMs: dxyNowMs + 120_000,
+  massiveApiKey: 'verification-secret',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'api.massive.com') {
+      throw new Error('request failed: https://api.massive.com/?apiKey=verification-secret');
+    }
+    throw new Error('cached non-DXY data unexpectedly missed cache');
+  },
+});
+assert.equal(dxyRequestFailed.dxy.status, 'UNAVAILABLE');
+assert.ok(!JSON.stringify(dxyRequestFailed).includes('verification-secret'));
+
+const maintenanceNowMs = Date.now() + 24 * 60 * 60_000;
+const fredMaintenance = await fetchFreeMacroData({
+  nowMs: maintenanceNowMs,
+  massiveApiKey: '',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      return new Response('<!doctype html><title>Site Maintenance</title>');
+    }
+    return Response.json({
+      data: [{
+        asset: 'btc',
+        time: new Date(maintenanceNowMs - 60 * 60_000).toISOString(),
+        AdrActCnt: '650000',
+      }],
+    });
+  },
+});
+assert.equal(fredMaintenance.sp500.status, 'UNAVAILABLE');
+assert.match(fredMaintenance.sp500.error ?? '', /HTML maintenance\/access page/);
+
+console.log('Free macro and live DXY provider schema, freshness, provenance, and secret-isolation checks passed.');

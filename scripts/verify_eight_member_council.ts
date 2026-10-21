@@ -48,6 +48,7 @@ const macroContext: CouncilMacroContext = {
   sp500Status: 'LIVE',
   sp500DailyChangePct: 1,
   dxyStatus: 'LIVE',
+  dxyIndex: 104.25,
   dxyDailyChangePct: -0.5,
   etfFlowStatus: 'LIVE',
   spotEtfNetInflowMillionUsd: 100,
@@ -180,6 +181,7 @@ const directMacroContext: CouncilMacroContext = {
   broadDollarProxyDailyChangePct: -0.2,
   provenance: {
     sp500DailyChangePct: { status: 'LIVE', observedAtMs: nowMs - 1_000 },
+    dxyIndex: { status: 'LIVE', observedAtMs: nowMs - 1_000 },
     broadDollarProxy: { status: 'LIVE', observedAtMs: nowMs - 1_000 },
   },
 };
@@ -189,7 +191,29 @@ const directMacroCouncil = evaluateEightMemberCouncil({
   nowMs,
 });
 assert.equal(directMacroCouncil.members[6].vote, 'LONG');
+assert.ok(directMacroCouncil.members[6].moduleIds.includes('macro.dxy'));
+assert.match(directMacroCouncil.members[6].rationaleFa, /شاخص واقعی DXY/);
 assert.match(directMacroCouncil.members[6].rationaleFa, /proxy، نه DXY/);
+
+const staleDxyCouncil = evaluateEightMemberCouncil({
+  analysis,
+  macroContext: {
+    ...directMacroContext,
+    overallDataStatus: 'UNAVAILABLE',
+    fundamentalBias: 'UNAVAILABLE',
+    sp500Status: 'UNAVAILABLE',
+    sp500DailyChangePct: null,
+    broadDollarProxyStatus: 'UNAVAILABLE',
+    broadDollarProxyDailyChangePct: null,
+    etfFlowStatus: 'UNAVAILABLE',
+    spotEtfNetInflowMillionUsd: null,
+    provenance: {
+      dxyIndex: { status: 'LIVE', observedAtMs: nowMs - 121_000 },
+    },
+  },
+  nowMs,
+});
+assert.equal(staleDxyCouncil.members[6].vote, 'ABSTAIN');
 
 const attachedEvidence = evaluateEightMemberCouncil({
   analysis,

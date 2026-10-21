@@ -218,7 +218,7 @@ export class MacroContextBrainService {
         json.dxyIndex > 0 &&
         typeof json.dxyDailyChangePct === 'number' &&
         Number.isFinite(json.dxyDailyChangePct) &&
-        hasFreshMetricProvenance('dxyIndex', 5 * 24 * 60 * 60_000)
+        hasFreshMetricProvenance('dxyIndex', 2 * 60_000)
         ? 'LIVE'
         : 'UNAVAILABLE';
       const dxyIndex = dxyStatus === 'LIVE' ? json.dxyIndex : null;

@@ -100,6 +100,7 @@ const report = {
   checkedAt: new Date().toISOString(),
   credentials: {
     fredApiKeyRequired: false,
+    massiveApiKeyConfigured: Boolean(process.env.MASSIVE_API_KEY?.trim()),
     whaleAlertApiKeyConfigured: Boolean(process.env.WHALE_ALERT_API_KEY?.trim()),
   },
   macro: Object.fromEntries(

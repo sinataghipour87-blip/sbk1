@@ -214,6 +214,19 @@ function macroMetric(metric: string, value: number): DirectMetricResult {
 }
 const freeMacroData: FreeMacroDataResult = {
   sp500: macroMetric('sp500', 5000),
+  dxy: {
+    ...macroMetric('dxy', 105),
+    status: 'UNAVAILABLE',
+    value: null,
+    previousValue: null,
+    changePct: null,
+    observedAt: null,
+    observedAtMs: null,
+    retrievedAtMs: null,
+    latencyMs: null,
+    ageMs: null,
+    error: 'No verification API key configured.',
+  },
   broadDollar: {
     ...macroMetric('broad-dollar-proxy', 120),
     observedAt: new Date(nowMs - 2 * 24 * 60 * 60_000).toISOString(),
@@ -367,6 +380,7 @@ try {
   assert.equal(macroMember.vote, 'LONG', 'member 7 must use the fresh direct macro sources provided to the server runtime');
   assert.match(macroMember.rationaleFa, /proxy، نه DXY/);
   assert.equal(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.broadDollarProxy').status, 'AVAILABLE');
+  assert.equal(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.dxy').status, 'UNAVAILABLE');
   assert.equal('output' in macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.broadDollarProxy'), false);
   assert.match(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.broadDollarProxy').summaryFa, /proxy/);
   assert.equal(

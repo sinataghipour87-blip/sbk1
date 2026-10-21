@@ -12,6 +12,14 @@ export interface PublicMarketFallbackFeed<T> {
   error?: string;
 }
 
+export interface PublicExchangeQuote {
+  exchange: 'binance' | 'bybit' | 'okx';
+  symbol: string;
+  price: number;
+  sourceTimestampMs: number;
+  retrievedAtMs: number;
+}
+
 export interface PublicMarketFallbackData {
   provider: 'Binance public REST API';
   venue: 'binance';
@@ -19,6 +27,7 @@ export interface PublicMarketFallbackData {
   pair: string;
   timeframe: string;
   retrievedAtMs: number;
+  exchangeQuotes: PublicMarketFallbackFeed<PublicExchangeQuote[]>;
   candles: PublicMarketFallbackFeed<FreqtradeMarketCandle[]>;
   orderBook: PublicMarketFallbackFeed<FreqtradeMarketOrderBook>;
   tradeFlow: PublicMarketFallbackFeed<FreqtradeMarketTradeFlow>;
@@ -31,7 +40,9 @@ const MAX_FEED_AGE_MS = {
   tradeFlow: 5_000,
   fundingRate: 60_000,
   openInterest: 10 * 60_000,
+  exchangeQuotes: 5_000,
 } as const;
+const MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT = 2;
 
 type MarketKind = 'spot' | 'futures';
 
@@ -240,6 +251,111 @@ function parseTrades(payload: unknown, retrievedAtMs: number, nowMs: number): Fr
   return { retrievedAtMs, trades };
 }
 
+async function fetchCrossExchangeQuotes(options: {
+  symbol: string;
+  market: MarketKind;
+  nowMs: number;
+  fetcher: typeof fetch;
+  timeoutMs: number;
+}): Promise<PublicMarketFallbackFeed<PublicExchangeQuote[]>> {
+  const baseAsset = options.symbol.slice(0, -4);
+  const okxSymbol = options.market === 'futures'
+    ? `${baseAsset}-USDT-SWAP`
+    : `${baseAsset}-USDT`;
+  const requests = [
+    {
+      exchange: 'binance' as const,
+      symbol: options.symbol,
+      url: `https://${options.market === 'futures' ? 'fapi.binance.com' : 'api.binance.com'}${options.market === 'futures' ? '/fapi/v1' : '/api/v3'}/ticker/price?symbol=${options.symbol}`,
+      parse(payload: unknown, retrievedAtMs: number): PublicExchangeQuote {
+        if (!isRecord(payload) || payload.symbol !== options.symbol) {
+          throw new Error('Binance ticker response is malformed or has the wrong symbol.');
+        }
+        const price = Number(payload.price);
+        const timestamp = Number(payload.time);
+        const sourceTimestampMs = Number.isSafeInteger(timestamp) ? timestamp : retrievedAtMs;
+        if (!Number.isFinite(price) || price <= 0) {
+          throw new Error('Binance ticker price is invalid.');
+        }
+        return { exchange: 'binance', symbol: options.symbol, price, sourceTimestampMs, retrievedAtMs };
+      },
+    },
+    {
+      exchange: 'bybit' as const,
+      symbol: options.symbol,
+      url: `https://api.bybit.com/v5/market/tickers?category=${options.market === 'futures' ? 'linear' : 'spot'}&symbol=${options.symbol}`,
+      parse(payload: unknown, retrievedAtMs: number): PublicExchangeQuote {
+        if (!isRecord(payload) || Number(payload.retCode) !== 0 ||
+            !isRecord(payload.result) || !Array.isArray(payload.result.list)) {
+          throw new Error('Bybit ticker response is malformed or unsuccessful.');
+        }
+        const ticker = payload.result.list.find((item: unknown) =>
+          isRecord(item) && item.symbol === options.symbol
+        );
+        if (!isRecord(ticker)) throw new Error('Bybit returned no ticker for the requested symbol.');
+        const price = Number(ticker.lastPrice);
+        const timestamp = Number(payload.time);
+        const sourceTimestampMs = Number.isSafeInteger(timestamp) ? timestamp : retrievedAtMs;
+        if (!Number.isFinite(price) || price <= 0) throw new Error('Bybit ticker price is invalid.');
+        return { exchange: 'bybit', symbol: options.symbol, price, sourceTimestampMs, retrievedAtMs };
+      },
+    },
+    {
+      exchange: 'okx' as const,
+      symbol: okxSymbol,
+      url: `https://www.okx.com/api/v5/market/ticker?instId=${okxSymbol}`,
+      parse(payload: unknown, retrievedAtMs: number): PublicExchangeQuote {
+        if (!isRecord(payload) || payload.code !== '0' || !Array.isArray(payload.data)) {
+          throw new Error('OKX ticker response is malformed or unsuccessful.');
+        }
+        const ticker = payload.data.find((item: unknown) =>
+          isRecord(item) && item.instId === okxSymbol
+        );
+        if (!isRecord(ticker)) throw new Error('OKX returned no ticker for the requested instrument.');
+        const price = Number(ticker.last);
+        const sourceTimestampMs = Number(ticker.ts);
+        if (!Number.isSafeInteger(sourceTimestampMs) || !Number.isFinite(price) || price <= 0) {
+          throw new Error('OKX ticker price or exchange timestamp is invalid.');
+        }
+        return { exchange: 'okx', symbol: okxSymbol, price, sourceTimestampMs, retrievedAtMs };
+      },
+    },
+  ];
+
+  try {
+    const quotes = await Promise.all(requests.map(async (request) => {
+      const { payload, retrievedAtMs } = await requestJson(
+        request.url,
+        options.fetcher,
+        options.nowMs,
+        options.timeoutMs,
+      );
+      const quote = request.parse(payload, retrievedAtMs);
+      const ageMs = Math.max(options.nowMs, Date.now()) - quote.sourceTimestampMs;
+      if (ageMs < 0 || ageMs > MAX_FEED_AGE_MS.exchangeQuotes) {
+        throw new Error(`${request.exchange} ticker is stale or future-dated.`);
+      }
+      return quote;
+    }));
+    const sortedPrices = quotes.map(({ price }) => price).sort((left, right) => left - right);
+    const medianPrice = sortedPrices[1];
+    const spreadPct = ((sortedPrices[2] - sortedPrices[0]) / medianPrice) * 100;
+    if (spreadPct > MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT) {
+      throw new Error(
+        `Cross-exchange ticker spread ${spreadPct.toFixed(3)}% exceeds the ${MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT}% quality limit.`,
+      );
+    }
+    return freshFeed(
+      quotes,
+      Math.min(...quotes.map(({ sourceTimestampMs }) => sourceTimestampMs)),
+      options.nowMs,
+      MAX_FEED_AGE_MS.exchangeQuotes,
+    );
+  } catch (error) {
+    return unavailable<PublicExchangeQuote[]>(error);
+  }
+}
+
 export async function fetchPublicMarketFallback(options: {
   pair: string;
   timeframe: string;
@@ -276,7 +392,58 @@ export async function fetchPublicMarketFallback(options: {
     }
   };
 
-  const [candles, orderBook, tradeFlow] = await Promise.all([
+  const fundingRateRequest = options.market === 'futures'
+    ? fetchFeed(endpoint('/fapi/v1/premiumIndex', { symbol }), (payload, retrievedAtMs) => {
+      if (!isRecord(payload) || !finiteNumber(Number(payload.lastFundingRate))) {
+        throw new Error('Binance premium-index response has no valid funding rate.');
+      }
+      const sourceTimestampMs = finiteNumber(Number(payload.time)) ? Number(payload.time) : retrievedAtMs;
+      return freshFeed(
+        { retrievedAtMs, rate: Number(payload.lastFundingRate) },
+        sourceTimestampMs,
+        nowMs,
+        MAX_FEED_AGE_MS.fundingRate,
+      );
+    })
+    : Promise.resolve(unavailable<{ retrievedAtMs: number; rate: number }>(
+      'Funding is unavailable for spot markets.',
+    ));
+  const openInterestRequest = options.market === 'futures'
+    ? fetchFeed(endpoint('/futures/data/openInterestHist', { symbol, period: '5m', limit: '2' }), (payload, retrievedAtMs) => {
+      if (!Array.isArray(payload) || payload.length < 2) {
+        throw new Error('Binance open-interest history returned fewer than two records.');
+      }
+      const records = payload.filter(isRecord).map((record) => ({
+        timestampMs: Number(record.timestamp),
+        amount: Number(record.sumOpenInterest),
+      })).filter((record) =>
+        Number.isSafeInteger(record.timestampMs) &&
+        record.timestampMs > 0 &&
+        Number.isFinite(record.amount) &&
+        record.amount > 0
+      ).sort((left, right) => left.timestampMs - right.timestampMs);
+      if (records.length < 2) throw new Error('Binance open-interest history is malformed.');
+      const previous = records.at(-2)!;
+      const latest = records.at(-1)!;
+      if (
+        latest.timestampMs - previous.timestampMs !== 5 * 60_000 ||
+        latest.timestampMs > nowMs ||
+        nowMs - latest.timestampMs > MAX_FEED_AGE_MS.openInterest
+      ) throw new Error('Binance open-interest records are not adjacent, fresh five-minute observations.');
+      const value: FreqtradeMarketOpenInterest = {
+        retrievedAtMs,
+        previousTimestampMs: previous.timestampMs,
+        latestTimestampMs: latest.timestampMs,
+        previousAmount: previous.amount,
+        latestAmount: latest.amount,
+      };
+      return freshFeed(value, latest.timestampMs, nowMs, MAX_FEED_AGE_MS.openInterest);
+    })
+    : Promise.resolve(unavailable<FreqtradeMarketOpenInterest>(
+      'Open interest is unavailable for spot markets.',
+    ));
+
+  const [candles, orderBook, tradeFlow, exchangeQuotes, fundingRate, openInterest] = await Promise.all([
     fetchFeed(endpoint(options.market === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines', {
       symbol, interval, limit: '500',
     }), (payload) => {
@@ -303,60 +470,16 @@ export async function fetchPublicMarketFallback(options: {
         MAX_FEED_AGE_MS.tradeFlow,
       );
     }),
+    fetchCrossExchangeQuotes({
+      symbol,
+      market: options.market,
+      nowMs,
+      fetcher,
+      timeoutMs,
+    }),
+    fundingRateRequest,
+    openInterestRequest,
   ]);
-
-  let fundingRate: PublicMarketFallbackFeed<{ retrievedAtMs: number; rate: number }> = unavailable(
-    options.market === 'futures' ? 'Funding endpoint was not queried.' : 'Funding is unavailable for spot markets.',
-  );
-  let openInterest: PublicMarketFallbackFeed<FreqtradeMarketOpenInterest> = unavailable(
-    options.market === 'futures' ? 'Open-interest endpoint was not queried.' : 'Open interest is unavailable for spot markets.',
-  );
-  if (options.market === 'futures') {
-    [fundingRate, openInterest] = await Promise.all([
-      fetchFeed(endpoint('/fapi/v1/premiumIndex', { symbol }), (payload, retrievedAtMs) => {
-        if (!isRecord(payload) || !finiteNumber(Number(payload.lastFundingRate))) {
-          throw new Error('Binance premium-index response has no valid funding rate.');
-        }
-        const sourceTimestampMs = finiteNumber(Number(payload.time)) ? Number(payload.time) : retrievedAtMs;
-        return freshFeed(
-          { retrievedAtMs, rate: Number(payload.lastFundingRate) },
-          sourceTimestampMs,
-          nowMs,
-          MAX_FEED_AGE_MS.fundingRate,
-        );
-      }),
-      fetchFeed(endpoint('/futures/data/openInterestHist', { symbol, period: '5m', limit: '2' }), (payload, retrievedAtMs) => {
-        if (!Array.isArray(payload) || payload.length < 2) {
-          throw new Error('Binance open-interest history returned fewer than two records.');
-        }
-        const records = payload.filter(isRecord).map((record) => ({
-          timestampMs: Number(record.timestamp),
-          amount: Number(record.sumOpenInterest),
-        })).filter((record) =>
-          Number.isSafeInteger(record.timestampMs) &&
-          record.timestampMs > 0 &&
-          Number.isFinite(record.amount) &&
-          record.amount > 0
-        ).sort((left, right) => left.timestampMs - right.timestampMs);
-        if (records.length < 2) throw new Error('Binance open-interest history is malformed.');
-        const previous = records.at(-2)!;
-        const latest = records.at(-1)!;
-        if (
-          latest.timestampMs - previous.timestampMs !== 5 * 60_000 ||
-          latest.timestampMs > nowMs ||
-          nowMs - latest.timestampMs > MAX_FEED_AGE_MS.openInterest
-        ) throw new Error('Binance open-interest records are not adjacent, fresh five-minute observations.');
-        const value: FreqtradeMarketOpenInterest = {
-          retrievedAtMs,
-          previousTimestampMs: previous.timestampMs,
-          latestTimestampMs: latest.timestampMs,
-          previousAmount: previous.amount,
-          latestAmount: latest.amount,
-        };
-        return freshFeed(value, latest.timestampMs, nowMs, MAX_FEED_AGE_MS.openInterest);
-      }),
-    ]);
-  }
 
   return {
     provider: 'Binance public REST API',
@@ -365,6 +488,7 @@ export async function fetchPublicMarketFallback(options: {
     pair: options.pair,
     timeframe: options.timeframe,
     retrievedAtMs: nowMs,
+    exchangeQuotes,
     candles,
     orderBook,
     tradeFlow,

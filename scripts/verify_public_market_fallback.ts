@@ -30,6 +30,11 @@ const candleRows = Array.from({ length: 40 }, (_, index) => {
 const latestOiTimestamp = Math.floor(nowMs / (5 * 60_000)) * 5 * 60_000;
 const payloads = new Map<string, unknown>([
   ['/fapi/v1/klines', candleRows],
+  ['/fapi/v1/ticker/price', {
+    symbol: 'BTCUSDT',
+    price: '101',
+    time: nowMs - 500,
+  }],
   ['/fapi/v1/depth', {
     bids: [['100', '5'], ['99', '3']],
     asks: [['101', '2'], ['102', '2']],
@@ -46,6 +51,15 @@ const payloads = new Map<string, unknown>([
     { timestamp: latestOiTimestamp - 5 * 60_000, sumOpenInterest: '9000' },
     { timestamp: latestOiTimestamp, sumOpenInterest: '10000' },
   ]],
+  ['api.bybit.com/v5/market/tickers', {
+    retCode: 0,
+    time: nowMs - 400,
+    result: { list: [{ symbol: 'BTCUSDT', lastPrice: '100.5' }] },
+  }],
+  ['www.okx.com/api/v5/market/ticker', {
+    code: '0',
+    data: [{ instId: 'BTC-USDT-SWAP', last: '100.25', ts: String(nowMs - 300) }],
+  }],
 ]);
 let aggTradeRequestCount = 0;
 const fixtureFetcher: typeof fetch = async (input) => {
@@ -53,7 +67,7 @@ const fixtureFetcher: typeof fetch = async (input) => {
   if (url.pathname === '/fapi/v1/aggTrades' && aggTradeRequestCount++ === 0) {
     return new Response('', { status: 429, headers: { 'retry-after': '0' } });
   }
-  const payload = payloads.get(url.pathname);
+  const payload = payloads.get(`${url.hostname}${url.pathname}`) ?? payloads.get(url.pathname);
   if (payload === undefined) return new Response('not found', { status: 404 });
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -77,6 +91,35 @@ assert.equal(aggTradeRequestCount, 2, '429 responses must receive one bounded re
 assert.equal(fallback.orderBook.status, 'LIVE');
 assert.equal(fallback.fundingRate.status, 'LIVE');
 assert.equal(fallback.openInterest.status, 'LIVE');
+assert.equal(fallback.exchangeQuotes.status, 'LIVE');
+assert.deepEqual(
+  fallback.exchangeQuotes.value?.map(({ exchange }) => exchange).sort(),
+  ['binance', 'bybit', 'okx'],
+);
+assert.ok(fallback.exchangeQuotes.value?.every(({ sourceTimestampMs }) =>
+  nowMs - sourceTimestampMs <= 5_000
+));
+const divergentQuoteFetcher: typeof fetch = async (input, init) => {
+  const url = new URL(String(input));
+  if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
+    return Response.json({
+      symbol: 'BTCUSDT',
+      price: '104',
+      time: nowMs - 500,
+    });
+  }
+  return fixtureFetcher(input, init);
+};
+const divergentQuotes = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: divergentQuoteFetcher,
+  timeoutMs: 100,
+});
+assert.equal(divergentQuotes.exchangeQuotes.status, 'UNAVAILABLE');
+assert.match(divergentQuotes.exchangeQuotes.error ?? '', /spread .* exceeds/);
 
 const invalidFetcher: typeof fetch = async (input) => {
   const url = new URL(String(input));
@@ -212,6 +255,10 @@ try {
     [2, 'marketFallback.binanceTrades'],
     [3, 'marketFallback.binanceOrderBook'],
     [4, 'marketFallback.binanceDerivatives'],
+    [1, 'marketFallback.crossExchangePrices.member1'],
+    [2, 'marketFallback.crossExchangePrices.member2'],
+    [3, 'marketFallback.crossExchangePrices.member3'],
+    [4, 'marketFallback.crossExchangePrices.member4'],
   ] as const;
   for (const [memberId, moduleId] of expectedEvidence) {
     const record = JSON.parse(
@@ -221,11 +268,21 @@ try {
       memberId: number;
       snapshotId: string;
       vote: string;
-      sourceData: { marketFallback?: { provider: string } };
+      sourceData: {
+        marketFallback?: {
+          provider: string;
+          crossExchangeQuotes?: { status: string; quotes: Array<{ exchange: string }> };
+        };
+      };
       moduleOutputs: Array<{ moduleId: string; status: string; sourceTimestampMs: number | null }>;
     };
     assert.equal(record.memberId, memberId);
     assert.equal(record.sourceData.marketFallback?.provider, fallback.provider);
+    assert.equal(record.sourceData.marketFallback?.crossExchangeQuotes?.status, 'LIVE');
+    assert.deepEqual(
+      record.sourceData.marketFallback?.crossExchangeQuotes?.quotes.map(({ exchange }) => exchange).sort(),
+      ['binance', 'bybit', 'okx'],
+    );
     assert.equal(
       record.moduleOutputs.find((item) => item.moduleId === moduleId)?.status,
       'AVAILABLE',

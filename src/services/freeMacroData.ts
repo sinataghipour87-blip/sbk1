@@ -18,6 +18,7 @@ export interface DirectMetricResult {
 
 export interface FreeMacroDataResult {
   sp500: DirectMetricResult;
+  dxy: DirectMetricResult;
   broadDollar: DirectMetricResult;
   fedEffectiveRate: DirectMetricResult;
   fedTargetUpperBound: DirectMetricResult;
@@ -25,14 +26,21 @@ export interface FreeMacroDataResult {
 }
 
 const FRED_CSV_ENDPOINT = 'https://fred.stlouisfed.org/graph/fredgraph.csv';
+const MASSIVE_INDICES_SNAPSHOT_ENDPOINT = 'https://api.massive.com/v3/snapshot/indices';
 const COINMETRICS_ENDPOINT =
   'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=AdrActCnt&limit_per_asset=1&pretty=false';
 const FRED_MAX_AGE_MS = 5 * 24 * 60 * 60_000;
+const DXY_MAX_AGE_MS = 2 * 60_000;
+const DXY_CACHE_TTL_MS = 30_000;
 const ON_CHAIN_MAX_AGE_MS = 3 * 24 * 60 * 60_000;
 const CACHE_TTL_MS = 15 * 60_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 
 const resultCache = new Map<string, { result: DirectMetricResult; cachedAtMs: number }>();
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 function unavailable(
   provider: string,
@@ -90,9 +98,14 @@ function validObservedAt(value: unknown, nowMs: number, maxAgeMs: number): numbe
   return observedAtMs;
 }
 
-function cachedResult(key: string, nowMs: number): DirectMetricResult | null {
+function cachedResult(
+  key: string,
+  nowMs: number,
+  ttlMs = CACHE_TTL_MS,
+): DirectMetricResult | null {
   const cached = resultCache.get(key);
-  if (!cached || nowMs - cached.cachedAtMs > CACHE_TTL_MS) return null;
+  const cacheAgeMs = cached ? nowMs - cached.cachedAtMs : Number.NaN;
+  if (!cached || cacheAgeMs < 0 || cacheAgeMs > ttlMs) return null;
   const result = structuredClone(cached.result);
   if (result.observedAtMs !== null) result.ageMs = Math.max(0, nowMs - result.observedAtMs);
   return result;
@@ -125,7 +138,11 @@ async function fetchFredSeries(
       fetcher,
       'text/csv, application/csv;q=0.9',
     );
-    const rows = (await response.text()).trim().split(/\r?\n/);
+    const csv = (await response.text()).trim();
+    if (csv.startsWith('<')) {
+      throw new Error('FRED returned an HTML maintenance/access page instead of CSV.');
+    }
+    const rows = csv.split(/\r?\n/);
     const expectedHeader = `observation_date,${seriesId}`;
     if (rows.length < 2 || rows[0].replace(/^\uFEFF/, '').trim() !== expectedHeader) {
       throw new Error('FRED returned a malformed CSV response.');
@@ -185,6 +202,93 @@ async function fetchFredSeries(
       endpoint,
       metric,
       error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+async function fetchMassiveDxy(
+  nowMs: number,
+  fetcher: typeof fetch,
+  apiKey: string | undefined,
+): Promise<DirectMetricResult> {
+  const endpointUrl = new URL(MASSIVE_INDICES_SNAPSHOT_ENDPOINT);
+  endpointUrl.searchParams.set('ticker', 'I:DXY');
+  const endpoint = endpointUrl.toString();
+  const key = apiKey?.trim();
+  if (!key) {
+    return unavailable(
+      'Massive Indices API',
+      endpoint,
+      'ICE U.S. Dollar Index (DXY)',
+      'MASSIVE_API_KEY is not configured.',
+    );
+  }
+
+  const cacheKey = 'massive:dxy';
+  const cached = cachedResult(cacheKey, nowMs, DXY_CACHE_TTL_MS);
+  if (cached) return cached;
+
+  const requestUrl = new URL(endpoint);
+  requestUrl.searchParams.set('apiKey', key);
+  try {
+    const { response, retrievedAtMs, latencyMs } = await fetchResponse(
+      requestUrl.toString(),
+      fetcher,
+    );
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || !Array.isArray(payload.results)) {
+      throw new Error('Massive returned a malformed indices snapshot.');
+    }
+    const quote = payload.results.find((item: unknown) =>
+      isRecord(item) && item.ticker === 'I:DXY'
+    );
+    if (!isRecord(quote) || quote.timeframe !== 'REAL-TIME' || !isRecord(quote.session)) {
+      throw new Error('Massive has no entitled real-time I:DXY index snapshot.');
+    }
+    const value = Number(quote.value);
+    const previousValue = Number(quote.session.previous_close);
+    const lastUpdatedNs = Number(quote.last_updated);
+    const observedAtMs = Number.isFinite(lastUpdatedNs) && lastUpdatedNs > 0
+      ? Math.floor(lastUpdatedNs / 1_000_000)
+      : Number.NaN;
+    if (
+      !Number.isFinite(value) || value <= 0 ||
+      !Number.isFinite(previousValue) || previousValue <= 0 ||
+      !Number.isSafeInteger(observedAtMs) ||
+      observedAtMs > nowMs + 60_000 ||
+      nowMs - observedAtMs > DXY_MAX_AGE_MS
+    ) {
+      throw new Error(
+        `Massive I:DXY quote is malformed or stale (maximum age ${DXY_MAX_AGE_MS}ms).`,
+      );
+    }
+
+    const result: DirectMetricResult = {
+      status: 'LIVE',
+      provider: 'Massive Indices Snapshot (I:DXY)',
+      endpoint,
+      metric: 'ICE U.S. Dollar Index (DXY)',
+      value,
+      previousValue,
+      changePct: ((value - previousValue) / previousValue) * 100,
+      observedAt: new Date(observedAtMs).toISOString(),
+      observedAtMs,
+      retrievedAtMs,
+      latencyMs,
+      ageMs: Math.max(0, nowMs - observedAtMs),
+    };
+    return storeResult(cacheKey, result, nowMs);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const safeDetail = detail
+      .replace(/([?&]apiKey=)[^&\s"']+/gi, '$1[redacted]')
+      .replaceAll(key, '[redacted]')
+      .replaceAll(encodeURIComponent(key), '[redacted]');
+    return unavailable(
+      'Massive Indices API',
+      endpoint,
+      'ICE U.S. Dollar Index (DXY)',
+      safeDetail,
     );
   }
 }
@@ -252,20 +356,23 @@ export async function fetchFreeMacroData(
   options: {
     nowMs?: number;
     fetcher?: typeof fetch;
+    massiveApiKey?: string;
   } = {},
 ): Promise<FreeMacroDataResult> {
   const nowMs = options.nowMs ?? Date.now();
   const fetcher = options.fetcher ?? fetch;
+  const dxyApiKey = options.massiveApiKey ?? process.env.MASSIVE_API_KEY;
   const fred = (seriesId: string, metric: string) =>
     fetchFredSeries(seriesId, metric, nowMs, fetcher);
-  const [sp500, broadDollar, fedEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses] =
+  const [sp500, dxy, broadDollar, fedEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses] =
     await Promise.all([
       fred('SP500', 'S&P 500 daily close'),
+      fetchMassiveDxy(nowMs, fetcher, dxyApiKey),
       fred('DTWEXBGS', 'Federal Reserve broad trade-weighted dollar index; not ICE DXY'),
       fred('DFF', 'Federal funds effective rate'),
       fred('DFEDTARU', 'Federal funds target range upper bound'),
       fetchBitcoinActiveAddresses(nowMs, fetcher),
     ]);
 
-  return { sp500, broadDollar, fedEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses };
+  return { sp500, dxy, broadDollar, fedEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses };
 }

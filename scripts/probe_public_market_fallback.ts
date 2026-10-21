@@ -16,8 +16,8 @@ const result = await fetchPublicMarketFallback({
   nowMs: requestStartedAtMs,
 });
 const checkedAtMs = Date.now();
-const summarize = (feed: typeof result.candles | typeof result.orderBook | typeof result.tradeFlow |
-  typeof result.fundingRate | typeof result.openInterest) => ({
+const summarize = (feed: typeof result.exchangeQuotes | typeof result.candles | typeof result.orderBook |
+  typeof result.tradeFlow | typeof result.fundingRate | typeof result.openInterest) => ({
   status: feed.status,
   sourceTimestampMs: feed.sourceTimestampMs,
   ageMs: feed.sourceTimestampMs === null ? null : checkedAtMs - feed.sourceTimestampMs,
@@ -30,7 +30,18 @@ const report = {
   market: result.market,
   pair: result.pair,
   timeframe: result.timeframe,
+  totalLatencyMs: checkedAtMs - requestStartedAtMs,
   feeds: {
+    exchangeQuotes: {
+      ...summarize(result.exchangeQuotes),
+      quotes: result.exchangeQuotes.value?.map(({ exchange, symbol, price, sourceTimestampMs, retrievedAtMs }) => ({
+        exchange,
+        symbol,
+        price,
+        sourceTimestampMs,
+        retrievedAtMs,
+      })) ?? [],
+    },
     candles: {
       ...summarize(result.candles),
       completedCandleCount: result.candles.value?.length ?? 0,
@@ -52,11 +63,12 @@ console.log(JSON.stringify(report, null, 2));
 
 const requiredFeeds = market === 'futures'
   ? [
+    result.exchangeQuotes,
     result.candles,
     result.tradeFlow,
     result.orderBook,
     result.fundingRate,
     result.openInterest,
   ]
-  : [result.candles, result.tradeFlow, result.orderBook];
+  : [result.exchangeQuotes, result.candles, result.tradeFlow, result.orderBook];
 if (requiredFeeds.some((feed) => feed.status !== 'LIVE')) process.exitCode = 1;

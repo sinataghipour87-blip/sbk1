@@ -804,17 +804,17 @@ async function analyzeSnapshot(
   openSourceAdvisories?: OpenSourceAdvisoryReport;
 }> {
   const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance, true);
-  const [freeMacroData, optionsData, whaleFlowData] = await Promise.all([
+  const [freeMacroData, optionsData, whaleFlowData, publicMarketFallback] = await Promise.all([
     fetchFreeMacroData(),
     fetchDeribitOptionsData({ nowMs }),
     fetchOnChainWhaleData({ nowMs, btcPriceUsd: analysis.price }),
+    fetchPublicMarketFallback({
+      pair: snapshot.pair,
+      timeframe: snapshot.timeframe,
+      market: snapshot.market,
+      nowMs,
+    }),
   ]);
-  const publicMarketFallback = await fetchPublicMarketFallback({
-    pair: snapshot.pair,
-    timeframe: snapshot.timeframe,
-    market: snapshot.market,
-    nowMs,
-  });
   const councilEvaluationNowMs = Math.max(nowMs, Date.now());
   const councilAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
     analysis,

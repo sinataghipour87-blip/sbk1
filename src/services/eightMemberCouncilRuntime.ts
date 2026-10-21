@@ -63,6 +63,7 @@ const MODULE_OUTPUTS_STORED_IN_MEMBER_SOURCE_DATA = new Set([
   'options.deribitPublicOptions',
   'onchain.bitcoinPublicTransfers',
   'macro.sp500',
+  'macro.dxy',
   'macro.broadDollarProxy',
   'macro.fedRates',
 ]);
@@ -308,6 +309,14 @@ function sourceDataForMember(
       retrievedAtMs: publicMarketFallback.retrievedAtMs,
     }
     : null;
+  const crossExchangeQuotes = publicMarketFallback
+    ? {
+      status: publicMarketFallback.exchangeQuotes.status,
+      sourceTimestampMs: publicMarketFallback.exchangeQuotes.sourceTimestampMs,
+      quotes: publicMarketFallback.exchangeQuotes.value,
+      error: publicMarketFallback.exchangeQuotes.error,
+    }
+    : null;
   switch (memberId) {
     case 1:
       return {
@@ -327,6 +336,7 @@ function sourceDataForMember(
         candleFeed: analysis.dataQualityReport?.feeds.candles,
         marketFallback: fallback && {
           ...fallback,
+          crossExchangeQuotes,
           feed: fallbackFeedSummary(publicMarketFallback!.candles),
         },
       };
@@ -336,6 +346,7 @@ function sourceDataForMember(
         orderFlowFeed: analysis.dataQualityReport?.feeds.orderFlow,
         marketFallback: fallback && {
           ...fallback,
+          crossExchangeQuotes,
           feed: fallbackFeedSummary(publicMarketFallback!.tradeFlow),
         },
       };
@@ -345,6 +356,7 @@ function sourceDataForMember(
         orderBookFeed: analysis.dataQualityReport?.feeds.orderBook,
         marketFallback: fallback && {
           ...fallback,
+          crossExchangeQuotes,
           feed: fallbackFeedSummary(publicMarketFallback!.orderBook),
         },
       };
@@ -357,6 +369,7 @@ function sourceDataForMember(
         derivativesFeed: analysis.dataQualityReport?.feeds.derivatives,
         marketFallback: fallback && {
           ...fallback,
+          crossExchangeQuotes,
           fundingRate: fallbackFeedSummary(publicMarketFallback!.fundingRate),
           openInterest: fallbackFeedSummary(publicMarketFallback!.openInterest),
         },
@@ -380,7 +393,7 @@ function sourceDataForMember(
         overallDataStatus: macro.overallDataStatus,
         fundamentalBias: macro.fundamentalBias,
         sp500: { status: macro.sp500Status, dailyChangePct: macro.sp500DailyChangePct },
-        dxy: { status: macro.dxyStatus, dailyChangePct: macro.dxyDailyChangePct },
+        dxy: { status: macro.dxyStatus, index: macro.dxyIndex, dailyChangePct: macro.dxyDailyChangePct },
         spotEtf: { status: macro.etfFlowStatus, netInflowMillionUsd: macro.spotEtfNetInflowMillionUsd },
         lastUpdatedTime: macro.lastUpdatedTime,
         directSources: freeMacroData ?? null,
@@ -484,6 +497,30 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
         ? `Funding و OI عمومی تازه از ${marketFallback.provider} (${marketFallback.pair}).`
         : `شواهد مشتقات جایگزین کامل نیستند: ${fundingEvidence.summaryFa} ${openInterestEvidence.summaryFa}`,
     };
+    const quotes = marketFallback.exchangeQuotes;
+    const quoteTimestampMs = quotes.sourceTimestampMs;
+    const quoteAgeMs = quoteTimestampMs === null ? null : nowMs - quoteTimestampMs;
+    const quoteNames = quotes.value?.map(({ exchange }) => exchange) ?? [];
+    const quotesFresh = quotes.status === 'LIVE' &&
+      quoteTimestampMs !== null &&
+      quoteAgeMs !== null &&
+      quoteAgeMs >= 0 &&
+      quoteAgeMs <= 5_000 &&
+      quoteNames.length === 3 &&
+      new Set(quoteNames).size === 3 &&
+      ['binance', 'bybit', 'okx'].every((exchange) => quoteNames.some((name) => name === exchange));
+    const crossExchangeEvidence: ModuleValue = {
+      output: quotes.value ?? null,
+      sourceTimestampMs: quoteTimestampMs,
+      available: quotesFresh,
+      resolvedStatus: quotesFresh ? 'AVAILABLE' : quotes.status === 'LIVE' ? 'STALE' : 'UNAVAILABLE',
+      summaryFa: quotesFresh
+        ? `قیمت زنده و مستقل جفت ${marketFallback.pair} از هر سه صرافی Binance، Bybit و OKX؛ بیشترین سن feedها ${Math.round(quoteAgeMs!)}ms.`
+        : quotes.error ?? 'قیمت تازه از هر سه صرافی Binance، Bybit و OKX هم‌زمان موجود نیست.',
+    };
+    for (const memberId of [1, 2, 3, 4]) {
+      values[`marketFallback.crossExchangePrices.member${memberId}`] = crossExchangeEvidence;
+    }
   }
   for (const [moduleId, output] of Object.entries(brains)) {
     const availability = brainEvidenceAvailability(moduleId, output);
@@ -647,6 +684,11 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
     macroData?.sp500,
     5 * 24 * 60 * 60_000,
     'شاخص S&P 500 و تغییر روزانه.',
+  );
+  values['macro.dxy'] = directMetricEvidence(
+    macroData?.dxy,
+    2 * 60_000,
+    'شاخص واقعی دلار DXY.',
   );
   values['macro.broadDollarProxy'] = directMetricEvidence(
     macroData?.broadDollar,

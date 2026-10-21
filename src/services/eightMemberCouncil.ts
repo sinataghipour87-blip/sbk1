@@ -84,6 +84,7 @@ export type CouncilMacroContext = Pick<
 > & Partial<Pick<
   MacroCorrelationData,
   | 'provenance'
+  | 'dxyIndex'
   | 'broadDollarProxyStatus'
   | 'broadDollarProxyDailyChangePct'
 >>;
@@ -139,7 +140,7 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
       'technical.mtfStructuralReport',
       'sb.SB1', 'openSource.candlestickPatterns', 'openSource.marketRegime', 'openSource.marketAnomaly',
       'openSource.lightgbmForecast', 'openSource.xgboostForecast',
-      'marketFallback.binanceCandles',
+      'marketFallback.binanceCandles', 'marketFallback.crossExchangePrices.member1',
     ],
   },
   {
@@ -148,7 +149,7 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
     nameEn: 'Trade Flow Analysis',
     questionFa: 'معاملات اجراشده واقعاً فشار خرید دارند یا فروش؟',
     inputIds: ['analysis.orderFlowFeatures.cvdDelta', 'dataQualityReport.feeds.orderFlow'],
-    moduleIds: ['brains.brain07OrderBookCvd', 'marketFallback.binanceTrades'],
+    moduleIds: ['brains.brain07OrderBookCvd', 'marketFallback.binanceTrades', 'marketFallback.crossExchangePrices.member2'],
   },
   {
     id: 3,
@@ -156,7 +157,7 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
     nameEn: 'Order Book & Liquidity',
     questionFa: 'دفتر سفارش زنده چه عدم‌تعادلی نشان می‌دهد؟',
     inputIds: ['analysis.realObiData', 'dataQualityReport.feeds.orderBook'],
-    moduleIds: ['brains.brain02LiquidityFlow', 'sb.SB2', 'marketFallback.binanceOrderBook'],
+    moduleIds: ['brains.brain02LiquidityFlow', 'sb.SB2', 'marketFallback.binanceOrderBook', 'marketFallback.crossExchangePrices.member3'],
   },
   {
     id: 4,
@@ -168,7 +169,7 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
       'brains.brain03GarchVolatility', 'brains.brain05FloatingRiskHedging',
       'derivatives.cvdOiMatrix', 'derivatives.liquidationCascade',
       'brains.brain10AutoPilotHarmonizer',
-      'marketFallback.binanceDerivatives',
+      'marketFallback.binanceDerivatives', 'marketFallback.crossExchangePrices.member4',
     ],
   },
   {
@@ -192,8 +193,8 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
     nameFa: 'تحلیلگر اقتصاد کلان و نقدینگی جهانی',
     nameEn: 'Macro & Global Liquidity',
     questionFa: 'شرایط کلان و جریان سرمایه به نفع کدام جهت است؟',
-    inputIds: ['macroContext.fundamentalBias', 'macroContext.sp500DailyChangePct', 'macroContext.dxyDailyChangePct', 'macroContext.spotEtfNetInflowMillionUsd', 'macroSource.sp500', 'macroSource.broadDollarProxy', 'macroSource.fedRates'],
-    moduleIds: ['brains.brain08FundamentalMacro', 'macro.sp500', 'macro.broadDollarProxy', 'macro.fedRates'],
+    inputIds: ['macroContext.fundamentalBias', 'macroContext.sp500DailyChangePct', 'macroContext.dxyDailyChangePct', 'macroContext.spotEtfNetInflowMillionUsd', 'macroSource.sp500', 'macroSource.dxy', 'macroSource.broadDollarProxy', 'macroSource.fedRates'],
+    moduleIds: ['brains.brain08FundamentalMacro', 'macro.sp500', 'macro.dxy', 'macro.broadDollarProxy', 'macro.fedRates'],
   },
   {
     id: 8,
@@ -211,6 +212,7 @@ const MAX_PUBLIC_ONCHAIN_AGE_MS = 20 * 60_000;
 const MAX_MACRO_AGE_MS = 5 * 24 * 60 * 60_000;
 const MAX_NEWS_AGE_MS = 24 * 60 * 60_000;
 const MAX_DIRECT_MACRO_AGE_MS = 5 * 24 * 60 * 60_000;
+const MAX_DXY_AGE_MS = 2 * 60_000;
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -326,6 +328,7 @@ function getMacroSourceTimestamp(
   macro: CouncilMacroContext | null | undefined,
   metricId: string,
   nowMs: number,
+  maxAgeMs = MAX_DIRECT_MACRO_AGE_MS,
 ): number | null {
   const provenance = macro?.provenance?.[metricId];
   if (!isRecord(provenance)) return null;
@@ -335,7 +338,7 @@ function getMacroSourceTimestamp(
     : source.retrievedAtMs;
   return isFiniteNumber(timestampMs) &&
     timestampMs <= nowMs &&
-    nowMs - timestampMs <= MAX_DIRECT_MACRO_AGE_MS
+    nowMs - timestampMs <= maxAgeMs
     ? timestampMs
     : null;
 }
@@ -343,6 +346,7 @@ function getMacroSourceTimestamp(
 function isFreshDirectMacroMetric(
   metric: FreeMacroDataResult[keyof FreeMacroDataResult] | undefined,
   nowMs: number,
+  maxAgeMs = MAX_DIRECT_MACRO_AGE_MS,
 ): metric is FreeMacroDataResult[keyof FreeMacroDataResult] & {
   value: number;
   previousValue: number | null;
@@ -355,7 +359,7 @@ function isFreshDirectMacroMetric(
     !isFiniteNumber(metric.observedAtMs)
   ) return false;
   const ageMs = nowMs - metric.observedAtMs;
-  return ageMs >= 0 && ageMs <= MAX_DIRECT_MACRO_AGE_MS;
+  return ageMs >= 0 && ageMs <= maxAgeMs;
 }
 
 function evaluateTechnical(
@@ -757,6 +761,15 @@ function evaluateMacro(
     });
   }
 
+  const dxy = directMacroData?.dxy;
+  if (isFreshDirectMacroMetric(dxy, nowMs, MAX_DXY_AGE_MS) && isFiniteNumber(dxy.changePct)) {
+    directSignals.push({
+      label: 'شاخص واقعی DXY',
+      direction: dxy.changePct >= 0.05 ? -1 : dxy.changePct <= -0.05 ? 1 : 0,
+      timestampMs: dxy.observedAtMs,
+    });
+  }
+
   const freshFedRates = [
     directMacroData?.fedEffectiveRate,
     directMacroData?.fedTargetUpperBound,
@@ -781,7 +794,7 @@ function evaluateMacro(
     return createVote(
       member,
       vote,
-      `رأی از ${directSignals.length} شاخص مستقیم و تازه گرفته شد: ${directSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ این شاخص‌ها الزاماً providerهای مستقل نیستند و proxy دلار به‌جای DXY معرفی نشده است.`,
+      `رأی از ${directSignals.length} شاخص مستقیم و تازه گرفته شد: ${directSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ proxy دلار به‌جای DXY معرفی نشده است.`,
       [
         {
           labelFa: 'تازگی منابع کلان مستقیم',
@@ -791,7 +804,7 @@ function evaluateMacro(
         {
           labelFa: 'تعداد شاخص‌های مستقیم معتبر',
           passed: true,
-          detailFa: `${directSignals.length} شاخص؛ استقلال providerها در این شمارش ادعا نمی‌شود: ${directSignals.map(({ label }) => label).join('، ')}`,
+          detailFa: `${directSignals.length} شاخص مستقیم: ${directSignals.map(({ label }) => label).join('، ')}`,
         },
       ],
       {
@@ -813,6 +826,22 @@ function evaluateMacro(
       label: 'S&P 500',
       direction: macro.sp500DailyChangePct >= 0.1 ? 1 : macro.sp500DailyChangePct <= -0.1 ? -1 : 0,
       timestampMs: sp500TimestampMs,
+    });
+  }
+  const dxyTimestampMs = getMacroSourceTimestamp(macro, 'dxyIndex', nowMs, MAX_DXY_AGE_MS);
+  if (
+    macro?.dxyStatus === 'LIVE' &&
+    isFiniteNumber(macro.dxyDailyChangePct) &&
+    dxyTimestampMs !== null
+  ) {
+    contextSignals.push({
+      label: 'شاخص واقعی DXY',
+      direction: macro.dxyDailyChangePct >= 0.05
+        ? -1
+        : macro.dxyDailyChangePct <= -0.05
+          ? 1
+          : 0,
+      timestampMs: dxyTimestampMs,
     });
   }
   const dollarTimestampMs = getMacroSourceTimestamp(macro, 'broadDollarProxy', nowMs);
@@ -862,7 +891,9 @@ function evaluateMacro(
   const freshness = getMacroAge(macro, nowMs, MAX_MACRO_AGE_MS);
   const liveIndicatorCount = [
     macro?.sp500Status === 'LIVE' && isFiniteNumber(macro.sp500DailyChangePct),
-    macro?.dxyStatus === 'LIVE' && isFiniteNumber(macro.dxyDailyChangePct),
+    macro?.dxyStatus === 'LIVE' &&
+      isFiniteNumber(macro.dxyDailyChangePct) &&
+      getMacroSourceTimestamp(macro, 'dxyIndex', nowMs, MAX_DXY_AGE_MS) !== null,
     macro?.etfFlowStatus === 'LIVE' && isFiniteNumber(macro.spotEtfNetInflowMillionUsd),
   ].filter(Boolean).length;
   const hasBias = macro?.overallDataStatus === 'LIVE' &&

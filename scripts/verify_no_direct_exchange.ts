@@ -10,10 +10,16 @@ const forbiddenStrings = [
   'api-testnet.bybit.com',
   'stream.bybit.com',
   'stream-testnet.bybit.com',
-  'binance',
   'okx.com',
   'kucoin.com',
   'nobitex',
+];
+const publicMarketFeedPath = path.join('src', 'services', 'publicMarketDataFallback.ts');
+const approvedPublicMarketEndpoints = [
+  'fapi.binance.com',
+  'api.binance.com',
+  'api.bybit.com/v5/market/tickers',
+  'www.okx.com/api/v5/market/ticker',
 ];
 
 function isExcluded(relativePath: string): boolean {
@@ -35,9 +41,14 @@ const files = collectSourceFiles(sourceRoot);
 files.push(path.join(repositoryRoot, 'server.ts'));
 
 const findings: string[] = [];
+let publicMarketFeedContents: string | null = null;
 for (const file of files) {
   const relativePath = path.relative(repositoryRoot, file);
   const contents = readFileSync(file, 'utf8');
+  if (relativePath === publicMarketFeedPath) {
+    publicMarketFeedContents = contents;
+    continue;
+  }
   const lines = contents.split(/\r?\n/);
   lines.forEach((line, index) => {
     const matched = forbiddenStrings.filter((value) => line.toLowerCase().includes(value));
@@ -47,10 +58,23 @@ for (const file of files) {
   });
 }
 
+assert.ok(publicMarketFeedContents, 'The read-only public market feed adapter must remain present.');
+for (const endpoint of approvedPublicMarketEndpoints) {
+  assert.ok(
+    publicMarketFeedContents.includes(endpoint),
+    `The read-only public market feed adapter must connect to ${endpoint}.`,
+  );
+}
+assert.doesNotMatch(
+  publicMarketFeedContents,
+  /(?:createOrder|cancelOrder|placeOrder|private\/|trade\/order)/i,
+  'Direct exchange adapters must remain public-market-data-only.',
+);
+
 if (findings.length > 0) {
   console.error('Direct-exchange references found:');
   findings.forEach((finding) => console.error(`  ${finding}`));
   assert.fail(`${findings.length} forbidden direct-exchange reference(s) found.`);
 }
 
-console.log('No direct-exchange references found in src and server.ts.');
+console.log('Direct exchange access is limited to read-only public market data from the approved venues.');

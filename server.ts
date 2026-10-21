@@ -1219,11 +1219,6 @@ app.get('/api/macro-context', async (_req, res) => {
     latencyMs: metric.latencyMs,
     ...(metric.error ? { error: metric.error } : {}),
   });
-  const unavailableExactDxy = {
-    ...unavailable,
-    provider: 'ICE DXY',
-    reason: 'No verified free direct DXY API is configured; the Federal Reserve broad-dollar index is exposed separately as a proxy.',
-  };
   const sourceRetrievedAtMs = [
     fearAndGreedRetrievedAtMs,
     newsHeadlines.retrievedAtMs,
@@ -1243,8 +1238,8 @@ app.get('/api/macro-context', async (_req, res) => {
           { provider: 'BlackRock iShares', endpoint: 'https://www.ishares.com/us/products/333011/ishares-bitcoin-trust-etf', type: 'ISSUER_FUND_DATA_NOT_AGGREGATE_FLOW' },
         ],
       },
-      dxyIndex: unavailableExactDxy,
-      dxyDailyChangePct: unavailableExactDxy,
+      dxyIndex: directMetric(macroData.dxy),
+      dxyDailyChangePct: directMetric(macroData.dxy),
       broadDollarProxy: directMetric(macroData.broadDollar),
       sp500Price: directMetric(macroData.sp500),
       sp500DailyChangePct: directMetric(macroData.sp500),
@@ -1276,7 +1271,8 @@ app.get('/api/macro-context', async (_req, res) => {
       bitcoinActiveAddresses: directMetric(macroData.bitcoinActiveAddresses),
     },
     etfFlowStatus: 'UNAVAILABLE', spotEtfNetInflowMillionUsd: null,
-    dxyStatus: 'UNAVAILABLE', dxyIndex: null, dxyDailyChangePct: null,
+    dxyStatus: macroData.dxy.status, dxyIndex: macroData.dxy.value,
+    dxyDailyChangePct: macroData.dxy.changePct,
     broadDollarProxyStatus: macroData.broadDollar.status,
     broadDollarProxyIndex: macroData.broadDollar.value,
     broadDollarProxyDailyChangePct: macroData.broadDollar.changePct,
