@@ -110,6 +110,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
     const finalizedDna: WaveDnaSignature = {
       ...liveWaveDna,
       dnaId: `DNA_${Date.now().toString(36).toUpperCase()}`,
+      dataProvenance: 'UNVALIDATED',
       outcome: edgeRadar.currentEvR >= 0.3 ? 'CONTINUED' : edgeRadar.currentEvR <= -0.1 ? 'FAILED' : 'REVERSED',
       actualRealizedR: Number(edgeRadar.currentEvR.toFixed(2)),
     };
@@ -512,7 +513,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
               className="flex items-center gap-1.5 px-3.5 py-2 bg-cyan-600 hover:bg-cyan-500 text-slate-950 text-xs font-black rounded-lg transition-all shadow-md shrink-0"
             >
               <Database className="w-3.5 h-3.5" />
-              <span>ثبت موج در دیتابیس ژنومی</span>
+              <span>ذخیرهٔ نمونهٔ غیرآماری</span>
             </button>
           </div>
 
@@ -1003,4 +1004,3 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
     </div>
   );
 };
-

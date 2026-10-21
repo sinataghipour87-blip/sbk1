@@ -454,6 +454,7 @@ export default function App() {
       hunterOsEngine.recordCompletedWaveDna({
         ...liveDna,
         dnaId: `DNA_CLOSED_${historyEntry.id || Date.now().toString(36)}`,
+        dataProvenance: 'UNVALIDATED',
         direction: historyEntry.dir,
         outcome: waveOutcome,
         actualRealizedR: Number(exitR.toFixed(2)),

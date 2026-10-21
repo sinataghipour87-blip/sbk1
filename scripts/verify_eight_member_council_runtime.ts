@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { AnalysisResult, DataQualityReport, MarketFeedQuality } from '../src/types/trading';
@@ -10,6 +10,7 @@ import {
 } from '../src/services/eightMemberCouncil';
 import {
   evaluateEightMemberCouncilForSnapshot,
+  pruneExpiredCouncilRecords,
   runEightMemberCouncilRuntime,
 } from '../src/services/eightMemberCouncilRuntime';
 import type { SbPentagonOutput } from '../src/services/sbFiveModelsEngine';
@@ -261,6 +262,15 @@ try {
 
   const technicalMember = JSON.parse(await readFile(path.join(repositoryDir, 'member-01.jsonl'), 'utf8').then((value) => value.trim()));
   assert.equal(technicalMember.memberId, 1);
+  assert.equal(
+    technicalMember.sourceData.peerCouncilSummary.length,
+    EIGHT_MEMBER_COUNCIL.length,
+    'each member record should include a timestamped summary of all peer votes without changing independent evaluation',
+  );
+  assert.deepEqual(
+    technicalMember.sourceData.peerCouncilSummary.map((peer: { memberId: number }) => peer.memberId),
+    EIGHT_MEMBER_COUNCIL.map(({ id }) => id),
+  );
   const technicalAdvisoryIds = [
     'openSource.candlestickPatterns',
     'openSource.marketRegime',
@@ -598,6 +608,35 @@ try {
   assert.equal(noQuorumVote.report.quorumMet, false);
 } finally {
   await rm(repositoryDir, { recursive: true, force: true });
+}
+
+const retentionDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-council-retention-'));
+try {
+  const currentTimestampMs = Date.now();
+  await writeFile(
+    path.join(retentionDir, 'member-01.jsonl'),
+    [
+      JSON.stringify({ evaluatedAtMs: currentTimestampMs - 5 * 60 * 60_000 - 1, vote: 'ABSTAIN' }),
+      JSON.stringify({ evaluatedAtMs: currentTimestampMs - 60_000, vote: 'NEUTRAL' }),
+      'invalid-json-record',
+    ].join('\n') + '\n',
+  );
+  await writeFile(
+    path.join(retentionDir, 'council-votes.jsonl'),
+    `${JSON.stringify({ report: { evaluatedAtMs: currentTimestampMs - 6 * 60 * 60_000 } })}\n`,
+  );
+  const removed = await pruneExpiredCouncilRecords(retentionDir, currentTimestampMs);
+  assert.equal(removed, 3, 'expired and malformed council records must be removed');
+  assert.deepEqual(
+    (await readFile(path.join(retentionDir, 'member-01.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line).vote),
+    ['NEUTRAL'],
+    'records younger than five hours must be retained',
+  );
+} finally {
+  await rm(retentionDir, { recursive: true, force: true });
 }
 
 console.log('Eight-member council runtime verification passed.');

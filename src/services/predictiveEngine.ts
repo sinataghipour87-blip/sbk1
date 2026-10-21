@@ -2636,7 +2636,8 @@ export interface WavePredictionMetrics {
   expectedMoveMagnitudePct: number | null;
   expectedDurationMinutes: number | null;
   reversalProbabilityPct: number | null;
-  outcomeProbabilityByHorizon: Record<'5m' | '15m' | '30m' | '60m', number | null>;
+  outcomeProbabilityByHorizon: Record<'5m' | '7m' | '15m' | '30m' | '60m', number | null>;
+  outcomeSampleCountByHorizon: Record<'5m' | '7m' | '15m' | '30m' | '60m', number>;
   summaryTextFa: string;
 }
 
@@ -2780,6 +2781,7 @@ export interface WaveEngineFullResult {
    const expectedDurationMinutes = outcomes.expectedDurationMinutes;
    const reversalProbabilityPct = outcomes.reversalProbabilityPct;
    const outcomeProbabilityByHorizon = outcomes.outcomesByHorizon;
+   const outcomeSampleCountByHorizon = outcomes.sampleCountByHorizon;
  
    const summaryTextFa = continuationProbabilityPct !== null
      ? `مدل outcome-based موج: احتمال ادامه ${continuationProbabilityPct}٪؛ سایر برآوردها فقط در صورت وجود نمونهٔ تاریخی معتبر نمایش داده می‌شوند.`
@@ -2793,6 +2795,7 @@ export interface WaveEngineFullResult {
      expectedDurationMinutes,
      reversalProbabilityPct,
      outcomeProbabilityByHorizon,
+     outcomeSampleCountByHorizon,
      summaryTextFa
    };
  }

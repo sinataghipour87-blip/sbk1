@@ -59,6 +59,7 @@ const DEFAULT_SIGNAL_TTL_SECONDS = 120;
 const DEFAULT_SIGNAL_MAX_DEVIATION_BPS = 100;
 const DEFAULT_RISK_BUDGET_PCT = 0.1;
 const DEFAULT_MAX_LEVERAGE = 1;
+const MAX_READY_ADVISORY_AGE_MS = 2 * 60_000;
 
 export interface ServerSignalAuditRecord {
   at: string;
@@ -462,6 +463,45 @@ function makeSnapshotAnalysisInputs(
   };
 }
 
+async function analyzeOpenSourceAdvisories(
+  snapshot: FreqtradeMarketSnapshot,
+  nowMs: number,
+): Promise<void> {
+  const completedSnapshotCandles = snapshot.candles
+    .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= nowMs);
+  const candleTimestampMs = completedSnapshotCandles.at(-1)?.timestampMs ?? snapshot.generatedAtMs;
+  const advisoryCandles = completedSnapshotCandles.slice(-500);
+  const advisoryTimestampMs = advisoryCandles.at(-1)?.timestampMs ?? candleTimestampMs;
+  let sourceHeadlines: Awaited<ReturnType<typeof fetchDirectNewsHeadlines>>['headlines'] = [];
+  let newsHeadlinesRetrievedAtMs: number | null = null;
+  try {
+    if (advisoryCandles.length === 0) {
+      throw new Error('No completed candles are available for open-source advisory analysis.');
+    }
+    const newsResult = await fetchDirectNewsHeadlines();
+    sourceHeadlines = newsResult.headlines;
+    newsHeadlinesRetrievedAtMs = newsResult.retrievedAtMs;
+    const report = await openSourceAdvisoryService.analyze(advisoryCandles, newsResult.headlines);
+    if (report.sourceTimestampMs !== advisoryTimestampMs) {
+      throw new Error('Open-source advisory output does not match the analyzed completed candle.');
+    }
+    report.sourceHeadlines = sourceHeadlines;
+    report.newsHeadlinesRetrievedAtMs = newsHeadlinesRetrievedAtMs;
+    await appendAdvisoryReport(report);
+  } catch (error: unknown) {
+    console.error('[SBK1_ADVISORIES] Local open-source analysis failed; council receives unavailable evidence:', error);
+    const reason = error instanceof Error ? error.message : String(error);
+    const report = openSourceAdvisoryService.publishUnavailable(
+      reason,
+      advisoryTimestampMs,
+      Date.now(),
+    );
+    report.sourceHeadlines = sourceHeadlines;
+    report.newsHeadlinesRetrievedAtMs = newsHeadlinesRetrievedAtMs;
+    await appendAdvisoryReport(report);
+  }
+}
+
 async function analyzeSnapshotData(
   snapshot: FreqtradeMarketSnapshot,
   candles: Candle[],
@@ -494,45 +534,10 @@ async function analyzeSnapshotData(
     inputs.futuresPrices,
     inputs.orderFlow,
   );
-  const completedSnapshotCandles = snapshot.candles
-    .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= nowMs);
-  const candleTimestampMs = completedSnapshotCandles.at(-1)?.timestampMs ?? snapshot.generatedAtMs;
   if (requestAdvisories && !openSourceAdvisoryService.isStopped()) {
-    const advisoryCandles = completedSnapshotCandles.slice(-500);
-    const advisoryTimestampMs = advisoryCandles.at(-1)?.timestampMs ?? candleTimestampMs;
-    let sourceHeadlines: Awaited<ReturnType<typeof fetchDirectNewsHeadlines>>['headlines'] = [];
-    let newsHeadlinesRetrievedAtMs: number | null = null;
-    try {
-      if (advisoryCandles.length === 0) {
-        throw new Error('No completed candles are available for open-source advisory analysis.');
-      }
-      const newsResult = await fetchDirectNewsHeadlines();
-      sourceHeadlines = newsResult.headlines;
-      newsHeadlinesRetrievedAtMs = newsResult.retrievedAtMs;
-      const report = await openSourceAdvisoryService.analyze(
-        advisoryCandles,
-        newsResult.headlines,
-      );
-      if (report.sourceTimestampMs !== advisoryTimestampMs) {
-        throw new Error('Open-source advisory output does not match the analyzed completed candle.');
-      }
-      report.sourceHeadlines = sourceHeadlines;
-      report.newsHeadlinesRetrievedAtMs = newsHeadlinesRetrievedAtMs;
-      analysis.openSourceAdvisories = report;
-      await appendAdvisoryReport(report);
-    } catch (error: unknown) {
-      console.error('[SBK1_ADVISORIES] Local open-source analysis failed; council receives unavailable evidence:', error);
-      const reason = error instanceof Error ? error.message : String(error);
-      const report = openSourceAdvisoryService.publishUnavailable(
-        reason,
-        advisoryTimestampMs,
-        Date.now(),
-      );
-      report.sourceHeadlines = sourceHeadlines;
-      report.newsHeadlinesRetrievedAtMs = newsHeadlinesRetrievedAtMs;
-      analysis.openSourceAdvisories = report;
-      await appendAdvisoryReport(report);
-    }
+    void analyzeOpenSourceAdvisories(snapshot, nowMs).catch((error: unknown) => {
+      console.error('[SBK1_ADVISORIES] Background advisory task failed:', error);
+    });
   }
   return analysis;
 }
@@ -652,7 +657,23 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
     return analysis;
   }
 
-  const feeds = existingFeeds ? { ...existingFeeds } : null;
+  const unavailableFeed = (feedName: string) => createMarketFeedQuality({
+    feedName,
+    source: 'No verified source in this analysis snapshot',
+    status: 'UNAVAILABLE',
+    timestamp: nowMs,
+    ageMs: Number.POSITIVE_INFINITY,
+    score: 0,
+    detailsFa: 'فید معتبر در snapshot تحلیل وجود ندارد.',
+  });
+  const feeds = existingFeeds ? { ...existingFeeds } : {
+    candles: unavailableFeed('candles'),
+    orderBook: unavailableFeed('orderBook'),
+    derivatives: unavailableFeed('derivatives'),
+    futuresPrices: unavailableFeed('futuresPrices'),
+    sentiment: unavailableFeed('sentiment'),
+    orderFlow: unavailableFeed('orderFlow'),
+  };
   const cloneFeed = (
     feedName: string,
     sourceTimestampMs: number,
@@ -773,16 +794,21 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
         source: `${fallback.provider} ${fallback.market} depth (${fallback.pair})`,
       },
     } : {}),
-    ...(existingQuality && feeds ? {
+    ...(feeds ? {
       dataQualityReport: {
-        ...existingQuality,
+        ...(existingQuality ?? {
+          overallScore: 0,
+          isTradeAllowed: false,
+          status: 'DATA_UNAVAILABLE' as const,
+          reasonsFa: [],
+        }),
         feeds,
         reasonsFa: [
-          ...existingQuality.reasonsFa,
+          ...(existingQuality?.reasonsFa ?? []),
           `Fallback council evidence: ${fallback.provider} ${fallback.market} ${fallback.pair}.`,
         ],
       },
-    } : analysis.dataQualityReport),
+    } : {}),
   };
 }
 
@@ -816,6 +842,18 @@ async function analyzeSnapshot(
     }),
   ]);
   const councilEvaluationNowMs = Math.max(nowMs, Date.now());
+  const latestCompletedCandleTimestampMs = snapshot.candles
+    .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= councilEvaluationNowMs)
+    .at(-1)?.timestampMs;
+  const readyAdvisory = openSourceAdvisoryService.getLatest();
+  if (
+    readyAdvisory &&
+    readyAdvisory.sourceTimestampMs === latestCompletedCandleTimestampMs &&
+    readyAdvisory.generatedAtMs <= councilEvaluationNowMs &&
+    councilEvaluationNowMs - readyAdvisory.generatedAtMs <= MAX_READY_ADVISORY_AGE_MS
+  ) {
+    analysis.openSourceAdvisories = readyAdvisory;
+  }
   const councilAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
     analysis,
     publicMarketFallback,

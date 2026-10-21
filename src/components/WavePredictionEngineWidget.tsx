@@ -61,7 +61,7 @@ export const WavePredictionEngineWidget: React.FC<Props> = ({ analysis, predicti
             </div>
 
             <div className="bg-[#040e21] p-2.5 rounded-lg border border-slate-800">
-              <span className="text-[10px] text-slate-400 font-sans block mb-0.5">۳) مدت باقی‌ماندهٔ مورد انتظار:</span>
+              <span className="text-[10px] text-slate-400 font-sans block mb-0.5">۳) میانگین تاریخی زمان تا اوج (حداکثر ۶۰ دقیقه):</span>
               <span className="text-sm font-black text-amber-300 flex items-center gap-1">
                 <Clock className="w-3.5 h-3.5 text-amber-400" />
                 <span>{predictionMetrics.expectedDurationMinutes === null ? 'UNVALIDATED' : `${predictionMetrics.expectedDurationMinutes} دقیقه`}</span>
@@ -76,10 +76,14 @@ export const WavePredictionEngineWidget: React.FC<Props> = ({ analysis, predicti
             </div>
           </div>
           <div className="flex flex-wrap gap-3 pt-2 text-[10px] text-slate-400">
-            <span>Outcome پس از Stage: 5m {predictionMetrics.outcomeProbabilityByHorizon['5m'] === null ? 'UNVALIDATED' : `${predictionMetrics.outcomeProbabilityByHorizon['5m']}٪`}</span>
-            <span>15m {predictionMetrics.outcomeProbabilityByHorizon['15m'] === null ? 'UNVALIDATED' : `${predictionMetrics.outcomeProbabilityByHorizon['15m']}٪`}</span>
-            <span>30m {predictionMetrics.outcomeProbabilityByHorizon['30m'] === null ? 'UNVALIDATED' : `${predictionMetrics.outcomeProbabilityByHorizon['30m']}٪`}</span>
-            <span>60m {predictionMetrics.outcomeProbabilityByHorizon['60m'] === null ? 'UNVALIDATED' : `${predictionMetrics.outcomeProbabilityByHorizon['60m']}٪`}</span>
+            <span>ادامهٔ جهتِ موج (نه احتمال سود):</span>
+            {(['5m', '7m', '15m', '30m', '60m'] as const).map((horizon) => (
+              <span key={horizon}>
+                {horizon} {predictionMetrics.outcomeProbabilityByHorizon[horizon] === null
+                  ? `UNVALIDATED (n=${predictionMetrics.outcomeSampleCountByHorizon[horizon]}/20)`
+                  : `${predictionMetrics.outcomeProbabilityByHorizon[horizon]}٪ (n=${predictionMetrics.outcomeSampleCountByHorizon[horizon]})`}
+              </span>
+            ))}
           </div>
         </div>
 

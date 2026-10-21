@@ -7,19 +7,45 @@ import { fetchDirectNewsHeadlines } from '../src/services/directNewsFeeds';
 import { fetchDeribitOptionsData } from '../src/services/deribitOptionsData';
 import { fetchFreeMacroData } from '../src/services/freeMacroData';
 import { fetchOnChainWhaleData } from '../src/services/publicBitcoinWhaleData';
+import { fetchPublicMarketFallback } from '../src/services/publicMarketDataFallback';
 import type { AnalysisResult } from '../src/types/trading';
 import type { CouncilMacroContext, CouncilMemberVote } from '../src/services/eightMemberCouncil';
 import { runEightMemberCouncilRuntime } from '../src/services/eightMemberCouncilRuntime';
+import { applyPublicMarketFallbackToCouncilAnalysis } from '../src/services/serverSignalRunner';
 
 dotenv.config();
-const checkedAtMs = Date.now();
+const probeStartedAtMs = Date.now();
 
-const [macro, options, onChainData, news] = await Promise.all([
+const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() ||
+  process.env.FREQTRADE_PAIR?.trim() ||
+  'BTC/USDT:USDT';
+const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
+  process.env.FREQTRADE_TIMEFRAME?.trim() ||
+  '1m';
+const market = process.env.SBK1_MARKET?.trim() === 'spot' ? 'spot' : 'futures';
+const [macro, options, onChainData, news, publicMarketFallback] = await Promise.all([
   fetchFreeMacroData(),
   fetchDeribitOptionsData(),
   fetchOnChainWhaleData(),
   fetchDirectNewsHeadlines(),
+  fetchPublicMarketFallback({ pair, timeframe, market, nowMs: probeStartedAtMs }),
 ]);
+const checkedAtMs = Date.now();
+const marketAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
+  {
+    price: publicMarketFallback.candles.value?.at(-1)?.close ?? 0,
+    candles: publicMarketFallback.candles.value?.map((candle) => [
+      candle.open,
+      candle.high,
+      candle.low,
+      candle.close,
+      candle.volume,
+    ]) ?? [],
+    timeframe,
+  } as unknown as AnalysisResult,
+  publicMarketFallback,
+  checkedAtMs,
+);
 const repositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-live-council-source-'));
 let whaleMemberVote: CouncilMemberVote;
 let memberVotes: Array<{
@@ -33,7 +59,7 @@ let memberVotes: Array<{
 }> = [];
 try {
   const runtimeReport = await runEightMemberCouncilRuntime({
-    analysis: { price: 1, candles: [] } as unknown as AnalysisResult,
+    analysis: marketAnalysis,
     macroContext: {
       overallDataStatus: 'UNAVAILABLE',
       lastUpdatedTime: null,
@@ -56,6 +82,8 @@ try {
     freeMacroData: macro,
     optionsData: options,
     whaleFlowData: onChainData,
+    publicMarketFallback,
+    decisionSnapshotTimestampMs: publicMarketFallback.candles.sourceTimestampMs ?? checkedAtMs,
     repositoryDir,
     nowMs: checkedAtMs,
   });
@@ -135,8 +163,30 @@ const report = {
     memberVerified: onChainMemberVerified,
   },
   councilMemberProbe: {
-    note: 'Only the sources listed in this report were fetched live; this probe does not provide a live Freqtrade market snapshot or execute orders.',
+    note: 'The probe uses live public market fallback data, not the configured Freqtrade DataProvider snapshot, and never executes orders.',
     members: memberVotes,
+  },
+  market: {
+    provider: publicMarketFallback.provider,
+    venue: publicMarketFallback.venue,
+    market: publicMarketFallback.market,
+    pair: publicMarketFallback.pair,
+    timeframe: publicMarketFallback.timeframe,
+    feeds: Object.fromEntries(
+      Object.entries({
+        exchangeQuotes: publicMarketFallback.exchangeQuotes,
+        candles: publicMarketFallback.candles,
+        trades: publicMarketFallback.tradeFlow,
+        orderBook: publicMarketFallback.orderBook,
+        funding: publicMarketFallback.fundingRate,
+        openInterest: publicMarketFallback.openInterest,
+      }).map(([name, feed]) => [name, {
+        status: feed.status,
+        sourceTimestampMs: feed.sourceTimestampMs,
+        ageMs: feed.sourceTimestampMs === null ? null : checkedAtMs - feed.sourceTimestampMs,
+        error: feed.error,
+      }]),
+    ),
   },
   news: {
     status: news.status,
@@ -152,6 +202,15 @@ const report = {
 
 const ready =
   Object.values(macro).every((result) => result.status === 'LIVE') &&
+  [
+    publicMarketFallback.exchangeQuotes,
+    publicMarketFallback.candles,
+    publicMarketFallback.tradeFlow,
+    publicMarketFallback.orderBook,
+    ...(market === 'futures'
+      ? [publicMarketFallback.fundingRate, publicMarketFallback.openInterest]
+      : []),
+  ].every((feed) => feed.status === 'LIVE') &&
   options.status === 'LIVE' &&
   onChainMemberVerified &&
   news.status === 'LIVE' &&

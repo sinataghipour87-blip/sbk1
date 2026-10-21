@@ -362,6 +362,24 @@ function isFreshDirectMacroMetric(
   return ageMs >= 0 && ageMs <= maxAgeMs;
 }
 
+function calculateRsi14(closes: number[]): number | null {
+  if (closes.length < 15) return null;
+  let averageGain = 0;
+  let averageLoss = 0;
+  for (let index = 1; index <= 14; index += 1) {
+    const change = closes[index] - closes[index - 1];
+    averageGain += Math.max(change, 0) / 14;
+    averageLoss += Math.max(-change, 0) / 14;
+  }
+  for (let index = 15; index < closes.length; index += 1) {
+    const change = closes[index] - closes[index - 1];
+    averageGain = (averageGain * 13 + Math.max(change, 0)) / 14;
+    averageLoss = (averageLoss * 13 + Math.max(-change, 0)) / 14;
+  }
+  if (averageLoss === 0) return averageGain === 0 ? 50 : 100;
+  return 100 - 100 / (1 + averageGain / averageLoss);
+}
+
 function evaluateTechnical(
   member: CouncilMemberDefinition,
   analysis: Partial<AnalysisResult> | null | undefined,
@@ -373,11 +391,14 @@ function evaluateTechnical(
     .map((candle) => candle.length >= 6 ? candle[4] : candle[3])
     .filter((close): close is number => isFiniteNumber(close) && close > 0);
   const hasCandles = candles.length >= 30 && closes.length === candles.length;
-  const hasRsi = isFiniteNumber(analysis?.rsi) && analysis.rsi >= 0 && analysis.rsi <= 100;
+  const rsi = isFiniteNumber(analysis?.rsi) && analysis.rsi >= 0 && analysis.rsi <= 100
+    ? analysis.rsi
+    : calculateRsi14(closes);
+  const hasRsi = rsi !== null;
   const checks = [
     { labelFa: 'تازگی و اعتبار فید کندل', passed: feed !== null, detailFa: feed ? `فید زنده؛ ${Math.round(feed.ageMs)}ms` : 'فید کندل زنده/تازه تأیید نشد.' },
     { labelFa: 'کامل بودن داده قیمت', passed: hasCandles, detailFa: hasCandles ? `${candles.length} کندل با close معتبر` : 'کمتر از ۳۰ کندل معتبر یا close نامعتبر است.' },
-    { labelFa: 'RSI قابل‌محاسبه', passed: hasRsi, detailFa: hasRsi ? `RSI: ${analysis!.rsi}` : 'RSI معتبر موجود نیست؛ این مؤلفه وارد تحلیل نمی‌شود.' },
+    { labelFa: 'RSI قابل‌محاسبه', passed: hasRsi, detailFa: hasRsi ? `RSI14: ${rsi!.toFixed(2)}${isFiniteNumber(analysis?.rsi) ? ' از تحلیل snapshot' : ' محاسبه‌شده از closeهای واقعی'}` : 'RSI معتبر از snapshot یا کندل‌ها قابل‌محاسبه نیست.' },
   ];
   if (!feed || !hasCandles) {
     return abstain(member, 'برای تحلیل مستقل تکنیکال، کندل تازه و حداقل ۳۰ close معتبر لازم است.', checks, feed?.feed.timestamp, feed?.ageMs);
@@ -395,7 +416,7 @@ function evaluateTechnical(
       : 0;
   const momentumSignal = momentumPct >= 0.2 ? 1 : momentumPct <= -0.2 ? -1 : 0;
   const rsiSignal = hasRsi
-    ? analysis.rsi >= 55 ? 1 : analysis.rsi <= 45 ? -1 : 0
+    ? rsi! >= 55 ? 1 : rsi! <= 45 ? -1 : 0
     : 0;
   const higherTimeframeSignals = [analysis?.mtf1h, analysis?.mtf4h]
     .filter((value): value is string => value === 'BULLISH' || value === 'BEARISH')
@@ -406,7 +427,7 @@ function evaluateTechnical(
     : 0;
   const score = trendSignal + momentumSignal + rsiSignal + higherTimeframeSignal;
   const vote: CouncilVote = score >= 2 ? 'LONG' : score <= -2 ? 'SHORT' : 'NEUTRAL';
-  const rationale = `تحلیل محلی کندل: SMA10 ${fastAverage.toFixed(2)} در برابر SMA30 ${slowAverage.toFixed(2)}؛ مومنتوم ۵ کندلی ${momentumPct.toFixed(3)}٪؛ RSI ${hasRsi ? analysis.rsi : 'ناموجود'}؛ سیگنال ۱h/۴h ${higherTimeframeSignal > 0 ? 'صعودی' : higherTimeframeSignal < 0 ? 'نزولی' : 'تأییدنشده'}؛ امتیاز اجزای تخصصی ${score}. امتیاز عمومی LONG/SHORT در رأی استفاده نشد.`;
+  const rationale = `تحلیل محلی کندل: SMA10 ${fastAverage.toFixed(2)} در برابر SMA30 ${slowAverage.toFixed(2)}؛ مومنتوم ۵ کندلی ${momentumPct.toFixed(3)}٪؛ RSI14 ${hasRsi ? rsi!.toFixed(2) : 'ناموجود'}؛ سیگنال ۱h/۴h ${higherTimeframeSignal > 0 ? 'صعودی' : higherTimeframeSignal < 0 ? 'نزولی' : 'تأییدنشده'}؛ امتیاز اجزای تخصصی ${score}. امتیاز عمومی LONG/SHORT در رأی استفاده نشد.`;
   return createVote(
     member,
     vote,

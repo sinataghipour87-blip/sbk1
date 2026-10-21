@@ -1,9 +1,10 @@
 import { AnalysisResult, Candle, OrderFlowFeatures, RealOrderBookImbalance } from '../types/trading';
 
-export type WaveOutcomeHorizon = '5m' | '15m' | '30m' | '60m';
+export type WaveOutcomeHorizon = '5m' | '7m' | '15m' | '30m' | '60m';
 export type LearnedWaveStage = 'WAVE_FORMING' | 'EARLY_ACCELERATION' | 'TREND_EXPANSION' | 'MATURE_TREND' | 'EXHAUSTION';
 
 interface WaveHorizonOutcome {
+  observedAtMs: number;
   continuation: boolean;
   reversal: boolean;
   terminalMovePct: number;
@@ -42,17 +43,20 @@ export interface WaveOutcomeMetrics {
   expectedRemainingMovePct: number | null;
   expectedDurationMinutes: number | null;
   outcomesByHorizon: Record<WaveOutcomeHorizon, number | null>;
+  sampleCountByHorizon: Record<WaveOutcomeHorizon, number>;
 }
 
 const DATASET_STORAGE_KEY = 'quantum_wave_outcome_dataset_v1';
 const HORIZON_MS: Record<WaveOutcomeHorizon, number> = {
   '5m': 5 * 60_000,
+  '7m': 7 * 60_000,
   '15m': 15 * 60_000,
   '30m': 30 * 60_000,
   '60m': 60 * 60_000,
 };
 const MAX_OBSERVATIONS = 2500;
-const MIN_OBSERVATION_INTERVAL_MS = 5 * 60_000;
+const MIN_OBSERVATION_INTERVAL_MS = 60_000;
+const MAX_OUTCOME_LABEL_DELAY_MS = 90_000;
 const MIN_INDEPENDENT_SAMPLE_SPACING_MS = HORIZON_MS['60m'];
 const MIN_SAMPLES_PER_STAGE = 20;
 const K_NEIGHBORS = 25;
@@ -73,6 +77,7 @@ function isHorizonOutcome(value: unknown): value is WaveHorizonOutcome {
   const outcome = value as Record<string, unknown>;
   return typeof outcome.continuation === 'boolean' &&
     typeof outcome.reversal === 'boolean' &&
+    (outcome.observedAtMs === undefined || isFiniteNumber(outcome.observedAtMs)) &&
     isFiniteNumber(outcome.terminalMovePct) &&
     isFiniteNumber(outcome.maximumFavorableMovePct) &&
     isFiniteNumber(outcome.maximumAdverseMovePct) &&
@@ -113,7 +118,19 @@ function readDataset(): WaveLearningDataset {
     !dataset.observations.every(isWaveObservation)) {
     throw new Error('Stored wave-learning dataset failed validation.');
   }
-  return { version: 1, observations: dataset.observations };
+  const observations = (dataset.observations as WaveObservation[]).map(observation => ({
+    ...observation,
+    outcomes: Object.fromEntries(
+      Object.entries(observation.outcomes).filter(([horizon, outcome]) => {
+        const horizonMs = HORIZON_MS[horizon as WaveOutcomeHorizon];
+        const targetTimestampMs = observation.timestampMs + horizonMs;
+        return outcome?.observedAtMs !== undefined &&
+          outcome.observedAtMs >= targetTimestampMs &&
+          outcome.observedAtMs <= targetTimestampMs + MAX_OUTCOME_LABEL_DELAY_MS;
+      }),
+    ) as WaveObservation['outcomes'],
+  }));
+  return { version: 1, observations };
 }
 
 function writeDataset(dataset: WaveLearningDataset): void {
@@ -228,8 +245,14 @@ function updateForwardOutcomes(observation: WaveObservation, price: number, high
 
   const terminalMovePct = ((price - observation.price) / observation.price) * 100 * (isLong ? 1 : -1);
   for (const [horizon, horizonMs] of Object.entries(HORIZON_MS) as Array<[WaveOutcomeHorizon, number]>) {
-    if (observation.outcomes[horizon] || now < observation.timestampMs + horizonMs) continue;
+    const targetTimestampMs = observation.timestampMs + horizonMs;
+    if (
+      observation.outcomes[horizon] ||
+      now < targetTimestampMs ||
+      now - targetTimestampMs > MAX_OUTCOME_LABEL_DELAY_MS
+    ) continue;
     observation.outcomes[horizon] = {
+      observedAtMs: now,
       continuation: terminalMovePct > 0,
       reversal: terminalMovePct < 0 && observation.maximumAdverseMovePct > observation.maximumFavorableMovePct,
       terminalMovePct,
@@ -384,13 +407,14 @@ export function getWaveOutcomeMetrics(
   analysis: Partial<AnalysisResult>,
   stage: LearnedWaveStage | 'UNCLASSIFIED'
 ): WaveOutcomeMetrics {
-  const horizons: WaveOutcomeHorizon[] = ['5m', '15m', '30m', '60m'];
+  const horizons: WaveOutcomeHorizon[] = ['5m', '7m', '15m', '30m', '60m'];
   const empty: WaveOutcomeMetrics = {
     continuationProbabilityPct: null,
     reversalProbabilityPct: null,
     expectedRemainingMovePct: null,
     expectedDurationMinutes: null,
-    outcomesByHorizon: { '5m': null, '15m': null, '30m': null, '60m': null },
+    outcomesByHorizon: { '5m': null, '7m': null, '15m': null, '30m': null, '60m': null },
+    sampleCountByHorizon: { '5m': 0, '7m': 0, '15m': 0, '30m': 0, '60m': 0 },
   };
   if (typeof window === 'undefined' || stage === 'UNCLASSIFIED') return empty;
   const current = buildFeatures(analysis);
@@ -440,6 +464,10 @@ export function getWaveOutcomeMetrics(
     horizon,
     probability(outcomes[horizon], 'continuation'),
   ])) as WaveOutcomeMetrics['outcomesByHorizon'];
+  const sampleCountByHorizon = Object.fromEntries(horizons.map(horizon => [
+    horizon,
+    outcomes[horizon].length,
+  ])) as WaveOutcomeMetrics['sampleCountByHorizon'];
 
   return {
     continuationProbabilityPct: probability(sixtyMinuteOutcomes, 'continuation'),
@@ -447,5 +475,6 @@ export function getWaveOutcomeMetrics(
     expectedRemainingMovePct: expectedMaximumMove,
     expectedDurationMinutes: expectedDuration === null ? null : Math.max(0, Math.round(expectedDuration)),
     outcomesByHorizon,
+    sampleCountByHorizon,
   };
 }

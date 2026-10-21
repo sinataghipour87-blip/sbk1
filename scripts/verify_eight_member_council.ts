@@ -147,6 +147,24 @@ assert.equal(
   'LONG',
   'technical vote must read close at index 3 from the production OHLCV tuple',
 );
+const locallyComputedRsi = evaluateEightMemberCouncil({
+  analysis: { ...analysis, rsi: undefined },
+  macroContext,
+  nowMs,
+});
+assert.notEqual(
+  locallyComputedRsi.members[0].vote,
+  'ABSTAIN',
+  'member 1 must calculate RSI14 from fresh close data when the upstream RSI is missing',
+);
+assert.equal(
+  locallyComputedRsi.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'RSI قابل‌محاسبه')?.passed,
+  true,
+);
+assert.match(
+  locallyComputedRsi.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'RSI قابل‌محاسبه')?.detailFa ?? '',
+  /محاسبه‌شده از closeهای واقعی/,
+);
 const changedVolumeOnly = evaluateEightMemberCouncil({
   analysis: {
     ...analysis,

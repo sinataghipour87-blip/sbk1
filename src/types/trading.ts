@@ -1697,6 +1697,7 @@ export type WaveExhaustionPattern =
 export interface WaveDnaSignature {
   dnaId: string;
   timestamp: number;
+  dataProvenance?: 'VERIFIED_ENTRY_OUTCOME' | 'UNVALIDATED' | 'BENCHMARK';
   origin: WaveOriginType;
   direction: 'LONG' | 'SHORT';
   regime: string;

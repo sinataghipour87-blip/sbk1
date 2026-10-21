@@ -1,4 +1,4 @@
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { AnalysisResult } from '../types/trading';
 import type { MultiBrainConsensusReport } from './multiBrainEnsemble';
@@ -53,6 +53,93 @@ type ModuleValue = {
   summaryFa: string;
   resolvedStatus?: CouncilModuleEvidence['status'];
 };
+
+const COUNCIL_RETENTION_MS = 5 * 60 * 60_000;
+const COUNCIL_RETENTION_SWEEP_INTERVAL_MS = 60_000;
+const councilRetentionTimers = new Map<string, NodeJS.Timeout>();
+const councilRetentionLocks = new Map<string, Promise<void>>();
+
+function timestampForCouncilRecord(record: unknown): number | null {
+  if (!isObject(record)) return null;
+  const timestamp = isFiniteNumber(record.evaluatedAtMs)
+    ? record.evaluatedAtMs
+    : isObject(record.report) && isFiniteNumber(record.report.evaluatedAtMs)
+      ? record.report.evaluatedAtMs
+      : null;
+  return timestamp !== null && Number.isSafeInteger(timestamp) ? timestamp : null;
+}
+
+async function pruneCouncilFile(filePath: string, nowMs: number): Promise<number> {
+  let content: string;
+  try {
+    content = await readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return 0;
+    throw error;
+  }
+  const lines = content.split('\n').filter((line) => line.length > 0);
+  const retained = lines.filter((line) => {
+    try {
+      const timestamp = timestampForCouncilRecord(JSON.parse(line));
+      return timestamp !== null && timestamp <= nowMs && nowMs - timestamp < COUNCIL_RETENTION_MS;
+    } catch {
+      return false;
+    }
+  });
+  const removedCount = lines.length - retained.length;
+  if (removedCount === 0) return 0;
+  if (retained.length === 0) {
+    try {
+      await unlink(filePath);
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    }
+    return removedCount;
+  }
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  await writeFile(temporaryPath, `${retained.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+  await rename(temporaryPath, filePath);
+  return removedCount;
+}
+
+export async function pruneExpiredCouncilRecords(
+  repositoryDir: string,
+  nowMs = Date.now(),
+): Promise<number> {
+  const resolvedDir = path.resolve(repositoryDir);
+  const previous = councilRetentionLocks.get(resolvedDir) ?? Promise.resolve();
+  const current = previous.then(async () => {
+    let removedCount = 0;
+    for (const fileName of [
+      ...EIGHT_MEMBER_COUNCIL.map(({ id }) => `member-${String(id).padStart(2, '0')}.jsonl`),
+      'council-votes.jsonl',
+    ]) {
+      removedCount += await pruneCouncilFile(path.join(resolvedDir, fileName), nowMs);
+    }
+    return removedCount;
+  });
+  const lock = current.then(() => undefined, () => undefined);
+  councilRetentionLocks.set(resolvedDir, lock);
+  try {
+    return await current;
+  } finally {
+    if (councilRetentionLocks.get(resolvedDir) === lock) {
+      councilRetentionLocks.delete(resolvedDir);
+    }
+  }
+}
+
+function scheduleCouncilRetentionSweep(repositoryDir: string): void {
+  const resolvedDir = path.resolve(repositoryDir);
+  if (councilRetentionTimers.has(resolvedDir)) return;
+  const timer = setInterval(() => {
+    void pruneExpiredCouncilRecords(resolvedDir).catch((error: unknown) => {
+      console.error('[EightMemberCouncil] Could not prune expired council records:', error);
+    });
+  }, COUNCIL_RETENTION_SWEEP_INTERVAL_MS);
+  timer.unref();
+  councilRetentionTimers.set(resolvedDir, timer);
+}
 
 const MODULE_OUTPUTS_STORED_IN_MEMBER_SOURCE_DATA = new Set([
   'technical.mtfStructuralReport',
@@ -733,6 +820,7 @@ async function persistMemberRecords(
   repositoryDir: string,
 ): Promise<void> {
   await mkdir(repositoryDir, { recursive: true });
+  await pruneExpiredCouncilRecords(repositoryDir);
   for (const entry of entries) {
     const memberFile = path.join(repositoryDir, `member-${String(entry.memberId).padStart(2, '0')}.jsonl`);
     await appendFile(memberFile, `${JSON.stringify(entry)}\n`, { encoding: 'utf8', mode: 0o600 });
@@ -827,15 +915,26 @@ export async function runEightMemberCouncilRuntime(
     evaluatedAtMs: nowMs,
     memberId: member.id,
     memberName: member.nameFa,
-    sourceData: sourceDataForMember(
-      member.id,
-      input.analysis,
-      macroContext,
-      input.freeMacroData,
-      input.optionsData,
-      input.whaleFlowData,
-      input.publicMarketFallback,
-    ),
+    sourceData: {
+      ...sourceDataForMember(
+        member.id,
+        input.analysis,
+        macroContext,
+        input.freeMacroData,
+        input.optionsData,
+        input.whaleFlowData,
+        input.publicMarketFallback,
+      ),
+      peerCouncilSummary: report.members.map((peer) => ({
+        memberId: peer.id,
+        memberName: peer.nameFa,
+        vote: peer.vote,
+        rationaleFa: peer.rationaleFa,
+        sourceTimestampMs: peer.sourceTimestampMs,
+        sourceAgeMs: peer.sourceAgeMs,
+        dataQualityPct: peer.dataQualityPct,
+      })),
+    },
     moduleOutputs: member.supportingEvidence,
     vote: member.vote,
     rationaleFa: member.rationaleFa,
@@ -846,5 +945,10 @@ export async function runEightMemberCouncilRuntime(
     path.resolve(process.cwd(), 'data', 'council-members');
   const coordinatorOutput = input.sbReport?.models.find(({ id }) => id === 'SB5') ?? null;
   await persistMemberRecords(entries, report, snapshotId, coordinatorOutput, repositoryDir);
+  const operationalRepositoryDir = process.env.SBK1_COUNCIL_REPOSITORY_DIR ??
+    path.resolve(process.cwd(), 'data', 'council-members');
+  if (path.resolve(repositoryDir) === path.resolve(operationalRepositoryDir)) {
+    scheduleCouncilRetentionSweep(repositoryDir);
+  }
   return report;
 }

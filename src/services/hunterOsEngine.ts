@@ -35,6 +35,27 @@ import {
 const WAVE_DNA_STORAGE_KEY = 'quantum_wave_dna_dataset_v1';
 const HUNTER_MEMORY_STORAGE_KEY = 'quantum_hunter_episodic_memory_v1';
 
+function isVerifiedEntryOutcome(value: unknown): value is WaveDnaSignature {
+  if (!value || typeof value !== 'object') return false;
+  const wave = value as Partial<WaveDnaSignature>;
+  return wave.dataProvenance === 'VERIFIED_ENTRY_OUTCOME' &&
+    wave.outcome !== 'IN_PROGRESS' &&
+    ['CONTINUED', 'FAILED', 'REVERSED'].includes(wave.outcome ?? '') &&
+    typeof wave.dnaId === 'string' &&
+    Number.isFinite(wave.timestamp) &&
+    Number.isFinite(wave.momentum) &&
+    Number.isFinite(wave.volumeZScore) &&
+    Number.isFinite(wave.cvdDeltaPct) &&
+    Number.isFinite(wave.obiImbalance) &&
+    Number.isFinite(wave.liquidityScore) &&
+    Number.isFinite(wave.volatilityAtrPct) &&
+    Number.isFinite(wave.mfeR) &&
+    Number.isFinite(wave.maeR) &&
+    Number.isFinite(wave.durationSeconds) &&
+    Number.isFinite(wave.accelerationScore) &&
+    Number.isFinite(wave.actualRealizedR);
+}
+
 // Seed benchmark realistic episodic lessons for deep post-mortem learning
 const SEED_BENCHMARK_MEMORIES: HunterEpisodicMemoryRecord[] = [
   {
@@ -382,7 +403,7 @@ const SEED_BENCHMARK_MEMORIES: HunterEpisodicMemoryRecord[] = [
 ];
 
 
-// Seed benchmark verified waves for realistic historical foundation
+// Legacy illustrative fixtures are intentionally never persisted or used as historical evidence.
 const SEED_BENCHMARK_WAVES: WaveDnaSignature[] = [
   {
     dnaId: 'DNA_WAVE_001_SWEEP_LONG',
@@ -549,12 +570,10 @@ class HunterOsEngine {
           return;
         }
       }
-      // Seed with genuine foundational waves
-      this.waveDnaCache = [...SEED_BENCHMARK_WAVES];
-      localStorage.setItem(WAVE_DNA_STORAGE_KEY, JSON.stringify(this.waveDnaCache));
+      this.waveDnaCache = [];
       this.isLoadedFromStorage = true;
     } catch {
-      this.waveDnaCache = [...SEED_BENCHMARK_WAVES];
+      this.waveDnaCache = [];
     }
   }
 
@@ -562,7 +581,7 @@ class HunterOsEngine {
     if (!this.isLoadedFromStorage) {
       this.initWaveDnaStorage();
     }
-    return this.waveDnaCache;
+    return this.waveDnaCache.filter(isVerifiedEntryOutcome);
   }
 
   public recordCompletedWaveDna(wave: WaveDnaSignature): void {
@@ -767,11 +786,11 @@ class HunterOsEngine {
       ? Number((significantMatches.reduce((acc, m) => acc + m.matchedDna.maeR, 0) / totalSimilar).toFixed(2))
       : null;
 
-    const isStatisticallySufficient = totalSimilar >= 5;
+    const isStatisticallySufficient = totalSimilar >= 20;
 
     let verdictFa = '';
     if (!isStatisticallySufficient) {
-      verdictFa = `دیتابیس در حال حاضر ${totalSimilar} موج کاملاً منطبق شناسایی کرد. برای نتیجه قطعی آماری نمونه‌های واقعی بیشتری در دیتابیس ثبت خواهند شد.`;
+      verdictFa = `دیتابیس ${totalSimilar} نمونهٔ تأییدشدهٔ مشابه دارد؛ برای گزارش آماری حداقل ۲۰ نمونه لازم است.`;
     } else {
       verdictFa = `این موج فعلی با مشخصات ژنتیکی (${liveDna.origin} / ${liveDna.direction}) شبیه ${totalSimilar} موج گذشته است؛ ${continuationCount} مورد ادامه داده‌اند و ${failedCount} مورد شکست خورده‌اند.`;
     }
