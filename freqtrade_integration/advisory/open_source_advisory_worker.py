@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,6 +24,19 @@ LOGGER = logging.getLogger("sbk1.open_source_advisories")
 CONTRACT_VERSION = "sbk1.open-source-advisories.v1"
 NEWS_MODEL = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
 NEWS_MODEL_REVISION = "ae0eab9ad336d7d548e0efe394b07c04bcaf6e91"
+LEXICON_POSITIVE_TERMS = {
+    "adoption", "approved", "approval", "bullish", "gain", "gains", "inflow",
+    "outperform", "outperforms", "rally", "rallies", "rebound", "recovered",
+    "recovery", "record", "rise", "rises", "rising", "surge", "surges",
+    "صعود", "افزایش", "رشد", "جهش", "رکورد", "تایید", "تصویب", "پذیرش",
+}
+LEXICON_NEGATIVE_TERMS = {
+    "ban", "banned", "bankruptcy", "bearish", "crash", "crashes", "decline",
+    "default", "defaults", "drop", "dropped", "exploit", "falling", "fraud",
+    "hack", "hacked", "liquidation", "loss", "losses", "outflow", "plunge",
+    "plunges", "selloff", "sued", "lawsuit",
+    "افت", "کاهش", "سقوط", "ریزش", "ممنوع", "ورشکستگی", "هک", "خروج", "لیکویید",
+}
 FEATURE_NAMES = (
     "return_1",
     "return_4",
@@ -422,6 +436,56 @@ def analyze_news(headlines: list[dict[str, Any]], timestamp_ms: int) -> dict[str
     )
 
 
+def analyze_news_with_lexicon(
+    headlines: list[dict[str, Any]],
+    timestamp_ms: int,
+    fallback_reason: str,
+) -> dict[str, Any]:
+    output = []
+    scores = []
+    matched_headlines = 0
+    for headline in headlines[:24]:
+        text = headline["headline"].lower()
+        tokens = set(re.findall(r"[a-z]+|[\u0600-\u06ff]+", text))
+        positive_matches = sorted(LEXICON_POSITIVE_TERMS.intersection(tokens))
+        negative_matches = sorted(LEXICON_NEGATIVE_TERMS.intersection(tokens))
+        positive_count = len(positive_matches)
+        negative_count = len(negative_matches)
+        matched = positive_count + negative_count
+        if matched:
+            matched_headlines += 1
+        score = (positive_count - negative_count) / matched if matched else 0.0
+        scores.append(score)
+        output.append({
+            "headline": headline["headline"],
+            "publisher": headline["publisher"],
+            "publishedAt": headline["publishedAt"],
+            "positiveMatches": positive_matches,
+            "negativeMatches": negative_matches,
+            "sentiment": "POSITIVE" if score > 0 else "NEGATIVE" if score < 0 else "NEUTRAL",
+        })
+    if matched_headlines == 0:
+        return unavailable(
+            f"Local finance lexicon matched no sentiment terms; model unavailable: {fallback_reason}",
+            timestamp_ms,
+        )
+    return available(
+        timestamp_ms,
+        library="Built-in conservative financial-news keyword lexicon",
+        analysisMethod="LEXICON_FALLBACK",
+        calibrationStatus="UNCALIBRATED",
+        fallbackReason=fallback_reason,
+        headlineCount=len(output),
+        sentimentMatchedHeadlineCount=matched_headlines,
+        aggregateSentiment=float(sum(scores) / len(scores)),
+        headlines=output,
+        interpretation=(
+            "Uncalibrated keyword-only headline sentiment; negation, context, "
+            "article bodies, and market impact are not modeled."
+        ),
+    )
+
+
 def analyze_news_isolated(headlines: list[dict[str, Any]], timestamp_ms: int) -> dict[str, Any]:
     if not headlines:
         return unavailable("No fresh headlines were supplied by configured RSS sources.", timestamp_ms)
@@ -436,31 +500,39 @@ def analyze_news_isolated(headlines: list[dict[str, Any]], timestamp_ms: int) ->
             env=os.environ.copy(),
         )
     except subprocess.TimeoutExpired:
-        LOGGER.error("Isolated sentiment model exceeded its 60-second timeout.")
-        return unavailable("Isolated sentiment model exceeded its 60-second timeout.", timestamp_ms)
+        reason = "Isolated sentiment model exceeded its 60-second timeout."
+        LOGGER.warning("%s Falling back to the built-in news lexicon.", reason)
+        return analyze_news_with_lexicon(headlines, timestamp_ms, reason)
 
     if result.returncode != 0:
-        LOGGER.error(
+        failure_detail = result.stderr.strip().splitlines()[-1:]
+        reason = f"Isolated sentiment process exited with status {result.returncode}."
+        if failure_detail:
+            reason = f"{reason} {failure_detail[0][:240]}"
+        LOGGER.warning(
             "Isolated sentiment process exited with status %s: %s",
             result.returncode,
             result.stderr[-1_000:],
         )
-        return unavailable(
-            f"Isolated sentiment process exited with status {result.returncode}.",
-            timestamp_ms,
-        )
+        return analyze_news_with_lexicon(headlines, timestamp_ms, reason)
     try:
         response = json.loads(result.stdout)
     except json.JSONDecodeError:
-        LOGGER.error("Isolated sentiment process returned invalid JSON: %s", result.stderr[-1_000:])
-        return unavailable("Isolated sentiment process returned invalid JSON.", timestamp_ms)
+        reason = "Isolated sentiment process returned invalid JSON."
+        LOGGER.warning("%s Falling back to the built-in news lexicon.", reason)
+        return analyze_news_with_lexicon(headlines, timestamp_ms, reason)
     if (
         not isinstance(response, dict)
         or response.get("status") not in ("AVAILABLE", "UNAVAILABLE")
         or response.get("sourceTimestampMs") != timestamp_ms
     ):
-        LOGGER.error("Isolated sentiment process returned an incompatible response.")
-        return unavailable("Isolated sentiment process returned an incompatible response.", timestamp_ms)
+        reason = "Isolated sentiment process returned an incompatible response."
+        LOGGER.warning("%s Falling back to the built-in news lexicon.", reason)
+        return analyze_news_with_lexicon(headlines, timestamp_ms, reason)
+    if response.get("status") != "AVAILABLE":
+        reason = str(response.get("reason", "Financial-news sentiment model is unavailable."))
+        LOGGER.warning("Sentiment model unavailable: %s Falling back to the built-in news lexicon.", reason)
+        return analyze_news_with_lexicon(headlines, timestamp_ms, reason)
     return response
 
 

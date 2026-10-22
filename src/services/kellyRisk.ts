@@ -574,9 +574,9 @@ export function evaluateAccountLevelRisk(...args: any[]): {
 
   // 81. Daily Loss Limit Check from real Equity
   const realDailyLoss = calculateRealDailyLoss(activePositions, tradeHistory);
-  const dailyLossLimitUsd = accountEquity * 0.05; // 5% daily loss limit of account equity
+  const dailyLossLimitUsd = accountEquity * 0.10;
 
-  if (realDailyLoss < -dailyLossLimitUsd) {
+  if (realDailyLoss <= -dailyLossLimitUsd) {
     return {
       allowed: false,
       isOrderPermitted: false,

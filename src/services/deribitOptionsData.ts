@@ -104,7 +104,7 @@ function parseOption(summary: DeribitOptionSummary, nowMs: number): ParsedOption
   };
 }
 
-async function fetchJson(fetcher: typeof fetch): Promise<unknown> {
+async function fetchJson(fetcher: typeof fetch): Promise<{ payload: unknown; retrievedAtMs: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -114,7 +114,8 @@ async function fetchJson(fetcher: typeof fetch): Promise<unknown> {
       headers: { Accept: 'application/json' },
     });
     if (!response.ok) throw new Error(`Deribit options API returned HTTP ${response.status}.`);
-    return await response.json();
+    const payload: unknown = await response.json();
+    return { payload, retrievedAtMs: Date.now() };
   } finally {
     clearTimeout(timeout);
   }
@@ -132,31 +133,30 @@ export async function fetchDeribitOptionsData(options: {
     };
   }
   try {
-    const payload = await fetchJson(options.fetcher ?? fetch);
+    const { payload, retrievedAtMs } = await fetchJson(options.fetcher ?? fetch);
+    const evaluatedAtMs = Math.max(nowMs, retrievedAtMs);
     if (typeof payload !== 'object' || payload === null ||
         !('result' in payload) || !Array.isArray(payload.result)) {
       throw new Error('Deribit options response is malformed.');
     }
     const summaries = payload.result.filter(isSummary);
     const eligible = summaries.flatMap((summary) => {
-      const parsed = parseOption(summary, nowMs);
+      const parsed = parseOption(summary, evaluatedAtMs);
       return parsed && parsed.strikePrice >= parsed.underlyingPrice * 0.75 &&
         parsed.strikePrice <= parsed.underlyingPrice * 1.25
-        ? [{ ...parsed, sourceTimestampMs: summary.creation_timestamp }]
+        ? [parsed]
         : [];
     });
-    const valid = eligible.filter((option) =>
-      option.sourceTimestampMs <= nowMs &&
-      nowMs - option.sourceTimestampMs <= MAX_SOURCE_AGE_MS
-    );
+    const valid = retrievedAtMs <= nowMs + 1_000 &&
+      nowMs - retrievedAtMs <= MAX_SOURCE_AGE_MS
+      ? eligible
+      : [];
     const calls = valid.filter(({ optionType }) => optionType === 'call');
     const puts = valid.filter(({ optionType }) => optionType === 'put');
     const callOpenInterest = calls.reduce((sum, option) => sum + option.openInterest, 0);
     const putOpenInterest = puts.reduce((sum, option) => sum + option.openInterest, 0);
     const totalOpenInterest = callOpenInterest + putOpenInterest;
-    const timestampMs = valid.length > 0
-      ? Math.min(...valid.map(({ sourceTimestampMs }) => sourceTimestampMs))
-      : null;
+    const timestampMs = valid.length > 0 ? retrievedAtMs : null;
     if (
       valid.length < MIN_VALID_CONTRACTS ||
       calls.length === 0 ||
@@ -179,7 +179,7 @@ export async function fetchDeribitOptionsData(options: {
       Math.abs(left.strikePrice - left.underlyingPrice) / left.underlyingPrice -
       Math.abs(right.strikePrice - right.underlyingPrice) / right.underlyingPrice
     )[0];
-    const ageMs = nowMs - timestampMs;
+    const ageMs = Math.max(0, evaluatedAtMs - timestampMs);
     const result: CouncilOptionsData = {
       status: 'LIVE',
       timestampMs,

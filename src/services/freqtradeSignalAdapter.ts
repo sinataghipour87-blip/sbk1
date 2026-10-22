@@ -391,11 +391,11 @@ export function validateSbkFreqtradeSignal(
     typeof signal.riskLimits.riskBudgetPct !== 'number' ||
     !Number.isFinite(signal.riskLimits.riskBudgetPct) ||
     signal.riskLimits.riskBudgetPct <= 0 ||
-    signal.riskLimits.riskBudgetPct > 1.5 ||
+    signal.riskLimits.riskBudgetPct > 10 ||
     !finitePositive(signal.riskLimits.maxStakeQuote) ||
     !Number.isFinite(signal.riskLimits.maxLeverage) ||
     signal.riskLimits.maxLeverage < 1 ||
-    signal.riskLimits.maxLeverage > 20
+    signal.riskLimits.maxLeverage > 25
   ) {
     throw new SbkSignalValidationError('Position sizing exceeds configured risk limits.', 'INVALID_RISK_LIMITS');
   }

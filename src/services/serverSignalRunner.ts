@@ -57,10 +57,11 @@ const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MINIMUM_CANDLES_FOR_ANALYSIS = 300;
 const DEFAULT_SIGNAL_TTL_SECONDS = 120;
 const DEFAULT_SIGNAL_MAX_DEVIATION_BPS = 100;
-const DEFAULT_RISK_BUDGET_PCT = 0.1;
-const DEFAULT_MAX_LEVERAGE = 1;
-const DEFAULT_DAILY_LOSS_LIMIT_PCT = 2;
-const MAX_DAILY_LOSS_LIMIT_PCT = 5;
+const DEFAULT_RISK_BUDGET_PCT = 10;
+const DEFAULT_MAX_LEVERAGE = 25;
+const MAX_RISK_BUDGET_PCT = 10;
+const DEFAULT_DAILY_LOSS_LIMIT_PCT = 10;
+const MAX_DAILY_LOSS_LIMIT_PCT = 10;
 const DEFAULT_MAX_ATR_PCT = 2;
 const MAX_READY_ADVISORY_AGE_MS = 2 * 60_000;
 
@@ -183,9 +184,17 @@ function readSignalSettings(): {
   maxAtrPct: number;
 } {
   const ttlSeconds = readPositiveEnv('SBK1_SIGNAL_TTL_SECONDS', DEFAULT_SIGNAL_TTL_SECONDS, 120);
-  const riskBudgetPct = readPositiveEnv('SBK1_SIGNAL_RISK_BUDGET_PCT', DEFAULT_RISK_BUDGET_PCT, 1.5);
-  const maxStakeQuote = readPositiveEnv('SBK1_SIGNAL_MAX_STAKE_QUOTE', 100, Number.MAX_SAFE_INTEGER);
-  const maxLeverage = readPositiveEnv('SBK1_SIGNAL_MAX_LEVERAGE', DEFAULT_MAX_LEVERAGE, 20);
+  const riskBudgetPct = readPositiveEnv(
+    'SBK1_SIGNAL_RISK_BUDGET_PCT',
+    DEFAULT_RISK_BUDGET_PCT,
+    MAX_RISK_BUDGET_PCT,
+  );
+  const maxStakeQuote = readPositiveEnv(
+    'SBK1_SIGNAL_MAX_STAKE_QUOTE',
+    Number.MAX_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER,
+  );
+  const maxLeverage = readPositiveEnv('SBK1_SIGNAL_MAX_LEVERAGE', DEFAULT_MAX_LEVERAGE, 25);
   return {
     ttlSeconds,
     maxDeviationBps: readPositiveEnv(
@@ -620,7 +629,22 @@ async function analyzeSnapshotData(
     inputs.futuresPrices,
     inputs.orderFlow,
   );
+  analysis.htfCandles = informativeCandles;
   analysis.timeframe = snapshot.timeframe;
+  const informativeCloseTimestamp = (timeframe: string): number | null => {
+    const latest = snapshot.additionalCandles[timeframe]
+      ?.filter((candle) => candle.timestampMs + timeframeToMs(timeframe) <= nowMs)
+      .at(-1);
+    return latest ? latest.timestampMs + timeframeToMs(timeframe) : null;
+  };
+  analysis.signalDataTimestamps = {
+    fundingRateMs: snapshot.fundingRate?.retrievedAtMs ?? null,
+    openInterestMs: snapshot.openInterest?.latestTimestampMs ?? null,
+    mtf1mMs: informativeCloseTimestamp('1m'),
+    mtf5mMs: informativeCloseTimestamp('5m'),
+    mtf1hMs: informativeCloseTimestamp('1h'),
+    mtf4hMs: informativeCloseTimestamp('4h'),
+  };
   if (requestAdvisories && !openSourceAdvisoryService.isStopped()) {
     void analyzeOpenSourceAdvisories(snapshot, nowMs).catch((error: unknown) => {
       console.error('[SBK1_ADVISORIES] Background advisory task failed:', error);
@@ -659,11 +683,11 @@ function makeServerFeatureSnapshot(
   };
 }
 
-export function applyPublicMarketFallbackToCouncilAnalysis(
+export async function applyPublicMarketFallbackToCouncilAnalysis(
   analysis: AnalysisResult,
   fallback: Awaited<ReturnType<typeof fetchPublicMarketFallback>>,
   nowMs: number,
-): AnalysisResult {
+): Promise<AnalysisResult> {
   const timeframeMatch = typeof analysis.timeframe === 'string'
     ? /^(\d+)([mhdw])$/.exec(analysis.timeframe)
     : null;
@@ -729,18 +753,49 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
   const fundingFallback = fallback.fundingRate.status === 'LIVE' &&
     fallback.fundingRate.value !== null &&
     fallback.fundingRate.sourceTimestampMs !== null;
-  const oiFallback = fallback.openInterest.status === 'LIVE' &&
-    fallback.openInterest.value !== null &&
-    fallback.openInterest.sourceTimestampMs !== null;
+  const liveOiFallback = fallback.liveOpenInterest.status === 'LIVE' &&
+    fallback.liveOpenInterest.value !== null &&
+    fallback.liveOpenInterest.sourceTimestampMs !== null;
+  const fastCandles = fallback.fastCandles.status === 'LIVE' &&
+    fallback.fastCandles.value !== null &&
+    fallback.fastCandles.sourceTimestampMs !== null &&
+    fallback.fastCandles.sourceTimestampMs <= nowMs
+    ? fallback.fastCandles
+    : null;
+  const fastCandlesTimestampMs = fastCandles?.sourceTimestampMs ?? null;
+  const existingFastCandlesTimestampMs = analysis.signalDataTimestamps?.mtf1mMs ?? null;
+  const useFastFallbackCandles = fastCandlesTimestampMs !== null &&
+    (existingFastCandlesTimestampMs === null ||
+      fastCandlesTimestampMs > existingFastCandlesTimestampMs);
+  const useFallbackHigherTimeframe = (timeframe: '1h' | '4h'): boolean => {
+    const feed = fallback.higherTimeframeCandles[timeframe];
+    const existingTimestamp = analysis.signalDataTimestamps?.[
+      timeframe === '1h' ? 'mtf1hMs' : 'mtf4hMs'
+    ];
+    return feed.status === 'LIVE' &&
+      feed.value !== null &&
+      feed.sourceTimestampMs !== null &&
+      feed.sourceTimestampMs <= nowMs &&
+      (existingTimestamp == null || feed.sourceTimestampMs > existingTimestamp);
+  };
+  const useFallback1hCandles = useFallbackHigherTimeframe('1h');
+  const useFallback4hCandles = useFallbackHigherTimeframe('4h');
+  const primaryOpenInterestFresh = analysis.signalDataTimestamps?.openInterestMs !== undefined &&
+    analysis.signalDataTimestamps.openInterestMs !== null &&
+    nowMs >= analysis.signalDataTimestamps.openInterestMs &&
+    nowMs - analysis.signalDataTimestamps.openInterestMs <= 10_000;
   const primaryDerivativesFresh = isPrimaryFeedFresh(existingFeeds?.derivatives, 60_000) &&
     typeof analysis.fundingRate === 'number' &&
     Number.isFinite(analysis.fundingRate) &&
     typeof analysis.oi === 'number' &&
     Number.isFinite(analysis.oi) &&
-    analysis.oi > 0;
-  const useFallbackDerivatives = !primaryDerivativesFresh && fundingFallback && oiFallback;
+    analysis.oi > 0 &&
+    primaryOpenInterestFresh;
+  const useFallbackDerivatives = !primaryDerivativesFresh && fundingFallback && liveOiFallback;
 
-  if (!useFallbackCandles && !useFallbackTrades && !useFallbackBook && !useFallbackDerivatives) {
+  if (!useFallbackCandles && !useFallbackTrades && !useFallbackBook &&
+      !useFallbackDerivatives && !useFastFallbackCandles &&
+      !useFallback1hCandles && !useFallback4hCandles) {
     return analysis;
   }
 
@@ -781,7 +836,7 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
   const fallbackTrades = useFallbackTrades ? fallback.tradeFlow.value! : null;
   const fallbackBook = useFallbackBook ? fallback.orderBook.value! : null;
   const fallbackFunding = useFallbackDerivatives ? fallback.fundingRate.value! : null;
-  const fallbackOi = useFallbackDerivatives ? fallback.openInterest.value! : null;
+  const fallbackOi = useFallbackDerivatives ? fallback.liveOpenInterest.value! : null;
   if (feeds && fallbackCandles) {
     feeds.candles = cloneFeed(
       `${fallback.provider} completed candles`,
@@ -808,10 +863,10 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
   }
   if (feeds && fallbackFunding && fallbackOi) {
     feeds.derivatives = cloneFeed(
-      `${fallback.provider} funding and open interest`,
-      fallback.fundingRate.sourceTimestampMs!,
+      `${fallback.provider} funding and current open interest`,
+      Math.min(fallback.fundingRate.sourceTimestampMs!, fallback.liveOpenInterest.sourceTimestampMs!),
       60_000,
-      'Funding و OI معتبر از بازار آتی عمومی برای عضو ۴.',
+      'Funding تازه و OI لحظه‌ای از بازار آتی عمومی برای عضو ۴.',
     );
   }
 
@@ -823,7 +878,7 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
   const bidDepthUsd = fallbackBook?.bids.reduce((sum, level) => sum + level.price * level.amount, 0);
   const askDepthUsd = fallbackBook?.asks.reduce((sum, level) => sum + level.price * level.amount, 0);
   const fallbackFundingRate = fallbackFunding?.rate;
-  const fallbackOpenInterest = fallbackOi?.latestAmount;
+  const fallbackOpenInterest = fallbackOi?.amount;
   const fallbackCandlesTuple = fallbackCandles?.map((candle) => [
     candle.open,
     candle.high,
@@ -831,9 +886,63 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
     candle.close,
     candle.volume,
   ] as Candle);
+  const fastFallbackCandlesTuple = useFastFallbackCandles
+    ? fastCandles!.value!.map((candle) => [
+      candle.open,
+      candle.high,
+      candle.low,
+      candle.close,
+      candle.volume,
+    ] as Candle)
+    : null;
+  const fallback1hCandlesTuple = useFallback1hCandles
+    ? fallback.higherTimeframeCandles['1h'].value!.map((candle) => [
+      candle.open,
+      candle.high,
+      candle.low,
+      candle.close,
+      candle.volume,
+    ] as Candle)
+    : null;
+  const fallback4hCandlesTuple = useFallback4hCandles
+    ? fallback.higherTimeframeCandles['4h'].value!.map((candle) => [
+      candle.open,
+      candle.high,
+      candle.low,
+      candle.close,
+      candle.volume,
+    ] as Candle)
+    : null;
 
-  return {
+  const councilAnalysis: AnalysisResult = {
     ...analysis,
+    signalDataTimestamps: {
+      ...analysis.signalDataTimestamps,
+      ...(fastFallbackCandlesTuple && fastCandlesTimestampMs !== null
+        ? {
+          mtf1mMs: fastCandlesTimestampMs,
+          mtf1mIsPartial: fastCandles?.isPartial === true,
+        }
+        : {}),
+      ...(fallback1hCandlesTuple
+        ? { mtf1hMs: fallback.higherTimeframeCandles['1h'].sourceTimestampMs }
+        : {}),
+      ...(fallback4hCandlesTuple
+        ? { mtf4hMs: fallback.higherTimeframeCandles['4h'].sourceTimestampMs }
+        : {}),
+      ...(useFallbackDerivatives ? {
+        fundingRateMs: fallback.fundingRate.sourceTimestampMs,
+        openInterestMs: fallback.liveOpenInterest.sourceTimestampMs,
+      } : {}),
+    },
+    ...(fastFallbackCandlesTuple || fallback1hCandlesTuple || fallback4hCandlesTuple ? {
+      htfCandles: {
+        ...analysis.htfCandles,
+        ...(fastFallbackCandlesTuple ? { '1m': fastFallbackCandlesTuple } : {}),
+        ...(fallback1hCandlesTuple ? { '1h': fallback1hCandlesTuple } : {}),
+        ...(fallback4hCandlesTuple ? { '4h': fallback4hCandlesTuple } : {}),
+      },
+    } : {}),
     ...(fallbackCandlesTuple ? { candles: fallbackCandlesTuple } : {}),
     ...(typeof fallbackFundingRate === 'number' ? {
       funding: fallbackFundingRate,
@@ -897,6 +1006,16 @@ export function applyPublicMarketFallbackToCouncilAnalysis(
       },
     } : {}),
   };
+  if (fallback1hCandlesTuple || fallback4hCandlesTuple) {
+    const { analyzeHtfTrend } = await import('./analysisEngine');
+    if (fallback1hCandlesTuple) {
+      councilAnalysis.mtf1h = analyzeHtfTrend(fallback1hCandlesTuple);
+    }
+    if (fallback4hCandlesTuple) {
+      councilAnalysis.mtf4h = analyzeHtfTrend(fallback4hCandlesTuple);
+    }
+  }
+  return councilAnalysis;
 }
 
 async function analyzeSnapshot(
@@ -945,7 +1064,7 @@ async function analyzeSnapshot(
   ) {
     analysis.openSourceAdvisories = readyAdvisory;
   }
-  const councilAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
+  const councilAnalysis = await applyPublicMarketFallbackToCouncilAnalysis(
     analysis,
     publicMarketFallback,
     councilEvaluationNowMs,

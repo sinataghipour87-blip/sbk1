@@ -101,6 +101,26 @@ try {
   });
   assert.equal(validated.signalId, ids.signalId);
   assert.equal(validated.authorization.decision, 'APPROVE_ENTRY');
+  const maxBoundedRiskSignal = validateSbkFreqtradeSignal({
+    ...signal,
+    riskLimits: { ...signal.riskLimits, riskBudgetPct: 10, maxLeverage: 25 },
+  }, { nowMs });
+  assert.equal(maxBoundedRiskSignal.riskLimits.riskBudgetPct, 10);
+  assert.equal(maxBoundedRiskSignal.riskLimits.maxLeverage, 25);
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      riskLimits: { ...signal.riskLimits, riskBudgetPct: 10.01 },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_RISK_LIMITS',
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      riskLimits: { ...signal.riskLimits, maxLeverage: 25.01 },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_RISK_LIMITS',
+  );
   const unscoredSignal = validateSbkFreqtradeSignal({
     ...signal,
     engineScore: null,

@@ -679,6 +679,15 @@ export interface SmcZone {
 
 export interface AnalysisResult {
   openSourceAdvisories?: OpenSourceAdvisoryReport;
+  signalDataTimestamps?: {
+    fundingRateMs?: number | null;
+    openInterestMs?: number | null;
+    mtf1mMs?: number | null;
+    mtf1mIsPartial?: boolean;
+    mtf5mMs?: number | null;
+    mtf1hMs?: number | null;
+    mtf4hMs?: number | null;
+  };
   price: number;
   lastPrice?: number;        // Executable fill price (Last Price)
   markPrice?: number;        // Stop Loss & Liquidation Benchmark (Mark Price)

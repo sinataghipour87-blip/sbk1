@@ -107,6 +107,12 @@ const analysis = {
   },
   fundingRate: -0.0003,
   oi: 10_000,
+  signalDataTimestamps: {
+    fundingRateMs: sourceTimestampMs,
+    openInterestMs: sourceTimestampMs,
+    mtf1hMs: sourceTimestampMs,
+    mtf4hMs: sourceTimestampMs,
+  },
   openSourceAdvisories: {
     requestId: 'runtime-test',
     contractVersion: 'sbk1.open-source-advisories.v1' as const,
@@ -299,6 +305,12 @@ const freeMacroData: FreeMacroDataResult = {
     ageMs: null,
     error: 'No verification API key configured.',
   },
+  dxyProxy: {
+    ...macroMetric('tradingview-dxy-proxy', 105),
+    provider: 'TradingView public Scanner (TVC:DXY CFD; upstream observation timestamp unavailable)',
+    metric: 'TradingView TVC:DXY CFD proxy (not official ICE DXY; retrieval time only)',
+    changePct: -0.2,
+  },
   broadDollar: {
     ...macroMetric('broad-dollar-proxy', 120),
     observedAt: new Date(nowMs - 2 * 24 * 60 * 60_000).toISOString(),
@@ -481,9 +493,12 @@ try {
 
   const macroMember = JSON.parse(await readFile(path.join(repositoryDir, 'member-07.jsonl'), 'utf8').then((value) => value.trim()));
   assert.equal(macroMember.vote, 'LONG', 'member 7 must use the fresh direct macro sources provided to the server runtime');
-  assert.match(macroMember.rationaleFa, /proxy، نه DXY/);
+  assert.match(macroMember.rationaleFa, /TradingView TVC:DXY/);
+  assert.match(macroMember.rationaleFa, /CFD proxy/);
   assert.equal(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.broadDollarProxy').status, 'AVAILABLE');
   assert.equal(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.dxy').status, 'UNAVAILABLE');
+  assert.equal(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.tradingViewDxyProxy').status, 'AVAILABLE');
+  assert.match(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.tradingViewDxyProxy').summaryFa, /CFD proxy/);
   assert.equal('output' in macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.broadDollarProxy'), false);
   assert.match(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.broadDollarProxy').summaryFa, /proxy/);
   assert.equal(

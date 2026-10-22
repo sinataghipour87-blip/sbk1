@@ -8,7 +8,7 @@ let requestCount = 0;
 
 const live = await fetchFreeMacroData({
   nowMs,
-  fetcher: async (input) => {
+  fetcher: async (input, init) => {
     requestCount += 1;
     const endpoint = new URL(String(input));
     if (endpoint.hostname === 'fred.stlouisfed.org') {
@@ -21,6 +21,8 @@ const live = await fetchFreeMacroData({
     }
     if (endpoint.hostname === 'query1.finance.yahoo.com') {
       assert.equal(endpoint.pathname.endsWith('/DX-Y.NYB'), true);
+      assert.match(new Headers(init?.headers).get('user-agent') ?? '', /Mozilla\/5\.0/);
+      assert.match(new Headers(init?.headers).get('accept-language') ?? '', /en-US/);
       return Response.json({
         chart: {
           result: [{
@@ -129,9 +131,8 @@ const stale = await fetchFreeMacroData({
     });
   },
 });
-assert.equal(stale.sp500.status, 'UNAVAILABLE');
-assert.match(stale.sp500.error ?? '', /latest finite observation is 2026-10-16/);
-assert.match(stale.sp500.error ?? '', /exceeding the 7200-minute freshness limit/);
+assert.equal(stale.sp500.status, 'LIVE', 'weekly macro series remain usable within the 14-day freshness window');
+assert.equal(stale.sp500.observedAt, '2026-10-16');
 assert.equal(stale.bitcoinActiveAddresses.status, 'UNAVAILABLE');
 
 const freshnessBoundaryNowMs = Date.parse('2026-10-21T00:00:00.000Z');
@@ -253,9 +254,193 @@ const dxyUnavailable = await fetchFreeMacroData({
 });
 assert.equal(dxyUnavailable.dxy.status, 'UNAVAILABLE');
 assert.match(dxyUnavailable.dxy.error ?? '', /Yahoo DXY fallback unavailable/);
+assert.equal(dxyUnavailable.dxyProxy?.status, 'UNAVAILABLE');
+
+const tradingViewNowMs = Date.now();
+const tradingViewProxy = await fetchFreeMacroData({
+  nowMs: tradingViewNowMs,
+  massiveApiKey: '',
+  fetcher: async (input, init) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      const seriesId = endpoint.searchParams.get('id');
+      const date = new Date(tradingViewNowMs).toISOString().slice(0, 10);
+      return new Response(`observation_date,${seriesId}\n${date},100.5\n`, {
+        headers: { 'Content-Type': 'text/csv' },
+      });
+    }
+    if (endpoint.hostname === 'query1.finance.yahoo.com') {
+      throw new Error('Yahoo DXY is rate-limited.');
+    }
+    if (endpoint.hostname === 'scanner.tradingview.com') {
+      assert.equal(init?.method, 'POST');
+      assert.match(new Headers(init?.headers).get('user-agent') ?? '', /Mozilla\/5\.0/);
+      assert.deepEqual(JSON.parse(String(init?.body)), {
+        symbols: { tickers: ['TVC:DXY'], query: { types: [] } },
+        columns: ['close', 'change', 'update_mode', 'type', 'subtype'],
+      });
+      return Response.json({
+        totalCount: 1,
+        data: [{
+          s: 'TVC:DXY',
+          d: [101.616, -0.07375, 'streaming', 'index', 'cfd'],
+        }],
+      });
+    }
+    return Response.json({
+      data: [{
+        asset: 'btc',
+        time: new Date(tradingViewNowMs - 60 * 60_000).toISOString(),
+        AdrActCnt: '650000',
+      }],
+    });
+  },
+});
+assert.equal(tradingViewProxy.dxy.status, 'UNAVAILABLE', 'a CFD proxy must never be reported as exact DXY');
+assert.equal(tradingViewProxy.dxyProxy?.status, 'LIVE');
+assert.equal(tradingViewProxy.dxyProxy?.value, 101.616);
+assert.equal(tradingViewProxy.dxyProxy?.changePct, -0.07375);
+assert.match(tradingViewProxy.dxyProxy?.provider ?? '', /TVC:DXY CFD/);
+assert.match(tradingViewProxy.dxyProxy?.metric ?? '', /not official ICE DXY/);
+assert.equal(tradingViewProxy.dxyProxy?.observedAtMs, tradingViewProxy.dxyProxy?.retrievedAtMs,
+  'proxy timestamp explicitly means scanner retrieval time, not exchange observation time');
+
+const invalidTradingViewResponses: Array<{ payload: unknown; error: RegExp }> = [
+  { payload: { totalCount: 0, data: [] }, error: /malformed or incomplete/ },
+  {
+    payload: { totalCount: 1, data: [{ s: 'TVC:EURUSD', d: [1.08, 0.1, 'streaming', 'index', 'cfd'] }] },
+    error: /unexpected DXY symbol or schema/,
+  },
+  {
+    payload: { totalCount: 1, data: [{ s: 'TVC:DXY', d: [101.616, -0.07375, 'delayed', 'index', 'cfd'] }] },
+    error: /not marked streaming/,
+  },
+  {
+    payload: { totalCount: 1, data: [{ s: 'TVC:DXY', d: [101.616, -0.07375, 'streaming', 'index', 'spot'] }] },
+    error: /not marked streaming/,
+  },
+];
+for (const invalidResponse of invalidTradingViewResponses) {
+  const tradingViewUnavailable = await fetchFreeMacroData({
+    nowMs: tradingViewNowMs + 10_000,
+    massiveApiKey: '',
+    fetcher: async (input) => {
+      const endpoint = new URL(String(input));
+      if (endpoint.hostname === 'scanner.tradingview.com') {
+        return Response.json(invalidResponse.payload);
+      }
+      if (endpoint.hostname === 'fred.stlouisfed.org') {
+        const seriesId = endpoint.searchParams.get('id');
+        const date = new Date(tradingViewNowMs).toISOString().slice(0, 10);
+        return new Response(`observation_date,${seriesId}\n${date},100.5\n`, {
+          headers: { 'Content-Type': 'text/csv' },
+        });
+      }
+      throw new Error('No usable DXY source.');
+    },
+  });
+  assert.equal(tradingViewUnavailable.dxyProxy?.status, 'UNAVAILABLE');
+  assert.match(tradingViewUnavailable.dxyProxy?.error ?? '', invalidResponse.error);
+}
+
+const closedSessionNowMs = Date.now() + 3 * 60_000;
+const closedSessionDxyTimestampMs =
+  Math.floor((closedSessionNowMs - 3 * 24 * 60 * 60_000) / 1_000) * 1_000;
+const closedSessionDxy = await fetchFreeMacroData({
+  nowMs: closedSessionNowMs,
+  massiveApiKey: '',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'query1.finance.yahoo.com') {
+      assert.match(endpoint.search, /range=5d/);
+      return Response.json({
+        chart: { result: [{
+          meta: {
+            chartPreviousClose: 104,
+            regularMarketPrice: 104.25,
+            currentTradingPeriod: {
+              regular: {
+                start: Math.floor((closedSessionNowMs - 6 * 60 * 60_000) / 1_000),
+                end: Math.floor((closedSessionNowMs - 60 * 60_000) / 1_000),
+              },
+            },
+          },
+          timestamp: [Math.floor(closedSessionDxyTimestampMs / 1_000)],
+          indicators: { quote: [{ close: [104.25] }] },
+        }] },
+      });
+    }
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      const seriesId = endpoint.searchParams.get('id');
+      return new Response(`observation_date,${seriesId}\n2026-10-16,100.5\n`, {
+        headers: { 'Content-Type': 'text/csv' },
+      });
+    }
+    return Response.json({ data: [] });
+  },
+});
+assert.equal(closedSessionDxy.dxy.status, 'LIVE');
+assert.equal(closedSessionDxy.dxy.observedAtMs, closedSessionDxyTimestampMs);
+assert.match(closedSessionDxy.dxy.provider, /Yahoo Finance chart/);
+
+const closedSessionCacheFallback = await fetchFreeMacroData({
+  nowMs: closedSessionNowMs + 31_000,
+  massiveApiKey: '',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'query1.finance.yahoo.com') {
+      throw new Error('Yahoo temporary outage.');
+    }
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      const seriesId = endpoint.searchParams.get('id');
+      return new Response(`observation_date,${seriesId}\n2026-10-16,100.5\n`, {
+        headers: { 'Content-Type': 'text/csv' },
+      });
+    }
+    return Response.json({ data: [] });
+  },
+});
+assert.equal(closedSessionCacheFallback.dxy.status, 'LIVE');
+assert.match(closedSessionCacheFallback.dxy.provider, /cached last close/);
+
+const openSessionNowMs = closedSessionNowMs + 62_000;
+const staleOpenSessionDxy = await fetchFreeMacroData({
+  nowMs: openSessionNowMs,
+  massiveApiKey: '',
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'query1.finance.yahoo.com') {
+      return Response.json({
+        chart: { result: [{
+          meta: {
+            chartPreviousClose: 104,
+            regularMarketPrice: 104.25,
+            currentTradingPeriod: {
+              regular: {
+                start: Math.floor((openSessionNowMs - 60_000) / 1_000),
+                end: Math.floor((openSessionNowMs + 6 * 60 * 60_000) / 1_000),
+              },
+            },
+          },
+          timestamp: [Math.floor(closedSessionDxyTimestampMs / 1_000)],
+          indicators: { quote: [{ close: [104.25] }] },
+        }] },
+      });
+    }
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      const seriesId = endpoint.searchParams.get('id');
+      return new Response(`observation_date,${seriesId}\n2026-10-16,100.5\n`, {
+        headers: { 'Content-Type': 'text/csv' },
+      });
+    }
+    return Response.json({ data: [] });
+  },
+});
+assert.equal(staleOpenSessionDxy.dxy.status, 'UNAVAILABLE');
+assert.match(staleOpenSessionDxy.dxy.error ?? '', /live limit/);
 
 const delayedDxy = await fetchFreeMacroData({
-  nowMs: dxyNowMs + 60_000,
+  nowMs: dxyNowMs + 24 * 60 * 60_000,
   massiveApiKey: 'verification-secret',
   fetcher: async (input) => {
     const endpoint = new URL(String(input));
@@ -275,7 +460,7 @@ assert.equal(delayedDxy.dxy.status, 'UNAVAILABLE');
 assert.match(delayedDxy.dxy.error ?? '', /no entitled real-time/);
 
 const dxyRequestFailed = await fetchFreeMacroData({
-  nowMs: dxyNowMs + 120_000,
+  nowMs: dxyNowMs + 24 * 60 * 60_000 + 60_000,
   massiveApiKey: 'verification-secret',
   fetcher: async (input) => {
     const endpoint = new URL(String(input));

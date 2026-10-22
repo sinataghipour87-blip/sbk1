@@ -276,10 +276,10 @@ export class RiskEngine {
     // Calculates: Realized PnL + Unrealized Losses + Fees + Funding + Slippage
     const realDailyLossUsd = calculateRealDailyLoss(activePositions, tradeHistory);
     const realEquityUsd = accountState.currentEquityUsd > 0 ? accountState.currentEquityUsd : 1000;
-    const dailyLossLimitUsd = realEquityUsd * 0.05; // 5% of real exchange equity
+    const dailyLossLimitUsd = realEquityUsd * 0.10;
 
-    if (realDailyLossUsd < -dailyLossLimitUsd) {
-      rejectionReasonsFa.push(`لایه ریسک: زیان واقعی روزانه به سقف مجاز ۵٪ اکوئیتی صرافی رسیده است (-$${Math.abs(realDailyLossUsd).toFixed(2)} / -$${dailyLossLimitUsd.toFixed(2)}).`);
+    if (realDailyLossUsd <= -dailyLossLimitUsd) {
+      rejectionReasonsFa.push(`لایه ریسک: زیان واقعی روزانه به سقف مجاز ۱۰٪ اکوئیتی صرافی رسیده است (-$${Math.abs(realDailyLossUsd).toFixed(2)} / -$${dailyLossLimitUsd.toFixed(2)}).`);
     }
 
     // 6. Item 35: Max Drawdown Gate from Real Peak Exchange Equity (< 15.0%)

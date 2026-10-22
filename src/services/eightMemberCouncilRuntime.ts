@@ -366,9 +366,11 @@ function sourceDataForMember(
     sourceTimestampMs: number | null;
     value: unknown;
     error?: string;
+    isPartial?: boolean;
   }) => ({
     status: feed.status,
     sourceTimestampMs: feed.sourceTimestampMs,
+    isPartial: feed.isPartial === true,
     observationCount: Array.isArray(feed.value)
       ? feed.value.length
       : isObject(feed.value) && Array.isArray(feed.value.trades)
@@ -400,6 +402,7 @@ function sourceDataForMember(
     case 1:
       return {
         candles: analysis.candles.slice(-30),
+        oneMinuteCandles: analysis.htfCandles?.['1m']?.slice(-30) ?? [],
         scoreLong: analysis.scoreLong,
         scoreShort: analysis.scoreShort,
         indicators: {
@@ -413,10 +416,19 @@ function sourceDataForMember(
           structuralReport: analysis.mtfStructuralReport,
         },
         candleFeed: analysis.dataQualityReport?.feeds.candles,
+        signalDataTimestamps: {
+          mtf1mMs: analysis.signalDataTimestamps?.mtf1mMs ?? null,
+          mtf1mIsPartial: analysis.signalDataTimestamps?.mtf1mIsPartial ?? false,
+          mtf1hMs: analysis.signalDataTimestamps?.mtf1hMs ?? null,
+          mtf4hMs: analysis.signalDataTimestamps?.mtf4hMs ?? null,
+        },
         marketFallback: fallback && {
           ...fallback,
           crossExchangeQuotes,
           feed: fallbackFeedSummary(publicMarketFallback!.candles),
+          fastCandles: fallbackFeedSummary(publicMarketFallback!.fastCandles),
+          oneHourCandles: fallbackFeedSummary(publicMarketFallback!.higherTimeframeCandles['1h']),
+          fourHourCandles: fallbackFeedSummary(publicMarketFallback!.higherTimeframeCandles['4h']),
         },
       };
     case 2:
@@ -443,6 +455,10 @@ function sourceDataForMember(
       return {
         fundingRate: analysis.fundingRate ?? analysis.funding,
         openInterest: analysis.oi,
+        signalDataTimestamps: {
+          fundingRateMs: analysis.signalDataTimestamps?.fundingRateMs ?? null,
+          openInterestMs: analysis.signalDataTimestamps?.openInterestMs ?? null,
+        },
         derivatives: analysis.cvdOiMatrix,
         liquidationCascade: analysis.liquidationCascadePrediction,
         derivativesFeed: analysis.dataQualityReport?.feeds.derivatives,
@@ -450,7 +466,8 @@ function sourceDataForMember(
           ...fallback,
           crossExchangeQuotes,
           fundingRate: fallbackFeedSummary(publicMarketFallback!.fundingRate),
-          openInterest: fallbackFeedSummary(publicMarketFallback!.openInterest),
+          openInterest: fallbackFeedSummary(publicMarketFallback!.liveOpenInterest),
+          historicalOpenInterest: fallbackFeedSummary(publicMarketFallback!.openInterest),
         },
       };
     case 5:
@@ -508,7 +525,7 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
     const fallbackEvidence = (
       feed: PublicMarketFallbackData['candles'] | PublicMarketFallbackData['orderBook'] |
         PublicMarketFallbackData['tradeFlow'] | PublicMarketFallbackData['fundingRate'] |
-        PublicMarketFallbackData['openInterest'],
+        PublicMarketFallbackData['openInterest'] | PublicMarketFallbackData['liveOpenInterest'],
       maxAgeMs: number,
       label: string,
     ): ModuleValue => {
@@ -528,18 +545,28 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
           status: feed.status,
           sourceTimestampMs: timestampMs,
           ageMs,
+          isPartial: feed.isPartial === true,
           error: feed.error,
         },
         sourceTimestampMs: timestampMs,
         available: isFresh,
         resolvedStatus: isFresh ? 'AVAILABLE' : feed.status === 'LIVE' ? 'STALE' : 'UNAVAILABLE',
         summaryFa: isFresh
-          ? `${label} از ${marketFallback.provider} (${marketFallback.pair})؛ سن ${Math.round(ageMs!)}ms.`
+          ? `${label}${feed.isPartial ? ' در حال تشکیل' : ''} از ${marketFallback.provider} (${marketFallback.pair})؛ سن ${Math.round(ageMs!)}ms.`
           : feed.error ?? `${label} از منبع جایگزین موجود نیست یا کهنه است.`,
       };
     };
     values['marketFallback.binanceCandles'] = fallbackEvidence(
       marketFallback.candles, candleMaxAgeMs, 'کندل‌های عمومی تکمیل‌شده',
+    );
+    values['marketFallback.binanceFastCandles'] = fallbackEvidence(
+      marketFallback.fastCandles, 65_000, 'کندل‌های عمومی ۱دقیقه‌ای برای رأی سریع عضو ۱',
+    );
+    values['marketFallback.binance1hCandles'] = fallbackEvidence(
+      marketFallback.higherTimeframeCandles['1h'], 60 * 60_000 + 5_000, 'کندل‌های عمومی ۱ساعته',
+    );
+    values['marketFallback.binance4hCandles'] = fallbackEvidence(
+      marketFallback.higherTimeframeCandles['4h'], 4 * 60 * 60_000 + 5_000, 'کندل‌های عمومی ۴ساعته',
     );
     values['marketFallback.binanceTrades'] = fallbackEvidence(
       marketFallback.tradeFlow, 5_000, 'معاملات عمومی اجراشده برای CVD',
@@ -551,7 +578,7 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
       marketFallback.fundingRate, 60_000, 'Funding عمومی',
     );
     const openInterestEvidence = fallbackEvidence(
-      marketFallback.openInterest, 10 * 60_000, 'OI عمومی',
+      marketFallback.liveOpenInterest, 10_000, 'OI لحظه‌ای عمومی',
     );
     const derivativesAvailable = fundingEvidence.available && openInterestEvidence.available;
     values['marketFallback.binanceDerivatives'] = {
@@ -564,7 +591,7 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
         openInterest: openInterestEvidence.output,
       },
       sourceTimestampMs: derivativesAvailable
-        ? Math.max(fundingEvidence.sourceTimestampMs!, openInterestEvidence.sourceTimestampMs!)
+        ? Math.min(fundingEvidence.sourceTimestampMs!, openInterestEvidence.sourceTimestampMs!)
         : null,
       available: derivativesAvailable,
       resolvedStatus: derivativesAvailable
@@ -746,41 +773,53 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
   const whaleFlowAvailable = whaleFlow?.status === 'LIVE' &&
     whaleFlowAgeMs !== null &&
     whaleFlowAgeMs >= 0 &&
-    whaleFlowAgeMs <= (whaleFlow?.largeTransfers ? 20 : 10) * 60_000 &&
+    whaleFlowAgeMs <= 5 * 60_000 &&
     whaleFlow.qualityPct >= 80 &&
     (Array.isArray(whaleFlow.largeTransfers) || isFiniteNumber(whaleFlow.netExchangeFlowBtc));
   values['onchain.bitcoinPublicTransfers'] = {
     output: whaleFlow ?? null,
     sourceTimestampMs: whaleFlow?.timestampMs ?? null,
     available: whaleFlowAvailable,
-    resolvedStatus: whaleFlowAvailable ? 'AVAILABLE' : whaleFlow?.status === 'STALE' ? 'STALE' : 'UNAVAILABLE',
+    resolvedStatus: whaleFlowAvailable
+      ? 'AVAILABLE'
+      : whaleFlow?.status === 'STALE' || (whaleFlowAgeMs !== null && whaleFlowAgeMs > 5 * 60_000)
+        ? 'STALE'
+        : 'UNAVAILABLE',
     summaryFa: whaleFlowAvailable
       ? `دادهٔ خام آن‌چین از ${whaleFlow.provider}؛ ${whaleFlow.transactionCount} خروجی بزرگ مشاهده‌شده. پوشش نمونه‌ای است و انتساب صرافی ندارد.`
-      : whaleFlow?.unavailableReason ?? 'دادهٔ خام زنجیره‌ای با کیفیت و تازگی لازم موجود نیست.',
+      : whaleFlow?.unavailableReason ??
+        (whaleFlowAgeMs !== null && whaleFlowAgeMs > 5 * 60_000
+          ? 'دادهٔ معتبر آن‌چین قدیمی‌تر از پنج دقیقه است و برای رأی استفاده نمی‌شود.'
+          : 'دادهٔ خام زنجیره‌ای با کیفیت و تازگی لازم موجود نیست.'),
   };
   values['macro.sp500'] = directMetricEvidence(
     macroData?.sp500,
-    5 * 24 * 60 * 60_000,
+    14 * 24 * 60 * 60_000,
     'شاخص S&P 500 و تغییر روزانه.',
   );
   values['macro.dxy'] = directMetricEvidence(
     macroData?.dxy,
-    2 * 60_000,
+    7 * 24 * 60 * 60_000,
     'شاخص واقعی دلار DXY.',
+  );
+  values['macro.tradingViewDxyProxy'] = directMetricEvidence(
+    macroData?.dxyProxy,
+    5_000,
+    'TradingView TVC:DXY؛ CFD proxy با زمان دریافت snapshot، نه زمان مشاهدهٔ مستقل منبع.',
   );
   values['macro.broadDollarProxy'] = directMetricEvidence(
     macroData?.broadDollar,
-    5 * 24 * 60 * 60_000,
+    14 * 24 * 60 * 60_000,
     'شاخص گسترده دلارِ فدرال رزرو به‌عنوان proxy؛ این داده DXY نیست.',
   );
   const fedEffectiveRate = directMetricEvidence(
     macroData?.fedEffectiveRate,
-    5 * 24 * 60 * 60_000,
+    14 * 24 * 60 * 60_000,
     'نرخ مؤثر فدرال رزرو.',
   );
   const fedTargetUpperBound = directMetricEvidence(
     macroData?.fedTargetUpperBound,
-    5 * 24 * 60 * 60_000,
+    14 * 24 * 60 * 60_000,
     'سقف نرخ هدف فدرال رزرو.',
   );
   const fedRatesAvailable = fedEffectiveRate.available || fedTargetUpperBound.available;

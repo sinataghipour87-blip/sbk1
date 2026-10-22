@@ -501,7 +501,7 @@ export function runPostCouncilTradeControl(
     input.dailyLossUsd >= 0 &&
     Number.isFinite(input.dailyLossLimitPct) &&
     input.dailyLossLimitPct > 0 &&
-    input.dailyLossLimitPct <= 5;
+    input.dailyLossLimitPct <= 10;
   const maxPortfolioRiskUsd = input.balance * input.riskBudgetPct / 100 * input.maxOpenTrades;
   const maxDailyLossUsd = input.balance * input.dailyLossLimitPct / 100;
   const portfolioRiskAvailable = riskContextIsValid &&

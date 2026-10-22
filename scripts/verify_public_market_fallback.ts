@@ -27,6 +27,23 @@ const candleRows = Array.from({ length: 40 }, (_, index) => {
     '10',
   ];
 });
+const makeHigherTimeframeRows = (durationMs: number) => {
+  const latestCloseMs = Math.floor(nowMs / durationMs) * durationMs;
+  return Array.from({ length: 40 }, (_, index) => {
+    const openTimestamp = latestCloseMs - (40 - index) * durationMs;
+    const open = 100 + index;
+    return [
+      openTimestamp,
+      String(open),
+      String(open + 2),
+      String(open - 1),
+      String(open + 1),
+      '10',
+    ];
+  });
+};
+const hourlyRows = makeHigherTimeframeRows(60 * 60_000);
+const fourHourlyRows = makeHigherTimeframeRows(4 * 60 * 60_000);
 const latestOiTimestamp = Math.floor(nowMs / (5 * 60_000)) * 5 * 60_000;
 const payloads = new Map<string, unknown>([
   ['/fapi/v1/klines', candleRows],
@@ -51,6 +68,11 @@ const payloads = new Map<string, unknown>([
     { timestamp: latestOiTimestamp - 5 * 60_000, sumOpenInterest: '9000' },
     { timestamp: latestOiTimestamp, sumOpenInterest: '10000' },
   ]],
+  ['/fapi/v1/openInterest', {
+    symbol: 'BTCUSDT',
+    openInterest: '10025',
+    time: nowMs - 100,
+  }],
   ['api.bybit.com/v5/market/tickers', {
     retCode: 0,
     time: nowMs - 400,
@@ -62,8 +84,14 @@ const payloads = new Map<string, unknown>([
   }],
 ]);
 let aggTradeRequestCount = 0;
+const candleRequestLimits: number[] = [];
 const fixtureFetcher: typeof fetch = async (input) => {
   const url = new URL(String(input));
+  if (url.pathname === '/fapi/v1/klines') {
+    candleRequestLimits.push(Number(url.searchParams.get('limit')));
+    if (url.searchParams.get('interval') === '1h') return Response.json(hourlyRows);
+    if (url.searchParams.get('interval') === '4h') return Response.json(fourHourlyRows);
+  }
   if (url.pathname === '/fapi/v1/aggTrades' && aggTradeRequestCount++ === 0) {
     return new Response('', { status: 429, headers: { 'retry-after': '0' } });
   }
@@ -86,11 +114,19 @@ const fallback = await fetchPublicMarketFallback({
 assert.equal(fallback.provider, 'Binance public REST API');
 assert.equal(fallback.candles.status, 'LIVE');
 assert.equal(fallback.candles.value?.length, 40);
+assert.equal(fallback.fastCandles.status, 'LIVE');
+assert.equal(fallback.fastCandles.sourceTimestampMs, fallback.candles.sourceTimestampMs);
+assert.equal(fallback.higherTimeframeCandles['1h'].status, 'LIVE');
+assert.equal(fallback.higherTimeframeCandles['4h'].status, 'LIVE');
+assert.ok(candleRequestLimits.includes(500), 'historical candles are capped at 500 rows');
+assert.ok(candleRequestLimits.every((limit) => limit <= 500));
 assert.equal(fallback.tradeFlow.status, 'LIVE');
 assert.equal(aggTradeRequestCount, 2, '429 responses must receive one bounded retry');
 assert.equal(fallback.orderBook.status, 'LIVE');
 assert.equal(fallback.fundingRate.status, 'LIVE');
 assert.equal(fallback.openInterest.status, 'LIVE');
+assert.equal(fallback.liveOpenInterest.status, 'LIVE');
+assert.equal(fallback.liveOpenInterest.value?.amount, 10_025);
 assert.equal(fallback.exchangeQuotes.status, 'LIVE');
 assert.deepEqual(
   fallback.exchangeQuotes.value?.map(({ exchange }) => exchange).sort(),
@@ -99,6 +135,42 @@ assert.deepEqual(
 assert.ok(fallback.exchangeQuotes.value?.every(({ sourceTimestampMs }) =>
   nowMs - sourceTimestampMs <= 5_000
 ));
+const fiveMinuteCloseMs = Math.floor(nowMs / (5 * 60_000)) * 5 * 60_000;
+const fiveMinuteRows = Array.from({ length: 40 }, (_, index) => {
+  const openTimestamp = fiveMinuteCloseMs - (40 - index) * 5 * 60_000;
+  const open = 100 + index;
+  return [
+    openTimestamp,
+    String(open),
+    String(open + 2),
+    String(open - 1),
+    String(open + 1),
+    '10',
+  ];
+});
+const requestedIntervals: string[] = [];
+const fasterTimeframeFallback = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '5m',
+  market: 'futures',
+  nowMs,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/fapi/v1/klines') {
+      requestedIntervals.push(url.searchParams.get('interval') ?? '');
+      if (url.searchParams.get('interval') === '5m') {
+        return Response.json(fiveMinuteRows);
+      }
+    }
+    return fixtureFetcher(input, init);
+  },
+  timeoutMs: 100,
+});
+assert.equal(fasterTimeframeFallback.candles.status, 'LIVE');
+assert.equal(fasterTimeframeFallback.candles.value?.length, 40);
+assert.equal(fasterTimeframeFallback.fastCandles.status, 'LIVE');
+assert.equal(fasterTimeframeFallback.fastCandles.value?.length, 40);
+assert.deepEqual(requestedIntervals.sort(), ['1h', '1m', '4h', '5m']);
 const smallClockSkewFetcher: typeof fetch = async (input, init) => {
   const url = new URL(String(input));
   const response = await fixtureFetcher(input, init);
@@ -143,7 +215,7 @@ const excessiveClockSkewFetcher: typeof fetch = async (input, init) => {
     return Response.json({
       symbol: 'BTCUSDT',
       price: '101',
-      time: nowMs + 6_000,
+      time: nowMs + 11_000,
     });
   }
   return fixtureFetcher(input, init);
@@ -157,6 +229,53 @@ const excessiveClockSkewQuotes = await fetchPublicMarketFallback({
   timeoutMs: 100,
 });
 assert.equal(excessiveClockSkewQuotes.exchangeQuotes.status, 'UNAVAILABLE');
+const staleClockSkewFetcher: typeof fetch = async (input, init) => {
+  const url = new URL(String(input));
+  if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
+    return Response.json({
+      symbol: 'BTCUSDT',
+      price: '101',
+      time: nowMs - 11_000,
+    });
+  }
+  return fixtureFetcher(input, init);
+};
+const staleClockSkewQuotes = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: staleClockSkewFetcher,
+  timeoutMs: 100,
+});
+assert.equal(staleClockSkewQuotes.exchangeQuotes.status, 'UNAVAILABLE');
+
+let binanceTickerRequests = 0;
+const websocketReferenceQuotes = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
+      binanceTickerRequests += 1;
+    }
+    return fixtureFetcher(input, init);
+  },
+  marketDataStream: {
+    getSnapshot: () => ({
+      price: { sourceTimestampMs: nowMs - 100, retrievedAtMs: nowMs - 100, price: 100.4 },
+      tradeFlow: null,
+      orderBook: null,
+      partialFastCandle: null,
+    }),
+  },
+  timeoutMs: 100,
+});
+assert.equal(websocketReferenceQuotes.exchangeQuotes.status, 'LIVE');
+assert.equal(binanceTickerRequests, 0, 'a fresh Binance WebSocket price replaces the REST ticker request');
+assert.equal(websocketReferenceQuotes.exchangeQuotes.value?.find(({ exchange }) => exchange === 'binance')?.price, 100.4);
 const divergentQuoteFetcher: typeof fetch = async (input, init) => {
   const url = new URL(String(input));
   if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
@@ -264,7 +383,7 @@ const emptyAnalysis = {
   oi: null,
   dataQualityReport: nominallyLiveQuality,
 } as unknown as AnalysisResult;
-const councilAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
+const councilAnalysis = await applyPublicMarketFallbackToCouncilAnalysis(
   emptyAnalysis,
   fallback,
   nowMs,
@@ -273,7 +392,22 @@ assert.equal(councilAnalysis.candles.length, 40);
 assert.equal(councilAnalysis.orderFlowFeatures?.source?.includes('Binance public REST API'), true);
 assert.equal(councilAnalysis.realObiData?.source?.includes('Binance public REST API'), true);
 assert.equal(councilAnalysis.fundingRate, -0.0002);
-assert.equal(councilAnalysis.oi, 10_000);
+assert.equal(councilAnalysis.oi, 10_025);
+assert.equal(councilAnalysis.signalDataTimestamps?.openInterestMs, nowMs - 100);
+assert.equal(councilAnalysis.signalDataTimestamps?.mtf1mMs, fallback.fastCandles.sourceTimestampMs);
+assert.equal(
+  councilAnalysis.signalDataTimestamps?.mtf1hMs,
+  fallback.higherTimeframeCandles['1h'].sourceTimestampMs,
+);
+assert.equal(
+  councilAnalysis.signalDataTimestamps?.mtf4hMs,
+  fallback.higherTimeframeCandles['4h'].sourceTimestampMs,
+);
+assert.equal(councilAnalysis.htfCandles?.['1m']?.length, 40);
+assert.equal(councilAnalysis.htfCandles?.['1h']?.length, 40);
+assert.equal(councilAnalysis.htfCandles?.['4h']?.length, 40);
+assert.equal(councilAnalysis.mtf1h, 'BULLISH');
+assert.equal(councilAnalysis.mtf4h, 'BULLISH');
 
 const macroContext: CouncilMacroContext = {
   overallDataStatus: 'UNAVAILABLE',
@@ -310,6 +444,9 @@ try {
   assert.equal(report.members[3].vote, 'LONG');
   const expectedEvidence = [
     [1, 'marketFallback.binanceCandles'],
+    [1, 'marketFallback.binanceFastCandles'],
+    [1, 'marketFallback.binance1hCandles'],
+    [1, 'marketFallback.binance4hCandles'],
     [2, 'marketFallback.binanceTrades'],
     [3, 'marketFallback.binanceOrderBook'],
     [4, 'marketFallback.binanceDerivatives'],

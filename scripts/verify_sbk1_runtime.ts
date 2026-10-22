@@ -19,13 +19,13 @@ const environment = {
   SBK1_FREQTRADE_BRIDGE_TOKEN: 'runtime-test-bridge-token-that-is-long-enough',
   SBK1_BRIDGE_URL: 'http://127.0.0.1:3000',
   SBK1_SIGNAL_RISK_PCT: '1',
-  SBK1_SIGNAL_MAX_LEVERAGE: '1',
-  SBK1_SIGNAL_MAX_STAKE_QUOTE: '100',
+  SBK1_SIGNAL_MAX_LEVERAGE: '25',
+  SBK1_SIGNAL_MAX_STAKE_QUOTE: '1000000000',
 };
 const config = {
   dry_run: true,
   dry_run_wallet: 1000,
-  stake_amount: 100,
+  stake_amount: 'unlimited',
   max_open_trades: 1,
   tradable_balance_ratio: 0.9,
   margin_mode: 'isolated',
@@ -115,8 +115,8 @@ assert.throws(
   /force_entry_enable باید false/,
 );
 assert.throws(
-  () => validateRuntimeSettings({ ...config, stake_amount: 'unlimited' }, environment),
-  /fixed amount between 0 and 100/,
+  () => validateRuntimeSettings({ ...config, stake_amount: 100 }, environment),
+  /stake_amount must be unlimited/,
 );
 assert.throws(
   () => validateRuntimeSettings({ ...config, max_open_trades: 2 }, environment),
@@ -140,17 +140,10 @@ assert.throws(
 assert.throws(
   () => validateRuntimeSettings(config, {
     ...environment,
-    SBK1_SIGNAL_MAX_STAKE_QUOTE: '101',
-  }),
-  /risk limits must be finite, bounded/,
-);
-assert.throws(
-  () => validateRuntimeSettings(config, {
-    ...environment,
     SBK1_DRY_RUN_FIXTURE_ENABLED: 'true',
-    SBK1_SIGNAL_MAX_LEVERAGE: '',
+    SBK1_SIGNAL_RISK_PCT: '1.01',
   }),
-  /risk limits must be finite, bounded/,
+  /Fixture risk limits must be finite and no greater than 1%/,
 );
 assert.throws(
   () => validateRuntimeSettings({ ...config, force_entry_enable: true }, environment),

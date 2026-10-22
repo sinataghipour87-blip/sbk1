@@ -30,6 +30,7 @@ import { operationalTradeArchive } from './src/services/operationalTradeArchive'
 import { fetchDirectNewsHeadlines } from './src/services/directNewsFeeds';
 import { fetchFreeMacroData } from './src/services/freeMacroData';
 import { openSourceAdvisoryService } from './src/services/openSourceAdvisoryService';
+import { binancePublicMarketDataStream } from './src/services/publicMarketDataStream';
 
 dotenv.config();
 
@@ -1633,8 +1634,8 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
 
         const riskLimits = {
             riskBudgetPct: Number(process.env.SBK1_SIGNAL_RISK_PCT),
-            maxStakeQuote: Number(process.env.SBK1_SIGNAL_MAX_STAKE_QUOTE),
-            maxLeverage: Number(process.env.SBK1_SIGNAL_MAX_LEVERAGE),
+            maxStakeQuote: 100,
+            maxLeverage: 1,
         };
         if (
             !Number.isFinite(riskLimits.riskBudgetPct) ||
@@ -1642,15 +1643,12 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
             riskLimits.riskBudgetPct > 1 ||
             !Number.isFinite(riskLimits.maxStakeQuote) ||
             riskLimits.maxStakeQuote <= 0 ||
-            riskLimits.maxStakeQuote > 100 ||
-            !Number.isFinite(riskLimits.maxLeverage) ||
-            riskLimits.maxLeverage <= 0 ||
-            riskLimits.maxLeverage > 1
+            riskLimits.maxStakeQuote > 100
         ) {
             return res.status(503).json({
                 success: false,
                 code: 'FIXTURE_RISK_LIMITS_INVALID',
-                error: 'Valid fixture risk limits are required: risk <= 1%, stake <= 100 USDT, and leverage <= 1x.',
+                error: 'Valid fixture risk limits are required: risk <= 1%, stake <= 100 USDT, and leverage is fixed at 1x.',
             });
         }
 
@@ -2051,6 +2049,21 @@ async function startServer() {
     await viteServer.close();
     return;
   }
+  const streamPair = process.env.SBK1_FREQTRADE_PAIR?.trim() ||
+    process.env.FREQTRADE_PAIR?.trim();
+  if (streamPair) {
+    const streamMarket = process.env.SBK1_MARKET?.trim() === 'spot' ||
+      process.env.FREQTRADE_MARKET?.trim() === 'spot'
+      ? 'spot'
+      : 'futures';
+    try {
+      binancePublicMarketDataStream.start(streamPair, streamMarket);
+    } catch (error) {
+      console.error('[SBK1] Binance live market stream could not be configured; REST fallback remains enabled:', error);
+    }
+  } else {
+    console.warn('[SBK1] Binance live market stream was not started; no Freqtrade pair is configured.');
+  }
 
     const configuredPort = Number(process.env.SBK1_PORT || 3000);
     if (!Number.isInteger(configuredPort) || configuredPort < 1 || configuredPort > 65535) {
@@ -2081,6 +2094,7 @@ async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
     await Promise.all([
       serverSignalRunner?.stop(),
       openSourceAdvisoryService.stop(),
+      Promise.resolve(binancePublicMarketDataStream.stop()),
       new Promise<void>((resolve, reject) => {
         if (!httpServer?.listening) {
           resolve();

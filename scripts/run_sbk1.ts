@@ -183,13 +183,8 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   if (config.trading_mode === 'futures' && config.margin_mode !== 'isolated') {
     throw new Error('Freqtrade futures margin_mode must be isolated for the reviewed DEMO risk profile.');
   }
-  if (
-    typeof config.stake_amount !== 'number' ||
-    !Number.isFinite(config.stake_amount) ||
-    config.stake_amount <= 0 ||
-    config.stake_amount > 100
-  ) {
-    throw new Error('Freqtrade stake_amount must be a finite fixed amount between 0 and 100 USDT; unlimited sizing is prohibited.');
+  if (config.stake_amount !== 'unlimited') {
+    throw new Error('Freqtrade stake_amount must be unlimited so the signal strategy can apply its per-trade margin cap.');
   }
   if (config.max_open_trades !== 1) {
     throw new Error('Freqtrade max_open_trades must be exactly 1 for the reviewed DEMO risk profile.');
@@ -225,20 +220,18 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
     throw new Error('Freqtrade must use market stoploss and emergency/force exits; dry-run must keep stoploss_on_exchange disabled.');
   }
   const riskPctRaw = env.SBK1_SIGNAL_RISK_PCT?.trim();
-  const maxStakeRaw = env.SBK1_SIGNAL_MAX_STAKE_QUOTE?.trim();
-  const maxLeverageRaw = env.SBK1_SIGNAL_MAX_LEVERAGE?.trim();
   const riskPct = riskPctRaw ? Number(riskPctRaw) : undefined;
-  const maxStake = maxStakeRaw ? Number(maxStakeRaw) : undefined;
-  const maxLeverage = maxLeverageRaw ? Number(maxLeverageRaw) : undefined;
   const fixtureEnabled = env.SBK1_DRY_RUN_FIXTURE_ENABLED === 'true';
   if (
-    (fixtureEnabled && (riskPct === undefined || maxStake === undefined || maxLeverage === undefined)) ||
-    (riskPct !== undefined && (!Number.isFinite(riskPct) || riskPct <= 0 || riskPct > 1)) ||
-    (maxStake !== undefined &&
-      (!Number.isFinite(maxStake) || maxStake <= 0 || maxStake > config.stake_amount)) ||
-    (maxLeverage !== undefined && (!Number.isFinite(maxLeverage) || maxLeverage <= 0 || maxLeverage > 1))
+    fixtureEnabled &&
+    (
+      riskPct === undefined ||
+      !Number.isFinite(riskPct) ||
+      riskPct <= 0 ||
+      riskPct > 1
+    )
   ) {
-    throw new Error('Fixture risk limits must be finite, bounded (risk <= 1%, leverage <= 1x), and max stake must not exceed Freqtrade stake_amount.');
+    throw new Error('Fixture risk limits must be finite and no greater than 1%.');
   }
 
   const api = config.api_server;

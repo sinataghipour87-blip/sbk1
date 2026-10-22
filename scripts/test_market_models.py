@@ -359,6 +359,37 @@ class MarketModelFailClosedTests(unittest.TestCase):
                     )
                 )
 
+    def test_python_consumer_accepts_bounded_dynamic_risk_limits(self):
+        now_ms = 1_800_000_000_000
+        signal = valid_sbk_signal(now_ms)
+        signal["riskLimits"]["riskBudgetPct"] = 10
+        signal["riskLimits"]["maxLeverage"] = 25
+        self.assertTrue(
+            is_valid_sbk_signal(
+                signal,
+                now_ms=now_ms,
+                expected_exchange="bybit",
+                expected_market="futures",
+                expected_pair="BTC/USDT:USDT",
+                expected_timeframe="15m",
+            )
+        )
+
+        for field, value in (("riskBudgetPct", 10.01), ("maxLeverage", 25.01)):
+            invalid = valid_sbk_signal(now_ms)
+            invalid["riskLimits"][field] = value
+            with self.subTest(field=field):
+                self.assertFalse(
+                    is_valid_sbk_signal(
+                        invalid,
+                        now_ms=now_ms,
+                        expected_exchange="bybit",
+                        expected_market="futures",
+                        expected_pair="BTC/USDT:USDT",
+                        expected_timeframe="15m",
+                    )
+                )
+
     def test_bridge_url_only_allows_remote_https(self):
         self.assertEqual(
             validate_bridge_url("http://127.0.0.1:3000/"),

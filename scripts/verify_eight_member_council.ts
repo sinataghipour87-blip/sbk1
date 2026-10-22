@@ -105,6 +105,12 @@ const analysis = {
   },
   fundingRate: -0.0003,
   oi: 10_000,
+  signalDataTimestamps: {
+    fundingRateMs: nowMs - 1_000,
+    openInterestMs: nowMs - 1_000,
+    mtf1hMs: nowMs - 1_000,
+    mtf4hMs: nowMs - 1_000,
+  },
 };
 
 const report = evaluateEightMemberCouncil({ analysis, macroContext, nowMs });
@@ -161,12 +167,12 @@ assert.notEqual(
   'member 1 must calculate RSI14 from fresh close data when the upstream RSI is missing',
 );
 assert.equal(
-  locallyComputedRsi.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'RSI قابل‌محاسبه')?.passed,
+  locallyComputedRsi.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'RSI از کندل‌های همین snapshot')?.passed,
   true,
 );
 assert.match(
-  locallyComputedRsi.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'RSI قابل‌محاسبه')?.detailFa ?? '',
-  /محاسبه‌شده از closeهای واقعی/,
+  locallyComputedRsi.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'RSI از کندل‌های همین snapshot')?.detailFa ?? '',
+  /مستقیماً از closeهای همین snapshot/,
 );
 const changedVolumeOnly = evaluateEightMemberCouncil({
   analysis: {
@@ -193,6 +199,86 @@ const contradictoryGeneralScores = evaluateEightMemberCouncil({
   nowMs,
 });
 assert.equal(contradictoryGeneralScores.members[0].vote, 'LONG');
+const staleIndicatorInputs = evaluateEightMemberCouncil({
+  analysis: {
+    ...analysis,
+    rsi: 1,
+    mtf1h: 'BEARISH',
+    mtf4h: 'BEARISH',
+    signalDataTimestamps: {
+      ...analysis.signalDataTimestamps,
+      mtf1hMs: nowMs - 2 * 60 * 60_000,
+      mtf4hMs: nowMs - 5 * 60 * 60_000,
+    },
+  },
+  macroContext,
+  nowMs,
+});
+assert.equal(
+  staleIndicatorInputs.members[0].vote,
+  report.members[0].vote,
+  'stale RSI values and stale higher-timeframe signals must not change the technical vote',
+);
+assert.equal(
+  staleIndicatorInputs.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'تازگی تایم‌فریم ۱h/۴h')?.passed,
+  false,
+);
+const staleOneMinuteCandles = evaluateEightMemberCouncil({
+  analysis: {
+    ...analysis,
+    htfCandles: { '1m': analysis.candles },
+    signalDataTimestamps: {
+      ...analysis.signalDataTimestamps,
+      mtf1mMs: nowMs - 66_000,
+    },
+  },
+  macroContext,
+  nowMs,
+});
+assert.equal(staleOneMinuteCandles.members[0].vote, 'ABSTAIN');
+assert.equal(
+  staleOneMinuteCandles.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'تازگی کندل رأی')?.passed,
+  false,
+);
+const missingDerivativeTimestamps = evaluateEightMemberCouncil({
+  analysis: { ...analysis, signalDataTimestamps: undefined },
+  macroContext,
+  nowMs,
+});
+assert.equal(
+  missingDerivativeTimestamps.members[3].vote,
+  'ABSTAIN',
+  'derivatives must abstain when individual funding and open-interest timestamps are missing',
+);
+const staleDerivativeInputs = evaluateEightMemberCouncil({
+  analysis: {
+    ...analysis,
+    signalDataTimestamps: {
+      ...analysis.signalDataTimestamps,
+      fundingRateMs: nowMs - 61_000,
+      openInterestMs: nowMs - 11 * 60_000,
+    },
+  },
+  macroContext,
+  nowMs,
+});
+assert.equal(staleDerivativeInputs.members[3].vote, 'ABSTAIN');
+const slightlyStaleDerivativeInputs = evaluateEightMemberCouncil({
+  analysis: {
+    ...analysis,
+    signalDataTimestamps: {
+      ...analysis.signalDataTimestamps,
+      openInterestMs: nowMs - 11_000,
+    },
+  },
+  macroContext,
+  nowMs,
+});
+assert.equal(
+  slightlyStaleDerivativeInputs.members[3].vote,
+  'ABSTAIN',
+  'current open interest older than 10 seconds must not affect the derivatives vote',
+);
 
 const directMacroContext: CouncilMacroContext = {
   ...macroContext,
@@ -214,7 +300,7 @@ const directMacroCouncil = evaluateEightMemberCouncil({
 assert.equal(directMacroCouncil.members[6].vote, 'LONG');
 assert.ok(directMacroCouncil.members[6].moduleIds.includes('macro.dxy'));
 assert.match(directMacroCouncil.members[6].rationaleFa, /شاخص واقعی DXY/);
-assert.match(directMacroCouncil.members[6].rationaleFa, /proxy، نه DXY/);
+assert.match(directMacroCouncil.members[6].rationaleFa, /proxy دلار به‌جای DXY معرفی نشده/);
 
 const staleDxyCouncil = evaluateEightMemberCouncil({
   analysis,

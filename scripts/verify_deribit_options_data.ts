@@ -20,7 +20,7 @@ const summaries = Array.from({ length: 24 }, (_, index) => {
     open_interest: optionType === 'call' ? 10 : 20,
     mark_iv: optionType === 'call' ? 40 : 50,
     underlying_price: 100_000,
-    creation_timestamp: nowMs - 2_000,
+    creation_timestamp: nowMs - 30 * 24 * 60 * 60_000,
   };
 });
 
@@ -39,8 +39,8 @@ assert.equal(data.putCallRatio, 2);
 assert.equal(data.impliedVolatilityPct, 46.67);
 assert.equal(data.skewPct, 10);
 assert.equal(data.qualityPct, 100);
-assert.equal(data.timestampMs, nowMs - 2_000);
-assert.ok(data.ageMs !== null && data.ageMs <= 2_000);
+assert.ok(data.timestampMs !== null && data.timestampMs <= Date.now());
+assert.ok(data.ageMs !== null && data.ageMs <= 1_000);
 
 const freshFeed: MarketFeedQuality = {
   feedName: 'candles',
@@ -76,7 +76,7 @@ const council = evaluateEightMemberCouncil({
     candles: [],
     dataQualityReport,
   },
-  nowMs,
+  nowMs: Date.now(),
 });
 assert.equal(council.members[4].vote, 'SHORT');
 assert.match(council.members[4].rationaleFa, /Deribit public options API/);

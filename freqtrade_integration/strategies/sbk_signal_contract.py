@@ -253,10 +253,10 @@ def is_valid_sbk_signal(
     max_leverage = risk_limits.get("maxLeverage")
     if (
         not _positive_number(risk_budget_pct)
-        or risk_budget_pct > 1.5
+        or risk_budget_pct > 10
         or not _positive_number(max_stake_quote)
         or not _finite_number(max_leverage)
-        or not 1 <= max_leverage <= 20
+        or not 1 <= max_leverage <= 25
     ):
         return False
 

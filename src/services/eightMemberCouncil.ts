@@ -140,7 +140,9 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
       'technical.mtfStructuralReport',
       'sb.SB1', 'openSource.candlestickPatterns', 'openSource.marketRegime', 'openSource.marketAnomaly',
       'openSource.lightgbmForecast', 'openSource.xgboostForecast',
-      'marketFallback.binanceCandles', 'marketFallback.crossExchangePrices.member1',
+      'marketFallback.binanceCandles', 'marketFallback.binanceFastCandles',
+      'marketFallback.binance1hCandles', 'marketFallback.binance4hCandles',
+      'marketFallback.crossExchangePrices.member1',
     ],
   },
   {
@@ -193,8 +195,8 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
     nameFa: 'تحلیلگر اقتصاد کلان و نقدینگی جهانی',
     nameEn: 'Macro & Global Liquidity',
     questionFa: 'شرایط کلان و جریان سرمایه به نفع کدام جهت است؟',
-    inputIds: ['macroContext.fundamentalBias', 'macroContext.sp500DailyChangePct', 'macroContext.dxyDailyChangePct', 'macroContext.spotEtfNetInflowMillionUsd', 'macroSource.sp500', 'macroSource.dxy', 'macroSource.broadDollarProxy', 'macroSource.fedRates'],
-    moduleIds: ['brains.brain08FundamentalMacro', 'macro.sp500', 'macro.dxy', 'macro.broadDollarProxy', 'macro.fedRates'],
+    inputIds: ['macroContext.fundamentalBias', 'macroContext.sp500DailyChangePct', 'macroContext.dxyDailyChangePct', 'macroContext.spotEtfNetInflowMillionUsd', 'macroSource.sp500', 'macroSource.dxy', 'macroSource.tradingViewDxyProxy', 'macroSource.broadDollarProxy', 'macroSource.fedRates'],
+    moduleIds: ['brains.brain08FundamentalMacro', 'macro.sp500', 'macro.dxy', 'macro.tradingViewDxyProxy', 'macro.broadDollarProxy', 'macro.fedRates'],
   },
   {
     id: 8,
@@ -208,11 +210,11 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
 
 const MAX_OPTIONS_AGE_MS = 5 * 60_000;
 const MAX_ONCHAIN_AGE_MS = 10 * 60_000;
-const MAX_PUBLIC_ONCHAIN_AGE_MS = 20 * 60_000;
-const MAX_MACRO_AGE_MS = 5 * 24 * 60 * 60_000;
+const MAX_PUBLIC_ONCHAIN_AGE_MS = 5 * 60_000;
+const MAX_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_NEWS_AGE_MS = 6 * 60 * 60_000;
-const MAX_DIRECT_MACRO_AGE_MS = 5 * 24 * 60 * 60_000;
-const MAX_DXY_AGE_MS = 2 * 60_000;
+const MAX_DIRECT_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
+const MAX_DXY_AGE_MS = 7 * 24 * 60 * 60_000;
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -385,23 +387,68 @@ function evaluateTechnical(
   analysis: Partial<AnalysisResult> | null | undefined,
   nowMs: number
 ): CouncilMemberVote {
-  const feed = getFreshFeed(analysis?.dataQualityReport, 'candles', nowMs, 15_000);
-  const candles = Array.isArray(analysis?.candles) ? analysis.candles : [];
+  const dataQuality = analysis?.dataQualityReport;
+  const candleFeed = dataQuality?.feeds.candles;
+  const usesOneMinuteCandles = Array.isArray(analysis?.htfCandles?.['1m']) &&
+    analysis.htfCandles['1m'].length >= 30;
+  const candles = usesOneMinuteCandles
+    ? analysis!.htfCandles!['1m']
+    : Array.isArray(analysis?.candles) ? analysis.candles : [];
   const closes = candles
     .map((candle) => candle.length >= 6 ? candle[4] : candle[3])
     .filter((close): close is number => isFiniteNumber(close) && close > 0);
   const hasCandles = candles.length >= 30 && closes.length === candles.length;
-  const rsi = isFiniteNumber(analysis?.rsi) && analysis.rsi >= 0 && analysis.rsi <= 100
-    ? analysis.rsi
-    : calculateRsi14(closes);
+  const candleTimestampMs = usesOneMinuteCandles
+    ? analysis?.signalDataTimestamps?.mtf1mMs
+    : candleFeed?.timestamp;
+  const candleFreshness = freshTimestamp(
+    candleTimestampMs,
+    candleTimestampMs == null ? null : nowMs - candleTimestampMs,
+    nowMs,
+    65_000,
+  );
+  const candleFeedIsValid = !!candleFeed &&
+    isLiveStatus(candleFeed.status) &&
+    isFiniteNumber(candleFeed.score) &&
+    candleFeed.score >= 0 &&
+    candleFeed.score <= 100;
+  const rsi = calculateRsi14(closes);
   const hasRsi = rsi !== null;
+  const mtf1hFreshness = freshTimestamp(
+    analysis?.signalDataTimestamps?.mtf1hMs,
+    analysis?.signalDataTimestamps?.mtf1hMs == null
+      ? null
+      : nowMs - analysis.signalDataTimestamps.mtf1hMs,
+    nowMs,
+    60 * 60_000 + 5_000,
+  );
+  const mtf4hFreshness = freshTimestamp(
+    analysis?.signalDataTimestamps?.mtf4hMs,
+    analysis?.signalDataTimestamps?.mtf4hMs == null
+      ? null
+      : nowMs - analysis.signalDataTimestamps.mtf4hMs,
+    nowMs,
+    4 * 60 * 60_000 + 5_000,
+  );
+  const higherTimeframeEvidenceIsTimestamped = mtf1hFreshness !== null &&
+    mtf4hFreshness !== null;
+  const higherTimeframeValuesAreValid =
+    (analysis?.mtf1h === 'BULLISH' || analysis?.mtf1h === 'BEARISH') &&
+    (analysis?.mtf4h === 'BULLISH' || analysis?.mtf4h === 'BEARISH');
   const checks = [
-    { labelFa: 'تازگی و اعتبار فید کندل', passed: feed !== null, detailFa: feed ? `فید زنده؛ ${Math.round(feed.ageMs)}ms` : 'فید کندل زنده/تازه تأیید نشد.' },
+    { labelFa: 'تازگی کندل رأی', passed: candleFreshness !== null && candleFeedIsValid, detailFa: candleFreshness && candleFeedIsValid ? `${usesOneMinuteCandles ? analysis?.signalDataTimestamps?.mtf1mIsPartial ? 'کندل ۱m در حال تشکیل' : 'کندل ۱m تکمیل‌شده' : 'کندل اصلی'}؛ سن ${Math.round(candleFreshness.ageMs)}ms` : 'فید معتبر یا کندل تازهٔ حداکثر ۶۵ ثانیه‌ای موجود نیست.' },
     { labelFa: 'کامل بودن داده قیمت', passed: hasCandles, detailFa: hasCandles ? `${candles.length} کندل با close معتبر` : 'کمتر از ۳۰ کندل معتبر یا close نامعتبر است.' },
-    { labelFa: 'RSI قابل‌محاسبه', passed: hasRsi, detailFa: hasRsi ? `RSI14: ${rsi!.toFixed(2)}${isFiniteNumber(analysis?.rsi) ? ' از تحلیل snapshot' : ' محاسبه‌شده از closeهای واقعی'}` : 'RSI معتبر از snapshot یا کندل‌ها قابل‌محاسبه نیست.' },
+    { labelFa: 'RSI از کندل‌های همین snapshot', passed: hasRsi, detailFa: hasRsi ? `RSI14: ${rsi!.toFixed(2)}؛ مستقیماً از closeهای همین snapshot محاسبه شد.` : 'RSI از کندل‌های همین snapshot قابل‌محاسبه نیست.' },
+    { labelFa: 'تازگی تایم‌فریم ۱h/۴h', passed: higherTimeframeEvidenceIsTimestamped, detailFa: higherTimeframeEvidenceIsTimestamped ? `۱h ${Math.round(mtf1hFreshness!.ageMs / 1000)}s؛ ۴h ${Math.round(mtf4hFreshness!.ageMs / 1000)}s` : 'timestamp مستقل و تازه برای هر دو تایم‌فریم موجود نیست؛ تأیید آن‌ها در رأی استفاده نمی‌شود.' },
   ];
-  if (!feed || !hasCandles) {
-    return abstain(member, 'برای تحلیل مستقل تکنیکال، کندل تازه و حداقل ۳۰ close معتبر لازم است.', checks, feed?.feed.timestamp, feed?.ageMs);
+  if (!candleFreshness || !candleFeedIsValid || !hasCandles) {
+    return abstain(
+      member,
+      'برای تحلیل مستقل تکنیکال، کندل تازه و حداقل ۳۰ close معتبر لازم است.',
+      checks,
+      candleFreshness?.timestampMs ?? candleFeed?.timestamp ?? null,
+      candleFreshness?.ageMs ?? null,
+    );
   }
 
   const fastAverage = closes.slice(-10).reduce((sum, close) => sum + close, 0) / 10;
@@ -418,25 +465,28 @@ function evaluateTechnical(
   const rsiSignal = hasRsi
     ? rsi! >= 55 ? 1 : rsi! <= 45 ? -1 : 0
     : 0;
-  const higherTimeframeSignals = [analysis?.mtf1h, analysis?.mtf4h]
-    .filter((value): value is string => value === 'BULLISH' || value === 'BEARISH')
-    .map((value) => value === 'BULLISH' ? 1 : -1);
-  const higherTimeframeSignal = higherTimeframeSignals.length >= 2 &&
+  const higherTimeframeSignals = higherTimeframeEvidenceIsTimestamped && higherTimeframeValuesAreValid
+    ? [analysis!.mtf1h, analysis!.mtf4h].map((value) => value === 'BULLISH' ? 1 : -1)
+    : [];
+  const higherTimeframeSignal = higherTimeframeSignals.length === 2 &&
     higherTimeframeSignals.every((signal) => signal === higherTimeframeSignals[0])
     ? higherTimeframeSignals[0]
     : 0;
   const score = trendSignal + momentumSignal + rsiSignal + higherTimeframeSignal;
   const vote: CouncilVote = score >= 2 ? 'LONG' : score <= -2 ? 'SHORT' : 'NEUTRAL';
-  const rationale = `تحلیل محلی کندل: SMA10 ${fastAverage.toFixed(2)} در برابر SMA30 ${slowAverage.toFixed(2)}؛ مومنتوم ۵ کندلی ${momentumPct.toFixed(3)}٪؛ RSI14 ${hasRsi ? rsi!.toFixed(2) : 'ناموجود'}؛ سیگنال ۱h/۴h ${higherTimeframeSignal > 0 ? 'صعودی' : higherTimeframeSignal < 0 ? 'نزولی' : 'تأییدنشده'}؛ امتیاز اجزای تخصصی ${score}. امتیاز عمومی LONG/SHORT در رأی استفاده نشد.`;
+  const candleState = usesOneMinuteCandles && analysis?.signalDataTimestamps?.mtf1mIsPartial
+    ? 'کندل زندهٔ درحال‌تشکیل'
+    : 'کندل بسته‌شده';
+  const rationale = `تحلیل محلی ${candleState}: SMA10 ${fastAverage.toFixed(2)} در برابر SMA30 ${slowAverage.toFixed(2)}؛ مومنتوم ۵ کندلی ${momentumPct.toFixed(3)}٪؛ RSI14 ${hasRsi ? rsi!.toFixed(2) : 'ناموجود'}؛ تأیید ۱h/۴h ${higherTimeframeSignal > 0 ? 'صعودی' : higherTimeframeSignal < 0 ? 'نزولی' : 'نامعتبر/ناهمسو'}؛ امتیاز اجزای تخصصی ${score}. امتیاز عمومی LONG/SHORT در رأی استفاده نشد.`;
   return createVote(
     member,
     vote,
     rationale,
     checks,
     {
-      sourceTimestampMs: feed.feed.timestamp,
-      sourceAgeMs: feed.ageMs,
-      dataQualityPct: feed.feed.score,
+      sourceTimestampMs: candleFreshness.timestampMs,
+      sourceAgeMs: candleFreshness.ageMs,
+      dataQualityPct: candleFeed.score,
       confidencePct: confidenceForStrength(Math.min(35, Math.abs(score) * 10)),
     }
   );
@@ -531,13 +581,35 @@ function evaluateDerivatives(
   const feed = getFreshFeed(analysis?.dataQualityReport, 'derivatives', nowMs, 60_000);
   const fundingRate = analysis?.fundingRate ?? analysis?.funding;
   const hasOpenInterest = isFiniteNumber(analysis?.oi) && analysis.oi > 0;
-  const valid = feed !== null && isFiniteNumber(fundingRate) && hasOpenInterest;
+  const fundingFreshness = freshTimestamp(
+    analysis?.signalDataTimestamps?.fundingRateMs,
+    analysis?.signalDataTimestamps?.fundingRateMs === undefined ||
+      analysis.signalDataTimestamps.fundingRateMs === null
+      ? null
+      : nowMs - analysis.signalDataTimestamps.fundingRateMs,
+    nowMs,
+    60_000,
+  );
+  const openInterestFreshness = freshTimestamp(
+    analysis?.signalDataTimestamps?.openInterestMs,
+    analysis?.signalDataTimestamps?.openInterestMs === undefined ||
+      analysis.signalDataTimestamps.openInterestMs === null
+      ? null
+      : nowMs - analysis.signalDataTimestamps.openInterestMs,
+    nowMs,
+    10_000,
+  );
+  const valid = feed !== null &&
+    isFiniteNumber(fundingRate) &&
+    fundingFreshness !== null &&
+    hasOpenInterest &&
+    openInterestFreshness !== null;
   const checks = [
     { labelFa: 'فید مشتقات زنده و تازه', passed: feed !== null, detailFa: feed ? `${Math.round(feed.ageMs)}ms` : 'فید مشتقات زنده/تازه تأیید نشد.' },
-    { labelFa: 'Funding معتبر', passed: isFiniteNumber(fundingRate), detailFa: isFiniteNumber(fundingRate) ? `Funding: ${fundingRate}` : 'Funding موجود نیست.' },
-    { labelFa: 'Open Interest معتبر', passed: hasOpenInterest, detailFa: hasOpenInterest ? `OI: ${analysis!.oi}` : 'OI معتبر موجود نیست.' },
+    { labelFa: 'Funding معتبر و تازه', passed: isFiniteNumber(fundingRate) && fundingFreshness !== null, detailFa: fundingFreshness && isFiniteNumber(fundingRate) ? `Funding: ${fundingRate}؛ سن ${Math.round(fundingFreshness.ageMs)}ms` : 'Funding فاقد timestamp مستقل و تازه است.' },
+    { labelFa: 'Open Interest معتبر و تازه', passed: hasOpenInterest && openInterestFreshness !== null, detailFa: openInterestFreshness && hasOpenInterest ? `OI: ${analysis!.oi}؛ سن ${Math.round(openInterestFreshness.ageMs)}ms` : 'OI فاقد timestamp مستقل و تازه است.' },
   ];
-  if (!valid || !feed || !isFiniteNumber(fundingRate)) {
+  if (!valid || !feed || !fundingFreshness || !openInterestFreshness || !isFiniteNumber(fundingRate)) {
     return abstain(member, 'بدون Funding، OI و فید تازه مشتقات، رأی صادر نمی‌شود.', checks, feed?.feed.timestamp, feed?.ageMs);
   }
 
@@ -553,8 +625,8 @@ function evaluateDerivatives(
     `برداشت از ازدحام Funding (${fundingPct.toFixed(4)}٪) با OI معتبر است؛ Funding به‌تنهایی پیش‌بینی جهت قیمت تلقی نمی‌شود.`,
     checks,
     {
-      sourceTimestampMs: feed.feed.timestamp,
-      sourceAgeMs: feed.ageMs,
+      sourceTimestampMs: Math.min(fundingFreshness.timestampMs, openInterestFreshness.timestampMs),
+      sourceAgeMs: Math.max(fundingFreshness.ageMs, openInterestFreshness.ageMs),
       dataQualityPct: feed.feed.score,
       confidencePct: confidenceForStrength(Math.min(30, Math.abs(fundingRate) * 100_000)),
     }
@@ -643,14 +715,15 @@ function evaluateOnChain(
     );
     const usable = directWhaleFlow.status === 'LIVE' &&
       freshness !== null &&
-      directWhaleFlow.coverageStatus === 'SAMPLED' &&
-      confirmedTransfers.length > 0;
+      directWhaleFlow.coverageStatus === 'SAMPLED';
     const checks = [
       {
-        labelFa: 'تراکنش‌های بزرگ تأییدشده',
+        labelFa: 'اعتبار دادهٔ بلوک‌های نمونه‌برداری‌شده',
         passed: usable,
         detailFa: usable
-          ? `${confirmedTransfers.length} تراکنش تأییدشده؛ دادهٔ خام بدون انتساب مالکیت کیف‌پول`
+          ? confirmedTransfers.length > 0
+            ? `${confirmedTransfers.length} انتقال بزرگ تأییدشده؛ دادهٔ خام بدون انتساب مالکیت کیف‌پول`
+            : 'نمونهٔ تازه معتبر است؛ در بلوک‌های بررسی‌شده انتقال بزرگِ واجد آستانه پیدا نشد.'
           : directWhaleFlow.unavailableReason ?? 'تراکنش بزرگِ تأییدشده و تازه برای تحلیل جهت‌دار موجود نیست.',
       },
       {
@@ -668,6 +741,20 @@ function evaluateOnChain(
     ];
     if (!usable || !freshness) {
       return abstain(member, directWhaleFlow.unavailableReason ?? 'شواهد آن‌چین تازه و تأییدشده برای رأی معتبر کافی نیست.', checks, freshness?.timestampMs, freshness?.ageMs);
+    }
+    if (confirmedTransfers.length === 0) {
+      return createVote(
+        member,
+        'NEUTRAL',
+        'در بلوک‌های تازه و نمونه‌برداری‌شده انتقال بزرگِ واجد آستانه مشاهده نشد؛ این فقط نبود رویداد نهنگی در نمونهٔ محدود است، نه اثبات آرامش کل شبکه یا نبود فشار فروش.',
+        checks,
+        {
+          sourceTimestampMs: freshness.timestampMs,
+          sourceAgeMs: freshness.ageMs,
+          dataQualityPct: directWhaleFlow.qualityPct,
+          confidencePct: 0,
+        },
+      );
     }
     return createVote(
       member,
@@ -773,22 +860,40 @@ function evaluateMacro(
     });
   }
 
-  const broadDollar = directMacroData?.broadDollar;
-  if (isFreshDirectMacroMetric(broadDollar, nowMs) && isFiniteNumber(broadDollar.changePct)) {
-    directSignals.push({
-      label: 'دلار گستردهٔ فدرال رزرو (proxy، نه DXY)',
-      direction: broadDollar.changePct >= 0.05 ? -1 : broadDollar.changePct <= -0.05 ? 1 : 0,
-      timestampMs: broadDollar.observedAtMs,
-    });
-  }
-
   const dxy = directMacroData?.dxy;
-  if (isFreshDirectMacroMetric(dxy, nowMs, MAX_DXY_AGE_MS) && isFiniteNumber(dxy.changePct)) {
+  const freshDxy = isFreshDirectMacroMetric(dxy, nowMs, MAX_DXY_AGE_MS) &&
+    isFiniteNumber(dxy.changePct);
+  if (freshDxy) {
     directSignals.push({
       label: 'شاخص واقعی DXY',
       direction: dxy.changePct >= 0.05 ? -1 : dxy.changePct <= -0.05 ? 1 : 0,
       timestampMs: dxy.observedAtMs,
     });
+  } else {
+    const dxyProxy = directMacroData?.dxyProxy;
+    const freshTradingViewProxy = isFreshDirectMacroMetric(
+      dxyProxy,
+      nowMs,
+      5_000,
+    ) && isFiniteNumber(dxyProxy.changePct) &&
+      dxyProxy.provider.includes('TradingView public Scanner') &&
+      dxyProxy.metric.includes('not official ICE DXY');
+    if (freshTradingViewProxy) {
+      directSignals.push({
+        label: 'TradingView TVC:DXY (CFD proxy؛ زمان دریافت، نه timestamp منبع)',
+        direction: dxyProxy.changePct >= 0.05 ? -1 : dxyProxy.changePct <= -0.05 ? 1 : 0,
+        timestampMs: dxyProxy.observedAtMs,
+      });
+    } else {
+      const broadDollar = directMacroData?.broadDollar;
+      if (isFreshDirectMacroMetric(broadDollar, nowMs) && isFiniteNumber(broadDollar.changePct)) {
+        directSignals.push({
+          label: 'دلار گستردهٔ فدرال رزرو (proxy، نه DXY)',
+          direction: broadDollar.changePct >= 0.05 ? -1 : broadDollar.changePct <= -0.05 ? 1 : 0,
+          timestampMs: broadDollar.observedAtMs,
+        });
+      }
+    }
   }
 
   const freshFedRates = [
@@ -815,7 +920,7 @@ function evaluateMacro(
     return createVote(
       member,
       vote,
-      `رأی از ${directSignals.length} شاخص مستقیم و تازه گرفته شد: ${directSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ proxy دلار به‌جای DXY معرفی نشده است.`,
+      `رأی از ${directSignals.length} شاخص مستقیم و تازه گرفته شد: ${directSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ شاخص یا proxy با نام و نوع واقعی خودش گزارش شده است.`,
       [
         {
           labelFa: 'تازگی منابع کلان مستقیم',
@@ -867,6 +972,7 @@ function evaluateMacro(
   }
   const dollarTimestampMs = getMacroSourceTimestamp(macro, 'broadDollarProxy', nowMs);
   if (
+    contextSignals.every(({ label }) => label !== 'شاخص واقعی DXY') &&
     (macro?.broadDollarProxyStatus === 'LIVE' || macro?.broadDollarProxyStatus === 'PROXY') &&
     isFiniteNumber(macro.broadDollarProxyDailyChangePct) &&
     dollarTimestampMs !== null

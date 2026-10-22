@@ -37,14 +37,14 @@ let newsAdvisoryError: string | null = null;
 if (news.headlines.length > 0 && publicMarketFallback.candles.value) {
   try {
     newsAdvisoryReport = await openSourceAdvisoryService.analyze(
-      publicMarketFallback.candles.value,
+      publicMarketFallback.candles.value.slice(-500),
       news.headlines,
     );
   } catch (error) {
     newsAdvisoryError = error instanceof Error ? error.message : String(error);
   }
 }
-const marketAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
+const marketAnalysis = await applyPublicMarketFallbackToCouncilAnalysis(
   {
     price: publicMarketFallback.candles.value?.at(-1)?.close ?? 0,
     candles: publicMarketFallback.candles.value?.map((candle) => [
@@ -60,6 +60,36 @@ const marketAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
   publicMarketFallback,
   checkedAtMs,
 );
+marketAnalysis.htfCandles = {
+  ...marketAnalysis.htfCandles,
+  '1m': publicMarketFallback.fastCandles.value?.map((candle) => [
+    candle.open,
+    candle.high,
+    candle.low,
+    candle.close,
+    candle.volume,
+  ]) ?? [],
+  '1h': publicMarketFallback.higherTimeframeCandles['1h'].value?.map((candle) => [
+    candle.open,
+    candle.high,
+    candle.low,
+    candle.close,
+    candle.volume,
+  ]) ?? [],
+  '4h': publicMarketFallback.higherTimeframeCandles['4h'].value?.map((candle) => [
+    candle.open,
+    candle.high,
+    candle.low,
+    candle.close,
+    candle.volume,
+  ]) ?? [],
+};
+marketAnalysis.signalDataTimestamps = {
+  ...marketAnalysis.signalDataTimestamps,
+  mtf1mMs: publicMarketFallback.fastCandles.sourceTimestampMs,
+  mtf1hMs: publicMarketFallback.higherTimeframeCandles['1h'].sourceTimestampMs,
+  mtf4hMs: publicMarketFallback.higherTimeframeCandles['4h'].sourceTimestampMs,
+};
 const repositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-live-council-source-'));
 let whaleMemberVote: CouncilMemberVote;
 let memberVotes: Array<{
@@ -121,7 +151,7 @@ try {
 }
 const onChainFresh = onChainData.timestampMs !== null &&
   checkedAtMs >= onChainData.timestampMs &&
-  checkedAtMs - onChainData.timestampMs <= 20 * 60_000;
+  checkedAtMs - onChainData.timestampMs <= 5 * 60_000;
 const onChainRecordsValid = onChainData.status === 'LIVE' &&
   onChainData.coverageStatus === 'SAMPLED' &&
   Array.isArray(onChainData.largeTransfers) &&
@@ -195,10 +225,15 @@ const report = {
         orderBook: publicMarketFallback.orderBook,
         funding: publicMarketFallback.fundingRate,
         openInterest: publicMarketFallback.openInterest,
+        liveOpenInterest: publicMarketFallback.liveOpenInterest,
+        fastCandles: publicMarketFallback.fastCandles,
+        oneHourCandles: publicMarketFallback.higherTimeframeCandles['1h'],
+        fourHourCandles: publicMarketFallback.higherTimeframeCandles['4h'],
       }).map(([name, feed]) => [name, {
         status: feed.status,
         sourceTimestampMs: feed.sourceTimestampMs,
         ageMs: feed.sourceTimestampMs === null ? null : checkedAtMs - feed.sourceTimestampMs,
+        isPartial: feed.isPartial === true,
         error: feed.error,
       }]),
     ),
@@ -221,16 +256,27 @@ const report = {
   },
 };
 
+const macroFeedsWithoutDxy = Object.entries(macro)
+  .filter(([name]) => name !== 'dxy' && name !== 'dxyProxy')
+  .map(([, result]) => result);
 const ready =
-  Object.values(macro).every((result) => result.status === 'LIVE') &&
+  macroFeedsWithoutDxy.every((result) => result.status === 'LIVE') &&
+  (macro.dxy.status === 'LIVE' || macro.dxyProxy?.status === 'LIVE') &&
   [
     publicMarketFallback.exchangeQuotes,
     publicMarketFallback.candles,
     publicMarketFallback.tradeFlow,
     publicMarketFallback.orderBook,
     ...(market === 'futures'
-      ? [publicMarketFallback.fundingRate, publicMarketFallback.openInterest]
-      : []),
+    ? [
+        publicMarketFallback.fundingRate,
+        publicMarketFallback.openInterest,
+        publicMarketFallback.liveOpenInterest,
+      ]
+    : []),
+    publicMarketFallback.fastCandles,
+    publicMarketFallback.higherTimeframeCandles['1h'],
+    publicMarketFallback.higherTimeframeCandles['4h'],
   ].every((feed) => feed.status === 'LIVE') &&
   options.status === 'LIVE' &&
   onChainMemberVerified &&

@@ -24,18 +24,86 @@ assert.ok(
   tightStopAllocation.marginUsd * tightStopAllocation.leverage * 0.002 <=
     tightStopAllocation.riskBudgetUsd,
 );
+assert.ok(tightStopAllocation.leverage <= 25, 'the selected leverage must stay within the hard 25x cap');
+
+const maximumRiskAllocation = calculateCentralRiskAllocation({
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 25,
+  riskBudgetPct: 10,
+  stopFraction: 0.002,
+});
+assert.ok(maximumRiskAllocation);
+assert.equal(maximumRiskAllocation.leverage, 25);
+assert.equal(maximumRiskAllocation.marginUsd, 100);
+assert.ok(maximumRiskAllocation.allocatedRiskUsd <= 100);
+assert.equal(calculateCentralRiskAllocation({
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 25.01,
+  riskBudgetPct: 10,
+  stopFraction: 0.002,
+}), null, 'leverage above the hard cap must be rejected');
+assert.equal(calculateCentralRiskAllocation({
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 25,
+  riskBudgetPct: 10.01,
+  stopFraction: 0.002,
+}), null, 'risk above the hard per-trade cap must be rejected');
 
 const wideStopAllocation = calculateCentralRiskAllocation({
   balance: 1_000,
   maxStakeQuote: 100,
   maxLeverage: 5,
   riskBudgetPct: 0.1,
-  stopFraction: 0.02,
+  stopFraction: 0.005,
 });
 assert.ok(wideStopAllocation);
-assert.equal(wideStopAllocation.leverage, 1);
-assert.equal(wideStopAllocation.marginUsd, 50);
-assert.ok(wideStopAllocation.marginUsd * 0.02 <= wideStopAllocation.riskBudgetUsd);
+assert.equal(wideStopAllocation.leverage, 5);
+assert.equal(wideStopAllocation.marginUsd, 40);
+assert.ok(wideStopAllocation.marginUsd * 5 * 0.005 <= wideStopAllocation.riskBudgetUsd);
+assert.ok(wideStopAllocation.marginUsd >= 20 && wideStopAllocation.marginUsd <= 100);
+const variableAllocation = calculateCentralRiskAllocation({
+  balance: 1_000,
+  maxStakeQuote: 1_000,
+  maxLeverage: 25,
+  riskBudgetPct: 10,
+  stopFraction: 0.045,
+});
+assert.ok(variableAllocation);
+assert.equal(variableAllocation.marginUsd, 100);
+assert.ok(variableAllocation.leverage > 5 && variableAllocation.leverage < 25);
+assert.ok(variableAllocation.allocatedRiskUsd <= variableAllocation.riskBudgetUsd);
+assert.equal(
+  maximumRiskAllocation.marginUsd,
+  1_000 * 0.1,
+  'the maximum margin must be 10% of equity',
+);
+const minimumBoundsAllocation = calculateCentralRiskAllocation({
+  balance: 1_000,
+  maxStakeQuote: 1_000,
+  maxLeverage: 25,
+  riskBudgetPct: 0.1,
+  stopFraction: 0.01,
+});
+assert.ok(minimumBoundsAllocation);
+assert.equal(minimumBoundsAllocation.marginUsd, 20);
+assert.equal(minimumBoundsAllocation.leverage, 5);
+assert.equal(calculateCentralRiskAllocation({
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 25,
+  riskBudgetPct: 0.1,
+  stopFraction: 0.02,
+}), null, 'the trade must be rejected when risk cannot fund the minimum margin and leverage');
+assert.equal(calculateCentralRiskAllocation({
+  balance: 1_000,
+  maxStakeQuote: 19,
+  maxLeverage: 25,
+  riskBudgetPct: 10,
+  stopFraction: 0.005,
+}), null, 'the trade must be rejected if available margin is below 2% of equity');
 assert.ok(
   wideStopAllocation.allocatedRiskUsd <= wideStopAllocation.riskBudgetUsd,
   'the central controller must communicate the actual absolute risk budget to Freqtrade',
@@ -563,7 +631,7 @@ const remainingPortfolioBudget = runPostCouncilTradeControl({
   maxLeverage: 5,
   riskBudgetPct: 1,
   ...controlRisk,
-  openRiskUsd: 29,
+  openRiskUsd: 28.3,
   dailyLossLimitPct: 5,
   referencePrice: 60_000,
   maxDeviationBps: 100,
@@ -571,7 +639,7 @@ const remainingPortfolioBudget = runPostCouncilTradeControl({
 });
 assert.equal(remainingPortfolioBudget.approved, true);
 assert.ok(
-  (remainingPortfolioBudget.executionRisk?.allocatedRiskUsd ?? Number.POSITIVE_INFINITY) <= 1.01,
+  (remainingPortfolioBudget.executionRisk?.allocatedRiskUsd ?? Number.POSITIVE_INFINITY) <= 1.71,
   'new allocation must be limited to remaining portfolio risk, not a fresh full per-trade budget',
 );
 
@@ -598,15 +666,63 @@ const remainingDailyBudget = runPostCouncilTradeControl({
   maxLeverage: 5,
   riskBudgetPct: 1,
   ...controlRisk,
-  dailyLossUsd: 19.5,
+  dailyLossUsd: 18.3,
+  dailyLossLimitPct: 2,
   referencePrice: 60_000,
   maxDeviationBps: 100,
   nowMs,
 });
 assert.equal(remainingDailyBudget.approved, true);
 assert.ok(
-  (remainingDailyBudget.executionRisk?.allocatedRiskUsd ?? Number.POSITIVE_INFINITY) <= 0.51,
+  (remainingDailyBudget.executionRisk?.allocatedRiskUsd ?? Number.POSITIVE_INFINITY) <= 1.71,
   'new allocation must fit in the remaining daily-loss budget',
 );
+
+const maxDailyLossLimit = runPostCouncilTradeControl({
+  analysis,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  dailyLossUsd: 98.3,
+  dailyLossLimitPct: 10,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(maxDailyLossLimit.approved, true, 'the configured 10% daily-loss limit must be accepted');
+
+const exhaustedMaxDailyLossLimit = runPostCouncilTradeControl({
+  analysis,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  dailyLossUsd: 100,
+  dailyLossLimitPct: 10,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(exhaustedMaxDailyLossLimit.approved, false, 'reaching the 10% daily-loss limit must block new entries');
+
+const invalidDailyLossLimit = runPostCouncilTradeControl({
+  analysis,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  dailyLossLimitPct: 10.01,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(invalidDailyLossLimit.approved, false, 'a daily-loss limit above 10% must be rejected');
 
 console.log('Central council execution-control checks passed; no predictive ensemble is required or produced.');

@@ -843,7 +843,7 @@ class SbkSignalStrategy(IStrategy):
         signal = self._signals.get(entry_tag or "")
         if not signal or signal["market"] == "spot":
             return 1.0
-        return min(float(signal["riskLimits"]["maxLeverage"]), float(max_leverage), float(proposed_leverage))
+        return min(float(signal["riskLimits"]["maxLeverage"]), float(max_leverage))
 
     def custom_stake_amount(
         self,
@@ -868,7 +868,7 @@ class SbkSignalStrategy(IStrategy):
             or not math.isfinite(proposed_stake)
             or proposed_stake <= 0
             or not math.isfinite(leverage)
-            or leverage <= 0
+            or leverage < 5
         ):
             return 0.0
         stop_fraction = abs(current_rate - signal["entryConditions"]["stopLoss"]) / current_rate

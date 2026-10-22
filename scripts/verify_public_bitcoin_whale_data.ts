@@ -69,6 +69,43 @@ assert.equal(report.members[5].vote, 'NEUTRAL');
 assert.equal(report.members.filter((member) => member.id === 6).length, 1);
 assert.match(report.members[5].rationaleFa, /به‌تنهایی هویت مالک/);
 
+const staleForCouncil = {
+  ...data,
+  timestampMs: nowMs - 6 * 60_000,
+  ageMs: 6 * 60_000,
+};
+assert.equal(
+  evaluateEightMemberCouncil({ whaleFlowData: staleForCouncil, nowMs }).members[5].vote,
+  'ABSTAIN',
+  'the on-chain member abstains when sampled block evidence exceeds five minutes',
+);
+
+resetPublicBitcoinWhaleDataCacheForTests();
+let activeBlockRequests = 0;
+let maximumConcurrentBlockRequests = 0;
+const concurrentBlockFetcher: typeof fetch = async (input) => {
+  const url = new URL(String(input));
+  if (url.pathname.endsWith('/v1/blocks')) return Response.json(blocks);
+  activeBlockRequests += 1;
+  maximumConcurrentBlockRequests = Math.max(maximumConcurrentBlockRequests, activeBlockRequests);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  activeBlockRequests -= 1;
+  return Response.json([{
+    txid: 'c'.repeat(64),
+    status: { confirmed: true, block_height: 900_003, block_time: blockTimestamp },
+    vout: [{ value: 1_200_000_000 }],
+  }]);
+};
+const concurrentlySampled = await fetchPublicBitcoinWhaleData({
+  nowMs,
+  btcPriceUsd: 60_000,
+  fetcher: concurrentBlockFetcher,
+  sleep: async () => {},
+  forceRefresh: true,
+});
+assert.equal(concurrentlySampled.status, 'LIVE');
+assert.ok(maximumConcurrentBlockRequests > 1, 'sampled block transaction pages are requested concurrently');
+
 resetPublicBitcoinWhaleDataCacheForTests();
 const noPrice = await fetchPublicBitcoinWhaleData({
   nowMs,
@@ -91,7 +128,8 @@ assert.equal(configuredThreshold.status, 'LIVE');
 assert.equal(configuredThreshold.largeTransfers?.length, 0);
 assert.equal(
   evaluateEightMemberCouncil({ whaleFlowData: configuredThreshold, nowMs }).members[5].vote,
-  'ABSTAIN',
+  'NEUTRAL',
+  'fresh sampled blocks without large transfers produce a conservative neutral vote',
 );
 if (priorThreshold === undefined) delete process.env.SBK1_WHALE_MIN_TRANSFER_BTC;
 else process.env.SBK1_WHALE_MIN_TRANSFER_BTC = priorThreshold;
@@ -167,6 +205,65 @@ assert.match(stale.unavailableReason ?? '', /stale/);
 assert.equal(
   evaluateEightMemberCouncil({ whaleFlowData: stale, nowMs }).members[5].vote,
   'ABSTAIN',
+);
+
+resetPublicBitcoinWhaleDataCacheForTests();
+const nearFreshnessBoundary = await fetchPublicBitcoinWhaleData({
+  nowMs,
+  fetcher: async (input) => new URL(String(input)).pathname.endsWith('/v1/blocks')
+    ? Response.json(blocks.map((block) => ({
+        ...block,
+        timestamp: Math.floor((nowMs - 299_000) / 1_000),
+      })))
+    : Response.json([]),
+  sleep: async () => {},
+  forceRefresh: true,
+});
+assert.equal(nearFreshnessBoundary.status, 'LIVE');
+const cacheCrossingFreshnessBoundary = await fetchPublicBitcoinWhaleData({
+  nowMs: nowMs + 2_000,
+  fetcher: async () => {
+    throw new Error('The still-valid request cache should prevent a new fetch.');
+  },
+  sleep: async () => {},
+});
+assert.equal(
+  cacheCrossingFreshnessBoundary.status,
+  'STALE',
+  'a cached response becomes stale as soon as its source timestamp crosses five minutes',
+);
+
+resetPublicBitcoinWhaleDataCacheForTests();
+const cachedFreshSample = await fetchPublicBitcoinWhaleData({
+  nowMs,
+  fetcher: successfulFetcher,
+  sleep: async () => {},
+  forceRefresh: true,
+});
+assert.equal(cachedFreshSample.status, 'LIVE');
+const cachedOnProviderError = await fetchPublicBitcoinWhaleData({
+  nowMs: nowMs + 2 * 60_000,
+  fetcher: async () => new Response('', { status: 503 }),
+  sleep: async () => {},
+  forceRefresh: true,
+});
+assert.equal(cachedOnProviderError.status, 'LIVE');
+assert.match(cachedOnProviderError.unavailableReason ?? '', /using the last successful sample/);
+assert.equal(
+  evaluateEightMemberCouncil({ whaleFlowData: cachedOnProviderError, nowMs: nowMs + 2 * 60_000 }).members[5].vote,
+  'NEUTRAL',
+);
+const cachedTooOldForVote = await fetchPublicBitcoinWhaleData({
+  nowMs: nowMs + 6 * 60_000,
+  fetcher: async () => new Response('', { status: 503 }),
+  sleep: async () => {},
+  forceRefresh: true,
+});
+assert.equal(cachedTooOldForVote.status, 'STALE');
+assert.equal(
+  evaluateEightMemberCouncil({ whaleFlowData: cachedTooOldForVote, nowMs: nowMs + 6 * 60_000 }).members[5].vote,
+  'ABSTAIN',
+  'the retained cache never makes on-chain evidence older than five minutes vote-eligible',
 );
 
 resetPublicBitcoinWhaleDataCacheForTests();

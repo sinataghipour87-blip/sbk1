@@ -19,6 +19,7 @@ export interface DirectMetricResult {
 export interface FreeMacroDataResult {
   sp500: DirectMetricResult;
   dxy: DirectMetricResult;
+  dxyProxy?: DirectMetricResult;
   broadDollar: DirectMetricResult;
   fedEffectiveRate: DirectMetricResult;
   fedTargetUpperBound: DirectMetricResult;
@@ -29,16 +30,25 @@ const FRED_CSV_ENDPOINT = 'https://fred.stlouisfed.org/graph/fredgraph.csv';
 const NYFED_EFFR_ENDPOINT = 'https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json';
 const MASSIVE_INDICES_SNAPSHOT_ENDPOINT = 'https://api.massive.com/v3/snapshot/indices';
 const YAHOO_CHART_ENDPOINT = 'https://query1.finance.yahoo.com/v8/finance/chart';
+const TRADINGVIEW_SCANNER_ENDPOINT = 'https://scanner.tradingview.com/america/scan';
 const COINMETRICS_ENDPOINT =
   'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=AdrActCnt&limit_per_asset=1&pretty=false';
-const FRED_MAX_AGE_MS = 5 * 24 * 60 * 60_000;
+const FRED_MAX_AGE_MS = 14 * 24 * 60 * 60_000;
 const DXY_MAX_AGE_MS = 2 * 60_000;
+const DXY_CLOSED_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+const DXY_LIVE_QUOTE_MAX_AGE_MS = 2 * 60_000;
+const TRADINGVIEW_DXY_PROXY_MAX_AGE_MS = 5_000;
 const DXY_CACHE_TTL_MS = 30_000;
 const ON_CHAIN_MAX_AGE_MS = 3 * 24 * 60 * 60_000;
 const CACHE_TTL_MS = 15 * 60_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 
 const resultCache = new Map<string, { result: DirectMetricResult; cachedAtMs: number }>();
+let cachedYahooDxyLastClose: {
+  result: DirectMetricResult;
+  sessionStartMs: number;
+  sessionEndMs: number;
+} | null = null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -71,6 +81,7 @@ async function fetchResponse(
   endpoint: string,
   fetcher: typeof fetch,
   accept = 'application/json',
+  additionalHeaders: Record<string, string> = {},
 ): Promise<{ response: Response; retrievedAtMs: number; latencyMs: number }> {
   const startedAtMs = Date.now();
   const controller = new AbortController();
@@ -79,7 +90,7 @@ async function fetchResponse(
     const response = await fetcher(endpoint, {
       signal: controller.signal,
       cache: 'no-store',
-      headers: { Accept: accept },
+      headers: { Accept: accept, ...additionalHeaders },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const retrievedAtMs = Date.now();
@@ -116,6 +127,14 @@ function cachedResult(
 function storeResult(key: string, result: DirectMetricResult, nowMs: number): DirectMetricResult {
   resultCache.set(key, { result: structuredClone(result), cachedAtMs: nowMs });
   return result;
+}
+
+function isConfirmedCachedDxySessionClosed(nowMs: number): boolean {
+  return cachedYahooDxyLastClose !== null &&
+    new Date(nowMs).toISOString().slice(0, 10) ===
+      new Date(cachedYahooDxyLastClose.sessionStartMs).toISOString().slice(0, 10) &&
+    (nowMs < cachedYahooDxyLastClose.sessionStartMs ||
+      nowMs >= cachedYahooDxyLastClose.sessionEndMs);
 }
 
 function preservePrimaryFailure(
@@ -286,17 +305,51 @@ async function fetchYahooIndex(
   fetcher: typeof fetch,
   maxAgeMs: number,
 ): Promise<DirectMetricResult> {
-  const endpoint = `${YAHOO_CHART_ENDPOINT}/${encodeURIComponent(symbol)}?range=1d&interval=1m`;
+  const endpoint = `${YAHOO_CHART_ENDPOINT}/${encodeURIComponent(symbol)}?range=${symbol === 'DX-Y.NYB' ? '5d' : '1d'}&interval=1m`;
   const cacheKey = `yahoo:index:${symbol}`;
   const cached = cachedResult(cacheKey, nowMs, symbol === 'DX-Y.NYB' ? DXY_CACHE_TTL_MS : CACHE_TTL_MS);
-  if (cached) return cached;
+  if (cached) {
+    const cachedAgeMs = cached.observedAtMs === null ? Number.POSITIVE_INFINITY : nowMs - cached.observedAtMs;
+    if (
+      symbol !== 'DX-Y.NYB' ||
+      cachedAgeMs <= DXY_LIVE_QUOTE_MAX_AGE_MS
+    ) return cached;
+  }
+  let currentDxySessionClosed: boolean | null = null;
   try {
-    const { response, retrievedAtMs, latencyMs } = await fetchResponse(endpoint, fetcher);
+    const { response, retrievedAtMs, latencyMs } = await fetchResponse(
+      endpoint,
+      fetcher,
+      'application/json',
+      {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    );
     const payload: unknown = await response.json();
     const chart = isRecord(payload) && isRecord(payload.chart) ? payload.chart : null;
     const resultRows = chart && Array.isArray(chart.result) ? chart.result : [];
     const row = resultRows.find(isRecord);
     const meta = row && isRecord(row.meta) ? row.meta : null;
+    const tradingPeriods = meta && isRecord(meta.currentTradingPeriod)
+      ? meta.currentTradingPeriod
+      : null;
+    const regularPeriod = tradingPeriods && isRecord(tradingPeriods.regular)
+      ? tradingPeriods.regular
+      : null;
+    const sessionStartMs = Number(regularPeriod?.start) * 1_000;
+    const sessionEndMs = Number(regularPeriod?.end) * 1_000;
+    const hasSessionWindow = Number.isSafeInteger(sessionStartMs) &&
+      Number.isSafeInteger(sessionEndMs) &&
+      sessionEndMs > sessionStartMs;
+    const dxySessionClosed = symbol === 'DX-Y.NYB' &&
+      hasSessionWindow &&
+      (nowMs < sessionStartMs || nowMs >= sessionEndMs);
+    if (symbol === 'DX-Y.NYB') {
+      currentDxySessionClosed = hasSessionWindow
+        ? dxySessionClosed
+        : null;
+    }
     const timestamps = row && Array.isArray(row.timestamp) ? row.timestamp : [];
     const quoteBlock = row && isRecord(row.indicators) && Array.isArray(row.indicators.quote)
       ? row.indicators.quote.find(isRecord)
@@ -313,9 +366,16 @@ async function fetchYahooIndex(
       !Number.isFinite(value) || value <= 0 ||
       !Number.isFinite(previousValue) || previousValue <= 0 ||
       observedAtMs > nowMs + 60_000 ||
-      nowMs - observedAtMs > maxAgeMs
+      nowMs - observedAtMs > maxAgeMs ||
+      (symbol === 'DX-Y.NYB' &&
+        nowMs - observedAtMs > DXY_LIVE_QUOTE_MAX_AGE_MS &&
+        !dxySessionClosed)
     ) {
-      throw new Error(`${symbol} quote is malformed or stale (maximum age ${maxAgeMs}ms).`);
+      throw new Error(
+        symbol === 'DX-Y.NYB'
+          ? `${symbol} quote is malformed or stale (live limit ${DXY_LIVE_QUOTE_MAX_AGE_MS}ms; closed-session limit ${maxAgeMs}ms).`
+          : `${symbol} quote is malformed or stale (maximum age ${maxAgeMs}ms).`,
+      );
     }
     const result: DirectMetricResult = {
       status: 'LIVE',
@@ -331,14 +391,119 @@ async function fetchYahooIndex(
       latencyMs,
       ageMs: Math.max(0, nowMs - observedAtMs),
     };
+    if (
+      symbol === 'DX-Y.NYB' &&
+      hasSessionWindow
+    ) {
+      cachedYahooDxyLastClose = {
+        result: structuredClone(result),
+        sessionStartMs,
+        sessionEndMs,
+      };
+    } else if (symbol === 'DX-Y.NYB') {
+      cachedYahooDxyLastClose = null;
+    }
     return storeResult(cacheKey, result, nowMs);
   } catch (error) {
+    if (
+      symbol === 'DX-Y.NYB' &&
+      currentDxySessionClosed !== false &&
+      cachedYahooDxyLastClose &&
+      nowMs >= cachedYahooDxyLastClose.result.observedAtMs! &&
+      nowMs - cachedYahooDxyLastClose.result.observedAtMs! <= maxAgeMs &&
+      isConfirmedCachedDxySessionClosed(nowMs)
+    ) {
+      const result = structuredClone(cachedYahooDxyLastClose.result);
+      result.provider = 'Yahoo Finance chart (cached last close; market session confirmed closed)';
+      result.retrievedAtMs = nowMs;
+      result.ageMs = nowMs - result.observedAtMs!;
+      return result;
+    }
     return unavailable(
       `Yahoo Finance chart (${symbol})`,
       endpoint,
       metric,
       error instanceof Error ? error.message : String(error),
     );
+  }
+}
+
+async function fetchTradingViewDxyProxy(
+  nowMs: number,
+  fetcher: typeof fetch,
+): Promise<DirectMetricResult> {
+  const metric = 'TradingView TVC:DXY CFD proxy (not official ICE DXY; retrieval time only)';
+  const endpoint = TRADINGVIEW_SCANNER_ENDPOINT;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const startedAtMs = Date.now();
+  try {
+    const response = await fetcher(endpoint, {
+      method: 'POST',
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({
+        symbols: { tickers: ['TVC:DXY'], query: { types: [] } },
+        columns: ['close', 'change', 'update_mode', 'type', 'subtype'],
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`TradingView scanner returned HTTP ${response.status}.`);
+    }
+    const retrievedAtMs = Date.now();
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || !Array.isArray(payload.data) || payload.data.length !== 1) {
+      throw new Error('TradingView scanner returned a malformed or incomplete DXY result.');
+    }
+    const row = payload.data[0];
+    if (!isRecord(row) || row.s !== 'TVC:DXY' || !Array.isArray(row.d) || row.d.length < 5) {
+      throw new Error('TradingView scanner returned an unexpected DXY symbol or schema.');
+    }
+    const [value, changePct, updateMode, instrumentType, subtype] = row.d;
+    if (
+      typeof value !== 'number' || !Number.isFinite(value) || value <= 0 ||
+      typeof changePct !== 'number' || !Number.isFinite(changePct) ||
+      updateMode !== 'streaming' ||
+      instrumentType !== 'index' ||
+      subtype !== 'cfd'
+    ) {
+      throw new Error('TradingView DXY CFD snapshot is invalid or not marked streaming.');
+    }
+    if (
+      !Number.isSafeInteger(retrievedAtMs) ||
+      retrievedAtMs > nowMs + 60_000 ||
+      nowMs - retrievedAtMs > TRADINGVIEW_DXY_PROXY_MAX_AGE_MS
+    ) {
+      throw new Error('TradingView DXY proxy response exceeded its five-second retrieval freshness limit.');
+    }
+    return {
+      status: 'LIVE',
+      provider: 'TradingView public Scanner (TVC:DXY CFD; upstream observation timestamp unavailable)',
+      endpoint,
+      metric,
+      value,
+      previousValue: null,
+      changePct,
+      observedAt: new Date(retrievedAtMs).toISOString(),
+      observedAtMs: retrievedAtMs,
+      retrievedAtMs,
+      latencyMs: Math.max(0, retrievedAtMs - startedAtMs),
+      ageMs: Math.max(0, nowMs - retrievedAtMs),
+    };
+  } catch (error) {
+    return unavailable(
+      'TradingView public Scanner',
+      endpoint,
+      metric,
+      error instanceof Error ? error.message : String(error),
+    );
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -516,15 +681,26 @@ export async function fetchFreeMacroData(
       : fetchYahooIndex('^GSPC', 'S&P 500 index', nowMs, fetcher, FRED_MAX_AGE_MS),
     massiveDxy.status === 'LIVE'
       ? Promise.resolve(massiveDxy)
-      : fetchYahooIndex('DX-Y.NYB', 'ICE U.S. Dollar Index (DXY)', nowMs, fetcher, DXY_MAX_AGE_MS),
+      : fetchYahooIndex('DX-Y.NYB', 'ICE U.S. Dollar Index (DXY)', nowMs, fetcher, DXY_CLOSED_SESSION_MAX_AGE_MS),
     fredEffectiveRate.status === 'LIVE'
       ? Promise.resolve(fredEffectiveRate)
       : fetchNewYorkFedEffectiveRate(nowMs, fetcher),
   ]);
 
+  const dxy = preservePrimaryFailure(massiveDxy, fallbackDxy);
+  const dxyProxy = dxy.status === 'LIVE'
+    ? unavailable(
+      'TradingView public Scanner',
+      TRADINGVIEW_SCANNER_ENDPOINT,
+      'TradingView TVC:DXY CFD proxy (not official ICE DXY)',
+      'Not requested because a direct DXY source is available.',
+    )
+    : await fetchTradingViewDxyProxy(nowMs, fetcher);
+
   return {
     sp500: preservePrimaryFailure(fredSp500, sp500),
-    dxy: preservePrimaryFailure(massiveDxy, fallbackDxy),
+    dxy,
+    dxyProxy,
     broadDollar,
     fedEffectiveRate: preservePrimaryFailure(fredEffectiveRate, fallbackFedEffectiveRate),
     fedTargetUpperBound,

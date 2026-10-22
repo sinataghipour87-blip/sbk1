@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -11,6 +12,24 @@ from freqtrade_integration.advisory import open_source_advisory_worker as worker
 
 
 class OpenSourceAdvisoryWorkerTests(unittest.TestCase):
+    def mock_markov_regression(self, markov_regression: object):
+        statsmodels = ModuleType("statsmodels")
+        tsa = ModuleType("statsmodels.tsa")
+        regime_switching = ModuleType("statsmodels.tsa.regime_switching")
+        markov_regression_module = ModuleType(
+            "statsmodels.tsa.regime_switching.markov_regression"
+        )
+        markov_regression_module.MarkovRegression = markov_regression
+        statsmodels.tsa = tsa
+        tsa.regime_switching = regime_switching
+        regime_switching.markov_regression = markov_regression_module
+        return patch.dict(sys.modules, {
+            "statsmodels": statsmodels,
+            "statsmodels.tsa": tsa,
+            "statsmodels.tsa.regime_switching": regime_switching,
+            "statsmodels.tsa.regime_switching.markov_regression": markov_regression_module,
+        })
+
     def make_candles(self, count: int = 205) -> list[dict[str, float | int]]:
         return [
             {
@@ -46,10 +65,7 @@ class OpenSourceAdvisoryWorkerTests(unittest.TestCase):
                     ),
                 )
 
-        with patch(
-            "statsmodels.tsa.regime_switching.markov_regression.MarkovRegression",
-            FakeMarkovRegression,
-        ):
+        with self.mock_markov_regression(FakeMarkovRegression):
             result = worker.analyze_regime(candles, int(candles[-1]["timestampMs"]))
 
         expected = np.diff(np.log(np.asarray([item["close"] for item in candles]))) * 100
@@ -73,10 +89,7 @@ class OpenSourceAdvisoryWorkerTests(unittest.TestCase):
                     ),
                 )
 
-        with patch(
-            "statsmodels.tsa.regime_switching.markov_regression.MarkovRegression",
-            FakeMarkovRegression,
-        ):
+        with self.mock_markov_regression(FakeMarkovRegression):
             result = worker.analyze_regime(candles, int(candles[-1]["timestampMs"]))
 
         self.assertEqual(result["status"], "AVAILABLE")
@@ -116,21 +129,40 @@ class OpenSourceAdvisoryWorkerTests(unittest.TestCase):
         self.assertIn("--sentiment", run.call_args.args[0])
         self.assertEqual(run.call_args.kwargs["timeout"], 60)
 
-    def test_failed_news_sentiment_process_is_unavailable(self) -> None:
+    def test_failed_news_sentiment_process_uses_local_lexicon(self) -> None:
         timestamp_ms = 123_000
+        headlines = [{
+            "headline": "Bitcoin adoption surged as institutional inflows rise",
+            "publisher": "Example",
+            "publishedAt": "now",
+        }]
         with patch.object(
             worker.subprocess,
             "run",
-            return_value=SimpleNamespace(returncode=143, stdout="", stderr="terminated"),
+            return_value=SimpleNamespace(returncode=1, stdout="", stderr="No module named torch"),
         ):
-            result = worker.analyze_news_isolated(
-                [{"headline": "Market update", "publisher": "Example", "publishedAt": "now"}],
-                timestamp_ms,
-            )
+            result = worker.analyze_news_isolated(headlines, timestamp_ms)
+
+        self.assertEqual(result["status"], "AVAILABLE")
+        self.assertEqual(result["sourceTimestampMs"], timestamp_ms)
+        self.assertEqual(result["analysisMethod"], "LEXICON_FALLBACK")
+        self.assertEqual(result["calibrationStatus"], "UNCALIBRATED")
+        self.assertGreater(result["aggregateSentiment"], 0)
+        self.assertIn("torch", result["fallbackReason"])
+
+    def test_local_lexicon_does_not_invent_sentiment_without_keyword_matches(self) -> None:
+        result = worker.analyze_news_with_lexicon(
+            [{
+                "headline": "Bitcoin market update",
+                "publisher": "Example",
+                "publishedAt": "now",
+            }],
+            123_000,
+            "model unavailable",
+        )
 
         self.assertEqual(result["status"], "UNAVAILABLE")
-        self.assertEqual(result["sourceTimestampMs"], timestamp_ms)
-        self.assertIn("status 143", result["reason"])
+        self.assertIn("matched no sentiment terms", result["reason"])
 
 
 if __name__ == "__main__":

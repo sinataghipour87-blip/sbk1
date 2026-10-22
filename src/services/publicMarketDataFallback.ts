@@ -4,12 +4,14 @@ import type {
   FreqtradeMarketOrderBook,
   FreqtradeMarketTradeFlow,
 } from './freqtradeMarketDataBridge';
+import { binancePublicMarketDataStream } from './publicMarketDataStream';
 
 export interface PublicMarketFallbackFeed<T> {
   status: 'LIVE' | 'UNAVAILABLE';
   sourceTimestampMs: number | null;
   value: T | null;
   error?: string;
+  isPartial?: boolean;
 }
 
 export interface PublicExchangeQuote {
@@ -29,10 +31,16 @@ export interface PublicMarketFallbackData {
   retrievedAtMs: number;
   exchangeQuotes: PublicMarketFallbackFeed<PublicExchangeQuote[]>;
   candles: PublicMarketFallbackFeed<FreqtradeMarketCandle[]>;
+  fastCandles: PublicMarketFallbackFeed<FreqtradeMarketCandle[]>;
+  higherTimeframeCandles: {
+    '1h': PublicMarketFallbackFeed<FreqtradeMarketCandle[]>;
+    '4h': PublicMarketFallbackFeed<FreqtradeMarketCandle[]>;
+  };
   orderBook: PublicMarketFallbackFeed<FreqtradeMarketOrderBook>;
   tradeFlow: PublicMarketFallbackFeed<FreqtradeMarketTradeFlow>;
   fundingRate: PublicMarketFallbackFeed<{ retrievedAtMs: number; rate: number }>;
   openInterest: PublicMarketFallbackFeed<FreqtradeMarketOpenInterest>;
+  liveOpenInterest: PublicMarketFallbackFeed<{ timestampMs: number; amount: number }>;
 }
 
 const MAX_FEED_AGE_MS = {
@@ -40,14 +48,16 @@ const MAX_FEED_AGE_MS = {
   tradeFlow: 5_000,
   fundingRate: 60_000,
   openInterest: 10 * 60_000,
+  liveOpenInterest: 10_000,
   exchangeQuotes: 5_000,
 } as const;
 const MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT = 2;
-const MAX_EXCHANGE_CLOCK_SKEW_MS = 5_000;
+const MAX_EXCHANGE_CLOCK_SKEW_MS = 10_000;
 const MAX_HISTORICAL_CANDLE_LIMIT = {
-  spot: 1_000,
-  futures: 1_500,
+  spot: 500,
+  futures: 500,
 } as const;
+const FAST_CANDLE_LIMIT = 100;
 
 type MarketKind = 'spot' | 'futures';
 
@@ -262,6 +272,11 @@ async function fetchCrossExchangeQuotes(options: {
   nowMs: number;
   fetcher: typeof fetch;
   timeoutMs: number;
+  liveBinancePrice: {
+    sourceTimestampMs: number;
+    retrievedAtMs: number;
+    price: number;
+  } | null;
 }): Promise<PublicMarketFallbackFeed<PublicExchangeQuote[]>> {
   const baseAsset = options.symbol.slice(0, -4);
   const okxSymbol = options.market === 'futures'
@@ -325,10 +340,10 @@ async function fetchCrossExchangeQuotes(options: {
         return { exchange: 'okx', symbol: okxSymbol, price, sourceTimestampMs, retrievedAtMs };
       },
     },
-  ];
+  ].filter((request) => !(request.exchange === 'binance' && options.liveBinancePrice));
 
   try {
-    const quotes = await Promise.all(requests.map(async (request) => {
+    const restQuotes = await Promise.all(requests.map(async (request) => {
       const { payload, retrievedAtMs } = await requestJson(
         request.url,
         options.fetcher,
@@ -336,12 +351,29 @@ async function fetchCrossExchangeQuotes(options: {
         options.timeoutMs,
       );
       const quote = request.parse(payload, retrievedAtMs);
-      const ageMs = Math.max(options.nowMs, Date.now()) - quote.sourceTimestampMs;
-      if (ageMs < -MAX_EXCHANGE_CLOCK_SKEW_MS || ageMs > MAX_FEED_AGE_MS.exchangeQuotes) {
+      const evaluatedAtMs = Math.max(options.nowMs, Date.now());
+      const ageMs = evaluatedAtMs - quote.retrievedAtMs;
+      if (
+        Math.abs(quote.sourceTimestampMs - quote.retrievedAtMs) > MAX_EXCHANGE_CLOCK_SKEW_MS ||
+        ageMs < 0 ||
+        ageMs > MAX_FEED_AGE_MS.exchangeQuotes
+      ) {
         throw new Error(`${request.exchange} ticker is stale or future-dated.`);
       }
       return quote;
     }));
+    const quotes = options.liveBinancePrice
+      ? [
+        {
+          exchange: 'binance' as const,
+          symbol: options.symbol,
+          price: options.liveBinancePrice.price,
+          sourceTimestampMs: options.liveBinancePrice.sourceTimestampMs,
+          retrievedAtMs: options.liveBinancePrice.retrievedAtMs,
+        },
+        ...restQuotes,
+      ]
+      : restQuotes;
     const sortedPrices = quotes.map(({ price }) => price).sort((left, right) => left - right);
     const medianPrice = sortedPrices[1];
     const spreadPct = ((sortedPrices[2] - sortedPrices[0]) / medianPrice) * 100;
@@ -355,7 +387,7 @@ async function fetchCrossExchangeQuotes(options: {
       quotes,
       Math.min(
         evaluatedAtMs,
-        ...quotes.map(({ sourceTimestampMs }) => sourceTimestampMs),
+        ...quotes.map(({ retrievedAtMs }) => retrievedAtMs),
       ),
       evaluatedAtMs,
       MAX_FEED_AGE_MS.exchangeQuotes,
@@ -372,13 +404,13 @@ export async function fetchPublicMarketFallback(options: {
   nowMs?: number;
   fetcher?: typeof fetch;
   timeoutMs?: number;
+  marketDataStream?: Pick<typeof binancePublicMarketDataStream, 'getSnapshot'>;
 }): Promise<PublicMarketFallbackData> {
   const nowMs = options.nowMs ?? Date.now();
   const fetcher = options.fetcher ?? fetch;
   const timeoutMs = options.timeoutMs ?? 3_000;
   const symbol = normalizeSymbol(options.pair);
   const interval = timeframeInterval(options.timeframe);
-  const intervalMs = timeframeMs(interval);
   const tradeQueryNowMs = Math.max(nowMs, Date.now());
   const baseUrl = options.market === 'futures'
     ? 'https://fapi.binance.com'
@@ -451,15 +483,69 @@ export async function fetchPublicMarketFallback(options: {
     : Promise.resolve(unavailable<FreqtradeMarketOpenInterest>(
       'Open interest is unavailable for spot markets.',
     ));
+  const liveOpenInterestRequest = options.market === 'futures'
+    ? fetchFeed(endpoint('/fapi/v1/openInterest', { symbol }), (payload, retrievedAtMs) => {
+      if (!isRecord(payload) || payload.symbol !== symbol) {
+        throw new Error('Binance current open-interest response is malformed or has the wrong symbol.');
+      }
+      const timestampMs = Number(payload.time);
+      const amount = Number(payload.openInterest);
+      if (!Number.isSafeInteger(timestampMs) || !Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Binance current open-interest timestamp or amount is invalid.');
+      }
+      return freshFeed(
+        { timestampMs, amount },
+        timestampMs,
+        retrievedAtMs,
+        MAX_FEED_AGE_MS.liveOpenInterest,
+      );
+    })
+    : Promise.resolve(unavailable<{ timestampMs: number; amount: number }>(
+      'Open interest is unavailable for spot markets.',
+    ));
 
-  const [candles, orderBook, tradeFlow, exchangeQuotes, fundingRate, openInterest] = await Promise.all([
-    fetchFeed(endpoint(options.market === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines', {
-      symbol, interval, limit: String(MAX_HISTORICAL_CANDLE_LIMIT[options.market]),
-    }), (payload) => {
-      const maxAgeMs = candleMaxAgeMs(options.timeframe);
+  const fetchCandleFeed = (timeframe: string, limit: number) => fetchFeed(
+    endpoint(options.market === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines', {
+      symbol,
+      interval: timeframe,
+      limit: String(limit),
+    }),
+    (payload) => {
+      const intervalMs = timeframeMs(timeframe);
+      const maxAgeMs = candleMaxAgeMs(timeframe);
       const result = parseCandles(payload, nowMs, intervalMs, maxAgeMs);
       return freshFeed(result.candles, result.latestCloseMs, nowMs, maxAgeMs);
-    }),
+    },
+  );
+  const candlesRequest = fetchCandleFeed(interval, MAX_HISTORICAL_CANDLE_LIMIT[options.market]);
+  const fastCandlesRequest = interval === '1m'
+    ? candlesRequest
+    : fetchCandleFeed('1m', FAST_CANDLE_LIMIT);
+  const hourlyCandlesRequest = interval === '1h'
+    ? candlesRequest
+    : fetchCandleFeed('1h', FAST_CANDLE_LIMIT);
+  const fourHourlyCandlesRequest = interval === '4h'
+    ? candlesRequest
+    : fetchCandleFeed('4h', FAST_CANDLE_LIMIT);
+
+  const liveStream = (options.marketDataStream ?? binancePublicMarketDataStream)
+    .getSnapshot(Math.max(nowMs, Date.now()));
+  let [
+    candles,
+    fastCandles,
+    hourlyCandles,
+    fourHourlyCandles,
+    orderBook,
+    tradeFlow,
+    exchangeQuotes,
+    fundingRate,
+    openInterest,
+    liveOpenInterest,
+  ] = await Promise.all([
+    candlesRequest,
+    fastCandlesRequest,
+    hourlyCandlesRequest,
+    fourHourlyCandlesRequest,
     fetchFeed(endpoint(options.market === 'futures' ? '/fapi/v1/depth' : '/api/v3/depth', {
       symbol, limit: '20',
     }), (payload, retrievedAtMs) =>
@@ -485,10 +571,44 @@ export async function fetchPublicMarketFallback(options: {
       nowMs,
       fetcher,
       timeoutMs,
+      liveBinancePrice: liveStream.price,
     }),
     fundingRateRequest,
     openInterestRequest,
+    liveOpenInterestRequest,
   ]);
+  if (liveStream.orderBook) {
+    orderBook = {
+      status: 'LIVE',
+      sourceTimestampMs: liveStream.orderBook.timestampMs,
+      value: liveStream.orderBook,
+    };
+  }
+  if (liveStream.tradeFlow) {
+    tradeFlow = {
+      status: 'LIVE',
+      sourceTimestampMs: liveStream.tradeFlow.trades.at(-1)!.timestampMs,
+      value: liveStream.tradeFlow,
+    };
+  }
+  const partialCandle = liveStream.partialFastCandle;
+  const completedFastCandles = fastCandles.value;
+  if (
+    partialCandle &&
+    completedFastCandles &&
+    completedFastCandles.length >= 29 &&
+    partialCandle.candle.timestampMs === completedFastCandles.at(-1)!.timestampMs + 60_000
+  ) {
+    fastCandles = {
+      status: 'LIVE',
+      sourceTimestampMs: partialCandle.sourceTimestampMs,
+      value: [
+        ...completedFastCandles,
+        partialCandle.candle,
+      ],
+      isPartial: true,
+    };
+  }
 
   return {
     provider: 'Binance public REST API',
@@ -499,9 +619,15 @@ export async function fetchPublicMarketFallback(options: {
     retrievedAtMs: nowMs,
     exchangeQuotes,
     candles,
+    fastCandles,
+    higherTimeframeCandles: {
+      '1h': hourlyCandles,
+      '4h': fourHourlyCandles,
+    },
     orderBook,
     tradeFlow,
     fundingRate,
     openInterest,
+    liveOpenInterest,
   };
 }

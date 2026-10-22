@@ -21,6 +21,7 @@ import {
 } from '../src/services/centralProbabilityEngine';
 import { runPreTradeRiskGate, verifyAutoTradePrerequisites } from '../src/services/autoTradeGuard';
 import { riskEngine } from '../src/services/productionGateThreeLayerEngine';
+import { evaluateAccountLevelRisk } from '../src/services/kellyRisk';
 import { MissingDataIntegrityGuardService } from '../src/services/missingDataIntegrityGuard';
 import { globalKillSwitchEngine } from '../src/services/globalKillSwitchEngine';
 import { tradeThesisAndSmartExitEngine } from '../src/services/tradeThesisAndSmartExitEngine';
@@ -373,10 +374,26 @@ async function runTests() {
     rawAnalysis: null
   }, { availableBalanceUsdt: 8000, maxEquityUsd: 10000, currentEquityUsd: 8500 }, [], [
     // معاملات ضررده روزانه فراتر از حد مجاز
-    { id: 'L1', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: new Date().toISOString(), pnlUsd: -400, pnlPct: -40 },
-    { id: 'L2', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: new Date().toISOString(), pnlUsd: -350, pnlPct: -35 },
+    { id: 'L1', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: new Date().toISOString(), pnlUsd: -450, pnlPct: -45 },
+    { id: 'L2', dir: 'LONG', entry: 88000, lev: 10, initialMargin: 100, margin: 100, sl: 87000, tp: 90000, tp1: 90000, tp2: 91000, tp3: 92000, openedAt: '', closedAt: new Date().toISOString(), pnlUsd: -450, pnlPct: -45 },
   ]);
   assert.strictEqual(dailyLossBlocked.isApproved, false, 'Daily loss limit breach must reject new orders');
+  assert.ok(
+    dailyLossBlocked.rejectionReasonsFa.some((reason) => reason.includes('۱۰٪ اکوئیتی')),
+    'the production risk gate must enforce the 10% daily-loss cap',
+  );
+  const belowDailyLossLimit = evaluateAccountLevelRisk({
+    accountEquityUsd: 10_000,
+    activePositions: [],
+    tradeHistory: [{ closedAt: new Date().toISOString(), pnlUsd: -900 }],
+  });
+  assert.strictEqual(belowDailyLossLimit.isOrderPermitted, true, 'daily losses below 10% must not trigger the account-level cap');
+  const atDailyLossLimit = evaluateAccountLevelRisk({
+    accountEquityUsd: 10_000,
+    activePositions: [],
+    tradeHistory: [{ closedAt: new Date().toISOString(), pnlUsd: -1_000 }],
+  });
+  assert.strictEqual(atDailyLossLimit.isOrderPermitted, false, 'reaching 10% daily loss must block account-level entries');
   console.log('✅ سناریو ۱۶ پاس شد: تخطی از حد ضرر روزانه مانع ورود جدید شد.');
 
   // =========================================================================

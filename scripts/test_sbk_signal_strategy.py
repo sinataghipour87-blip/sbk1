@@ -366,12 +366,12 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             500,
             1,
             500,
-            2,
+            5,
             self.signal_id,
             "long",
         )
 
-        self.assertAlmostEqual(stake, 25, msg="Freqtrade must use the central absolute risk allocation once, not apply the percentage again")
+        self.assertAlmostEqual(stake, 10, msg="Freqtrade must use the central absolute risk allocation once, not apply the percentage again")
         self.assertLessEqual(stake, self.strategy.config["stake_amount"])
 
         self.strategy.config["stake_amount"] = 20
@@ -380,34 +380,53 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             datetime.fromtimestamp(self.now_ms / 1000, UTC),
             62_100,
             500,
-            1,
+            5,
             500,
             1,
             self.signal_id,
             "long",
         )
         self.assertLessEqual(capped_stake, 20)
+        below_minimum_leverage = self.strategy.custom_stake_amount(
+            self.signal["pair"],
+            datetime.fromtimestamp(self.now_ms / 1000, UTC),
+            62_100,
+            500,
+            1,
+            500,
+            4.99,
+            self.signal_id,
+            "long",
+        )
+        self.assertEqual(below_minimum_leverage, 0)
 
-    def test_leverage_is_capped_by_signal_and_exchange_and_defaults_to_one(self):
+    def test_selected_leverage_is_capped_by_signal_and_exchange(self):
         self.strategy._signals = {self.signal_id: self.signal}
-        self.signal["riskLimits"]["maxLeverage"] = 1.5
+        self.signal["riskLimits"]["maxLeverage"] = 25
         current_time = datetime.fromtimestamp(self.now_ms / 1000, UTC)
 
         self.assertEqual(
             self.strategy.leverage(
-                self.signal["pair"], current_time, 62_100, 3, 10, self.signal_id, "long"
+                self.signal["pair"], current_time, 62_100, 1, 30, self.signal_id, "long"
             ),
-            1.5,
+            25,
         )
         self.assertEqual(
             self.strategy.leverage(
-                self.signal["pair"], current_time, 62_100, 3, 1.25, self.signal_id, "long"
+                self.signal["pair"], current_time, 62_100, 1, 10, self.signal_id, "long"
             ),
-            1.25,
+            10,
         )
         self.assertEqual(
             self.strategy.leverage(
-                self.signal["pair"], current_time, 62_100, 3, 10, None, "long"
+                self.signal["pair"], current_time, 62_100, 25, 30, None, "long"
+            ),
+            1,
+        )
+        self.signal["market"] = "spot"
+        self.assertEqual(
+            self.strategy.leverage(
+                self.signal["pair"], current_time, 62_100, 25, 30, self.signal_id, "long"
             ),
             1,
         )
