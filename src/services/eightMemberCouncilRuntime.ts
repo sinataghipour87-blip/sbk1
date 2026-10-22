@@ -610,7 +610,6 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
       summaryFa: availability.summaryFa,
     };
   }
-
   for (const model of input.sbReport?.models ?? []) {
     const available = model.status === 'ACTIVE' || model.status === 'EXECUTION_READY';
     values[`sb.${model.id}`] = {

@@ -29,6 +29,7 @@ export interface WalkForwardHorizonResult {
   grossWinRatePct: number | null;
   meanNetPredictedReturnPct: number | null;
   netWinRatePct: number | null;
+  netWinCount: number | null;
   meanMaximumFavorableMovePct: number | null;
   meanMaximumAdverseMovePct: number | null;
   meanCostAdjustedRewardRiskRatio: number | null;
@@ -37,6 +38,10 @@ export interface WalkForwardHorizonResult {
 export interface WalkForwardCandleResearchReport {
   status: 'AVAILABLE' | 'INSUFFICIENT_HISTORY' | 'INSUFFICIENT_EVIDENCE' | 'INVALID_INPUT';
   source: 'verified-live-exchange-candles';
+  exchange: string | null;
+  market: 'spot' | 'futures' | null;
+  pair: string | null;
+  sourceTimestampMs: number | null;
   timeframe: string | null;
   candleCount: number;
   trainingCandleCount: number;
@@ -62,6 +67,9 @@ export interface WalkForwardCandleResearchReport {
 
 export interface WalkForwardCandleResearchInput {
   candles: Candle[];
+  exchange?: string;
+  market?: 'spot' | 'futures';
+  pair?: string;
   timeframe: string;
   sourceTimestampMs: number;
   nowMs?: number;
@@ -193,6 +201,7 @@ function emptyHorizon(horizonMinutes: CandleResearchHorizon, actualHorizonMinute
     grossWinRatePct: null,
     meanNetPredictedReturnPct: null,
     netWinRatePct: null,
+    netWinCount: null,
     meanMaximumFavorableMovePct: null,
     meanMaximumAdverseMovePct: null,
     meanCostAdjustedRewardRiskRatio: null,
@@ -240,6 +249,10 @@ export function analyzeWalkForwardCandlePatterns(
   const invalid = (note: string): WalkForwardCandleResearchReport => ({
     status: 'INVALID_INPUT',
     source: 'verified-live-exchange-candles',
+    exchange: input.exchange?.trim().toLowerCase() || null,
+    market: input.market ?? null,
+    pair: input.pair?.trim().toUpperCase() || null,
+    sourceTimestampMs: Number.isSafeInteger(input.sourceTimestampMs) ? input.sourceTimestampMs : null,
     timeframe: input.timeframe || null,
     candleCount: input.candles.length,
     trainingCandleCount: 0,
@@ -256,6 +269,11 @@ export function analyzeWalkForwardCandlePatterns(
   });
   if (
     minutesPerCandle === null ||
+    typeof input.exchange !== 'string' ||
+    !/^[a-z0-9_-]{2,32}$/i.test(input.exchange.trim()) ||
+    (input.market !== 'spot' && input.market !== 'futures') ||
+    typeof input.pair !== 'string' ||
+    !/^[A-Z0-9]{2,20}\/[A-Z0-9]{2,20}(?::[A-Z0-9]{2,20})?$/i.test(input.pair.trim()) ||
     !Number.isSafeInteger(input.sourceTimestampMs) ||
     !Number.isSafeInteger(input.nowMs ?? Date.now()) ||
     !['LIVE', 'VERIFIED_REALTIME'].includes(input.dataStatus)
@@ -282,17 +300,17 @@ export function analyzeWalkForwardCandlePatterns(
 
   const candles = parsed as NormalizedCandle[];
   const splitIndex = Math.floor(candles.length * TRAINING_FRACTION);
-  const testStarts: number[] = [];
-  for (
-    let start = Math.max(splitIndex, CONTEXT_WINDOW_SIZE);
-    start + PATTERN_WINDOW_SIZE + largestHorizonBars <= candles.length;
-    start += PATTERN_WINDOW_SIZE + largestHorizonBars
-  ) testStarts.push(start);
   const outputHorizons = { ...emptyHorizons };
 
   HORIZONS_MINUTES.forEach((horizonMinutes, horizonIndex) => {
     const bars = horizonBars[horizonIndex];
     const spacing = PATTERN_WINDOW_SIZE + bars;
+    const testStarts: number[] = [];
+    for (
+      let start = Math.max(splitIndex, CONTEXT_WINDOW_SIZE);
+      start + PATTERN_WINDOW_SIZE + bars <= candles.length;
+      start += spacing
+    ) testStarts.push(start);
     const referenceWindows: ReferenceWindow[] = [];
     for (let start = CONTEXT_WINDOW_SIZE; start + PATTERN_WINDOW_SIZE + bars <= splitIndex; start += spacing) {
       const features = extractFeatures(candles, start);
@@ -385,6 +403,9 @@ export function analyzeWalkForwardCandlePatterns(
       netWinRatePct: !enoughOutOfSampleForecasts || netReturns === null
         ? null
         : netReturns.filter(value => value > 0).length / netReturns.length * 100,
+      netWinCount: !enoughOutOfSampleForecasts || netReturns === null
+        ? null
+        : netReturns.filter(value => value > 0).length,
       meanMaximumFavorableMovePct: enoughOutOfSampleForecasts
         ? mean(forecasts.map(forecast => forecast.maximumFavorableMovePct))
         : null,
@@ -400,6 +421,10 @@ export function analyzeWalkForwardCandlePatterns(
   return {
     status: availableHorizons > 0 ? 'AVAILABLE' : 'INSUFFICIENT_EVIDENCE',
     source: 'verified-live-exchange-candles',
+    exchange: input.exchange.trim().toLowerCase(),
+    market: input.market!,
+    pair: input.pair.trim().toUpperCase(),
+    sourceTimestampMs: input.sourceTimestampMs,
     timeframe: input.timeframe,
     candleCount: candles.length,
     trainingCandleCount: splitIndex,

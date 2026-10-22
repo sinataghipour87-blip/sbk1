@@ -3,8 +3,8 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
-export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v2';
-export const SBK_ENTRY_AUTHORIZATION_VERSION = 'sbk1.entry.authorization.v1';
+export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v3';
+export const SBK_ENTRY_AUTHORIZATION_VERSION = 'sbk1.entry.authorization.v2';
 export const DRY_RUN_FIXTURE_SETUP_PREFIX = 'DRY_RUN_E2E_FIXTURE_';
 
 export type SbkSignalDirection = 'LONG' | 'SHORT';
@@ -50,6 +50,7 @@ export interface SbkEntryAuthorization {
   ensembleProbabilityPct: number | null;
   riskRewardRatio: number;
   allocatedRiskUsd: number;
+  holdingHorizonMinutes: number;
 }
 
 export interface SbkFreqtradeSignal {
@@ -78,6 +79,7 @@ export interface SbkFreqtradeSignal {
     stopLoss: number;
     takeProfit: number;
     maxPriceDeviationBps: number;
+    maxHoldingMinutes: number;
   };
   riskLimits: {
     riskBudgetPct: number;
@@ -359,7 +361,10 @@ export function validateSbkFreqtradeSignal(
     !finitePositive(signal.entryConditions.stopLoss) ||
     !finitePositive(signal.entryConditions.takeProfit) ||
     !finitePositive(signal.entryConditions.maxPriceDeviationBps) ||
-    signal.entryConditions.maxPriceDeviationBps > 100
+    signal.entryConditions.maxPriceDeviationBps > 100 ||
+    !Number.isSafeInteger(signal.entryConditions.maxHoldingMinutes) ||
+    signal.entryConditions.maxHoldingMinutes < 1 ||
+    signal.entryConditions.maxHoldingMinutes > 60
   ) {
     throw new SbkSignalValidationError('Entry, stop, target, or price-deviation condition is invalid.', 'INVALID_ENTRY_CONDITIONS');
   }
@@ -410,7 +415,11 @@ export function validateSbkFreqtradeSignal(
     !Array.isArray(authorization.models) ||
     typeof authorization.disagreementVeto !== 'boolean' ||
     !Number.isFinite(authorization.riskRewardRatio) ||
-    !finitePositive(authorization.allocatedRiskUsd)
+    !finitePositive(authorization.allocatedRiskUsd) ||
+    !Number.isSafeInteger(authorization.holdingHorizonMinutes) ||
+    authorization.holdingHorizonMinutes !== signal.entryConditions.maxHoldingMinutes ||
+    authorization.holdingHorizonMinutes < 1 ||
+    authorization.holdingHorizonMinutes > 60
   ) {
     throw new SbkSignalValidationError('A complete entry-decision authorization is required.', 'INVALID_AUTHORIZATION');
   }
@@ -438,12 +447,14 @@ export function validateSbkFreqtradeSignal(
       'COUNCIL_REPORT',
       'LIVE_DATA',
       'REFERENCE_PRICE',
+      'VOLATILITY',
       'EXECUTION_SPREAD',
       'TRADE_LEVELS',
       'STOP_AND_TARGET',
       'PORTFOLIO_RISK',
       'DAILY_LOSS',
       'RISK_ALLOCATION',
+      'HOLDING_HORIZON',
     ]);
     const seenGates = new Set<string>();
     for (const gate of authorization.gates) {

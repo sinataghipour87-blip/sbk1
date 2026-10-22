@@ -5,6 +5,8 @@ import { getLatestMultiBrainConsensusReport, type MultiBrainConsensusReport } fr
 import { sbFiveModelsEngine, type SbPentagonOutput } from '../services/sbFiveModelsEngine';
 import { evaluateSignalToExecution, type IndicatorScoreBreakdown } from '../services/signalToExecution';
 import { newsShockFirewallService } from '../services/newsShockFirewall';
+import type { WalkForwardCandleResearchReport } from '../services/walkForwardCandleResearch';
+import type { HoldingHorizonDecision } from '../services/postCouncilTradeController';
 import { CollapsibleCard } from './CollapsibleCard';
 import { macroContextBrainService } from '../services/macroContextBrain';
 import {
@@ -42,6 +44,14 @@ interface OpenSourceAdvisoryResponse {
   status: 'NOT_RUN' | OpenSourceAdvisoryReport['status'];
   decisionInfluence: 'ADVISORY_ONLY';
   report: OpenSourceAdvisoryReport | null;
+}
+
+interface ExecutionAuditView {
+  at: string;
+  decision: 'NO TRADE' | 'LONG' | 'SHORT';
+  reason: string;
+  signalId?: string;
+  holdingHorizon?: HoldingHorizonDecision;
 }
 
 const OPEN_SOURCE_MODULES = [
@@ -121,6 +131,74 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function isCandleResearchReport(value: unknown): value is WalkForwardCandleResearchReport {
+  if (!isRecord(value) || !isRecord(value.horizons) || !isRecord(value.costs)) return false;
+  return ['AVAILABLE', 'INSUFFICIENT_HISTORY', 'INSUFFICIENT_EVIDENCE', 'INVALID_INPUT'].includes(String(value.status)) &&
+    value.source === 'verified-live-exchange-candles' &&
+    (typeof value.exchange === 'string' || value.exchange === null) &&
+    (typeof value.pair === 'string' || value.pair === null) &&
+    (value.market === 'spot' || value.market === 'futures' || value.market === null) &&
+    Number.isSafeInteger(value.candleCount) &&
+    value.tradeEligible === false &&
+    typeof value.note === 'string';
+}
+
+function isHoldingHorizonDecision(value: unknown): value is HoldingHorizonDecision {
+  if (
+    !isRecord(value) ||
+    (value.status !== 'SELECTED' && value.status !== 'UNAVAILABLE') ||
+    !(value.selectedHorizonMinutes === null || Number.isFinite(value.selectedHorizonMinutes)) ||
+    !Array.isArray(value.evaluations) ||
+    typeof value.reason !== 'string'
+  ) return false;
+  return value.evaluations.every((evaluation: unknown) =>
+    isRecord(evaluation) &&
+    Number.isFinite(evaluation.horizonMinutes) &&
+    Number.isFinite(evaluation.actualHorizonMinutes) &&
+    typeof evaluation.eligible === 'boolean' &&
+    Number.isSafeInteger(evaluation.sampleCount) &&
+    (evaluation.netWinRateLowerBoundPct === null ||
+      (typeof evaluation.netWinRateLowerBoundPct === 'number' &&
+        Number.isFinite(evaluation.netWinRateLowerBoundPct))) &&
+    typeof evaluation.reason === 'string'
+  );
+}
+
+function CandleResearchDetails({ report }: { report: WalkForwardCandleResearchReport }) {
+  return (
+    <div className="mt-2 space-y-1 border-t border-cyan-950 pt-2 text-[10px] leading-5 text-slate-300">
+      <p>
+        بازار شواهد {report.exchange ?? 'ناموجود'} · {report.market ?? 'بازار ناموجود'} ·
+        {' '}{report.pair ?? 'نماد ناموجود'} ·
+        وضعیت {report.status} · تایم‌فریم {report.timeframe ?? 'ناموجود'} · {report.candleCount} کندل ·
+        {' '}آموزش/آزمون {report.trainingCandleCount}/{report.testCandleCount} ·
+        {' '}برش آموزش {formatTimestamp(report.trainingCutoffTimestampMs)} ·
+        {' '}شباهت {report.similarityThresholdPct}% (وزن زمینه {report.contextSimilarityWeightPct}%) ·
+        {' '}حداقل {report.requiredReferenceMatches} مرجع و {report.minimumOutOfSampleForecasts} پیش‌بینی خارج‌ازنمونه.
+      </p>
+      <div className="grid gap-1 md:grid-cols-2">
+        {Object.values(report.horizons).map((horizon) => (
+          <p key={horizon.horizonMinutes} className="rounded bg-black/20 p-2">
+            افق {horizon.horizonMinutes} دقیقه (واقعی {horizon.actualHorizonMinutes} دقیقه):{' '}
+            {horizon.available
+              ? `${horizon.outOfSampleForecastCount} پیش‌بینی؛ مرجع کافی ${horizon.forecastsWithEnoughMatches}؛ شباهت ${horizon.meanSimilarityPct?.toFixed(1) ?? 'ناموجود'}٪؛ دقت جهت ${horizon.grossDirectionAccuracyPct?.toFixed(1) ?? 'ناموجود'}٪؛ برد ناخالص/خالص ${horizon.grossWinRatePct?.toFixed(1) ?? 'ناموجود'}/${horizon.netWinRatePct?.toFixed(1) ?? 'ناموجود'}٪؛ بازده ناخالص/خالص ${horizon.meanGrossPredictedReturnPct?.toFixed(4) ?? 'ناموجود'}/${horizon.meanNetPredictedReturnPct?.toFixed(4) ?? 'ناموجود'}٪؛ MFE/MAE ${horizon.meanMaximumFavorableMovePct?.toFixed(4) ?? 'ناموجود'}/${horizon.meanMaximumAdverseMovePct?.toFixed(4) ?? 'ناموجود'}٪؛ نسبت پاداش/ریسک پس از هزینه ${horizon.meanCostAdjustedRewardRiskRatio?.toFixed(2) ?? 'ناموجود'}`
+              : `${horizon.outOfSampleForecastCount}/${horizon.minimumForecastsForMetrics} پیش‌بینی؛ داده برای گزارش معیار عملکرد کافی نیست.`}
+          </p>
+        ))}
+      </div>
+      <p>
+        هزینه رفت‌وبرگشت: {'roundTripPercent' in report.costs
+          ? `${report.costs.roundTripPercent.toFixed(4)}٪ (کارمزد هر سمت ${report.costs.takerFeeBpsPerSide}bp، لغزش هر سمت ${report.costs.slippageBpsPerSide}bp)`
+          : `تنظیم نشده؛ ${report.costs.note}`}
+        {' '}· مجاز به معامله: خیر. {report.note}
+      </p>
+      <p className="text-cyan-200">
+        این گزارش پژوهش خارج‌ازنمونه و شاهد کمکی عضو ۱ است؛ به‌تنهایی رأی جهت‌دار یا مجوز معامله تولید نمی‌کند.
+      </p>
+    </div>
+  );
+}
+
 function parseAdvisoryResponse(value: unknown): OpenSourceAdvisoryResponse | null {
   if (!isRecord(value) || value.decisionInfluence !== 'ADVISORY_ONLY') return null;
   if (value.report === null) {
@@ -163,9 +241,10 @@ function toEvidence(
   nameFa: string,
   summaryFa: string,
   status: CouncilModuleEvidence['status'],
-  sourceTimestampMs: number | null
+  sourceTimestampMs: number | null,
+  output?: unknown
 ): CouncilModuleEvidence {
-  return { moduleId, nameFa, summaryFa, status, sourceTimestampMs };
+  return { moduleId, nameFa, summaryFa, status, sourceTimestampMs, ...(output === undefined ? {} : { output }) };
 }
 
 function advisorySummary(moduleId: string, result: OpenSourceModuleResult): string {
@@ -404,12 +483,66 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
   const [advisory, setAdvisory] = useState<OpenSourceAdvisoryReport | null>(null);
   const [advisoryError, setAdvisoryError] = useState<string | null>(null);
   const [brainReport, setBrainReport] = useState<MultiBrainConsensusReport | null>(null);
+  const [latestExecutionAudit, setLatestExecutionAudit] = useState<ExecutionAuditView | null>(null);
+  const [executionAuditError, setExecutionAuditError] = useState<string | null>(null);
 
   useEffect(() => {
     const refresh = () => setMacroContext(macroContextBrainService.getMacroContext());
     refresh();
     const timer = window.setInterval(refresh, 15_000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let controller: AbortController | null = null;
+    const refresh = async () => {
+      const adminToken = localStorage.getItem('admin_token')?.trim();
+      if (!adminToken) {
+        setLatestExecutionAudit(null);
+        setExecutionAuditError('برای مشاهدهٔ تصمیم‌های ثبت‌شده، ابتدا دسترسی مدیر را وارد کنید.');
+        return;
+      }
+      controller?.abort();
+      controller = new AbortController();
+      try {
+        const response = await fetch('/api/freqtrade/execution-audit?limit=30', {
+          cache: 'no-store',
+          headers: { 'x-admin-token': adminToken },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`خواندن سابقهٔ کنترل مرکزی ناموفق بود (HTTP ${response.status}).`);
+        const payload: unknown = await response.json();
+        if (!isRecord(payload) || !Array.isArray(payload.records)) {
+          throw new Error('ساختار پاسخ سابقهٔ کنترل مرکزی معتبر نیست.');
+        }
+        const record = payload.records.find((item: unknown): item is ExecutionAuditView =>
+          isRecord(item) &&
+          typeof item.at === 'string' &&
+          (item.decision === 'NO TRADE' || item.decision === 'LONG' || item.decision === 'SHORT') &&
+          typeof item.reason === 'string' &&
+          isHoldingHorizonDecision(item.holdingHorizon)
+        ) ?? null;
+        if (!disposed) {
+          setLatestExecutionAudit(record);
+          setExecutionAuditError(null);
+        }
+      } catch (error) {
+        if (disposed || (error instanceof Error && error.name === 'AbortError')) return;
+        console.error('[EightMemberCouncil] Could not load central execution audit:', error);
+        if (!disposed) {
+          setLatestExecutionAudit(null);
+          setExecutionAuditError(error instanceof Error ? error.message : String(error));
+        }
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      controller?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -595,6 +728,59 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
           ))}
         </div>
 
+        <section className="space-y-2 rounded-xl border border-cyan-800/50 bg-cyan-950/20 p-3">
+          <h3 className="font-bold text-cyan-200">کنترل مرکزی · پژوهش و انتخاب افق نگهداری</h3>
+          {isCandleResearchReport(brainReport?.historicalCandleResearch) ? (
+            <>
+              <p className="text-[11px] leading-5 text-cyan-100">
+                این پژوهش ورودی انتخاب افق در کنترل مرکزی است؛ عضو اول آن را برای رأی دریافت نمی‌کند.
+                انتخاب واقعی فقط پس از حدنصاب شورا و گیت‌های اجرایی انجام می‌شود؛ افق‌های واجد/ردشده و علت هرکدام در authorization و audit همان معامله ثبت می‌شوند.
+              </p>
+              <CandleResearchDetails report={brainReport.historicalCandleResearch} />
+            </>
+          ) : (
+            <p className="text-[11px] text-amber-200">
+              گزارش معتبر پژوهش کندل برای انتخاب افق در دسترس نیست؛ کنترل مرکزی در این حالت مجوز ورود صادر نمی‌کند.
+            </p>
+          )}
+          <div className="mt-2 rounded-lg border border-slate-800 bg-black/20 p-2 text-[10px] leading-5">
+            <p className="font-bold text-slate-200">آخرین تصمیم واقعی کنترل مرکزی</p>
+            {latestExecutionAudit ? (
+              <>
+                <p className="text-slate-300">
+                  {formatTimestamp(Date.parse(latestExecutionAudit.at))} · {latestExecutionAudit.decision} ·
+                  {' '}{latestExecutionAudit.holdingHorizon?.status === 'SELECTED'
+                    ? `افق انتخابی ${latestExecutionAudit.holdingHorizon.selectedHorizonMinutes} دقیقه`
+                    : 'افقی انتخاب نشد'}
+                </p>
+                <p className="text-slate-400">
+                  بازار اجرا: {latestExecutionAudit.holdingHorizon?.executionMarket
+                    ? `${latestExecutionAudit.holdingHorizon.executionMarket.exchange} · ${latestExecutionAudit.holdingHorizon.executionMarket.market} · ${latestExecutionAudit.holdingHorizon.executionMarket.pair}`
+                    : 'ناموجود'}؛ منبع پژوهش: {latestExecutionAudit.holdingHorizon?.researchMarket
+                      ? `${latestExecutionAudit.holdingHorizon.researchMarket.exchange} · ${latestExecutionAudit.holdingHorizon.researchMarket.market} · ${latestExecutionAudit.holdingHorizon.researchMarket.pair}`
+                      : 'ناموجود'}
+                </p>
+                <p className="text-slate-400">{latestExecutionAudit.holdingHorizon?.reason}</p>
+                <ul className="mt-1 space-y-1 text-slate-400">
+                  {latestExecutionAudit.holdingHorizon?.evaluations.map((evaluation) => (
+                    <li key={evaluation.horizonMinutes}>
+                      {evaluation.actualHorizonMinutes} دقیقه · {evaluation.eligible ? 'مجاز' : 'رد'} ·
+                      {' '}{evaluation.sampleCount} نمونه · کران پایین نرخ برد {
+                        evaluation.netWinRateLowerBoundPct?.toFixed(1) ?? 'ناموجود'
+                      }٪ · {evaluation.reason}
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-1 text-slate-500">{latestExecutionAudit.reason}</p>
+              </>
+            ) : (
+              <p className="text-amber-300">
+                {executionAuditError ?? 'هنوز تصمیم دارای گزارش افق در سابقه ثبت نشده است.'}
+              </p>
+            )}
+          </div>
+        </section>
+
         <section className="rounded-xl border border-purple-800/50 bg-purple-950/20 p-3">
           <h3 className="font-bold text-purple-200">هماهنگ‌کنندهٔ شورا · خارج از شمارش ۸ رأی</h3>
           {COUNCIL_COORDINATOR_MODULES.map((moduleId) => {
@@ -607,51 +793,10 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
           })}
         </section>
 
-        <section className="space-y-2 rounded-xl border border-cyan-800/50 bg-cyan-950/20 p-3">
-          <h3 className="font-bold text-cyan-200">کنترل مرکزی · پژوهش کندل تاریخی و افق نگهداری</h3>
-          {!brainReport ? (
-            <p className="text-[11px] text-slate-400">گزارش پژوهش تاریخی هنوز به کنترل مرکزی نرسیده است.</p>
-          ) : (
-            <>
-              <p className="text-[11px] leading-5 text-slate-300">
-                وضعیت {brainReport.centralCandleResearch.status} · منبع {brainReport.centralCandleResearch.source} ·
-                {' '}{brainReport.centralCandleResearch.timeframe ?? 'تایم‌فریم ناموجود'} ·
-                {' '}{brainReport.centralCandleResearch.candleCount} کندل ·
-                {' '}آموزش/آزمون {brainReport.centralCandleResearch.trainingCandleCount}/{brainReport.centralCandleResearch.testCandleCount} ·
-                {' '}شباهت {brainReport.centralCandleResearch.similarityThresholdPct}% ·
-                {' '}وزن زمینه {brainReport.centralCandleResearch.contextSimilarityWeightPct}% ·
-                {' '}حداقل {brainReport.centralCandleResearch.requiredReferenceMatches} مرجع مشابه و
-                {' '}{brainReport.centralCandleResearch.minimumOutOfSampleForecasts} پیش‌بینی خارج‌ازنمونه.
-              </p>
-              <p className="text-[11px] leading-5 text-cyan-100">
-                این گزارش پژوهشی فقط برای مشاهده و پایش کیفیت است؛ کنترل مرکزی از آن جهت یا افق معامله پیش‌بینی/پیشنهاد نمی‌کند.
-              </p>
-              <div className="grid gap-1 md:grid-cols-2">
-                {Object.values(brainReport.centralCandleResearch.horizons).map((horizon) => (
-                  <p key={horizon.horizonMinutes} className="rounded bg-black/20 p-2 text-[10px] leading-5 text-slate-300">
-                    {horizon.horizonMinutes} دقیقه (اندازه‌گیری {horizon.actualHorizonMinutes} دقیقه):{' '}
-                    {horizon.available
-                      ? `${horizon.outOfSampleForecastCount} نمونه · شباهت میانگین ${horizon.meanSimilarityPct?.toFixed(1) ?? 'ناموجود'}٪ · دقت جهت ${horizon.grossDirectionAccuracyPct?.toFixed(1) ?? 'ناموجود'}٪ · بازده ناخالص ${horizon.meanGrossPredictedReturnPct?.toFixed(4) ?? 'ناموجود'}٪ · بازده خالص ${horizon.meanNetPredictedReturnPct?.toFixed(4) ?? 'ناموجود'}٪ · برد خالص ${horizon.netWinRatePct?.toFixed(1) ?? 'ناموجود'}٪ · MFE/MAE ${horizon.meanMaximumFavorableMovePct?.toFixed(4) ?? 'ناموجود'}/${horizon.meanMaximumAdverseMovePct?.toFixed(4) ?? 'ناموجود'}٪ · نسبت هزینه‌تعدیل‌شده ${horizon.meanCostAdjustedRewardRiskRatio?.toFixed(2) ?? 'ناموجود'}`
-                      : `${horizon.outOfSampleForecastCount}/${horizon.minimumForecastsForMetrics} نمونه؛ معیار عملکرد فعلاً گزارش نمی‌شود`}
-                  </p>
-                ))}
-              </div>
-              <p className="text-[10px] leading-5 text-slate-400">
-                هزینه‌ها: {brainReport.centralCandleResearch.costs.configured
-                  ? `تنظیم شده؛ رفت‌وبرگشت ${brainReport.centralCandleResearch.costs.roundTripPercent.toFixed(4)}٪`
-                  : 'تنظیم نشده؛ بازده خالص قابل انتخاب نیست'}.
-                {' '}این گزارش مجوز معامله یا زمان‌بندی خروج نیست.
-              </p>
-              <p className="text-[10px] leading-5 text-slate-400">
-                روش و محدودیت‌ها: {brainReport.centralCandleResearch.note}
-              </p>
-            </>
-          )}
-        </section>
-
         <p className="rounded-lg border border-slate-800 bg-slate-950/60 p-2 text-[10px] leading-5 text-slate-400">
           خروجی مغزها، SB1 تا SB4، مدل‌های متن‌باز و ارکان پایین کارت عضو مالک خودشان نمایش داده می‌شوند و
           فقط شاهد کمکی همان یک رأی هستند؛ SB5 در نقش هماهنگ‌کنندهٔ مرکزی و بیرون از شمارش رأی قرار دارد.
+          پژوهش الگوهای تاریخی و انتخاب مدت نگهداری در کنترل مرکزی انجام می‌شوند؛ این فرایند رأی جداگانه نمی‌سازد.
           اعضای ریسک/مشتقات و مدل‌های دیگر رأی جداگانهٔ اضافه نمی‌سازند. دادهٔ اختیار معامله
           تا زمان اتصال فید معتبر ممتنع می‌ماند؛ اخبار نیز فقط با خبر تازه و امتیاز سنتیمنت زنده حق رأی دارد.
           زمان ارزیابی: {formatTimestamp(report.evaluatedAtMs)}

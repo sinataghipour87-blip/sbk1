@@ -17,6 +17,7 @@ import { Candle } from '../types/trading';
 
 export interface RealGarchResult {
   status: 'AVAILABLE' | 'UNAVAILABLE';
+  timeframe: string | null;
   sampleSize: number;
   oosSampleSize: number;
   omega: number | null;
@@ -26,7 +27,9 @@ export interface RealGarchResult {
   longRunVolAnnualizedPct: number | null;
   currentConditionalVolPct: number | null;
   forecastVol15mPct: number | null;
+  forecastVol15mActualHorizonMinutes: number | null;
   forecastVol1hPct: number | null;
+  forecastVol1hActualHorizonMinutes: number | null;
   oosForecastMape: number | null; // Out-of-Sample Mean Absolute Percentage Error
   oosRmse: number | null;
   regime: 'COMPRESSION' | 'NORMAL' | 'EXPANSION' | 'SPIKE_TURBULENCE' | 'UNKNOWN';
@@ -34,6 +37,14 @@ export interface RealGarchResult {
   isStationary: boolean;
   modelTimestamp: number;
   detailsFa: string;
+}
+
+function timeframeMinutes(timeframe: string): number | null {
+  const match = /^([1-9]\d*)(m|h|d|w)$/.exec(timeframe);
+  if (!match) return null;
+  const units: Record<string, number> = { m: 1, h: 60, d: 1_440, w: 10_080 };
+  const minutes = Number(match[1]) * units[match[2]];
+  return Number.isSafeInteger(minutes) ? minutes : null;
 }
 
 export class RealGarchEngine {
@@ -50,57 +61,69 @@ export class RealGarchEngine {
    * Fit GARCH(1,1) model on series of candles.
    * Splits into In-Sample (80%) and Out-of-Sample (20%).
    */
-  public fitAndForecast(candles: Candle[] | any[]): RealGarchResult {
+  public fitAndForecast(candles: Candle[], timeframe: string): RealGarchResult {
+    const minutesPerCandle = timeframeMinutes(timeframe);
+    const unavailable = (sampleSize: number, detailsFa: string): RealGarchResult => ({
+      status: 'UNAVAILABLE',
+      timeframe: minutesPerCandle === null ? null : timeframe,
+      sampleSize,
+      oosSampleSize: 0,
+      omega: null,
+      alpha: null,
+      beta: null,
+      persistence: null,
+      longRunVolAnnualizedPct: null,
+      currentConditionalVolPct: null,
+      forecastVol15mPct: null,
+      forecastVol15mActualHorizonMinutes: null,
+      forecastVol1hPct: null,
+      forecastVol1hActualHorizonMinutes: null,
+      oosForecastMape: null,
+      oosRmse: null,
+      regime: 'UNKNOWN',
+      regimeProbability: null,
+      isStationary: false,
+      modelTimestamp: Date.now(),
+      detailsFa,
+    });
+    if (minutesPerCandle === null) {
+      return unavailable(0, 'تایم‌فریم معتبر برای تفسیر افق پیش‌بینی GARCH موجود نیست.');
+    }
     if (!candles || candles.length < 25) {
-      return {
-        status: 'UNAVAILABLE',
-        sampleSize: candles ? candles.length : 0,
-        oosSampleSize: 0,
-        omega: null,
-        alpha: null,
-        beta: null,
-        persistence: null,
-        longRunVolAnnualizedPct: null,
-        currentConditionalVolPct: null,
-        forecastVol15mPct: null,
-        forecastVol1hPct: null,
-        oosForecastMape: null,
-        oosRmse: null,
-        regime: 'UNKNOWN',
-        regimeProbability: null,
-        isStationary: false,
-        modelTimestamp: Date.now(),
-        detailsFa: 'داده‌های سری زمانی کندل‌ها ناکافی است (حداقل ۲۵ کندل جهت برازش GARCH الزامی است).'
-      };
+      return unavailable(
+        candles?.length ?? 0,
+        'داده‌های سری زمانی کندل‌ها ناکافی است (حداقل ۲۵ کندل جهت برازش GARCH الزامی است).',
+      );
     }
 
-    // Extract closes
-    const closes: number[] = candles.map((c: any) => {
-      if (Array.isArray(c)) return c[3] ?? c[4] ?? 0;
-      return c.close ?? c.c ?? 0;
-    }).filter(p => typeof p === 'number' && p > 0);
+    const timeframeMs = minutesPerCandle * 60_000;
+    const closes: number[] = [];
+    let previousTimestamp: number | null = null;
+    for (const candle of candles) {
+      const offset = candle.length === 6 ? 1 : 0;
+      const close = candle[offset + 3];
+      if (!Number.isFinite(close) || close <= 0) {
+        return unavailable(closes.length, 'کندل نامعتبر است؛ برازش GARCH متوقف شد.');
+      }
+      if (offset === 1) {
+        const timestamp = candle[0];
+        if (!Number.isSafeInteger(timestamp) ||
+          (previousTimestamp !== null && timestamp - previousTimestamp !== timeframeMs)) {
+          return unavailable(closes.length, 'timestamp یا cadence کندل‌ها با تایم‌فریم GARCH سازگار نیست.');
+        }
+        previousTimestamp = timestamp;
+      } else if (previousTimestamp !== null) {
+        return unavailable(closes.length, 'ساختار timestamp کندل‌ها یکدست نیست.');
+      }
+      closes.push(close);
+    }
+    if (candles.some(candle => candle.length === 6) &&
+      candles.some(candle => candle.length !== 6)) {
+      return unavailable(closes.length, 'ساختار timestamp کندل‌ها یکدست نیست.');
+    }
 
     if (closes.length < 25) {
-      return {
-        status: 'UNAVAILABLE',
-        sampleSize: closes.length,
-        oosSampleSize: 0,
-        omega: null,
-        alpha: null,
-        beta: null,
-        persistence: null,
-        longRunVolAnnualizedPct: null,
-        currentConditionalVolPct: null,
-        forecastVol15mPct: null,
-        forecastVol1hPct: null,
-        oosForecastMape: null,
-        oosRmse: null,
-        regime: 'UNKNOWN',
-        regimeProbability: null,
-        isStationary: false,
-        modelTimestamp: Date.now(),
-        detailsFa: 'تعداد قیمت‌های معتبر برای سری زمانی GARCH ناکافی است.'
-      };
+      return unavailable(closes.length, 'تعداد قیمت‌های معتبر برای سری زمانی GARCH ناکافی است.');
     }
 
     // 1. Calculate Log Returns: r_t = ln(P_t / P_{t-1})
@@ -114,26 +137,7 @@ export class RealGarchEngine {
 
     const totalN = logReturns.length;
     if (totalN < 20) {
-      return {
-        status: 'UNAVAILABLE',
-        sampleSize: totalN,
-        oosSampleSize: 0,
-        omega: null,
-        alpha: null,
-        beta: null,
-        persistence: null,
-        longRunVolAnnualizedPct: null,
-        currentConditionalVolPct: null,
-        forecastVol15mPct: null,
-        forecastVol1hPct: null,
-        oosForecastMape: null,
-        oosRmse: null,
-        regime: 'UNKNOWN',
-        regimeProbability: null,
-        isStationary: false,
-        modelTimestamp: Date.now(),
-        detailsFa: 'تعداد بازده‌های معتبر برای برازش GARCH کمتر از حد مجاز است.'
-      };
+      return unavailable(totalN, 'تعداد بازده‌های معتبر برای برازش GARCH کمتر از حد مجاز است.');
     }
 
     // 2. Train / OOS Split (80% In-sample train, 20% Out-of-sample test)
@@ -188,7 +192,8 @@ export class RealGarchEngine {
     const persistence = Number((alpha + beta).toFixed(4));
     const omega = sampleVar * (1 - persistence);
     const longRunVar = omega / Math.max(0.001, 1 - persistence);
-    const longRunVolAnnualizedPct = Number((Math.sqrt(longRunVar * 365 * 24 * 4) * 100).toFixed(2));
+    const barsPerYear = 365 * 24 * 60 / minutesPerCandle;
+    const longRunVolAnnualizedPct = Number((Math.sqrt(longRunVar * barsPerYear) * 100).toFixed(2));
 
     // 4. Filter full series up to current bar to obtain current conditional variance
     let currentSigma2 = sampleVar;
@@ -199,9 +204,20 @@ export class RealGarchEngine {
 
     const currentConditionalVolPct = Number((Math.sqrt(currentSigma2) * 100).toFixed(2));
 
-    // 5. Multi-step forecasts: σ_{t+k}^2 = σ_L^2 + (α + β)^k * (σ_t^2 - σ_L^2)
-    const forecastVar15m = longRunVar + persistence * (currentSigma2 - longRunVar);
-    const forecastVar1h = longRunVar + Math.pow(persistence, 4) * (currentSigma2 - longRunVar);
+    // Forecast each horizon using complete bars and report the effective horizon.
+    const forecastAtMinutes = (horizonMinutes: number) => {
+      const bars = Math.ceil(horizonMinutes / minutesPerCandle);
+      let cumulativeVariance = 0;
+      for (let step = 0; step < bars; step += 1) {
+        cumulativeVariance += longRunVar +
+          Math.pow(persistence, step) * (currentSigma2 - longRunVar);
+      }
+      return { bars, variance: cumulativeVariance };
+    };
+    const forecast15m = forecastAtMinutes(15);
+    const forecast1h = forecastAtMinutes(60);
+    const forecastVar15m = forecast15m.variance;
+    const forecastVar1h = forecast1h.variance;
     const forecastVol15mPct = Number((Math.sqrt(Math.max(0.000001, forecastVar15m)) * 100).toFixed(2));
     const forecastVol1hPct = Number((Math.sqrt(Math.max(0.000001, forecastVar1h)) * 100).toFixed(2));
 
@@ -240,26 +256,20 @@ export class RealGarchEngine {
     // 7. Dynamic Regime Classification based on conditional volatility vs long-run variance
     const volRatio = currentConditionalVolPct / Math.max(0.01, Math.sqrt(longRunVar) * 100);
     let regime: RealGarchResult['regime'] = 'NORMAL';
-    let regimeProbability = 0.50;
 
     if (volRatio < 0.75) {
       regime = 'COMPRESSION';
-      regimeProbability = Number((Math.min(0.92, 0.60 + (0.75 - volRatio) * 0.8)).toFixed(3));
     } else if (volRatio > 2.2) {
       regime = 'SPIKE_TURBULENCE';
-      regimeProbability = Number((Math.min(0.95, 0.70 + (volRatio - 2.2) * 0.2)).toFixed(3));
     } else if (volRatio > 1.3) {
       regime = 'EXPANSION';
-      regimeProbability = Number((Math.min(0.88, 0.55 + (volRatio - 1.3) * 0.3)).toFixed(3));
-    } else {
-      regime = 'NORMAL';
-      regimeProbability = 0.65;
     }
 
-    const detailsFa = `مدل GARCH(1,1) کالیبره‌شده: ω=${omega.toExponential(2)}, α=${alpha.toFixed(2)}, β=${beta.toFixed(2)} (ماندگاری: ${persistence}). نوسان شرطی ${currentConditionalVolPct}٪ در رژیم [${regime}] با خطای OOS برابر ${oosRmse ?? 'N/A'}٪.`;
+    const detailsFa = `برآورد GARCH(1,1) با جست‌وجوی شبکه‌ای: ω=${omega.toExponential(2)}, α=${alpha.toFixed(2)}, β=${beta.toFixed(2)} (ماندگاری: ${persistence}). نوسان شرطی هر کندل ${currentConditionalVolPct}٪ در رژیم heuristic [${regime}] است؛ افق‌ها با کندل کامل گرد شده‌اند و خطای OOS یک‌گام برابر ${oosRmse ?? 'N/A'}٪ است.`;
 
     return {
       status: 'AVAILABLE',
+      timeframe,
       sampleSize: totalN,
       oosSampleSize: oosSize,
       omega: Number(omega.toFixed(8)),
@@ -269,11 +279,13 @@ export class RealGarchEngine {
       longRunVolAnnualizedPct,
       currentConditionalVolPct,
       forecastVol15mPct,
+      forecastVol15mActualHorizonMinutes: forecast15m.bars * minutesPerCandle,
       forecastVol1hPct,
+      forecastVol1hActualHorizonMinutes: forecast1h.bars * minutesPerCandle,
       oosForecastMape,
       oosRmse,
       regime,
-      regimeProbability,
+      regimeProbability: null,
       isStationary: persistence < 1.0,
       modelTimestamp: Date.now(),
       detailsFa

@@ -6,8 +6,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
-SIGNAL_CONTRACT_VERSION = "sbk1.freqtrade.signal.v2"
-ENTRY_AUTHORIZATION_VERSION = "sbk1.entry.authorization.v1"
+SIGNAL_CONTRACT_VERSION = "sbk1.freqtrade.signal.v3"
+ENTRY_AUTHORIZATION_VERSION = "sbk1.entry.authorization.v2"
 DRY_RUN_FIXTURE_SETUP_PREFIX = "DRY_RUN_E2E_FIXTURE_"
 _SIGNAL_ID_PATTERN = re.compile(r"^sbk1_[a-f0-9]{32}$")
 _EXIT_SIGNAL_ID_PATTERN = re.compile(r"^sbk1_exit_[a-f0-9]{32}$")
@@ -181,6 +181,10 @@ def is_valid_sbk_signal(
         signal.get("contractVersion") != SIGNAL_CONTRACT_VERSION
         or authorization.get("contractVersion") != ENTRY_AUTHORIZATION_VERSION
         or authorization.get("decisionId") != decision_id
+        or authorization.get("holdingHorizonMinutes") != entry_conditions.get("maxHoldingMinutes")
+        or not isinstance(authorization.get("holdingHorizonMinutes"), int)
+        or isinstance(authorization.get("holdingHorizonMinutes"), bool)
+        or not 1 <= authorization["holdingHorizonMinutes"] <= 60
         or authorization.get("timeframe") != signal.get("timeframe")
         or authorization.get("direction") != signal.get("direction")
         or authorization.get("snapshotTimestampMs") != observed_at_ms
@@ -224,6 +228,7 @@ def is_valid_sbk_signal(
     stop_loss = entry_conditions.get("stopLoss")
     take_profit = entry_conditions.get("takeProfit")
     max_price_deviation_bps = entry_conditions.get("maxPriceDeviationBps")
+    max_holding_minutes = entry_conditions.get("maxHoldingMinutes")
     setup_type = entry_conditions.get("setupType")
     if (
         not _positive_number(reference_price)
@@ -235,6 +240,9 @@ def is_valid_sbk_signal(
         or not _positive_number(take_profit)
         or not _positive_number(max_price_deviation_bps)
         or max_price_deviation_bps > 100
+        or not isinstance(max_holding_minutes, int)
+        or isinstance(max_holding_minutes, bool)
+        or not 1 <= max_holding_minutes <= 60
         or not isinstance(setup_type, str)
         or not setup_type.strip()
     ):
@@ -295,12 +303,14 @@ def is_valid_sbk_signal(
         "COUNCIL_REPORT",
         "LIVE_DATA",
         "REFERENCE_PRICE",
+        "VOLATILITY",
         "EXECUTION_SPREAD",
         "TRADE_LEVELS",
         "STOP_AND_TARGET",
         "PORTFOLIO_RISK",
         "DAILY_LOSS",
         "RISK_ALLOCATION",
+        "HOLDING_HORIZON",
     }
     gate_ids = []
     for gate in gates:

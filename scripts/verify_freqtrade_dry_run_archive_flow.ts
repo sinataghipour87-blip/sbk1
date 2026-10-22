@@ -185,12 +185,14 @@ const authorizationGateIds = [
   'COUNCIL_REPORT',
   'LIVE_DATA',
   'REFERENCE_PRICE',
+  'VOLATILITY',
   'EXECUTION_SPREAD',
   'TRADE_LEVELS',
   'STOP_AND_TARGET',
   'PORTFOLIO_RISK',
   'DAILY_LOSS',
   'RISK_ALLOCATION',
+  'HOLDING_HORIZON',
 ];
 const signal = {
   contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
@@ -216,6 +218,7 @@ const signal = {
     stopLoss: 59_000,
     takeProfit: 62_000,
     maxPriceDeviationBps: 100,
+    maxHoldingMinutes: 30,
   },
   riskLimits: { riskBudgetPct: 0.1, maxStakeQuote: 100, maxLeverage: 1 },
   authorization: {
@@ -237,6 +240,7 @@ const signal = {
     ensembleProbabilityPct: null,
     riskRewardRatio: 2,
     allocatedRiskUsd: 0.4,
+    holdingHorizonMinutes: 30,
   },
 };
 

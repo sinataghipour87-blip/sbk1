@@ -1018,7 +1018,7 @@ export function validateCouncilModuleOwnership(
 export const COUNCIL_COORDINATOR_MODULES = ['sb.SB5'] as const;
 
 export const CENTRAL_CONTROL_MODULES = [
-  'control.centralCandleResearch',
+  'control.holdingHorizonSelector',
   'control.postCouncilTradeController',
   'control.decisionPipeline',
   'control.riskAllocator',

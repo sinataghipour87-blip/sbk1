@@ -17,7 +17,7 @@ Object.defineProperty(globalThis, 'localStorage', {
   value: localStorageMock,
 });
 
-function analysis(price: number): Partial<AnalysisResult> {
+function analysis(price: number, candleTimestampMs?: number): Partial<AnalysisResult> {
   const candles = Array.from({ length: 5 }, (_, index) => {
     const close = price - (4 - index) * 0.1;
     return [close - 0.05, close + 0.1, close - 0.1, close, 10] as [number, number, number, number, number];
@@ -28,7 +28,12 @@ function analysis(price: number): Partial<AnalysisResult> {
     direction: 'LONG',
     rawCandles: candles,
     dataStatus: 'LIVE',
-    dataQualityReport: { isTradeAllowed: true } as AnalysisResult['dataQualityReport'],
+    dataQualityReport: {
+      isTradeAllowed: true,
+      feeds: candleTimestampMs === undefined ? undefined : {
+        candles: { timestamp: candleTimestampMs },
+      },
+    } as AnalysisResult['dataQualityReport'],
     orderFlowFeatures: {
       isRealTradeFlow: true,
       status: 'LIVE',
@@ -64,6 +69,19 @@ assert.equal(stored.observations[0].outcomes['5m']?.observedAtMs, startMs + 5 * 
 assert.equal(stored.observations[0].outcomes['7m']?.observedAtMs, startMs + 7 * 60_000);
 assert.equal(stored.observations[0].outcomes['7m']?.terminalMovePct, 2);
 assert.equal(stored.observations[0].outcomes['15m'], undefined);
+
+store.delete(observationKey);
+recordWaveObservationAndClassify(analysis(100, startMs), startMs);
+recordWaveObservationAndClassify(analysis(101, startMs), startMs + 2 * 60_000);
+recordWaveObservationAndClassify(analysis(102, startMs + 5 * 60_000), startMs + 5 * 60_000);
+const deduplicated = JSON.parse(store.get(observationKey) ?? '{}') as {
+  observations: Array<{ sourceCandleTimestampMs?: number | null }>;
+};
+assert.equal(deduplicated.observations.length, 2, 'repeated or out-of-order candle timestamps must not create observations');
+assert.deepEqual(
+  deduplicated.observations.map(observation => observation.sourceCandleTimestampMs),
+  [startMs, startMs + 5 * 60_000],
+);
 
 store.set(observationKey, JSON.stringify({
   version: 1,

@@ -4,7 +4,10 @@ import {
   evaluateEightMemberCouncil,
   type EightMemberCouncilReport,
 } from '../src/services/eightMemberCouncil';
-import { runPostCouncilTradeControl } from '../src/services/postCouncilTradeController';
+import {
+  runPostCouncilTradeControl as runControlWithResearch,
+} from '../src/services/postCouncilTradeController';
+import type { WalkForwardCandleResearchReport } from '../src/services/walkForwardCandleResearch';
 import { calculateCentralRiskAllocation } from '../src/services/centralRiskAllocation';
 
 const tightStopAllocation = calculateCentralRiskAllocation({
@@ -46,6 +49,59 @@ assert.equal(calculateCentralRiskAllocation({
 }), null);
 
 const nowMs = Date.now();
+const candleResearch: WalkForwardCandleResearchReport = {
+  status: 'AVAILABLE',
+  source: 'verified-live-exchange-candles',
+  exchange: 'bybit',
+  market: 'futures',
+  pair: 'BTC/USDT:USDT',
+  sourceTimestampMs: nowMs,
+  timeframe: '1m',
+  candleCount: 1_000,
+  trainingCandleCount: 700,
+  testCandleCount: 300,
+  trainingCutoffTimestampMs: nowMs - 300 * 60_000,
+  similarityThresholdPct: 85,
+  contextSimilarityWeightPct: 30,
+  requiredReferenceMatches: 3,
+  minimumOutOfSampleForecasts: 20,
+  costs: { configured: true, takerFeeBpsPerSide: 5, slippageBpsPerSide: 2, roundTripPercent: 0.14 },
+  horizons: Object.fromEntries([7, 15, 30, 60].map((horizonMinutes) => [horizonMinutes, {
+    horizonMinutes,
+    actualHorizonMinutes: horizonMinutes,
+    available: true,
+    outOfSampleForecastCount: 50,
+    forecastsWithEnoughMatches: 50,
+    minimumForecastsForMetrics: 20,
+    averageReferenceMatches: 4,
+    meanSimilarityPct: 90,
+    grossDirectionAccuracyPct: 60,
+    meanGrossPredictedReturnPct: 0.3,
+    grossWinRatePct: 60,
+    meanNetPredictedReturnPct: 0.16,
+    netWinRatePct: 76,
+    netWinCount: 38,
+    meanMaximumFavorableMovePct: 0.4,
+    meanMaximumAdverseMovePct: 0.2,
+    meanCostAdjustedRewardRiskRatio: 1.2,
+  }])) as WalkForwardCandleResearchReport['horizons'],
+  tradeEligible: false,
+  note: 'OOS verification evidence only.',
+};
+function runPostCouncilTradeControl(
+  input: Omit<Parameters<typeof runControlWithResearch>[0], 'marketIdentity'> &
+    Partial<Pick<Parameters<typeof runControlWithResearch>[0], 'marketIdentity'>>,
+) {
+  return runControlWithResearch({
+    marketIdentity: input.marketIdentity ?? {
+      exchange: 'bybit',
+      market: 'futures',
+      pair: 'BTC/USDT:USDT',
+    },
+    candleResearch,
+    ...input,
+  });
+}
 const baseCouncil = evaluateEightMemberCouncil({ nowMs });
 const council: EightMemberCouncilReport = {
   ...baseCouncil,
@@ -78,7 +134,9 @@ const controlRisk = {
   dailyLossLimitPct: 2,
 };
 const analysis = {
+  timeframe: '1m',
   price: 60_000,
+  atr: 100,
   dataStatus: 'LIVE',
   candles: Array.from({ length: 30 }, (_, index) =>
     [nowMs - (30 - index) * 60_000, 60_000, 60_100, 59_900, 60_000, 1] as const
@@ -168,6 +226,125 @@ assert.match(
 );
 assert.ok(valid.executionRisk);
 assert.equal('models' in valid, false, 'central control must not generate model predictions');
+assert.equal(valid.gates.find((gate) => gate.id === 'VOLATILITY')?.passed, true);
+assert.equal(valid.executionPlan?.holdingHorizon.selectedHorizonMinutes, 60);
+assert.equal(valid.gates.find((gate) => gate.id === 'HOLDING_HORIZON')?.passed, true);
+
+const noResearchHorizon = runControlWithResearch({
+  analysis,
+  council,
+  marketIdentity: { exchange: 'bybit', market: 'futures', pair: 'BTC/USDT:USDT' },
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(noResearchHorizon.approved, false);
+assert.equal(noResearchHorizon.gates.at(-1)?.id, 'HOLDING_HORIZON');
+assert.equal(noResearchHorizon.holdingHorizon?.status, 'UNAVAILABLE');
+
+const malformedResearch = structuredClone(candleResearch);
+delete (malformedResearch.horizons as Partial<typeof malformedResearch.horizons>)[60];
+const malformedResearchResult = runControlWithResearch({
+  analysis,
+  council,
+  marketIdentity: { exchange: 'bybit', market: 'futures', pair: 'BTC/USDT:USDT' },
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  candleResearch: malformedResearch,
+  nowMs,
+});
+assert.equal(malformedResearchResult.approved, false);
+assert.equal(malformedResearchResult.holdingHorizon?.status, 'UNAVAILABLE');
+
+const weakWinEvidence = structuredClone(candleResearch);
+for (const horizon of Object.values(weakWinEvidence.horizons)) {
+  horizon.netWinRatePct = 64;
+  horizon.netWinCount = 32;
+}
+const weakWinResult = runControlWithResearch({
+  analysis,
+  council,
+  marketIdentity: { exchange: 'bybit', market: 'futures', pair: 'BTC/USDT:USDT' },
+  candleResearch: weakWinEvidence,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(weakWinResult.approved, false);
+assert.match(
+  weakWinResult.holdingHorizon?.evaluations[0]?.reason ?? '',
+  /کران پایین Wilson/,
+  'minimum sample wins alone must not pass without a multiple-horizon confidence bound',
+);
+
+for (const marketIdentity of [
+  { exchange: 'binance', market: 'futures' as const, pair: 'BTC/USDT:USDT' },
+  { exchange: 'bybit', market: 'spot' as const, pair: 'BTC/USDT:USDT' },
+  { exchange: 'bybit', market: 'futures' as const, pair: 'ETH/USDT:USDT' },
+]) {
+  const mismatchedResearch = runControlWithResearch({
+    analysis,
+    council,
+    marketIdentity,
+    candleResearch,
+    balance: 1_000,
+    maxStakeQuote: 100,
+    maxLeverage: 5,
+    riskBudgetPct: 1,
+    ...controlRisk,
+    referencePrice: 60_000,
+    maxDeviationBps: 100,
+    nowMs,
+  });
+  assert.equal(mismatchedResearch.approved, false);
+  assert.match(mismatchedResearch.holdingHorizon?.reason ?? '', /صرافی، نماد یا نوع بازار/);
+}
+
+const excessiveVolatility = runPostCouncilTradeControl({
+  analysis: { ...analysis, atr: 1_500 } as AnalysisResult,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  maxAtrPct: 2,
+  nowMs,
+});
+assert.equal(excessiveVolatility.approved, false);
+assert.equal(excessiveVolatility.gates.at(-1)?.id, 'VOLATILITY');
+
+const unavailableAtr = runPostCouncilTradeControl({
+  analysis: { ...analysis, atr: Number.NaN } as AnalysisResult,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(unavailableAtr.approved, false);
+assert.equal(unavailableAtr.gates.at(-1)?.id, 'VOLATILITY');
 
 const staleReferencePrice = runPostCouncilTradeControl({
   analysis,
@@ -344,7 +521,7 @@ const staleOrderBook = runPostCouncilTradeControl({
   nowMs,
 });
 assert.equal(staleOrderBook.approved, false, 'stale execution book must fail closed');
-assert.equal(staleOrderBook.gates[1]?.passed, false);
+assert.equal(staleOrderBook.gates.find((gate) => gate.id === 'LIVE_DATA')?.passed, false);
 
 const staleTradeFlow = runPostCouncilTradeControl({
   analysis: {

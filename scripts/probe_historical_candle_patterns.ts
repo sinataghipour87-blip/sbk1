@@ -25,6 +25,9 @@ const report = analyzeWalkForwardCandlePatterns({
   candles: candles.map(({ open, high, low, close, volume }) =>
     [open, high, low, close, volume] as Candle
   ),
+  exchange: marketData.venue,
+  market: marketData.market,
+  pair: marketData.pair,
   timeframe,
   dataStatus: 'LIVE',
   sourceTimestampMs: marketData.candles.sourceTimestampMs,

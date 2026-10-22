@@ -320,7 +320,10 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
               </p>
               <div className="flex items-center justify-between text-[10.5px] font-mono text-slate-400 pt-1">
                 <span>استاپ شناور: {report.brain3Volatility.adaptiveTrailingOffsetPct}٪</span>
-                <span>پیش‌بینی نوسان: {report.brain3Volatility.volatilityForecastPct}٪</span>
+                <span>
+                  برآورد نوسان ({report.brain3Volatility.volatilityForecastHorizonMinutes ?? 'ناموجود'} دقیقه):
+                  {' '}{report.brain3Volatility.volatilityForecastPct ?? 'ناموجود'}٪
+                </span>
               </div>
             </div>
 

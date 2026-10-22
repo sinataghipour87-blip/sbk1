@@ -3,12 +3,9 @@ import {
   Zap,
   Flame,
   AlertTriangle,
-  TrendingUp,
-  TrendingDown,
   ShieldCheck,
   RefreshCw,
   CheckCircle2,
-  Activity
 } from 'lucide-react';
 import { CollapsibleCard } from './CollapsibleCard';
 import { evaluateVolatilitySpike, VolatilitySpikeReport } from '../services/volatilitySpikePredictor';
@@ -39,12 +36,13 @@ export const VolatilitySpikePredictorWidget: React.FC<Props> = ({ analysis, curr
   if (!report) return null;
 
   const isCritical = report.alertLevel === 'CRITICAL_SPIKE_IMMINENT';
+  const isUnavailable = report.status === 'UNAVAILABLE';
 
   return (
     <CollapsibleCard
       title="ویجت پیش‌بینی نوسانات ناگهانی (Volatility Spike Predictor)"
-      badge="هشدار پیش‌دستانه شارپ"
-      badgeColor={isCritical ? "text-rose-300 bg-rose-950/80 border-rose-500/50 shadow-[0_0_15px_rgba(244,63,94,0.4)] animate-pulse" : "text-amber-300 bg-amber-950/80 border-amber-500/40 shadow-[0_0_12px_rgba(245,158,11,0.3)]"}
+      badge={isUnavailable ? 'دادهٔ زنده ناموجود' : 'امتیاز هشدار heuristic'}
+      badgeColor={isCritical ? "text-rose-300 bg-rose-950/80 border-rose-500/50 shadow-[0_0_15px_rgba(244,63,94,0.4)] animate-pulse" : isUnavailable ? "text-slate-300 bg-slate-950/80 border-slate-500/40" : "text-amber-300 bg-amber-950/80 border-amber-500/40 shadow-[0_0_12px_rgba(245,158,11,0.3)]"}
       defaultOpen={true}
       icon={<Flame className={`w-5 h-5 ${isCritical ? 'text-rose-400 animate-bounce' : 'text-amber-400'}`} />}
       headerAction={
@@ -71,18 +69,19 @@ export const VolatilitySpikePredictorWidget: React.FC<Props> = ({ analysis, curr
                 <Zap className="w-4 h-4" />
               </div>
               <div>
-                <div className="text-white font-bold font-sans text-xs">احتمال وقوع نوسان ناگهانی و شارپ:</div>
+                <div className="text-white font-bold font-sans text-xs">هشدار نوسان (غیرکالیبره):</div>
                 <div className="text-[11px] text-amber-300 font-mono mt-0.5">
-                  احتمال هشدار: {report.spikeProbabilityPct}٪ | جهت پیش‌بینی: [{report.expectedDirection}]
+                  {report.riskScorePct === null ? 'امتیاز ناموجود' : `امتیاز هشدار: ${report.riskScorePct}٪`}
+                  {' | '}جهت: [{report.expectedDirection}]
                 </div>
               </div>
             </div>
 
             <span className={`px-3 py-1 rounded-xl border text-xs font-bold font-sans flex items-center gap-1 ${
-              isCritical ? 'bg-rose-950 text-rose-300 border-rose-500/50' : 'bg-emerald-950 text-emerald-300 border-emerald-500/50'
+              isCritical ? 'bg-rose-950 text-rose-300 border-rose-500/50' : isUnavailable ? 'bg-slate-950 text-slate-300 border-slate-500/50' : 'bg-emerald-950 text-emerald-300 border-emerald-500/50'
             }`}>
               {isCritical ? <AlertTriangle className="w-3.5 h-3.5" /> : <ShieldCheck className="w-3.5 h-3.5" />}
-              <span>{isCritical ? 'وضعیت بحرانی / احتمال شلیک شارپ' : 'وضعیت پایدار'}</span>
+              <span>{isCritical ? 'هشدار heuristic بالا' : isUnavailable ? 'ورودی معتبر موجود نیست' : 'هشدار بحرانی ثبت نشد'}</span>
             </span>
           </div>
 
@@ -95,8 +94,10 @@ export const VolatilitySpikePredictorWidget: React.FC<Props> = ({ analysis, curr
               <span className="text-[10px] text-slate-400 font-sans block mb-1">عدم تقارن اردربوک (OBI Score):</span>
               <div className="flex items-center justify-between text-xs font-mono pt-1">
                 <span className="text-slate-300">امتیاز فشار سفارشات:</span>
-                <span className={`font-bold ${report.orderBookImbalanceScore >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {report.orderBookImbalanceScore > 0 ? `+${report.orderBookImbalanceScore}` : report.orderBookImbalanceScore}٪
+                <span className={`font-bold ${(report.orderBookImbalanceScore ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {report.orderBookImbalanceScore === null
+                    ? 'ناموجود'
+                    : `${report.orderBookImbalanceScore > 0 ? '+' : ''}${report.orderBookImbalanceScore}٪`}
                 </span>
               </div>
             </div>

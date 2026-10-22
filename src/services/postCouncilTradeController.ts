@@ -1,6 +1,50 @@
 import type { AnalysisResult } from '../types/trading';
 import type { EightMemberCouncilReport } from './eightMemberCouncil';
 import { calculateCentralRiskAllocation } from './centralRiskAllocation';
+import type {
+  WalkForwardCandleResearchReport,
+  CandleResearchHorizon,
+} from './walkForwardCandleResearch';
+
+const MIN_EXECUTION_HORIZON_SAMPLES = 20;
+const MIN_EXECUTION_NET_WIN_RATE_PCT = 52;
+const MIN_EXECUTION_NET_WIN_RATE_LOWER_BOUND_PCT = 50;
+const FAMILYWISE_95_Z_SCORE_FOR_FOUR_HORIZONS = 2.241402727604947;
+const MIN_EXECUTION_REWARD_RISK_RATIO = 1.1;
+const MAX_EXECUTION_HORIZON_MINUTES = 60;
+const HOLDING_HORIZON_POLICY = 'longest-qualified-oos-horizon-v1';
+
+export interface HoldingHorizonEvaluation {
+  horizonMinutes: CandleResearchHorizon;
+  actualHorizonMinutes: number;
+  eligible: boolean;
+  sampleCount: number;
+  meanNetReturnPct: number | null;
+  netWinRatePct: number | null;
+  netWinRateLowerBoundPct: number | null;
+  costAdjustedRewardRiskRatio: number | null;
+  reason: string;
+}
+
+export interface HoldingHorizonDecision {
+  status: 'SELECTED' | 'UNAVAILABLE';
+  selectedHorizonMinutes: number | null;
+  researchMarket: {
+    exchange: string;
+    market: 'spot' | 'futures';
+    pair: string;
+  } | null;
+  executionMarket: {
+    exchange: string;
+    market: 'spot' | 'futures';
+    pair: string;
+  } | null;
+  sourceTimestampMs: number | null;
+  timeframe: string | null;
+  policy: string;
+  evaluations: HoldingHorizonEvaluation[];
+  reason: string;
+}
 
 export interface PostCouncilTradeControlInput {
   analysis: AnalysisResult;
@@ -9,12 +53,19 @@ export interface PostCouncilTradeControlInput {
   maxStakeQuote: number;
   maxLeverage: number;
   riskBudgetPct: number;
+  maxAtrPct?: number;
   referencePrice: number;
   maxDeviationBps: number;
   maxOpenTrades: number;
   openRiskUsd: number;
   dailyLossUsd: number;
   dailyLossLimitPct: number;
+  marketIdentity: {
+    exchange: string;
+    market: 'spot' | 'futures';
+    pair: string;
+  };
+  candleResearch?: WalkForwardCandleResearchReport;
   nowMs?: number;
 }
 
@@ -31,12 +82,14 @@ export interface CentralExecutionPlan {
   takeProfit: number;
   riskRewardRatio: number;
   setupType: string;
+  holdingHorizon: HoldingHorizonDecision;
 }
 
 export interface PostCouncilTradeControlResult {
   approved: boolean;
   reason: string;
   direction: 'LONG' | 'SHORT' | null;
+  holdingHorizon?: HoldingHorizonDecision;
   executionPlan?: CentralExecutionPlan;
   executionRisk?: {
     maxStakeQuote: number;
@@ -48,6 +101,166 @@ export interface PostCouncilTradeControlResult {
 
 function isFinitePositive(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function wilsonLowerBoundPct(successes: number, sampleCount: number): number {
+  const z = FAMILYWISE_95_Z_SCORE_FOR_FOUR_HORIZONS;
+  const proportion = successes / sampleCount;
+  const zSquared = z * z;
+  const denominator = 1 + zSquared / sampleCount;
+  const center = proportion + zSquared / (2 * sampleCount);
+  const margin = z * Math.sqrt(
+    proportion * (1 - proportion) / sampleCount +
+    zSquared / (4 * sampleCount * sampleCount),
+  );
+  return Math.max(0, (center - margin) / denominator * 100);
+}
+
+function selectHoldingHorizon(
+  report: WalkForwardCandleResearchReport | undefined,
+  analysis: AnalysisResult,
+  marketIdentity: PostCouncilTradeControlInput['marketIdentity'],
+  nowMs: number,
+): HoldingHorizonDecision {
+  const timeframe = analysis.timeframe ?? null;
+  const reportMarket = report?.exchange && report.market && report.pair
+    ? { exchange: report.exchange, market: report.market, pair: report.pair }
+    : null;
+  const executionMarket = marketIdentity
+    ? {
+        exchange: marketIdentity.exchange.trim().toLowerCase(),
+        market: marketIdentity.market,
+        pair: marketIdentity.pair.trim().toUpperCase(),
+      }
+    : null;
+  const unavailable = (reason: string): HoldingHorizonDecision => ({
+    status: 'UNAVAILABLE',
+    selectedHorizonMinutes: null,
+    researchMarket: reportMarket,
+    executionMarket,
+    sourceTimestampMs: report?.sourceTimestampMs ?? null,
+    timeframe,
+    policy: HOLDING_HORIZON_POLICY,
+    evaluations: [],
+    reason,
+  });
+  if (!report || report.status !== 'AVAILABLE' || report.source !== 'verified-live-exchange-candles') {
+    return unavailable('گزارش معتبر پژوهش خارج‌ازنمونهٔ افق‌ها موجود نیست.');
+  }
+  if (
+    typeof marketIdentity.exchange !== 'string' ||
+    !marketIdentity.exchange.trim() ||
+    (marketIdentity.market !== 'spot' && marketIdentity.market !== 'futures') ||
+    typeof marketIdentity.pair !== 'string' ||
+    !marketIdentity.pair.trim() ||
+    report.exchange !== marketIdentity.exchange.trim().toLowerCase() ||
+    report.market !== marketIdentity.market ||
+    report.pair !== marketIdentity.pair.trim().toUpperCase()
+  ) return unavailable('صرافی، نماد یا نوع بازار گزارش پژوهش با بازار معامله یکسان نیست.');
+  const timeframeMatch = typeof timeframe === 'string' ? /^(\d+)(m|h|d|w)$/.exec(timeframe) : null;
+  const timeframeMs = timeframeMatch
+    ? Number(timeframeMatch[1]) * ({ m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 } as const)[timeframeMatch[2] as 'm' | 'h' | 'd' | 'w']
+    : 0;
+  const sourceAgeMs = report.sourceTimestampMs === null ? Number.NaN : nowMs - report.sourceTimestampMs;
+  if (
+    !timeframe ||
+    report.timeframe !== timeframe ||
+    !Number.isSafeInteger(report.sourceTimestampMs) ||
+    report.sourceTimestampMs! > nowMs ||
+    !Number.isSafeInteger(timeframeMs) ||
+    timeframeMs <= 0 ||
+    sourceAgeMs < 0 ||
+    sourceAgeMs > timeframeMs + 60_000
+  ) return unavailable('تایم‌فریم پژوهش با معامله هم‌خوان نیست یا timestamp کندل پژوهش کهنه/نامعتبر است.');
+  if (
+    !report.costs ||
+    report.costs.configured !== true ||
+    !Number.isFinite(report.costs.takerFeeBpsPerSide) ||
+    report.costs.takerFeeBpsPerSide < 0 ||
+    !Number.isFinite(report.costs.slippageBpsPerSide) ||
+    report.costs.slippageBpsPerSide < 0 ||
+    !Number.isFinite(report.costs.roundTripPercent) ||
+    report.costs.roundTripPercent < 0
+  ) {
+    return unavailable('کارمزد و لغزش واقعی برای برآورد بازده خالص افق تنظیم نشده‌اند.');
+  }
+
+  const horizonKeys: CandleResearchHorizon[] = [7, 15, 30, 60];
+  const horizons = horizonKeys.map((horizonMinutes) => {
+    const horizon = report.horizons?.[horizonMinutes];
+    if (
+      !horizon ||
+      typeof horizon !== 'object' ||
+      horizon.horizonMinutes !== horizonMinutes ||
+      !Number.isSafeInteger(horizon.outOfSampleForecastCount) ||
+      horizon.outOfSampleForecastCount < 0 ||
+      typeof horizon.available !== 'boolean' ||
+      !Number.isFinite(horizon.actualHorizonMinutes) ||
+      horizon.actualHorizonMinutes <= 0
+    ) return null;
+    return horizon;
+  });
+  if (horizons.some((horizon) => horizon === null)) {
+    return unavailable('گزارش افق‌ها ناقص یا ساختاریافته به شکل نامعتبر است.');
+  }
+  const validHorizons = horizons.filter(
+    (horizon): horizon is NonNullable<typeof horizon> => horizon !== null,
+  );
+  const evaluations = validHorizons.map((horizon): HoldingHorizonEvaluation => {
+    const metricsValid =
+      Number.isFinite(horizon.meanNetPredictedReturnPct) &&
+      Number.isFinite(horizon.netWinRatePct) &&
+      Number.isSafeInteger(horizon.netWinCount) &&
+      (horizon.netWinCount ?? -1) >= 0 &&
+      (horizon.netWinCount ?? Number.POSITIVE_INFINITY) <= horizon.outOfSampleForecastCount &&
+      Number.isFinite(horizon.meanCostAdjustedRewardRiskRatio);
+    const netWinRateLowerBoundPct = metricsValid && horizon.outOfSampleForecastCount > 0
+      ? wilsonLowerBoundPct(horizon.netWinCount!, horizon.outOfSampleForecastCount)
+      : null;
+    const checks = [
+      [horizon.available && horizon.outOfSampleForecastCount >= MIN_EXECUTION_HORIZON_SAMPLES,
+        `حداقل ${MIN_EXECUTION_HORIZON_SAMPLES} پیش‌بینی خارج‌ازنمونه لازم است`],
+      [metricsValid && (horizon.meanNetPredictedReturnPct ?? Number.NEGATIVE_INFINITY) > 0,
+        'میانگین بازده خالص باید مثبت باشد'],
+      [metricsValid && (horizon.netWinRatePct ?? 0) >= MIN_EXECUTION_NET_WIN_RATE_PCT,
+        `نرخ برد خالص باید حداقل ${MIN_EXECUTION_NET_WIN_RATE_PCT}٪ باشد`],
+      [netWinRateLowerBoundPct !== null &&
+          netWinRateLowerBoundPct >= MIN_EXECUTION_NET_WIN_RATE_LOWER_BOUND_PCT,
+        `کران پایین Wilson با اطمینان خانوادگی ۹۵٪ باید حداقل ${MIN_EXECUTION_NET_WIN_RATE_LOWER_BOUND_PCT}٪ باشد`],
+      [metricsValid && (horizon.meanCostAdjustedRewardRiskRatio ?? 0) >= MIN_EXECUTION_REWARD_RISK_RATIO,
+        `نسبت پاداش/ریسک پس از هزینه باید حداقل ${MIN_EXECUTION_REWARD_RISK_RATIO} باشد`],
+      [horizon.actualHorizonMinutes > 0 && horizon.actualHorizonMinutes <= MAX_EXECUTION_HORIZON_MINUTES,
+        `افق واقعی باید حداکثر ${MAX_EXECUTION_HORIZON_MINUTES} دقیقه باشد`],
+    ] as const;
+    const failedChecks = checks.filter(([passed]) => !passed).map(([, message]) => message);
+    return {
+      horizonMinutes: horizon.horizonMinutes,
+      actualHorizonMinutes: horizon.actualHorizonMinutes,
+      eligible: failedChecks.length === 0,
+      sampleCount: horizon.outOfSampleForecastCount,
+      meanNetReturnPct: horizon.meanNetPredictedReturnPct,
+      netWinRatePct: horizon.netWinRatePct,
+      netWinRateLowerBoundPct,
+      costAdjustedRewardRiskRatio: horizon.meanCostAdjustedRewardRiskRatio,
+      reason: failedChecks.length === 0 ? 'همهٔ معیارهای سیاست افق پاس شدند.' : failedChecks.join('؛ '),
+    };
+  });
+  const selected = evaluations
+    .filter((evaluation) => evaluation.eligible)
+    .sort((left, right) => right.actualHorizonMinutes - left.actualHorizonMinutes)[0];
+  return {
+    status: selected ? 'SELECTED' : 'UNAVAILABLE',
+    selectedHorizonMinutes: selected?.actualHorizonMinutes ?? null,
+    researchMarket: reportMarket,
+    executionMarket,
+    sourceTimestampMs: report.sourceTimestampMs,
+    timeframe,
+    policy: HOLDING_HORIZON_POLICY,
+    evaluations,
+    reason: selected
+      ? `بلندترین افق واجد معیارهای خارج‌ازنمونه ${selected.actualHorizonMinutes} دقیقه انتخاب شد.`
+      : 'هیچ افقی همهٔ حداقل‌های آماری، بازده خالص و ریسک‌به‌بازده را پاس نکرد؛ ورود مجاز نیست.',
+  };
 }
 
 function validateCouncilReport(report: EightMemberCouncilReport): string | null {
@@ -95,6 +308,7 @@ export function runPostCouncilTradeControl(
 ): PostCouncilTradeControlResult {
   const nowMs = input.nowMs ?? Date.now();
   const gates: CentralExecutionGate[] = [];
+  let holdingHorizon: HoldingHorizonDecision | undefined;
   const addGate = (id: string, passed: boolean, reason: string) => {
     gates.push({ id, passed, reason });
   };
@@ -102,6 +316,7 @@ export function runPostCouncilTradeControl(
     approved: false,
     reason,
     direction: input.council?.selectedDirection ?? null,
+    ...(holdingHorizon ? { holdingHorizon } : {}),
     gates,
   });
 
@@ -109,6 +324,20 @@ export function runPostCouncilTradeControl(
   addGate('COUNCIL_REPORT', councilError === null, councilError ?? 'گزارش و حدنصاب شورا معتبر است.');
   if (councilError) return reject(councilError);
   const direction = input.council.selectedDirection!;
+  holdingHorizon = selectHoldingHorizon(
+    input.candleResearch,
+    input.analysis,
+    input.marketIdentity,
+    nowMs,
+  );
+  addGate(
+    'HOLDING_HORIZON',
+    holdingHorizon.status === 'SELECTED',
+    `${holdingHorizon.reason} سیاست ${holdingHorizon.policy}.`,
+  );
+  if (holdingHorizon.status !== 'SELECTED') {
+    return reject('کنترل مرکزی افق نگهداری معتبر و مبتنی بر شواهد برای معامله پیدا نکرد.');
+  }
 
   const quality = input.analysis.dataQualityReport;
   const candleFeed = quality?.feeds.candles;
@@ -195,6 +424,24 @@ export function runPostCouncilTradeControl(
       : 'قیمت نامعتبر است یا از حد انحراف مجاز نسبت به قیمت مرجع عبور کرده است.',
   );
   if (!referencePriceValid) return reject('کنترل مرکزی قیمت مرجع یا انحراف ورود را نپذیرفت.');
+
+  const atrPct = isFinitePositive(input.analysis.atr) && isFinitePositive(ticker?.lastPrice)
+    ? input.analysis.atr / ticker.lastPrice * 100
+    : Number.NaN;
+  const maxAtrPct = input.maxAtrPct ?? 2;
+  const volatilityValid = Number.isFinite(atrPct) &&
+    Number.isFinite(maxAtrPct) &&
+    maxAtrPct > 0 &&
+    maxAtrPct <= 5 &&
+    atrPct <= maxAtrPct;
+  addGate(
+    'VOLATILITY',
+    volatilityValid,
+    volatilityValid
+      ? `ATR برابر ${atrPct.toFixed(3)}٪ قیمت زنده و زیر سقف ${maxAtrPct}٪ در هر کندل است.`
+      : 'ATR ناموجود/نامعتبر است یا نوسان هر کندل از سقف مجاز عبور کرده است.',
+  );
+  if (!volatilityValid) return reject('کنترل مرکزی به‌دلیل نوسان بالا یا دادهٔ نوسان نامعتبر ورود را رد کرد.');
 
   const bid = orderBook?.bestBid;
   const ask = orderBook?.bestAsk;
@@ -313,11 +560,13 @@ export function runPostCouncilTradeControl(
     takeProfit,
     riskRewardRatio,
     setupType: setup?.setupType ?? 'COUNCIL_DIRECTION',
+    holdingHorizon,
   };
   return {
     approved: true,
     reason: `گزارش شورا معتبر است؛ گیت‌های داده، قیمت، اسپرد، سطوح و ریسک پاس شدند. طرح اجرایی با جهت ${direction} آمادهٔ ارسال به Freqtrade است.`,
     direction,
+    holdingHorizon,
     executionPlan,
     executionRisk: {
       maxStakeQuote: allocation.marginUsd,

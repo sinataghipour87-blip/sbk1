@@ -45,6 +45,7 @@ import {
   runEightMemberCouncilRuntime,
 } from './eightMemberCouncilRuntime';
 import { runPostCouncilTradeControl } from './postCouncilTradeController';
+import type { HoldingHorizonDecision } from './postCouncilTradeController';
 import { macroContextBrainService } from './macroContextBrain';
 import { sbFiveModelsEngine } from './sbFiveModelsEngine';
 import { fetchFreeMacroData } from './freeMacroData';
@@ -60,6 +61,7 @@ const DEFAULT_RISK_BUDGET_PCT = 0.1;
 const DEFAULT_MAX_LEVERAGE = 1;
 const DEFAULT_DAILY_LOSS_LIMIT_PCT = 2;
 const MAX_DAILY_LOSS_LIMIT_PCT = 5;
+const DEFAULT_MAX_ATR_PCT = 2;
 const MAX_READY_ADVISORY_AGE_MS = 2 * 60_000;
 
 function historicalPatternCostConfig(): {
@@ -94,6 +96,7 @@ export interface ServerSignalAuditRecord {
   duplicate?: boolean;
   unavailableInputs?: string[];
   openSourceAdvisories?: OpenSourceAdvisoryReport;
+  holdingHorizon?: HoldingHorizonDecision;
 }
 
 export interface ServerSignalRunnerDependencies {
@@ -134,6 +137,7 @@ export interface ServerSignalRunnerDependencies {
   ) => Promise<{
     candidate: DirectionalSignalCandidate | null;
     reason: string;
+    holdingHorizon?: HoldingHorizonDecision;
     executionRisk?: { maxStakeQuote: number; maxLeverage: number; allocatedRiskUsd: number };
     authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
     featureSnapshot?: OperationalTradeArchiveMetadata['featureSnapshot'];
@@ -176,6 +180,7 @@ function readSignalSettings(): {
   maxStakeQuote: number;
   maxLeverage: number;
   dailyLossLimitPct: number;
+  maxAtrPct: number;
 } {
   const ttlSeconds = readPositiveEnv('SBK1_SIGNAL_TTL_SECONDS', DEFAULT_SIGNAL_TTL_SECONDS, 120);
   const riskBudgetPct = readPositiveEnv('SBK1_SIGNAL_RISK_BUDGET_PCT', DEFAULT_RISK_BUDGET_PCT, 1.5);
@@ -196,6 +201,7 @@ function readSignalSettings(): {
       DEFAULT_DAILY_LOSS_LIMIT_PCT,
       MAX_DAILY_LOSS_LIMIT_PCT,
     ),
+    maxAtrPct: readPositiveEnv('SBK1_SIGNAL_MAX_ATR_PCT', DEFAULT_MAX_ATR_PCT, 5),
   };
 }
 
@@ -614,6 +620,7 @@ async function analyzeSnapshotData(
     inputs.futuresPrices,
     inputs.orderFlow,
   );
+  analysis.timeframe = snapshot.timeframe;
   if (requestAdvisories && !openSourceAdvisoryService.isStopped()) {
     void analyzeOpenSourceAdvisories(snapshot, nowMs).catch((error: unknown) => {
       console.error('[SBK1_ADVISORIES] Background advisory task failed:', error);
@@ -905,6 +912,7 @@ async function analyzeSnapshot(
 ): Promise<{
   candidate: DirectionalSignalCandidate | null;
   reason: string;
+  holdingHorizon?: HoldingHorizonDecision;
   executionRisk?: { maxStakeQuote: number; maxLeverage: number; allocatedRiskUsd: number };
   authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
   featureSnapshot: OperationalTradeArchiveMetadata['featureSnapshot'];
@@ -944,24 +952,26 @@ async function analyzeSnapshot(
   );
   const macroContext = macroContextBrainService.getCachedMacroContext();
   const { runUnifiedMultiBrainEnsemble } = await import('./multiBrainEnsemble');
-  const historicalCandles = publicMarketFallback.candles;
+  const historicalCandles = snapshot.candles;
   const patternCosts = historicalPatternCostConfig();
   const multiBrainReport = runUnifiedMultiBrainEnsemble(
     analysis,
     null,
     analysis.price,
     [],
-    historicalCandles.status === 'LIVE' && historicalCandles.value &&
-      historicalCandles.sourceTimestampMs !== null
-      ? {
-          candles: historicalCandles.value.map(({ open, high, low, close, volume }) =>
-            [open, high, low, close, volume] as Candle
-          ),
-          sourceTimestampMs: historicalCandles.sourceTimestampMs,
-          dataStatus: 'LIVE',
-          ...patternCosts,
-        }
-      : undefined,
+    {
+      candles: historicalCandles.map(({ open, high, low, close, volume }) =>
+        [open, high, low, close, volume] as Candle
+      ),
+      exchange: snapshot.exchange,
+      market: snapshot.market,
+      pair: snapshot.pair,
+      sourceTimestampMs: historicalCandles.at(-1)
+        ? historicalCandles.at(-1)!.timestampMs + timeframeToMs(snapshot.timeframe)
+        : Number.NaN,
+      dataStatus: historicalCandles.length > 0 ? 'LIVE' : 'UNAVAILABLE',
+      ...patternCosts,
+    },
   );
   const sbReport = sbFiveModelsEngine.evaluatePentagon(analysis, null, analysis.price);
   const decisionSnapshotTimestampMs = snapshot.candles
@@ -998,12 +1008,19 @@ async function analyzeSnapshot(
     maxStakeQuote: Math.min(signalSettings.maxStakeQuote, availableBalance),
     maxLeverage: signalSettings.maxLeverage,
     riskBudgetPct: signalSettings.riskBudgetPct,
+    maxAtrPct: signalSettings.maxAtrPct,
     referencePrice: analysis.futuresPrices?.lastPrice ?? Number.NaN,
     maxDeviationBps: signalSettings.maxDeviationBps,
     maxOpenTrades,
     openRiskUsd,
     dailyLossUsd,
     dailyLossLimitPct: signalSettings.dailyLossLimitPct,
+    marketIdentity: {
+      exchange: snapshot.exchange,
+      market: snapshot.market,
+      pair: snapshot.pair,
+    },
+    candleResearch: multiBrainReport.historicalCandleResearch,
     nowMs: councilEvaluationNowMs,
   });
   const approved = control.approved;
@@ -1022,10 +1039,11 @@ async function analyzeSnapshot(
       : null,
     ...(approved && control.executionRisk ? { executionRisk: control.executionRisk } : {}),
     reason: control.reason,
+    holdingHorizon: control.holdingHorizon,
     openSourceAdvisories: analysis.openSourceAdvisories,
     ...(approved && executionPlan ? {
       authorization: {
-        contractVersion: 'sbk1.entry.authorization.v1',
+        contractVersion: 'sbk1.entry.authorization.v2',
         decision: 'APPROVE_ENTRY' as const,
         snapshotId: `SNP_${snapshot.generatedAtMs}_${latestCandle?.[0] ?? 0}`,
         snapshotTimestampMs: snapshot.generatedAtMs,
@@ -1041,6 +1059,7 @@ async function analyzeSnapshot(
         disagreementVeto: false,
         ensembleProbabilityPct: null,
         riskRewardRatio: executionPlan.riskRewardRatio,
+        holdingHorizonMinutes: executionPlan.holdingHorizon.selectedHorizonMinutes!,
       },
     } : {}),
     featureSnapshot: makeServerFeatureSnapshot(analysis),
@@ -1411,6 +1430,7 @@ export class ServerSignalRunner {
           reason: result.reason,
           unavailableInputs: makeSnapshotAnalysisInputs(snapshot, completedCandles, nowMs).unavailableInputs,
           openSourceAdvisories: result.openSourceAdvisories,
+          holdingHorizon: result.holdingHorizon,
         });
         return;
       }
@@ -1421,6 +1441,9 @@ export class ServerSignalRunner {
         result.executionRisk.allocatedRiskUsd <= 0 ||
         result.authorization.decision !== 'APPROVE_ENTRY' ||
         result.authorization.direction !== candidate.direction ||
+        !Number.isSafeInteger(result.authorization.holdingHorizonMinutes) ||
+        result.authorization.holdingHorizonMinutes < 1 ||
+        result.authorization.holdingHorizonMinutes > 60 ||
         result.authorization.timeframe !== expected.timeframe ||
         result.authorization.snapshotTimestampMs !== snapshot.generatedAtMs ||
         result.authorization.gates.length === 0
@@ -1430,6 +1453,7 @@ export class ServerSignalRunner {
           decision: 'NO TRADE',
           reason: 'The complete decision pipeline did not provide an entry authorization.',
           openSourceAdvisories: result.openSourceAdvisories,
+          holdingHorizon: result.holdingHorizon,
         });
         return;
       }
@@ -1493,6 +1517,7 @@ export class ServerSignalRunner {
           stopLoss: candidate.stopLoss,
           takeProfit: candidate.takeProfit,
           maxPriceDeviationBps: settings.maxDeviationBps,
+          maxHoldingMinutes: result.authorization.holdingHorizonMinutes,
         },
         riskLimits: {
           riskBudgetPct: settings.riskBudgetPct,
@@ -1550,6 +1575,7 @@ export class ServerSignalRunner {
         duplicate: submitted.duplicate === true,
         unavailableInputs: makeSnapshotAnalysisInputs(snapshot, completedCandles, nowMs).unavailableInputs,
         openSourceAdvisories: result.openSourceAdvisories,
+        holdingHorizon: result.holdingHorizon,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

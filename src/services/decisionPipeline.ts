@@ -931,7 +931,7 @@ export function runUnifiedDecisionPipeline(options: RunPipelineOptions): Decisio
   });
 
   // Real GARCH Evaluation
-  const garchFit = realGarchEngine.fitAndForecast(analysis.candles);
+  const garchFit = realGarchEngine.fitAndForecast(analysis.candles, bayesTimeframe);
 
   const isM1Calibrated = winProb !== null;
   const isM2Calibrated = bayesInfer.status === 'CALIBRATED' && bayesInfer.posteriorProbability !== null;

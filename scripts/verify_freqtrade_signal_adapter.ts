@@ -30,12 +30,14 @@ const requiredGateIds = [
   'COUNCIL_REPORT',
   'LIVE_DATA',
   'REFERENCE_PRICE',
+  'VOLATILITY',
   'EXECUTION_SPREAD',
   'TRADE_LEVELS',
   'STOP_AND_TARGET',
   'PORTFOLIO_RISK',
   'DAILY_LOSS',
   'RISK_ALLOCATION',
+  'HOLDING_HORIZON',
 ];
 const signal = {
   contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
@@ -61,6 +63,7 @@ const signal = {
     stopLoss: 61_800,
     takeProfit: 62_700,
     maxPriceDeviationBps: 50,
+    maxHoldingMinutes: 30,
   },
   riskLimits: {
     riskBudgetPct: 1,
@@ -82,6 +85,7 @@ const signal = {
     ensembleProbabilityPct: null,
     riskRewardRatio: 2,
     allocatedRiskUsd: 0.4,
+    holdingHorizonMinutes: 30,
   },
 } as const;
 

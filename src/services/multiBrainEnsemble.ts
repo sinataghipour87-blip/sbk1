@@ -59,6 +59,7 @@ export interface Brain3GarchVolatility {
   nameFa: string;
   garchRegime: 'COMPRESSION' | 'EXPANSION' | 'SPIKE_TURBULENCE' | 'NORMAL' | 'UNKNOWN';
   volatilityForecastPct: number | null;
+  volatilityForecastHorizonMinutes: number | null;
   adaptiveTrailingOffsetPct: number;
   stopLossBufferPct: number;
   calibratedProbabilityPct: number | null;
@@ -321,7 +322,7 @@ export interface MultiBrainConsensusReport {
   brain2Liquidity: Brain2LiquidityFlow;
   brain3Volatility: Brain3GarchVolatility;
   brain4Pattern: Brain4PatternDivergence;
-  centralCandleResearch: WalkForwardCandleResearchReport;
+  historicalCandleResearch: WalkForwardCandleResearchReport;
   brain5RiskHedging: Brain5FloatingRiskHedging;
   brain6OnChainWhale: Brain6OnChainWhaleFlow;
   brain7OrderBookCvd: Brain7OrderBookCvd;
@@ -404,7 +405,7 @@ export function runUnifiedMultiBrainEnsemble(
   recentHistory: TradeHistory[] = [],
   historicalCandleInput?: Pick<
     WalkForwardCandleResearchInput,
-    'candles' | 'sourceTimestampMs' | 'dataStatus' | 'feeBpsPerSide' | 'slippageBpsPerSide'
+    'candles' | 'exchange' | 'market' | 'pair' | 'sourceTimestampMs' | 'dataStatus' | 'feeBpsPerSide' | 'slippageBpsPerSide'
   >,
 ): MultiBrainConsensusReport {
   const datasetService = centralTradeDatasetService;
@@ -469,7 +470,7 @@ export function runUnifiedMultiBrainEnsemble(
   };
 
   // ۳. مغز ۳: مدل نوسان‌سنج پارامتری GARCH (Statistical Model - Item 9)
-  const garchResult = realGarchEngine.fitAndForecast(analysis?.candles || []);
+  const garchResult = realGarchEngine.fitAndForecast(analysis?.candles || [], analysis?.timeframe ?? '');
   const garchRegime: Brain3GarchVolatility['garchRegime'] = garchResult.regime;
   const adaptiveTrailingOffsetPct = garchRegime === 'SPIKE_TURBULENCE' ? 0.25 : 0.40;
   const stopLossBufferPct = garchRegime === 'COMPRESSION' ? 0.28 : 0.32;
@@ -479,9 +480,10 @@ export function runUnifiedMultiBrainEnsemble(
     nameFa: 'مغز ۳: مدل نوسان‌سنج پارامتری GARCH(1,1)',
     garchRegime,
     volatilityForecastPct: garchResult.forecastVol15mPct,
+    volatilityForecastHorizonMinutes: garchResult.forecastVol15mActualHorizonMinutes,
     adaptiveTrailingOffsetPct,
     stopLossBufferPct,
-    calibratedProbabilityPct: garchResult.status === 'AVAILABLE' ? (garchResult.regimeProbability !== null ? Math.round(garchResult.regimeProbability * 100) : null) : null,
+    calibratedProbabilityPct: null,
     oosForecastErrorPct: garchResult.oosRmse,
     rationaleFa: garchResult.status === 'AVAILABLE'
       ? garchResult.detailsFa
@@ -1039,7 +1041,7 @@ export function runUnifiedMultiBrainEnsemble(
     brain2Liquidity,
     brain3Volatility,
     brain4Pattern,
-    centralCandleResearch: historicalRepeatAnalysis,
+    historicalCandleResearch: historicalRepeatAnalysis,
     brain5RiskHedging,
     brain6OnChainWhale,
     brain7OrderBookCvd,

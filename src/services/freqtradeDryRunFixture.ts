@@ -106,6 +106,7 @@ export function createDryRunFixtureSignal(input: {
         stopLoss,
         takeProfit,
         maxPriceDeviationBps: 100,
+        maxHoldingMinutes: 60,
       },
       riskLimits: input.riskLimits,
       authorization: {
@@ -132,6 +133,7 @@ export function createDryRunFixtureSignal(input: {
             input.riskLimits.maxLeverage *
             Math.abs(input.referencePrice - stopLoss) / input.referencePrice,
         ),
+        holdingHorizonMinutes: 60,
       },
     },
     {

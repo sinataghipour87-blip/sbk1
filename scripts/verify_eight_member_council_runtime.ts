@@ -186,6 +186,49 @@ const multiBrainReport = {
   brain2Liquidity: { obiValue: 0.2, liquidityPoolUsd: 1_000 },
   brain3Volatility: { garchRegime: 'NORMAL', volatilityForecastPct: 1.2 },
   brain4Pattern: { patternMatchPct: 65, matchedPatternName: 'verification pattern' },
+  historicalCandleResearch: {
+    status: 'AVAILABLE',
+    source: 'verified-live-exchange-candles',
+    exchange: 'bybit',
+    market: 'futures',
+    pair: 'BTC/USDT:USDT',
+    timeframe: '1m',
+    candleCount: 500,
+    trainingCandleCount: 350,
+    testCandleCount: 150,
+    trainingCutoffTimestampMs: sourceTimestampMs - 150 * 60_000,
+    similarityThresholdPct: 85,
+    contextSimilarityWeightPct: 30,
+    requiredReferenceMatches: 3,
+    minimumOutOfSampleForecasts: 20,
+    costs: {
+      configured: true,
+      takerFeeBpsPerSide: 5,
+      slippageBpsPerSide: 2,
+      roundTripPercent: 0.14,
+    },
+    horizons: Object.fromEntries([7, 15, 30, 60].map((horizonMinutes) => [horizonMinutes, {
+      horizonMinutes,
+      actualHorizonMinutes: horizonMinutes,
+      available: true,
+      outOfSampleForecastCount: 25,
+      forecastsWithEnoughMatches: 24,
+      minimumForecastsForMetrics: 20,
+      averageReferenceMatches: 4,
+      meanSimilarityPct: 90,
+      grossDirectionAccuracyPct: 60,
+      meanGrossPredictedReturnPct: 0.1,
+      grossWinRatePct: 60,
+      meanNetPredictedReturnPct: 0.04,
+      netWinRatePct: 56,
+      netWinCount: 14,
+      meanMaximumFavorableMovePct: 0.2,
+      meanMaximumAdverseMovePct: 0.1,
+      meanCostAdjustedRewardRiskRatio: 1.2,
+    }])),
+    tradeEligible: false,
+    note: 'verification research only',
+  },
   brain5RiskHedging: { floatingSystemHarmonized: null },
   brain6OnChainWhale: { netflowBtc24h: -12, whaleSentiment: 'ACCUMULATION' },
   brain7OrderBookCvd: {
@@ -290,6 +333,12 @@ try {
 
   const technicalMember = JSON.parse(await readFile(path.join(repositoryDir, 'member-01.jsonl'), 'utf8').then((value) => value.trim()));
   assert.equal(technicalMember.memberId, 1);
+  assert.equal(technicalMember.moduleOutputs.some(
+    (item: { moduleId: string }) => item.moduleId === 'control.holdingHorizonSelector',
+  ), false, 'central holding-horizon selection must not be assigned to a voting member');
+  assert.equal(technicalMember.moduleOutputs.some(
+    (item: { moduleId: string }) => item.moduleId === 'technical.historicalCandleResearch',
+  ), false, 'central candle research must not be delivered as member 1 voting evidence');
   assert.equal(
     technicalMember.sourceData.peerCouncilSummary.length,
     EIGHT_MEMBER_COUNCIL.length,

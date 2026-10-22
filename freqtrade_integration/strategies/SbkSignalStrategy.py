@@ -92,7 +92,7 @@ class SbkSignalStrategy(IStrategy):
             )
             response.raise_for_status()
             payload = response.json()
-            if not isinstance(payload, dict) or payload.get("contractVersion") != "sbk1.freqtrade.signal.v2":
+            if not isinstance(payload, dict) or payload.get("contractVersion") != "sbk1.freqtrade.signal.v3":
                 logger.error("SBK1 signal bridge returned an unsupported contract response.")
                 return
             records = payload.get("signals")
@@ -341,7 +341,7 @@ class SbkSignalStrategy(IStrategy):
 
         timeframe_ms = self._timeframe_seconds_for(timeframe) * 1000
         candles = []
-        for row in dataframe.tail(500).itertuples(index=False):
+        for row in dataframe.tail(1500).itertuples(index=False):
             candle_time = getattr(row, "date", None)
             if not isinstance(candle_time, datetime):
                 logger.warning("Freqtrade DataProvider returned a candle without a datetime for %s/%s.", pair, timeframe)
@@ -982,6 +982,16 @@ class SbkSignalStrategy(IStrategy):
                  or (direction == "SHORT" and current_rate <= take_profit))
         ):
             return "sbk_take_profit"
+        max_holding_minutes = entry_conditions.get("maxHoldingMinutes") if isinstance(entry_conditions, dict) else None
+        opened_at = getattr(trade, "open_date_utc", None)
+        if (
+            isinstance(max_holding_minutes, int)
+            and not isinstance(max_holding_minutes, bool)
+            and 1 <= max_holding_minutes <= 60
+            and isinstance(opened_at, datetime)
+            and current_time.timestamp() - opened_at.timestamp() >= max_holding_minutes * 60
+        ):
+            return "sbk_time_horizon"
         for exit_id, signal in self._exit_signals.items():
             if (
                 exit_id not in self._consumed_exit_ids
@@ -1006,7 +1016,7 @@ class SbkSignalStrategy(IStrategy):
         current_time: datetime,
         **kwargs: Any,
     ) -> bool:
-        if exit_reason in ("stop_loss", "stoploss_on_exchange", "emergency_exit", "force_exit"):
+        if exit_reason in ("stop_loss", "stoploss_on_exchange", "emergency_exit", "force_exit", "sbk_time_horizon"):
             return True
         if exit_reason == "sbk_take_profit":
             entry_signal = trade.get_custom_data("sbk_signal")

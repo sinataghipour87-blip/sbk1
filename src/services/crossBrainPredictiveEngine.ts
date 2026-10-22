@@ -99,7 +99,7 @@ export class CrossBrainPredictiveEngineService {
     const segmentOosAccPct = segmentSampleSize >= 4 ? Math.round((segmentWins / segmentSampleSize) * 100) : null;
 
     // 1. GARCH REAL EXECUTION (Item 9)
-    const garchResult = realGarchEngine.fitAndForecast(candles);
+    const garchResult = realGarchEngine.fitAndForecast(candles, timeframe);
     const isGarchAvailable = garchResult.status === 'AVAILABLE';
 
     // 2. BAYESIAN REAL INFERENCE (Item 10)
@@ -159,21 +159,21 @@ export class CrossBrainPredictiveEngineService {
         correlationFactor: 0.55,
         detailsFa: `عدم‌تقارن دفتر سفارشات (OBI: ${(obi * 100).toFixed(1)}٪).`
       },
-      // Brain 3: GARCH(1,1) Volatility Model (STATISTICAL MODEL - Item 9)
+      // GARCH reports volatility only; it is not a directional or calibrated vote.
       {
         brainId: 3,
         nameFa: 'مغز ۳: نوسان‌سنج پارامتری GARCH(1,1)',
         role: 'STATISTICAL_MODEL',
-        weight: isGarchAvailable ? 0.20 : 0.0,
-        individualSignal: isGarchAvailable ? (garchResult.regime === 'SPIKE_TURBULENCE' ? 'NEUTRAL' : dir) : 'UNAVAILABLE',
-        probability: isGarchAvailable ? garchResult.regimeProbability : null,
+        weight: 0.0,
+        individualSignal: isGarchAvailable ? 'NEUTRAL' : 'UNAVAILABLE',
+        probability: null,
         sampleSize: garchResult.sampleSize,
         oosSampleSize: garchResult.oosSampleSize,
-        oosAccuracyPct: garchResult.oosForecastMape !== null ? Math.round(100 - Math.min(100, garchResult.oosForecastMape)) : null,
-        calibrationStatus: isGarchAvailable ? 'CALIBRATED' : 'UNAVAILABLE',
+        oosAccuracyPct: null,
+        calibrationStatus: isGarchAvailable ? 'UNCALIBRATED' : 'UNAVAILABLE',
         dataQuality: isGarchAvailable ? 'VERIFIED_REALTIME' : 'UNAVAILABLE',
-        modelVersion: 'v1.1-garch-mle',
-        correlationFactor: 0.20, // High independence from directional indicators
+        modelVersion: 'v1.2-garch-grid-volatility-only',
+        correlationFactor: 1.0,
         detailsFa: garchResult.detailsFa
       },
       // Brain 4: Momentum & Oscillator Feature Processor

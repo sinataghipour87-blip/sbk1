@@ -15,6 +15,7 @@ interface WaveHorizonOutcome {
 
 interface WaveObservation {
   timestampMs: number;
+  sourceCandleTimestampMs?: number | null;
   direction: 'LONG' | 'SHORT';
   price: number;
   atr: number;
@@ -89,6 +90,9 @@ function isWaveObservation(value: unknown): value is WaveObservation {
   const observation = value as Record<string, unknown>;
   const outcomes = observation.outcomes;
   return isFiniteNumber(observation.timestampMs) &&
+    (observation.sourceCandleTimestampMs === undefined ||
+      observation.sourceCandleTimestampMs === null ||
+      isFiniteNumber(observation.sourceCandleTimestampMs)) &&
     (observation.direction === 'LONG' || observation.direction === 'SHORT') &&
     isFiniteNumber(observation.price) && observation.price > 0 &&
     isFiniteNumber(observation.atr) && observation.atr > 0 &&
@@ -172,7 +176,9 @@ function buildFeatures(analysis: Partial<AnalysisResult>): {
   features: number[];
 } | null {
   const candles = analysis.rawCandles;
-  const price = analysis.price;
+  const price = isFiniteNumber(analysis.futuresPrices?.lastPrice) && analysis.futuresPrices.lastPrice > 0
+    ? analysis.futuresPrices.lastPrice
+    : analysis.price;
   const atr = analysis.atr;
   const direction = analysis.direction;
   const flow = analysis.orderFlowFeatures;
@@ -194,8 +200,8 @@ function buildFeatures(analysis: Partial<AnalysisResult>): {
   const recentCandles: Candle[] = candles.slice(-5);
   const latest = recentCandles[recentCandles.length - 1];
   const previous = recentCandles[0];
-  const currentHigh = latest[1];
-  const currentLow = latest[2];
+  const currentHigh = Math.max(latest[1], price);
+  const currentLow = Math.min(latest[2], price);
   const currentVolume = latest[4];
   const previousClose = previous[3];
   if (![currentHigh, currentLow, currentVolume, previousClose].every(isFiniteNumber) ||
@@ -231,7 +237,10 @@ function buildFeatures(analysis: Partial<AnalysisResult>): {
     : null;
 }
 
-function updateForwardOutcomes(observation: WaveObservation, price: number, high: number, low: number, now: number): void {
+function updateForwardOutcomes(observation: WaveObservation, price: number, high: number, low: number, now: number): boolean {
+  const previousMfe = observation.maximumFavorableMovePct;
+  const previousMae = observation.maximumAdverseMovePct;
+  const previousOutcomeCount = Object.keys(observation.outcomes).length;
   const isLong = observation.direction === 'LONG';
   const favorablePrice = isLong ? high : low;
   const adversePrice = isLong ? low : high;
@@ -261,6 +270,9 @@ function updateForwardOutcomes(observation: WaveObservation, price: number, high
       durationToPeakMinutes: Math.max(0, (observation.peakTimestampMs - observation.timestampMs) / 60_000),
     };
   }
+  return previousMfe !== observation.maximumFavorableMovePct ||
+    previousMae !== observation.maximumAdverseMovePct ||
+    previousOutcomeCount !== Object.keys(observation.outcomes).length;
 }
 
 function quantile(values: number[], fraction: number): number {
@@ -337,21 +349,56 @@ export function recordWaveObservationAndClassify(
   if (!current) return unclassified;
 
   const dataset = readDataset();
+  const latestRawCandle = analysis.rawCandles?.at(-1);
+  const sourceCandleTimestampMs = latestRawCandle?.length === 6 &&
+    isFiniteNumber(latestRawCandle[0])
+    ? latestRawCandle[0]
+    : analysis.dataQualityReport?.feeds?.candles?.timestamp ?? null;
+  const recordedSourceTimestamps = dataset.observations.flatMap(observation =>
+    observation.sourceCandleTimestampMs === undefined || observation.sourceCandleTimestampMs === null
+      ? []
+      : [observation.sourceCandleTimestampMs]
+  );
+  const latestRecordedSourceTimestampMs = recordedSourceTimestamps.length > 0
+    ? Math.max(...recordedSourceTimestamps)
+    : null;
+  if (
+    sourceCandleTimestampMs !== null &&
+    latestRecordedSourceTimestampMs !== null &&
+    sourceCandleTimestampMs < latestRecordedSourceTimestampMs
+  ) {
+    return classifyWave(current.features, dataset.observations);
+  }
+  const sourceCandleAlreadyRecorded = sourceCandleTimestampMs !== null &&
+    recordedSourceTimestamps.includes(sourceCandleTimestampMs);
+  let outcomesChanged = false;
+  for (const observation of dataset.observations) {
+    if (now > observation.timestampMs) {
+      outcomesChanged = updateForwardOutcomes(
+        observation,
+        current.price,
+        current.currentHigh,
+        current.currentLow,
+        now,
+      ) || outcomesChanged;
+    }
+  }
+  if (sourceCandleAlreadyRecorded) {
+    if (outcomesChanged) writeDataset(dataset);
+    return classifyWave(current.features, dataset.observations);
+  }
   const lastObservation = dataset.observations[dataset.observations.length - 1];
   if (lastObservation && now <= lastObservation.timestampMs) {
     return classifyWave(current.features, dataset.observations);
   }
   if (lastObservation && now - lastObservation.timestampMs < MIN_OBSERVATION_INTERVAL_MS) {
+    if (outcomesChanged) writeDataset(dataset);
     return classifyWave(current.features, dataset.observations);
   }
 
-  for (const observation of dataset.observations) {
-    if (now > observation.timestampMs) {
-      updateForwardOutcomes(observation, current.price, current.currentHigh, current.currentLow, now);
-    }
-  }
   dataset.observations.push({
     timestampMs: now,
+    sourceCandleTimestampMs,
     direction: current.direction,
     price: current.price,
     atr: current.atr,

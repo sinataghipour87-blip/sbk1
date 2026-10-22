@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import crypto from 'crypto';
+import path from 'node:path';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { TradePosition, TradeHistory, ExecutionSettings } from './src/types/trading';
@@ -1794,6 +1795,52 @@ app.get('/api/operational-trade-archive', requireAdminAuth, async (_req, res) =>
     } catch (error) {
         return res.status(503).json({
             error: `Could not load the operational trade archive: ${error instanceof Error ? error.message : String(error)}`,
+        });
+    }
+});
+
+app.get('/api/freqtrade/execution-audit', requireAdminAuth, async (req, res) => {
+    const limit = Number(req.query.limit ?? 30);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        return res.status(400).json({ error: 'Audit limit must be an integer between 1 and 100.' });
+    }
+    try {
+        const content = await fs.promises.readFile(
+            path.resolve('data/sbk1-execution-audit.jsonl'),
+            'utf8',
+        );
+        const lines = content.split(/\r?\n/).filter(Boolean).slice(-limit);
+        const records = lines.map((line) => {
+            const value: unknown = JSON.parse(line);
+            if (
+                typeof value !== 'object' ||
+                value === null ||
+                Array.isArray(value) ||
+                typeof (value as Record<string, unknown>).at !== 'string' ||
+                !['NO TRADE', 'LONG', 'SHORT'].includes(String((value as Record<string, unknown>).decision)) ||
+                typeof (value as Record<string, unknown>).reason !== 'string'
+            ) {
+                throw new Error('Execution audit contains an invalid record.');
+            }
+            const record = value as Record<string, unknown>;
+            return {
+                at: record.at,
+                decision: record.decision,
+                reason: record.reason,
+                ...(typeof record.signalId === 'string' ? { signalId: record.signalId } : {}),
+                ...(record.holdingHorizon && typeof record.holdingHorizon === 'object'
+                    ? { holdingHorizon: record.holdingHorizon }
+                    : {}),
+            };
+        });
+        return res.json({ records });
+    } catch (error) {
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+            return res.json({ records: [] });
+        }
+        console.error('[SBK1_EXECUTION_AUDIT] Could not read execution audit:', error);
+        return res.status(503).json({
+            error: `Could not read execution audit: ${error instanceof Error ? error.message : String(error)}`,
         });
     }
 });
