@@ -378,7 +378,7 @@ def analyze_news(headlines: list[dict[str, Any]], timestamp_ms: int) -> dict[str
     if not headlines:
         return unavailable("No fresh headlines were supplied by configured RSS sources.", timestamp_ms)
     torch, tokenizer, model = load_news_model()
-    texts = [headline["headline"] for headline in headlines[:12]]
+    texts = [headline["headline"] for headline in headlines[:24]]
     encoded = tokenizer(texts, padding=True, truncation=True, max_length=160, return_tensors="pt")
     with torch.inference_mode():
         probabilities = torch.softmax(model(**encoded).logits, dim=-1).cpu().tolist()
@@ -391,7 +391,7 @@ def analyze_news(headlines: list[dict[str, Any]], timestamp_ms: int) -> dict[str
 
     output = []
     scores = []
-    for headline, values in zip(headlines[:12], probabilities, strict=True):
+    for headline, values in zip(headlines[:24], probabilities, strict=True):
         label_probabilities = {
             normalized_labels[index]: float(value)
             for index, value in enumerate(values)
@@ -469,8 +469,8 @@ def analyze_request(request: Any) -> dict[str, Any]:
         raise ValueError("requestId is required")
     candles, timestamp_ms = validate_candles(request.get("candles"))
     raw_headlines = request.get("headlines")
-    if not isinstance(raw_headlines, list) or len(raw_headlines) > 12:
-        raise ValueError("headlines must be a list with at most 12 records")
+    if not isinstance(raw_headlines, list) or len(raw_headlines) > 24:
+        raise ValueError("headlines must be a list with at most 24 records")
     headlines = []
     for headline in raw_headlines:
         if (

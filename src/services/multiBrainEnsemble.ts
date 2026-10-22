@@ -14,6 +14,11 @@ import { centralTradeDatasetService } from './centralTradeDataset';
 import { macroContextBrainService } from './macroContextBrain';
 import { whaleStatisticalProofEngine } from './whaleStatisticalProofEngine';
 import { metaModelEnsembleEngine } from './metaModelEnsemble';
+import {
+  analyzeWalkForwardCandlePatterns,
+  type WalkForwardCandleResearchInput,
+  type WalkForwardCandleResearchReport,
+} from './walkForwardCandleResearch';
 
 /**
  * 🧠 معماری ۲۱ مغز پردازشی سیستم معاملاتی (Transparent 21-Brain Architecture)
@@ -65,7 +70,7 @@ export interface Brain4PatternDivergence {
   brainType: BrainType;
   role: BrainRoleType;
   nameFa: string;
-  patternMatchPct: number;
+  patternMatchPct: number | null;
   matchedPatternName: string;
   reversal30mProbabilityPct: number | null;
   expectedMove30mPct: number | null;
@@ -316,6 +321,7 @@ export interface MultiBrainConsensusReport {
   brain2Liquidity: Brain2LiquidityFlow;
   brain3Volatility: Brain3GarchVolatility;
   brain4Pattern: Brain4PatternDivergence;
+  centralCandleResearch: WalkForwardCandleResearchReport;
   brain5RiskHedging: Brain5FloatingRiskHedging;
   brain6OnChainWhale: Brain6OnChainWhaleFlow;
   brain7OrderBookCvd: Brain7OrderBookCvd;
@@ -395,7 +401,11 @@ export function runUnifiedMultiBrainEnsemble(
   analysis: Partial<AnalysisResult> | any,
   aiPrediction: any,
   currentPrice: number,
-  recentHistory: TradeHistory[] = []
+  recentHistory: TradeHistory[] = [],
+  historicalCandleInput?: Pick<
+    WalkForwardCandleResearchInput,
+    'candles' | 'sourceTimestampMs' | 'dataStatus' | 'feeBpsPerSide' | 'slippageBpsPerSide'
+  >,
 ): MultiBrainConsensusReport {
   const datasetService = centralTradeDatasetService;
   const p = currentPrice;
@@ -480,16 +490,29 @@ export function runUnifiedMultiBrainEnsemble(
 
   // ۴. مغز ۴: مدل انطباق الگوهای تاریخی (Statistical Pattern Model)
   const reversalAnalysis = predict30mTrendReversalPatternLayer(analysis?.candles || [], p, rawDirection === 'SHORT' ? 'BEARISH' : 'BULLISH', obi, volPct, rsi);
+  const candleFeed = analysis?.dataQualityReport?.feeds.candles;
+  const historicalResearchCandles = historicalCandleInput?.candles ?? analysis?.candles ?? [];
+  const historicalRepeatAnalysis = analyzeWalkForwardCandlePatterns({
+    candles: historicalResearchCandles,
+    timeframe: analysis?.timeframe ?? '15m',
+    dataStatus: historicalCandleInput?.dataStatus ?? analysis?.dataStatus ?? 'UNAVAILABLE',
+    sourceTimestampMs: historicalCandleInput?.sourceTimestampMs ??
+      candleFeed?.timestamp ?? Number.NaN,
+    feeBpsPerSide: historicalCandleInput?.feeBpsPerSide,
+    slippageBpsPerSide: historicalCandleInput?.slippageBpsPerSide,
+  });
   const brain4Pattern: Brain4PatternDivergence = {
     brainType: 'STATISTICAL_MODEL',
     role: 'STATISTICAL_MODEL',
-    nameFa: 'مغز ۴: مدل انطباق الگوهای تاریخی و واگرایی (Historical Pattern Similarity Model)',
-    patternMatchPct: reversalAnalysis.primaryMatchedPattern.similarityPct,
-    matchedPatternName: reversalAnalysis.primaryMatchedPattern.nameFa,
+    nameFa: 'مغز ۴: سنجش شباهت الگو و بازده نمونه‌های تاریخی (Historical Pattern Research)',
+    patternMatchPct: null,
+    matchedPatternName: 'Current 30m reversal analysis; historical-repeat research is owned by central control',
     reversal30mProbabilityPct: reversalAnalysis.reversalProbability,
     expectedMove30mPct: reversalAnalysis.expectedMovePct30m,
     calibratedProbabilityPct: reversalAnalysis.reversalProbability !== null ? Math.round(reversalAnalysis.reversalProbability) : null,
-    rationaleFa: `امتیاز شباهت هیوریستیک ${reversalAnalysis.primaryMatchedPattern.similarityPct}٪ است؛ احتمال و بازده کالیبره‌شده موجود نیست و خروجی غیرقابل معامله است.`
+    rationaleFa: reversalAnalysis.reversalProbability === null
+      ? 'تحلیل بازگشت ۳۰ دقیقه‌ای فعلی کالیبره نشده و رأی مستقل یا مجوز معامله نیست.'
+      : 'خروجی تحلیل بازگشت ۳۰ دقیقه‌ای است؛ جست‌وجوی تکرار تاریخی و تعیین افق نگهداری در گزارش مستقل کنترل مرکزی قرار دارد.'
   };
 
   // ۵. مغز ۵: کنترل‌کننده ریسک پویای پوزیشن (Risk Controller - Item 5)
@@ -1016,6 +1039,7 @@ export function runUnifiedMultiBrainEnsemble(
     brain2Liquidity,
     brain3Volatility,
     brain4Pattern,
+    centralCandleResearch: historicalRepeatAnalysis,
     brain5RiskHedging,
     brain6OnChainWhale,
     brain7OrderBookCvd,

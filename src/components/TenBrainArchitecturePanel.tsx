@@ -115,7 +115,9 @@ export const TenBrainArchitecturePanel: React.FC<Props> = ({
             </div>
             <div className="bg-[#041124] p-2 rounded-xl border border-indigo-950 text-center">
               <span className="text-[9px] text-slate-400 block font-sans">۴. الگوی ۳۰m:</span>
-              <span className="font-bold text-amber-300">{report.brain4Pattern.patternMatchPct}٪</span>
+              <span className="font-bold text-amber-300">
+                {report.brain4Pattern.patternMatchPct === null ? 'ناموجود' : `${report.brain4Pattern.patternMatchPct}٪`}
+              </span>
             </div>
             <div className="bg-[#041124] p-2 rounded-xl border border-indigo-950 text-center">
               <span className="text-[9px] text-slate-400 block font-sans">۵. ریسک صفر:</span>

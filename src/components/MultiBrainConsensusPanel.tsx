@@ -340,7 +340,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
               </p>
               <div className="flex items-center justify-between text-[10.5px] font-mono text-slate-400 pt-1">
                 <span>احتمال چرخش ۳۰m: {report.brain4Pattern.reversal30mProbabilityPct}٪</span>
-                <span>انطباق: {report.brain4Pattern.patternMatchPct}%</span>
+                <span>انطباق: {report.brain4Pattern.patternMatchPct === null ? 'ناموجود' : `${report.brain4Pattern.patternMatchPct}%`}</span>
               </div>
             </div>
 

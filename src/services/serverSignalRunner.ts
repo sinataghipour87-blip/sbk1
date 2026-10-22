@@ -45,7 +45,6 @@ import {
   runEightMemberCouncilRuntime,
 } from './eightMemberCouncilRuntime';
 import { runPostCouncilTradeControl } from './postCouncilTradeController';
-import { isCouncilDelegatedStageId } from './decisionPipeline';
 import { macroContextBrainService } from './macroContextBrain';
 import { sbFiveModelsEngine } from './sbFiveModelsEngine';
 import { fetchFreeMacroData } from './freeMacroData';
@@ -59,7 +58,31 @@ const DEFAULT_SIGNAL_TTL_SECONDS = 120;
 const DEFAULT_SIGNAL_MAX_DEVIATION_BPS = 100;
 const DEFAULT_RISK_BUDGET_PCT = 0.1;
 const DEFAULT_MAX_LEVERAGE = 1;
+const DEFAULT_DAILY_LOSS_LIMIT_PCT = 2;
+const MAX_DAILY_LOSS_LIMIT_PCT = 5;
 const MAX_READY_ADVISORY_AGE_MS = 2 * 60_000;
+
+function historicalPatternCostConfig(): {
+  feeBpsPerSide?: number;
+  slippageBpsPerSide?: number;
+} {
+  const feeValue = process.env.SBK1_PATTERN_TAKER_FEE_BPS?.trim();
+  const slippageValue = process.env.SBK1_PATTERN_SLIPPAGE_BPS?.trim();
+  if (!feeValue && !slippageValue) return {};
+  const feeBpsPerSide = Number(feeValue);
+  const slippageBpsPerSide = Number(slippageValue);
+  if (
+    !feeValue || !slippageValue ||
+    !Number.isFinite(feeBpsPerSide) || feeBpsPerSide < 0 ||
+    !Number.isFinite(slippageBpsPerSide) || slippageBpsPerSide < 0
+  ) {
+    console.error(
+      '[SBK1_PATTERN_RESEARCH] Invalid cost configuration. Set both SBK1_PATTERN_TAKER_FEE_BPS and SBK1_PATTERN_SLIPPAGE_BPS to non-negative per-side basis points.',
+    );
+    return {};
+  }
+  return { feeBpsPerSide, slippageBpsPerSide };
+}
 
 export interface ServerSignalAuditRecord {
   at: string;
@@ -77,6 +100,7 @@ export interface ServerSignalRunnerDependencies {
   getFreqtradeStatus(): Promise<FreqtradeBotState>;
   getOpenTrades(): Promise<FreqtradeTrade[]>;
   getFreqtradeBalance(): Promise<FreqtradeBalance>;
+  getDailyRealizedLossUsd(dayStartMs: number, nowMs: number): Promise<number>;
   getSnapshot(expected: FreqtradeMarketSnapshotExpectation, nowMs: number): FreqtradeMarketSnapshot;
   isKillSwitchActive(): boolean;
   submitSignal(
@@ -104,10 +128,13 @@ export interface ServerSignalRunnerDependencies {
     balance: number,
     signalSettings?: ReturnType<typeof readSignalSettings>,
     availableBalance?: number,
+    openRiskUsd?: number,
+    dailyLossUsd?: number,
+    maxOpenTrades?: number,
   ) => Promise<{
     candidate: DirectionalSignalCandidate | null;
     reason: string;
-    executionRisk?: { maxStakeQuote: number; maxLeverage: number };
+    executionRisk?: { maxStakeQuote: number; maxLeverage: number; allocatedRiskUsd: number };
     authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
     featureSnapshot?: OperationalTradeArchiveMetadata['featureSnapshot'];
     featureVersion?: string;
@@ -148,6 +175,7 @@ function readSignalSettings(): {
   riskBudgetPct: number;
   maxStakeQuote: number;
   maxLeverage: number;
+  dailyLossLimitPct: number;
 } {
   const ttlSeconds = readPositiveEnv('SBK1_SIGNAL_TTL_SECONDS', DEFAULT_SIGNAL_TTL_SECONDS, 120);
   const riskBudgetPct = readPositiveEnv('SBK1_SIGNAL_RISK_BUDGET_PCT', DEFAULT_RISK_BUDGET_PCT, 1.5);
@@ -163,7 +191,59 @@ function readSignalSettings(): {
     riskBudgetPct,
     maxStakeQuote,
     maxLeverage,
+    dailyLossLimitPct: readPositiveEnv(
+      'SBK1_SIGNAL_DAILY_LOSS_LIMIT_PCT',
+      DEFAULT_DAILY_LOSS_LIMIT_PCT,
+      MAX_DAILY_LOSS_LIMIT_PCT,
+    ),
   };
+}
+
+export async function calculateOpenTradeRiskUsd(
+  openTrades: FreqtradeTrade[],
+  getSignal: (signalId: string) => Promise<SbkFreqtradeSignalRecord | null>,
+): Promise<number> {
+  let totalRiskUsd = 0;
+  for (const trade of openTrades) {
+    if (!trade.is_open) continue;
+    const leverage = trade.leverage;
+    if (
+      !Number.isSafeInteger(trade.trade_id) ||
+      trade.trade_id <= 0 ||
+      typeof trade.enter_tag !== 'string' ||
+      !trade.enter_tag ||
+      !Number.isFinite(trade.open_rate) ||
+      trade.open_rate <= 0 ||
+      !Number.isFinite(trade.stake_amount) ||
+      trade.stake_amount <= 0 ||
+      typeof leverage !== 'number' ||
+      !Number.isFinite(leverage) ||
+      leverage < 1
+    ) {
+      throw new Error(`Open Freqtrade trade ${String(trade.trade_id)} has no verifiable entry risk.`);
+    }
+    const record = await getSignal(trade.enter_tag);
+    const expectedDirection = trade.is_short ? 'SHORT' : 'LONG';
+    if (
+      !record ||
+      record.signal.pair !== trade.pair ||
+      record.signal.direction !== expectedDirection ||
+      (record.tradeId !== undefined && record.tradeId !== trade.trade_id)
+    ) {
+      throw new Error(`Open Freqtrade trade ${trade.trade_id} has no matching authorized signal; portfolio risk is unknown.`);
+    }
+    const stopLoss = record.signal.entryConditions.stopLoss;
+    const stopIsValid = expectedDirection === 'LONG'
+      ? stopLoss < trade.open_rate
+      : stopLoss > trade.open_rate;
+    if (!Number.isFinite(stopLoss) || stopLoss <= 0 || !stopIsValid) {
+      throw new Error(`Open Freqtrade trade ${trade.trade_id} has no valid protective-stop distance.`);
+    }
+    totalRiskUsd += trade.stake_amount * leverage *
+      Math.abs(trade.open_rate - stopLoss) / trade.open_rate;
+  }
+  if (!Number.isFinite(totalRiskUsd)) throw new Error('Aggregate open-trade risk is not finite.');
+  return totalRiskUsd;
 }
 
 export function toCandleTuple(
@@ -819,10 +899,13 @@ async function analyzeSnapshot(
   balance: number,
   signalSettings: ReturnType<typeof readSignalSettings> = readSignalSettings(),
   availableBalance: number = balance,
+  openRiskUsd = 0,
+  dailyLossUsd = 0,
+  maxOpenTrades = 1,
 ): Promise<{
   candidate: DirectionalSignalCandidate | null;
   reason: string;
-  executionRisk?: { maxStakeQuote: number; maxLeverage: number };
+  executionRisk?: { maxStakeQuote: number; maxLeverage: number; allocatedRiskUsd: number };
   authorization?: Omit<SbkEntryAuthorization, 'decisionId' | 'allocatedRiskUsd'>;
   featureSnapshot: OperationalTradeArchiveMetadata['featureSnapshot'];
   featureVersion: string;
@@ -861,7 +944,25 @@ async function analyzeSnapshot(
   );
   const macroContext = macroContextBrainService.getCachedMacroContext();
   const { runUnifiedMultiBrainEnsemble } = await import('./multiBrainEnsemble');
-  const multiBrainReport = runUnifiedMultiBrainEnsemble(analysis, null, analysis.price);
+  const historicalCandles = publicMarketFallback.candles;
+  const patternCosts = historicalPatternCostConfig();
+  const multiBrainReport = runUnifiedMultiBrainEnsemble(
+    analysis,
+    null,
+    analysis.price,
+    [],
+    historicalCandles.status === 'LIVE' && historicalCandles.value &&
+      historicalCandles.sourceTimestampMs !== null
+      ? {
+          candles: historicalCandles.value.map(({ open, high, low, close, volume }) =>
+            [open, high, low, close, volume] as Candle
+          ),
+          sourceTimestampMs: historicalCandles.sourceTimestampMs,
+          dataStatus: 'LIVE',
+          ...patternCosts,
+        }
+      : undefined,
+  );
   const sbReport = sbFiveModelsEngine.evaluatePentagon(analysis, null, analysis.price);
   const decisionSnapshotTimestampMs = snapshot.candles
     .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= nowMs)
@@ -890,43 +991,39 @@ async function analyzeSnapshot(
     };
   }
 
-  const selectedAnalysis: AnalysisResult = {
-    ...analysis,
-    direction: councilReport.selectedDirection,
-  };
   const control = runPostCouncilTradeControl({
-    analysis: selectedAnalysis,
+    analysis,
     council: councilReport,
-    multiBrainReport,
     balance,
     maxStakeQuote: Math.min(signalSettings.maxStakeQuote, availableBalance),
     maxLeverage: signalSettings.maxLeverage,
     riskBudgetPct: signalSettings.riskBudgetPct,
-    referencePrice: candles.at(-1)?.[3] ?? Number.NaN,
+    referencePrice: analysis.futuresPrices?.lastPrice ?? Number.NaN,
     maxDeviationBps: signalSettings.maxDeviationBps,
-    minWinProbability: 68,
+    maxOpenTrades,
+    openRiskUsd,
+    dailyLossUsd,
+    dailyLossLimitPct: signalSettings.dailyLossLimitPct,
+    nowMs: councilEvaluationNowMs,
   });
-  const decision = control.decision;
-  const tradeContract = control.tradeContract;
   const approved = control.approved;
   const latestCandle = analysis.candles.at(-1);
+  const executionPlan = control.executionPlan;
   return {
-    candidate: approved && tradeContract
+    candidate: approved && executionPlan
       ? {
-        direction: tradeContract.direction,
-        entryPrice: tradeContract.entryZone.target,
-        stopLoss: tradeContract.stop,
-        takeProfit: tradeContract.tp1,
-        engineScore: tradeContract.confidenceScore,
-        setupType: analysis.setupContext?.setupType ?? '',
+        direction: executionPlan.direction,
+        entryPrice: executionPlan.entryPrice,
+        stopLoss: executionPlan.stopLoss,
+        takeProfit: executionPlan.takeProfit,
+        engineScore: analysis.confScore,
+        setupType: executionPlan.setupType,
       }
       : null,
     ...(approved && control.executionRisk ? { executionRisk: control.executionRisk } : {}),
-    reason: approved
-      ? control.reason
-      : control.reason,
+    reason: control.reason,
     openSourceAdvisories: analysis.openSourceAdvisories,
-    ...(approved && tradeContract ? {
+    ...(approved && executionPlan ? {
       authorization: {
         contractVersion: 'sbk1.entry.authorization.v1',
         decision: 'APPROVE_ENTRY' as const,
@@ -934,61 +1031,16 @@ async function analyzeSnapshot(
         snapshotTimestampMs: snapshot.generatedAtMs,
         evaluatedAtMs: nowMs,
         timeframe: snapshot.timeframe,
-        direction: tradeContract.direction,
-        gates: (decision?.stages ?? []).map((stage, index, stages) => ({
-          id: stages.findIndex((candidate) => candidate.id === stage.id) === index
-            ? stage.id
-            : `${stage.id}_${index}`,
-          status: stage.status === 'PASSED' ||
-            (stage.status === 'SKIPPED' && isCouncilDelegatedStageId(stage.id))
-            ? 'PASSED' as const
-            : 'FAILED' as const,
-          reason: stage.reasonFa,
+        direction: executionPlan.direction,
+        gates: control.gates.map((gate) => ({
+          id: gate.id,
+          status: gate.passed ? 'PASSED' as const : 'FAILED' as const,
+          reason: gate.reason,
         })),
-        models: multiBrainReport.independentModels.map((model) => ({
-          id: model.modelId,
-          status: model.independenceValidated ? model.healthState : 'UNVALIDATED',
-          calibrated: model.calibrationFactor > 0 &&
-            model.rawProbabilityPct !== null &&
-            model.historicalPrecisionPct !== null,
-          independenceValidated: model.independenceValidated,
-          direction: model.prediction === 'BULLISH'
-            ? 'LONG' as const
-            : model.prediction === 'BEARISH'
-              ? 'SHORT' as const
-              : 'NEUTRAL' as const,
-          probabilityPct: model.rawProbabilityPct,
-          sampleSize: model.sampleSize,
-          oosPrecisionPct: model.historicalPrecisionPct,
-          effectiveWeight: model.independenceValidated &&
-            model.healthState === 'HEALTHY' &&
-            model.calibrationFactor > 0 &&
-            model.rawProbabilityPct !== null &&
-            model.historicalPrecisionPct !== null
-            ? model.effectiveWeight
-            : 0,
-        })),
-        disagreementVeto: multiBrainReport.modelDisagreement.vetoTriggered,
-        ensembleProbabilityPct: (() => {
-          const eligibleModels = multiBrainReport.independentModels.filter((model) =>
-            model.healthState === 'HEALTHY' &&
-            model.independenceValidated &&
-            model.calibrationFactor > 0 &&
-            model.rawProbabilityPct !== null &&
-            model.historicalPrecisionPct !== null &&
-            model.prediction === (tradeContract.direction === 'LONG' ? 'BULLISH' : 'BEARISH') &&
-            model.effectiveWeight > 0
-          );
-          const totalWeight = eligibleModels.reduce((total, model) => total + model.effectiveWeight, 0);
-          return totalWeight > 0
-            ? eligibleModels.reduce(
-              (total, model) => total + (model.rawProbabilityPct ?? 0) * model.effectiveWeight,
-              0,
-            ) / totalWeight
-            : null;
-        })(),
-        riskRewardRatio: Math.abs(tradeContract.tp1 - tradeContract.entryZone.target) /
-          Math.abs(tradeContract.entryZone.target - tradeContract.stop),
+        models: [],
+        disagreementVeto: false,
+        ensembleProbabilityPct: null,
+        riskRewardRatio: executionPlan.riskRewardRatio,
       },
     } : {}),
     featureSnapshot: makeServerFeatureSnapshot(analysis),
@@ -1222,6 +1274,10 @@ export class ServerSignalRunner {
       if (!Array.isArray(openTrades)) {
         throw new Error('Freqtrade RPC did not return an open-trades list.');
       }
+      const actualOpenTradesCount = openTrades.filter((trade) => trade.is_open).length;
+      if (actualOpenTradesCount !== status.openTradesCount) {
+        throw new Error('Freqtrade status and open-trade list disagree; portfolio risk cannot be verified.');
+      }
       if (completedCandles.length < this.minimumCandles) {
         await this.record({
           candleTimestampMs,
@@ -1287,32 +1343,51 @@ export class ServerSignalRunner {
       }
       if (
         !Number.isSafeInteger(status.openTradesCount) ||
-        !Number.isSafeInteger(status.maxOpenTrades)
+        !Number.isSafeInteger(status.maxOpenTrades) ||
+        status.maxOpenTrades <= 0
       ) {
         await this.record({
           candleTimestampMs,
           decision: 'NO TRADE',
-          reason: 'Freqtrade RPC did not provide a valid open-trade count and max_open_trades limit.',
+          reason: 'Freqtrade must provide a positive finite max_open_trades limit for portfolio-risk control.',
         });
         return;
       }
-      if (status.maxOpenTrades >= 0 && openTrades.length >= status.maxOpenTrades) {
+      if (actualOpenTradesCount >= status.maxOpenTrades) {
         await this.record({
           candleTimestampMs,
           decision: 'NO TRADE',
-          reason: `Freqtrade open-trade limit reached (${openTrades.length}/${status.maxOpenTrades}).`,
+          reason: `Freqtrade open-trade limit reached (${actualOpenTradesCount}/${status.maxOpenTrades}).`,
         });
         return;
       }
 
       const balance = await this.dependencies.getFreqtradeBalance();
-      if (!Number.isFinite(balance.available) || balance.available <= 0) {
+      if (
+        !Number.isFinite(balance.equity) ||
+        balance.equity <= 0 ||
+        !Number.isFinite(balance.available) ||
+        balance.available <= 0
+      ) {
         await this.record({
           candleTimestampMs,
           decision: 'NO TRADE',
-          reason: 'Freqtrade reports no available quote balance for a valid risk limit.',
+          reason: 'Freqtrade reports invalid equity or no available quote balance for a valid risk limit.',
         });
         return;
+      }
+      const openRiskUsd = await calculateOpenTradeRiskUsd(
+        openTrades,
+        (signalId) => this.dependencies.getSignal(signalId),
+      );
+      const utcDayStartMs = Date.UTC(
+        new Date(nowMs).getUTCFullYear(),
+        new Date(nowMs).getUTCMonth(),
+        new Date(nowMs).getUTCDate(),
+      );
+      const dailyLossUsd = await this.dependencies.getDailyRealizedLossUsd(utcDayStartMs, nowMs);
+      if (!Number.isFinite(dailyLossUsd) || dailyLossUsd < 0) {
+        throw new Error('Freqtrade daily realized loss is invalid; new entries are blocked.');
       }
       if (!this.dependencies.analyze) {
         centralTradeDatasetService.replaceTrainingArchiveRecords(await operationalTradeArchive.getAll());
@@ -1324,6 +1399,9 @@ export class ServerSignalRunner {
         balance.equity,
         settings,
         balance.available,
+        openRiskUsd,
+        dailyLossUsd,
+        status.maxOpenTrades,
       );
       const candidate = result.candidate;
       if (!candidate) {
@@ -1338,6 +1416,9 @@ export class ServerSignalRunner {
       }
       if (
         !result.authorization ||
+        !result.executionRisk ||
+        !Number.isFinite(result.executionRisk.allocatedRiskUsd) ||
+        result.executionRisk.allocatedRiskUsd <= 0 ||
         result.authorization.decision !== 'APPROVE_ENTRY' ||
         result.authorization.direction !== candidate.direction ||
         result.authorization.timeframe !== expected.timeframe ||
@@ -1421,7 +1502,7 @@ export class ServerSignalRunner {
         authorization: {
           ...result.authorization,
           decisionId: ids.decisionId,
-          allocatedRiskUsd: maxStakeQuote * settings.riskBudgetPct / 100,
+          allocatedRiskUsd: result.executionRisk.allocatedRiskUsd,
         },
       }, {
         nowMs,
@@ -1490,6 +1571,8 @@ export function createServerSignalRunner(options: {
     getFreqtradeStatus: () => freqtradeBridge.getStatus(),
     getOpenTrades: () => freqtradeBridge.getOpenTrades(),
     getFreqtradeBalance: () => freqtradeBridge.getBalance(),
+    getDailyRealizedLossUsd: (dayStartMs, nowMs) =>
+      freqtradeBridge.getDailyRealizedLossUsd(dayStartMs, nowMs),
     getSnapshot: (expected, nowMs) => freqtradeMarketDataBridge.getLatestConfigured(expected, nowMs),
     isKillSwitchActive: options.isKillSwitchActive,
     submitSignal: (signal, expected) => freqtradeSignalAdapter.submit(signal, {

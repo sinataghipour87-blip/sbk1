@@ -17,7 +17,6 @@ import type { OpenSourceAdvisoryReport } from './openSourceAdvisoryService';
 import type { PublicMarketFallbackData } from './publicMarketDataFallback';
 import type { SbPentagonOutput } from './sbFiveModelsEngine';
 import type { SignalToExecutionResult } from './signalToExecution';
-
 export interface CouncilMemberRepositoryEntry {
   snapshotId: string;
   evaluatedAtMs: number;
@@ -194,12 +193,6 @@ function brainEvidenceAvailability(
           isFiniteNumber(output.volatilityForecastPct),
         summaryFa: 'پیش‌بینی GARCH فقط وقتی موجود است که مدل بر سری کندل معتبر fit شده باشد.',
       };
-    case 'brains.brain04PatternDivergence':
-      return {
-        available: isFiniteNumber(output.patternMatchPct) &&
-          typeof output.matchedPatternName === 'string',
-        summaryFa: 'خروجی شباهت الگو heuristic است؛ احتمال کالیبره یا مجوز معامله محسوب نمی‌شود.',
-      };
     case 'brains.brain05FloatingRiskHedging':
       return {
         available: output.floatingSystemHarmonized !== null &&
@@ -339,7 +332,6 @@ function brainModules(report: MultiBrainConsensusReport): Record<string, unknown
     'brains.brain01MacroTrend': report.brain1Macro,
     'brains.brain02LiquidityFlow': report.brain2Liquidity,
     'brains.brain03GarchVolatility': report.brain3Volatility,
-    'brains.brain04PatternDivergence': report.brain4Pattern,
     'brains.brain05FloatingRiskHedging': report.brain5RiskHedging,
     'brains.brain06OnChainWhaleFlow': report.brain6OnChainWhale,
     'brains.brain07OrderBookCvd': report.brain7OrderBookCvd,
@@ -591,7 +583,7 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
     const quotesFresh = quotes.status === 'LIVE' &&
       quoteTimestampMs !== null &&
       quoteAgeMs !== null &&
-      quoteAgeMs >= 0 &&
+      quoteAgeMs >= -5_000 &&
       quoteAgeMs <= 5_000 &&
       quoteNames.length === 3 &&
       new Set(quoteNames).size === 3 &&

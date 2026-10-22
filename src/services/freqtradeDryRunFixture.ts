@@ -126,7 +126,12 @@ export function createDryRunFixtureSignal(input: {
         disagreementVeto: false,
         ensembleProbabilityPct: null,
         riskRewardRatio: 2,
-        allocatedRiskUsd: input.riskLimits.maxStakeQuote * input.riskLimits.riskBudgetPct / 100,
+        allocatedRiskUsd: Math.min(
+          input.riskLimits.maxStakeQuote * input.riskLimits.riskBudgetPct / 100,
+          input.riskLimits.maxStakeQuote *
+            input.riskLimits.maxLeverage *
+            Math.abs(input.referencePrice - stopLoss) / input.referencePrice,
+        ),
       },
     },
     {

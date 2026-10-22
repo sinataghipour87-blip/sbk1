@@ -17,25 +17,19 @@ from sbk_signal_contract import is_signal_runtime, unresolved_inflight_signal_id
 
 
 AUTHORIZATION_GATE_IDS = (
-    "STAGE_1_MARKET_DATA",
-    "STAGE_2_DATA_QUALITY",
-    "STAGE_3_MARKET_REGIME",
-    "STAGE_4_HTF_STRUCTURE",
-    "STAGE_5_SETUP_DETECTION",
-    "STAGE_6_LIQUIDITY_ANALYSIS",
-    "STAGE_7_ORDER_FLOW",
-    "STAGE_8_ENTRY_TRIGGER",
-    "STAGE_9_ENTRY_PRICE",
-    "STAGE_10_STOP_INVALIDATION",
-    "STAGE_11_TP_TARGETS",
-    "STAGE_12_EXPECTED_VALUE",
-    "STAGE_13_POSITION_SIZE",
-    "STAGE_14_EXECUTION",
+    "COUNCIL_REPORT",
+    "LIVE_DATA",
+    "REFERENCE_PRICE",
+    "EXECUTION_SPREAD",
+    "TRADE_LEVELS",
+    "STOP_AND_TARGET",
+    "PORTFOLIO_RISK",
+    "DAILY_LOSS",
+    "RISK_ALLOCATION",
 )
 
 
 def make_authorization(signal_id, timestamp_ms, timeframe, direction):
-    model_direction = direction
     return {
         "contractVersion": "sbk1.entry.authorization.v1",
         "decision": "APPROVE_ENTRY",
@@ -49,34 +43,11 @@ def make_authorization(signal_id, timestamp_ms, timeframe, direction):
             {"id": gate_id, "status": "PASSED", "reason": "Isolated contract test evidence."}
             for gate_id in AUTHORIZATION_GATE_IDS
         ],
-        "models": [
-            {
-                "id": "M1_TEST",
-                "status": "HEALTHY",
-                "calibrated": True,
-                "independenceValidated": True,
-                "direction": model_direction,
-                "probabilityPct": 70,
-                "sampleSize": 40,
-                "oosPrecisionPct": 60,
-                "effectiveWeight": 0.4,
-            },
-            {
-                "id": "M2_TEST",
-                "status": "HEALTHY",
-                "calibrated": True,
-                "independenceValidated": True,
-                "direction": model_direction,
-                "probabilityPct": 68,
-                "sampleSize": 40,
-                "oosPrecisionPct": 60,
-                "effectiveWeight": 0.3,
-            },
-        ],
+        "models": [],
         "disagreementVeto": False,
-        "ensembleProbabilityPct": 69.14,
+        "ensembleProbabilityPct": None,
         "riskRewardRatio": 2,
-        "allocatedRiskUsd": 1,
+        "allocatedRiskUsd": 0.4,
     }
 
 
@@ -354,7 +325,8 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.strategy._signals = {self.signal_id: self.signal}
         self.strategy.config["stake_amount"] = 100
         self.signal["entryConditions"]["stopLoss"] = 62_100 * 0.99
-        self.signal["riskLimits"]["riskBudgetPct"] = 0.5
+        self.signal["authorization"]["allocatedRiskUsd"] = 0.5
+        self.signal["riskLimits"]["riskBudgetPct"] = 1.5
 
         stake = self.strategy.custom_stake_amount(
             self.signal["pair"],
@@ -368,7 +340,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "long",
         )
 
-        self.assertAlmostEqual(stake, 25)
+        self.assertAlmostEqual(stake, 25, msg="Freqtrade must use the central absolute risk allocation once, not apply the percentage again")
         self.assertLessEqual(stake, self.strategy.config["stake_amount"])
 
         self.strategy.config["stake_amount"] = 20

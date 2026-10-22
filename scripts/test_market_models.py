@@ -20,20 +20,15 @@ def flat_candles(count=25):
 def valid_sbk_signal(now_ms=1_800_000_000_000):
     observed_at_ms = now_ms - 500
     required_gate_ids = (
-        "STAGE_1_MARKET_DATA",
-        "STAGE_2_DATA_QUALITY",
-        "STAGE_3_MARKET_REGIME",
-        "STAGE_4_HTF_STRUCTURE",
-        "STAGE_5_SETUP_DETECTION",
-        "STAGE_6_LIQUIDITY_ANALYSIS",
-        "STAGE_7_ORDER_FLOW",
-        "STAGE_8_ENTRY_TRIGGER",
-        "STAGE_9_ENTRY_PRICE",
-        "STAGE_10_STOP_INVALIDATION",
-        "STAGE_11_TP_TARGETS",
-        "STAGE_12_EXPECTED_VALUE",
-        "STAGE_13_POSITION_SIZE",
-        "STAGE_14_EXECUTION",
+        "COUNCIL_REPORT",
+        "LIVE_DATA",
+        "REFERENCE_PRICE",
+        "EXECUTION_SPREAD",
+        "TRADE_LEVELS",
+        "STOP_AND_TARGET",
+        "PORTFOLIO_RISK",
+        "DAILY_LOSS",
+        "RISK_ALLOCATION",
     )
     return {
         "contractVersion": SIGNAL_CONTRACT_VERSION,
@@ -79,34 +74,11 @@ def valid_sbk_signal(now_ms=1_800_000_000_000):
                 {"id": gate_id, "status": "PASSED", "reason": "Isolated contract test evidence."}
                 for gate_id in required_gate_ids
             ],
-            "models": [
-                {
-                    "id": "M1_TEST",
-                    "status": "HEALTHY",
-                    "calibrated": True,
-                    "independenceValidated": True,
-                    "direction": "LONG",
-                    "probabilityPct": 70,
-                    "sampleSize": 40,
-                    "oosPrecisionPct": 60,
-                    "effectiveWeight": 0.4,
-                },
-                {
-                    "id": "M2_TEST",
-                    "status": "HEALTHY",
-                    "calibrated": True,
-                    "independenceValidated": True,
-                    "direction": "LONG",
-                    "probabilityPct": 68,
-                    "sampleSize": 40,
-                    "oosPrecisionPct": 60,
-                    "effectiveWeight": 0.3,
-                },
-            ],
+            "models": [],
             "disagreementVeto": False,
-            "ensembleProbabilityPct": 69,
+            "ensembleProbabilityPct": None,
             "riskRewardRatio": 2,
-            "allocatedRiskUsd": 1,
+            "allocatedRiskUsd": 0.4,
         },
     }
 
@@ -117,6 +89,22 @@ class MarketModelFailClosedTests(unittest.TestCase):
         self.assertFalse(is_signal_runtime("live"))
         self.assertFalse(is_signal_runtime("backtest"))
         self.assertFalse(is_signal_runtime(""))
+
+    def test_entry_authorization_uses_council_without_predictive_model_veto(self):
+        now_ms = 1_800_000_000_000
+        signal = valid_sbk_signal(now_ms)
+        signal["authorization"]["disagreementVeto"] = True
+
+        self.assertTrue(
+            is_valid_sbk_signal(
+                signal,
+                now_ms=now_ms,
+                expected_exchange="bybit",
+                expected_market="futures",
+                expected_pair="BTC/USDT:USDT",
+                expected_timeframe="15m",
+            )
+        )
 
     def test_exit_signal_contract_requires_target_direction_reason_and_expiry(self):
         now_ms = 1_800_000_000_000
@@ -273,36 +261,43 @@ class MarketModelFailClosedTests(unittest.TestCase):
             )
         )
 
-    def test_python_consumer_rejects_missing_calibration_or_failed_gate(self):
+    def test_python_consumer_rejects_failed_execution_gate(self):
         now_ms = 1_800_000_000_000
-        missing_model = valid_sbk_signal(now_ms)
-        missing_model["authorization"]["models"][1].update({
-            "status": "SUSPENDED",
-            "calibrated": False,
-            "effectiveWeight": 0,
-        })
         failed_gate = valid_sbk_signal(now_ms)
         failed_gate["authorization"]["gates"][0]["status"] = "FAILED"
 
-        for signal in (missing_model, failed_gate):
-            with self.subTest(signal=signal):
-                self.assertFalse(
-                    is_valid_sbk_signal(
-                        signal,
-                        now_ms=now_ms,
-                        expected_exchange="bybit",
-                        expected_market="futures",
-                        expected_pair="BTC/USDT:USDT",
-                        expected_timeframe="15m",
-                    )
-                )
+        self.assertFalse(
+            is_valid_sbk_signal(
+                failed_gate,
+                now_ms=now_ms,
+                expected_exchange="bybit",
+                expected_market="futures",
+                expected_pair="BTC/USDT:USDT",
+                expected_timeframe="15m",
+            )
+        )
 
-    def test_python_consumer_rejects_unvalidated_model_independence(self):
+    def test_python_consumer_ignores_optional_model_disagreement(self):
         now_ms = 1_800_000_000_000
         signal = valid_sbk_signal(now_ms)
-        for model in signal["authorization"]["models"]:
-            model["independenceValidated"] = False
-            model["effectiveWeight"] = 0
+        signal["authorization"]["disagreementVeto"] = True
+        signal["authorization"]["models"] = [{"status": "UNAVAILABLE"}]
+
+        self.assertTrue(
+            is_valid_sbk_signal(
+                signal,
+                now_ms=now_ms,
+                expected_exchange="bybit",
+                expected_market="futures",
+                expected_pair="BTC/USDT:USDT",
+                expected_timeframe="15m",
+            )
+        )
+
+    def test_python_consumer_rejects_risk_allocation_above_stop_loss_exposure(self):
+        now_ms = 1_800_000_000_000
+        signal = valid_sbk_signal(now_ms)
+        signal["authorization"]["allocatedRiskUsd"] = 1
 
         self.assertFalse(
             is_valid_sbk_signal(
@@ -314,6 +309,7 @@ class MarketModelFailClosedTests(unittest.TestCase):
                 expected_timeframe="15m",
             )
         )
+
 
     def test_python_consumer_rejects_stale_and_mismatched_contract_data(self):
         now_ms = 1_800_000_000_000

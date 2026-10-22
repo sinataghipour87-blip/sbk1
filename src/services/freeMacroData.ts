@@ -26,7 +26,9 @@ export interface FreeMacroDataResult {
 }
 
 const FRED_CSV_ENDPOINT = 'https://fred.stlouisfed.org/graph/fredgraph.csv';
+const NYFED_EFFR_ENDPOINT = 'https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json';
 const MASSIVE_INDICES_SNAPSHOT_ENDPOINT = 'https://api.massive.com/v3/snapshot/indices';
+const YAHOO_CHART_ENDPOINT = 'https://query1.finance.yahoo.com/v8/finance/chart';
 const COINMETRICS_ENDPOINT =
   'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=AdrActCnt&limit_per_asset=1&pretty=false';
 const FRED_MAX_AGE_MS = 5 * 24 * 60 * 60_000;
@@ -116,6 +118,18 @@ function storeResult(key: string, result: DirectMetricResult, nowMs: number): Di
   return result;
 }
 
+function preservePrimaryFailure(
+  primary: DirectMetricResult,
+  fallback: DirectMetricResult,
+): DirectMetricResult {
+  if (primary.status === 'LIVE') return primary;
+  if (fallback.status === 'LIVE') return fallback;
+  return {
+    ...fallback,
+    error: `${fallback.error ?? 'Fallback unavailable.'} Primary ${primary.provider}: ${primary.error ?? 'unavailable.'}`,
+  };
+}
+
 async function fetchFredSeries(
   seriesId: string,
   metric: string,
@@ -199,6 +213,128 @@ async function fetchFredSeries(
   } catch (error) {
     return unavailable(
       'FRED public CSV',
+      endpoint,
+      metric,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+async function fetchNewYorkFedEffectiveRate(
+  nowMs: number,
+  fetcher: typeof fetch,
+): Promise<DirectMetricResult> {
+  const cached = cachedResult('nyfed:effr', nowMs);
+  if (cached) return cached;
+
+  const endDate = new Date(nowMs).toISOString().slice(0, 10);
+  const startDate = new Date(nowMs - 14 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+  const endpointUrl = new URL(NYFED_EFFR_ENDPOINT);
+  endpointUrl.searchParams.set('startDate', startDate);
+  endpointUrl.searchParams.set('endDate', endDate);
+  const endpoint = endpointUrl.toString();
+  try {
+    const { response, retrievedAtMs, latencyMs } = await fetchResponse(endpoint, fetcher);
+    const payload: unknown = await response.json();
+    const rates = isRecord(payload) && Array.isArray(payload.refRates)
+      ? payload.refRates
+      : [];
+    const observations = rates.flatMap((row: unknown) => {
+      if (!isRecord(row) || row.type !== 'EFFR' || typeof row.effectiveDate !== 'string') return [];
+      const value = Number(row.percentRate);
+      const observedAtMs = validObservedAt(row.effectiveDate, nowMs, FRED_MAX_AGE_MS);
+      return Number.isFinite(value) && value > 0 && observedAtMs !== null
+        ? [{ date: row.effectiveDate, value, observedAtMs }]
+        : [];
+    }).sort((left, right) => left.date.localeCompare(right.date));
+    const latest = observations.at(-1);
+    const previous = observations.at(-2);
+    if (!latest) {
+      throw new Error('New York Fed returned no fresh, finite EFFR observations.');
+    }
+
+    return storeResult('nyfed:effr', {
+      status: 'LIVE',
+      provider: 'Federal Reserve Bank of New York reference rates API (EFFR)',
+      endpoint,
+      metric: 'Federal funds effective rate',
+      value: latest.value,
+      previousValue: previous?.value ?? null,
+      changePct: previous && previous.value !== 0
+        ? ((latest.value - previous.value) / Math.abs(previous.value)) * 100
+        : null,
+      observedAt: latest.date,
+      observedAtMs: latest.observedAtMs,
+      retrievedAtMs,
+      latencyMs,
+      ageMs: Math.max(0, nowMs - latest.observedAtMs),
+    }, nowMs);
+  } catch (error) {
+    return unavailable(
+      'Federal Reserve Bank of New York reference rates API (EFFR)',
+      endpoint,
+      'Federal funds effective rate',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+async function fetchYahooIndex(
+  symbol: '^GSPC' | 'DX-Y.NYB',
+  metric: string,
+  nowMs: number,
+  fetcher: typeof fetch,
+  maxAgeMs: number,
+): Promise<DirectMetricResult> {
+  const endpoint = `${YAHOO_CHART_ENDPOINT}/${encodeURIComponent(symbol)}?range=1d&interval=1m`;
+  const cacheKey = `yahoo:index:${symbol}`;
+  const cached = cachedResult(cacheKey, nowMs, symbol === 'DX-Y.NYB' ? DXY_CACHE_TTL_MS : CACHE_TTL_MS);
+  if (cached) return cached;
+  try {
+    const { response, retrievedAtMs, latencyMs } = await fetchResponse(endpoint, fetcher);
+    const payload: unknown = await response.json();
+    const chart = isRecord(payload) && isRecord(payload.chart) ? payload.chart : null;
+    const resultRows = chart && Array.isArray(chart.result) ? chart.result : [];
+    const row = resultRows.find(isRecord);
+    const meta = row && isRecord(row.meta) ? row.meta : null;
+    const timestamps = row && Array.isArray(row.timestamp) ? row.timestamp : [];
+    const quoteBlock = row && isRecord(row.indicators) && Array.isArray(row.indicators.quote)
+      ? row.indicators.quote.find(isRecord)
+      : null;
+    const closes = quoteBlock && Array.isArray(quoteBlock.close) ? quoteBlock.close : [];
+    const latestIndex = Math.min(timestamps.length, closes.length) - 1;
+    const observedAtMs = latestIndex >= 0 && Number.isFinite(Number(timestamps[latestIndex]))
+      ? Number(timestamps[latestIndex]) * 1_000
+      : Number(meta?.regularMarketTime) * 1_000;
+    const value = Number(closes[latestIndex] ?? meta?.regularMarketPrice);
+    const previousValue = Number(meta?.chartPreviousClose ?? meta?.previousClose);
+    if (
+      !Number.isSafeInteger(observedAtMs) ||
+      !Number.isFinite(value) || value <= 0 ||
+      !Number.isFinite(previousValue) || previousValue <= 0 ||
+      observedAtMs > nowMs + 60_000 ||
+      nowMs - observedAtMs > maxAgeMs
+    ) {
+      throw new Error(`${symbol} quote is malformed or stale (maximum age ${maxAgeMs}ms).`);
+    }
+    const result: DirectMetricResult = {
+      status: 'LIVE',
+      provider: `Yahoo Finance chart (${symbol}; timestamp-validated fallback)`,
+      endpoint,
+      metric,
+      value,
+      previousValue,
+      changePct: ((value - previousValue) / previousValue) * 100,
+      observedAt: new Date(observedAtMs).toISOString(),
+      observedAtMs,
+      retrievedAtMs,
+      latencyMs,
+      ageMs: Math.max(0, nowMs - observedAtMs),
+    };
+    return storeResult(cacheKey, result, nowMs);
+  } catch (error) {
+    return unavailable(
+      `Yahoo Finance chart (${symbol})`,
       endpoint,
       metric,
       error instanceof Error ? error.message : String(error),
@@ -364,7 +500,7 @@ export async function fetchFreeMacroData(
   const dxyApiKey = options.massiveApiKey ?? process.env.MASSIVE_API_KEY;
   const fred = (seriesId: string, metric: string) =>
     fetchFredSeries(seriesId, metric, nowMs, fetcher);
-  const [sp500, dxy, broadDollar, fedEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses] =
+  const [fredSp500, massiveDxy, broadDollar, fredEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses] =
     await Promise.all([
       fred('SP500', 'S&P 500 daily close'),
       fetchMassiveDxy(nowMs, fetcher, dxyApiKey),
@@ -374,5 +510,24 @@ export async function fetchFreeMacroData(
       fetchBitcoinActiveAddresses(nowMs, fetcher),
     ]);
 
-  return { sp500, dxy, broadDollar, fedEffectiveRate, fedTargetUpperBound, bitcoinActiveAddresses };
+  const [sp500, fallbackDxy, fallbackFedEffectiveRate] = await Promise.all([
+    fredSp500.status === 'LIVE'
+      ? Promise.resolve(fredSp500)
+      : fetchYahooIndex('^GSPC', 'S&P 500 index', nowMs, fetcher, FRED_MAX_AGE_MS),
+    massiveDxy.status === 'LIVE'
+      ? Promise.resolve(massiveDxy)
+      : fetchYahooIndex('DX-Y.NYB', 'ICE U.S. Dollar Index (DXY)', nowMs, fetcher, DXY_MAX_AGE_MS),
+    fredEffectiveRate.status === 'LIVE'
+      ? Promise.resolve(fredEffectiveRate)
+      : fetchNewYorkFedEffectiveRate(nowMs, fetcher),
+  ]);
+
+  return {
+    sp500: preservePrimaryFailure(fredSp500, sp500),
+    dxy: preservePrimaryFailure(massiveDxy, fallbackDxy),
+    broadDollar,
+    fedEffectiveRate: preservePrimaryFailure(fredEffectiveRate, fallbackFedEffectiveRate),
+    fedTargetUpperBound,
+    bitcoinActiveAddresses,
+  };
 }

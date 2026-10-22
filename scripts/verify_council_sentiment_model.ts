@@ -41,13 +41,29 @@ const candles = Array.from({ length: 30 }, (_, index) => ({
   volume: 1 + index,
 }));
 const sourceTimestampMs = candles.at(-1)!.timestampMs;
-const headlines: DirectNewsHeadline[] = [{
-  id: 'local-inference-fixture',
-  headline: 'Bitcoin market outlook improves as institutional demand strengthens',
-  publisher: 'SBK1 deterministic inference fixture',
-  url: 'https://example.invalid/sbk1-sentiment-fixture',
-  publishedAt: new Date(nowMs - 1_000).toISOString(),
-}];
+const headlines: DirectNewsHeadline[] = [
+  {
+    id: 'local-inference-fixture-1',
+    headline: 'Bitcoin market outlook improves as institutional demand strengthens',
+    publisher: 'SBK1 deterministic inference fixture',
+    url: 'https://example.invalid/sbk1-sentiment-fixture-1',
+    publishedAt: new Date(nowMs - 1_000).toISOString(),
+  },
+  {
+    id: 'local-inference-fixture-2',
+    headline: 'Digital asset investment products report fresh inflows',
+    publisher: 'Independent SBK1 inference fixture',
+    url: 'https://example.invalid/sbk1-sentiment-fixture-2',
+    publishedAt: new Date(nowMs - 1_000).toISOString(),
+  },
+  {
+    id: 'local-inference-fixture-3',
+    headline: 'Crypto market outlook remains constructive',
+    publisher: 'SBK1 deterministic inference fixture',
+    url: 'https://example.invalid/sbk1-sentiment-fixture-3',
+    publishedAt: new Date(nowMs - 1_000).toISOString(),
+  },
+];
 const analysisReport = await openSourceAdvisoryService.analyze(candles, headlines);
 const sentiment = analysisReport.modules.newsSentiment;
 if (sentiment.status !== 'AVAILABLE') {
@@ -64,7 +80,7 @@ if (typeof aggregateSentiment !== 'number' || !Number.isFinite(aggregateSentimen
 assert.equal(analysisReport.sourceTimestampMs, sourceTimestampMs);
 assert.equal(sentiment.sourceTimestampMs, sourceTimestampMs);
 assert.equal(sentiment.model, 'mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis');
-assert.equal(sentiment.headlineCount, 1);
+assert.equal(sentiment.headlineCount, 3);
 assert.equal(Array.isArray(sentiment.headlines), true);
 
 const repositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-sentiment-model-council-'));

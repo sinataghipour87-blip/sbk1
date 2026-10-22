@@ -114,13 +114,29 @@ const analysis = {
     sourceTimestampMs,
     status: 'AVAILABLE' as const,
     decisionInfluence: 'ADVISORY_ONLY' as const,
-    sourceHeadlines: [{
-      id: 'verified-headline',
-      headline: 'Verified fresh market report',
-      publisher: 'Verification source',
-      url: 'https://example.invalid/verified-headline',
-      publishedAt: new Date(sourceTimestampMs).toISOString(),
-    }],
+    sourceHeadlines: [
+      {
+        id: 'verified-headline',
+        headline: 'Verified fresh market report',
+        publisher: 'Verification source',
+        url: 'https://example.invalid/verified-headline',
+        publishedAt: new Date(sourceTimestampMs).toISOString(),
+      },
+      {
+        id: 'verified-headline-2',
+        headline: 'Verified market update',
+        publisher: 'Second verification source',
+        url: 'https://example.invalid/verified-headline-2',
+        publishedAt: new Date(sourceTimestampMs).toISOString(),
+      },
+      {
+        id: 'verified-headline-3',
+        headline: 'Verified policy report',
+        publisher: 'Verification source',
+        url: 'https://example.invalid/verified-headline-3',
+        publishedAt: new Date(sourceTimestampMs).toISOString(),
+      },
+    ],
     newsHeadlinesRetrievedAtMs: nowMs,
     modules: {
       candlestickPatterns: { ...advisoryModule, matchedPatternCount: 1 },
@@ -131,11 +147,23 @@ const analysis = {
       newsSentiment: {
         ...advisoryModule,
         aggregateSentiment: 0.25,
-        headlines: [{
-          headline: 'Verified fresh market report',
-          publisher: 'Verification source',
-          publishedAt: new Date(sourceTimestampMs).toISOString(),
-        }],
+        headlines: [
+          {
+            headline: 'Verified fresh market report',
+            publisher: 'Verification source',
+            publishedAt: new Date(sourceTimestampMs).toISOString(),
+          },
+          {
+            headline: 'Verified market update',
+            publisher: 'Second verification source',
+            publishedAt: new Date(sourceTimestampMs).toISOString(),
+          },
+          {
+            headline: 'Verified policy report',
+            publisher: 'Verification source',
+            publishedAt: new Date(sourceTimestampMs).toISOString(),
+          },
+        ],
       },
     },
   },
@@ -359,13 +387,29 @@ try {
       newsSentimentStatus: 'LIVE',
       newsSentimentScore: 50,
       newsHeadlinesStatus: 'LIVE',
-      recentHeadlines: [{
-        id: 'unrelated-base-headline',
-        headline: 'Unrelated cached headline',
-        source: 'Cached source',
-        url: 'https://example.invalid/cached-headline',
-        publishedAt: new Date(sourceTimestampMs).toISOString(),
-      }],
+      recentHeadlines: [
+        {
+          id: 'unrelated-base-headline',
+          headline: 'Unrelated cached headline',
+          source: 'Cached source',
+          url: 'https://example.invalid/cached-headline',
+          publishedAt: new Date(sourceTimestampMs).toISOString(),
+        },
+        {
+          id: 'unrelated-base-headline-2',
+          headline: 'Another unrelated cached headline',
+          source: 'Another cached source',
+          url: 'https://example.invalid/cached-headline-2',
+          publishedAt: new Date(sourceTimestampMs).toISOString(),
+        },
+        {
+          id: 'unrelated-base-headline-3',
+          headline: 'Third unrelated cached headline',
+          source: 'Cached source',
+          url: 'https://example.invalid/cached-headline-3',
+          publishedAt: new Date(sourceTimestampMs).toISOString(),
+        },
+      ],
     },
     nowMs,
   });

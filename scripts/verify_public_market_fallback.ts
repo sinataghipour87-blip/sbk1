@@ -99,6 +99,64 @@ assert.deepEqual(
 assert.ok(fallback.exchangeQuotes.value?.every(({ sourceTimestampMs }) =>
   nowMs - sourceTimestampMs <= 5_000
 ));
+const smallClockSkewFetcher: typeof fetch = async (input, init) => {
+  const url = new URL(String(input));
+  const response = await fixtureFetcher(input, init);
+  if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
+    return Response.json({
+      symbol: 'BTCUSDT',
+      price: '101',
+      time: nowMs + 2_000,
+    });
+  }
+  if (url.hostname === 'api.bybit.com' && url.pathname === '/v5/market/tickers') {
+    return Response.json({
+      retCode: 0,
+      time: nowMs + 2_000,
+      result: { list: [{ symbol: 'BTCUSDT', lastPrice: '100.5' }] },
+    });
+  }
+  if (url.hostname === 'www.okx.com' && url.pathname === '/api/v5/market/ticker') {
+    return Response.json({
+      code: '0',
+      data: [{ instId: 'BTC-USDT-SWAP', last: '100.25', ts: String(nowMs + 2_000) }],
+    });
+  }
+  return response;
+};
+const smallClockSkewQuotes = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: smallClockSkewFetcher,
+  timeoutMs: 100,
+});
+assert.equal(smallClockSkewQuotes.exchangeQuotes.status, 'LIVE');
+assert.equal(smallClockSkewQuotes.exchangeQuotes.sourceTimestampMs, nowMs);
+assert.ok(smallClockSkewQuotes.exchangeQuotes.value?.every(({ sourceTimestampMs }) =>
+  sourceTimestampMs === nowMs + 2_000
+));
+const excessiveClockSkewFetcher: typeof fetch = async (input, init) => {
+  const url = new URL(String(input));
+  if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
+    return Response.json({
+      symbol: 'BTCUSDT',
+      price: '101',
+      time: nowMs + 6_000,
+    });
+  }
+  return fixtureFetcher(input, init);
+};
+const excessiveClockSkewQuotes = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: excessiveClockSkewFetcher,
+  timeoutMs: 100,
+});
+assert.equal(excessiveClockSkewQuotes.exchangeQuotes.status, 'UNAVAILABLE');
 const divergentQuoteFetcher: typeof fetch = async (input, init) => {
   const url = new URL(String(input));
   if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {

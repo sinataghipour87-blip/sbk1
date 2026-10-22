@@ -182,20 +182,15 @@ const ids = deriveSbkSignalIds({
   takeProfit: 62_000,
 });
 const authorizationGateIds = [
-  'STAGE_1_MARKET_DATA',
-  'STAGE_2_DATA_QUALITY',
-  'STAGE_3_MARKET_REGIME',
-  'STAGE_4_HTF_STRUCTURE',
-  'STAGE_5_SETUP_DETECTION',
-  'STAGE_6_LIQUIDITY_ANALYSIS',
-  'STAGE_7_ORDER_FLOW',
-  'STAGE_8_ENTRY_TRIGGER',
-  'STAGE_9_ENTRY_PRICE',
-  'STAGE_10_STOP_INVALIDATION',
-  'STAGE_11_TP_TARGETS',
-  'STAGE_12_EXPECTED_VALUE',
-  'STAGE_13_POSITION_SIZE',
-  'STAGE_14_EXECUTION',
+  'COUNCIL_REPORT',
+  'LIVE_DATA',
+  'REFERENCE_PRICE',
+  'EXECUTION_SPREAD',
+  'TRADE_LEVELS',
+  'STOP_AND_TARGET',
+  'PORTFOLIO_RISK',
+  'DAILY_LOSS',
+  'RISK_ALLOCATION',
 ];
 const signal = {
   contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
@@ -237,14 +232,11 @@ const signal = {
       status: 'PASSED',
       reason: 'CONTRACT_E2E_TEST_ONLY isolated authorization.',
     })),
-    models: [
-      { id: 'M1_TEST', status: 'HEALTHY', calibrated: true, independenceValidated: true, direction: 'LONG', probabilityPct: 70, sampleSize: 40, oosPrecisionPct: 60, effectiveWeight: 0.4 },
-      { id: 'M2_TEST', status: 'HEALTHY', calibrated: true, independenceValidated: true, direction: 'LONG', probabilityPct: 68, sampleSize: 40, oosPrecisionPct: 60, effectiveWeight: 0.3 },
-    ],
+    models: [],
     disagreementVeto: false,
-    ensembleProbabilityPct: 69.14,
+    ensembleProbabilityPct: null,
     riskRewardRatio: 2,
-    allocatedRiskUsd: 0.1,
+    allocatedRiskUsd: 0.4,
   },
 };
 

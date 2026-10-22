@@ -47,6 +47,10 @@ assert.deepEqual(result.sources.map((source) => source.status), [
   'LIVE',
   'UNAVAILABLE',
   'UNAVAILABLE',
+  'UNAVAILABLE',
+  'UNAVAILABLE',
+  'UNAVAILABLE',
+  'UNAVAILABLE',
 ]);
 
 const unavailable = await fetchDirectNewsHeadlines(async () => new Response('fail', { status: 503 }), nowMs);

@@ -271,7 +271,7 @@ def is_valid_sbk_signal(
         or abs(authorization["riskRewardRatio"] - calculated_risk_reward) > 0.01
         or authorization["riskRewardRatio"] < 1
         or not _positive_number(allocated_risk)
-        or allocated_risk > max_stake_quote * risk_budget_pct / 100 + 0.01
+        or allocated_risk > max_stake_quote * max_leverage * risk_distance / entry_price + 0.01
     ):
         return False
 
@@ -292,20 +292,15 @@ def is_valid_sbk_signal(
         return False
 
     required_gate_ids = {
-        "STAGE_1_MARKET_DATA",
-        "STAGE_2_DATA_QUALITY",
-        "STAGE_3_MARKET_REGIME",
-        "STAGE_4_HTF_STRUCTURE",
-        "STAGE_5_SETUP_DETECTION",
-        "STAGE_6_LIQUIDITY_ANALYSIS",
-        "STAGE_7_ORDER_FLOW",
-        "STAGE_8_ENTRY_TRIGGER",
-        "STAGE_9_ENTRY_PRICE",
-        "STAGE_10_STOP_INVALIDATION",
-        "STAGE_11_TP_TARGETS",
-        "STAGE_12_EXPECTED_VALUE",
-        "STAGE_13_POSITION_SIZE",
-        "STAGE_14_EXECUTION",
+        "COUNCIL_REPORT",
+        "LIVE_DATA",
+        "REFERENCE_PRICE",
+        "EXECUTION_SPREAD",
+        "TRADE_LEVELS",
+        "STOP_AND_TARGET",
+        "PORTFOLIO_RISK",
+        "DAILY_LOSS",
+        "RISK_ALLOCATION",
     }
     gate_ids = []
     for gate in gates:
@@ -322,66 +317,7 @@ def is_valid_sbk_signal(
     if len(gate_ids) != len(set(gate_ids)) or not required_gate_ids.issubset(set(gate_ids)):
         return False
 
-    if authorization.get("disagreementVeto") is not False:
-        return False
-    model_ids = []
-    eligible_models = []
-    for model in models:
-        if not isinstance(model, dict):
-            return False
-        model_id = model.get("id")
-        status = model.get("status")
-        calibrated = model.get("calibrated")
-        independence_validated = model.get("independenceValidated")
-        direction = model.get("direction")
-        probability = model.get("probabilityPct")
-        sample_size = model.get("sampleSize")
-        precision = model.get("oosPrecisionPct")
-        weight = model.get("effectiveWeight")
-        if (
-            not isinstance(model_id, str)
-            or not model_id
-            or status not in ("HEALTHY", "DEGRADED", "SUSPENDED", "RETIRED", "UNAVAILABLE", "UNVALIDATED")
-            or not isinstance(calibrated, bool)
-            or not isinstance(independence_validated, bool)
-            or direction not in ("LONG", "SHORT", "NEUTRAL")
-            or not isinstance(sample_size, int)
-            or isinstance(sample_size, bool)
-            or sample_size < 0
-            or not _finite_number(weight)
-            or weight < 0
-            or (probability is not None and (
-                not _finite_number(probability) or not 0 <= probability <= 100
-            ))
-            or (precision is not None and (
-                not _finite_number(precision) or not 0 <= precision <= 100
-            ))
-            or ((status != "HEALTHY" or not calibrated or not independence_validated) and weight != 0)
-        ):
-            return False
-        model_ids.append(model_id)
-        if (
-            status == "HEALTHY"
-            and calibrated
-            and independence_validated
-            and direction == signal["direction"]
-            and _finite_number(probability)
-            and isinstance(sample_size, int)
-            and sample_size >= 35
-            and _finite_number(precision)
-            and precision >= 55
-            and weight > 0
-        ):
-            eligible_models.append(model)
-    if len(model_ids) != len(set(model_ids)) or len(eligible_models) < 2:
-        return False
-
-    ensemble_probability = authorization.get("ensembleProbabilityPct")
-    if (
-        not _finite_number(ensemble_probability)
-        or not 55 <= ensemble_probability <= 100
-        or authorization.get("direction") != signal["direction"]
-    ):
+    if authorization.get("direction") != signal["direction"]:
         return False
 
     return True

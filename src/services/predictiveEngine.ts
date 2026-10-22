@@ -817,7 +817,7 @@ export function predict30mTrendReversalPatternLayer(
   ) || 0.001;
   const normalizedVector = returnsVector.map((x) => (x - meanRet) / stdRet);
 
-  // 3. کتابخانه الگوهای فرکتالی تاریخی اثبات‌شده در بازارهای واقعی (Canonical Real-World Fractal Archetypes)
+  // Hand-authored archetypes are heuristic references, not exchange-sourced historical matches.
   const canonicalArchetypes: Array<{
     id: string;
     nameFa: string;
@@ -828,42 +828,42 @@ export function predict30mTrendReversalPatternLayer(
     {
       id: 'wyckoff_spring',
       nameFa: 'تله فنر انباشت وایکوف (Wyckoff Spring Reversal) با جاروی نقدینگی کف',
-      period: 'مارکت واقعی بیت‌کوین - کف‌های واگرا Q4',
+      period: 'الگوی مرجع هیوریستیک؛ تاریخچهٔ واقعی/منبع‌دار نیست',
       targetTrend: 'REVERSED_UP',
       archetypeVector: [-0.4, -0.8, -1.2, -1.8, -2.2, -0.6, 0.5, 1.2, 1.8, 1.5, 1.2],
     },
     {
       id: 'blowoff_upthrust',
       nameFa: 'تله سقف هیجانی و فرسایش حجم (Wyckoff Upthrust / Blow-off Top)',
-      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
+      period: 'الگوی مرجع هیوریستیک؛ تاریخچهٔ واقعی/منبع‌دار نیست',
       targetTrend: 'REVERSED_DOWN',
       archetypeVector: [0.3, 0.7, 1.1, 1.9, 2.3, 0.4, -0.7, -1.3, -1.7, -1.4, -1.1],
     },
     {
       id: 'v_shape_liquidity_sweep',
       nameFa: 'سقوط استاپ‌هانتر و جهش V شکل شارپ (V-Shape Liquidity Absorption)',
-      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
+      period: 'الگوی مرجع هیوریستیک؛ تاریخچهٔ واقعی/منبع‌دار نیست',
       targetTrend: 'REVERSED_UP',
       archetypeVector: [-0.2, -0.5, -1.5, -2.6, 0.8, 1.9, 2.1, 1.6, 1.3, 0.9, 0.6],
     },
     {
       id: 'double_bottom_divergence',
       nameFa: 'کف دوقلوی ساختاری همراه با واگرایی پنهان مومنتوم و جذب اردربوک',
-      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
+      period: 'الگوی مرجع هیوریستیک؛ تاریخچهٔ واقعی/منبع‌دار نیست',
       targetTrend: 'REVERSED_UP',
       archetypeVector: [-1.2, -0.4, 0.6, 0.2, -1.1, 0.4, 1.1, 1.4, 1.2, 1.0, 0.8],
     },
     {
       id: 'rounding_distribution_top',
       nameFa: 'چرخش فرسایشی توزیع سقف همراه با دیوارهای سنگین فروش نهنگ',
-      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
+      period: 'الگوی مرجع هیوریستیک؛ تاریخچهٔ واقعی/منبع‌دار نیست',
       targetTrend: 'REVERSED_DOWN',
       archetypeVector: [1.2, 1.1, 0.7, 0.3, -0.2, -0.6, -1.1, -1.5, -1.3, -1.0, -0.8],
     },
     {
       id: 'persistent_momentum_flag',
       nameFa: 'پرچم ادامه‌دهنده پرقدرت مومنتوم (Bull/Bear Momentum Highway)',
-      period: 'سناریوی هیوریستیک، نه نمونه تاریخی اعتبارسنجی‌شده',
+      period: 'الگوی مرجع هیوریستیک؛ تاریخچهٔ واقعی/منبع‌دار نیست',
       targetTrend: isBullish ? 'CONTINUED_BULL' : 'CONTINUED_BEAR',
       archetypeVector: isBullish
         ? [0.5, 0.8, 0.3, 0.4, 0.9, 1.2, 0.6, 0.8, 1.4, 1.1, 0.9]

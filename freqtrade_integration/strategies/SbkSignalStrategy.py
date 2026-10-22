@@ -888,8 +888,8 @@ class SbkSignalStrategy(IStrategy):
             float(signal["riskLimits"]["maxStakeQuote"]),
             proposed_stake,
         )
-        risk_budget = stake_cap * signal["riskLimits"]["riskBudgetPct"] / 100
-        risk_limited_stake = risk_budget / stop_fraction / leverage
+        allocated_risk = signal["authorization"]["allocatedRiskUsd"]
+        risk_limited_stake = allocated_risk / stop_fraction / leverage
         selected_stake = min(risk_limited_stake, stake_cap)
         if not math.isfinite(selected_stake):
             return 0.0

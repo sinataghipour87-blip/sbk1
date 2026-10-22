@@ -6,6 +6,7 @@ import { FreqtradeSignalAdapter } from '../src/services/freqtradeSignalAdapter';
 import type { FreqtradeTrade } from '../src/services/freqtradeBridge';
 import { buildDirectionalSignalCandidate } from '../src/services/decisionPipeline';
 import {
+  calculateOpenTradeRiskUsd,
   ServerSignalRunner,
   toCandleTuple,
   type ServerSignalAuditRecord,
@@ -132,6 +133,7 @@ try {
     getFreqtradeStatus: async () => status,
     getOpenTrades: () => mockFreqtradeRpc.getOpenTrades(),
     getFreqtradeBalance: async () => ({ equity: 1_000, available: 100, currency: 'USDT' }),
+    getDailyRealizedLossUsd: async () => 0,
     getSnapshot: () => snapshot,
     isKillSwitchActive: () => false,
     submitSignal: (signal: Parameters<FreqtradeSignalAdapter['submit']>[0], expected: {
@@ -158,6 +160,11 @@ try {
           engineScore: 75,
           setupType: 'CONTRACT_TEST_ONLY',
         },
+        executionRisk: {
+          maxStakeQuote: 100,
+          maxLeverage: 1,
+          allocatedRiskUsd: 0.05,
+        },
         authorization: {
           contractVersion: SBK_ENTRY_AUTHORIZATION_VERSION,
           decision: 'APPROVE_ENTRY',
@@ -167,47 +174,19 @@ try {
           timeframe: snapshot.timeframe,
           direction: 'SHORT',
           gates: [
-            'STAGE_1_MARKET_DATA',
-            'STAGE_2_DATA_QUALITY',
-            'STAGE_3_MARKET_REGIME',
-            'STAGE_4_HTF_STRUCTURE',
-            'STAGE_5_SETUP_DETECTION',
-            'STAGE_6_LIQUIDITY_ANALYSIS',
-            'STAGE_7_ORDER_FLOW',
-            'STAGE_8_ENTRY_TRIGGER',
-            'STAGE_9_ENTRY_PRICE',
-            'STAGE_10_STOP_INVALIDATION',
-            'STAGE_11_TP_TARGETS',
-            'STAGE_12_EXPECTED_VALUE',
-            'STAGE_13_POSITION_SIZE',
-            'STAGE_14_EXECUTION',
+            'COUNCIL_REPORT',
+            'LIVE_DATA',
+            'REFERENCE_PRICE',
+            'EXECUTION_SPREAD',
+            'TRADE_LEVELS',
+            'STOP_AND_TARGET',
+            'PORTFOLIO_RISK',
+            'DAILY_LOSS',
+            'RISK_ALLOCATION',
           ].map((id) => ({ id, status: 'PASSED' as const, reason: 'CONTRACT_TEST_ONLY isolated authorization.' })),
-          models: [
-            {
-              id: 'M1_TEST',
-              status: 'HEALTHY' as const,
-              calibrated: true,
-              independenceValidated: true,
-              direction: 'SHORT' as const,
-              probabilityPct: 70,
-              sampleSize: 40,
-              oosPrecisionPct: 60,
-              effectiveWeight: 0.4,
-            },
-            {
-              id: 'M2_TEST',
-              status: 'HEALTHY' as const,
-              calibrated: true,
-              independenceValidated: true,
-              direction: 'SHORT' as const,
-              probabilityPct: 68,
-              sampleSize: 40,
-              oosPrecisionPct: 60,
-              effectiveWeight: 0.3,
-            },
-          ],
+          models: [],
           disagreementVeto: false,
-          ensembleProbabilityPct: 69.14,
+          ensembleProbabilityPct: null,
           riskRewardRatio: Math.abs(candle.close - candle.low) / Math.abs(candle.high - candle.close),
         },
         reason: 'CONTRACT_TEST_ONLY decision candidate.',
@@ -234,6 +213,37 @@ try {
   assert.equal(stored[0]?.signal.entryConditions.stopLoss, candle.high);
   assert.equal(stored[0]?.signal.entryConditions.takeProfit, candle.low);
   assert.equal(stored[0]?.signal.engineScore, 75);
+  const openTrade: FreqtradeTrade = {
+    trade_id: 42,
+    pair: stored[0]!.signal.pair,
+    enter_tag: stored[0]!.signal.signalId,
+    is_open: true,
+    is_short: true,
+    amount: 0.001,
+    amount_requested: 0.001,
+    open_rate: stored[0]!.signal.entryConditions.entryPrice,
+    stake_amount: 100,
+    has_open_orders: false,
+    orders: [],
+    fee_open_cost: null,
+    fee_close_cost: null,
+    open_fill_timestamp: currentNowMs,
+    close_timestamp: null,
+    leverage: 1,
+  };
+  const expectedOpenRiskUsd = openTrade.stake_amount *
+    Math.abs(openTrade.open_rate - stored[0]!.signal.entryConditions.stopLoss) /
+    openTrade.open_rate;
+  assert.equal(
+    await calculateOpenTradeRiskUsd([openTrade], async () => stored[0]!),
+    expectedOpenRiskUsd,
+    'portfolio risk uses actual stake, leverage, entry, and authorized stop levels',
+  );
+  await assert.rejects(
+    calculateOpenTradeRiskUsd([{ ...openTrade, enter_tag: 'unknown-signal' }], async () => null),
+    /portfolio risk is unknown/,
+    'unlinked open positions must block further entries',
+  );
   const archivedDecision = await archive.getBySignalId(stored[0]!.signal.signalId);
   assert.ok(archivedDecision, 'accepted dry-run decision is archived');
   assert.equal(archivedDecision.decision.decisionId, stored[0]?.signal.decisionId);

@@ -114,6 +114,8 @@ assert.deepEqual(COUNCIL_COORDINATOR_MODULES, ['sb.SB5']);
 assert.ok(EIGHT_MEMBER_COUNCIL.reduce((count, member) => count + member.moduleIds.length, 0) > 0);
 const councilModuleIds = new Set(EIGHT_MEMBER_COUNCIL.flatMap((member) => member.moduleIds));
 assert.ok(CENTRAL_CONTROL_MODULES.every((id) => !councilModuleIds.has(id)));
+assert.ok(CENTRAL_CONTROL_MODULES.includes('control.centralCandleResearch'));
+assert.ok(!EIGHT_MEMBER_COUNCIL[0].moduleIds.includes('brains.brain04PatternDivergence'));
 assert.ok(UNWIRED_TRADE_MANAGEMENT_MODULES.every((id) => !councilModuleIds.has(id)));
 assert.ok(UNWIRED_OR_LEGACY_ANALYSIS_MODULES.every((id) => !councilModuleIds.has(id)));
 assert.equal(EIGHT_MEMBER_COUNCIL.filter((member) => member.moduleIds.includes('openSource.newsSentiment')).map(({ id }) => id).join(','), '8');

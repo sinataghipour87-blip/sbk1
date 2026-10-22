@@ -8,6 +8,7 @@ import { fetchDeribitOptionsData } from '../src/services/deribitOptionsData';
 import { fetchFreeMacroData } from '../src/services/freeMacroData';
 import { fetchOnChainWhaleData } from '../src/services/publicBitcoinWhaleData';
 import { fetchPublicMarketFallback } from '../src/services/publicMarketDataFallback';
+import { openSourceAdvisoryService } from '../src/services/openSourceAdvisoryService';
 import type { AnalysisResult } from '../src/types/trading';
 import type { CouncilMacroContext, CouncilMemberVote } from '../src/services/eightMemberCouncil';
 import { runEightMemberCouncilRuntime } from '../src/services/eightMemberCouncilRuntime';
@@ -31,6 +32,18 @@ const [macro, options, onChainData, news, publicMarketFallback] = await Promise.
   fetchPublicMarketFallback({ pair, timeframe, market, nowMs: probeStartedAtMs }),
 ]);
 const checkedAtMs = Date.now();
+let newsAdvisoryReport: Awaited<ReturnType<typeof openSourceAdvisoryService.analyze>> | null = null;
+let newsAdvisoryError: string | null = null;
+if (news.headlines.length > 0 && publicMarketFallback.candles.value) {
+  try {
+    newsAdvisoryReport = await openSourceAdvisoryService.analyze(
+      publicMarketFallback.candles.value,
+      news.headlines,
+    );
+  } catch (error) {
+    newsAdvisoryError = error instanceof Error ? error.message : String(error);
+  }
+}
 const marketAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
   {
     price: publicMarketFallback.candles.value?.at(-1)?.close ?? 0,
@@ -42,6 +55,7 @@ const marketAnalysis = applyPublicMarketFallbackToCouncilAnalysis(
       candle.volume,
     ]) ?? [],
     timeframe,
+    openSourceAdvisories: newsAdvisoryReport ?? undefined,
   } as unknown as AnalysisResult,
   publicMarketFallback,
   checkedAtMs,
@@ -103,6 +117,7 @@ try {
   }));
 } finally {
   await rm(repositoryDir, { recursive: true, force: true });
+  await openSourceAdvisoryService.stop();
 }
 const onChainFresh = onChainData.timestampMs !== null &&
   checkedAtMs >= onChainData.timestampMs &&
@@ -191,6 +206,12 @@ const report = {
   news: {
     status: news.status,
     headlineCount: news.headlines.length,
+    publisherCount: new Set(news.headlines.map(({ publisher }) => publisher)).size,
+    sentimentStatus: newsAdvisoryReport?.modules.newsSentiment.status ?? 'UNAVAILABLE',
+    sentimentHeadlineCount: newsAdvisoryReport?.modules.newsSentiment.headlineCount ?? 0,
+    sentimentScore: newsAdvisoryReport?.modules.newsSentiment.aggregateSentiment ?? null,
+    sentimentError: newsAdvisoryError,
+    memberEightVote: memberVotes[7]?.vote ?? 'UNKNOWN',
     sources: news.sources.map(({ publisher, status, headlineCount, error }) => ({
       publisher,
       status,
@@ -214,7 +235,9 @@ const ready =
   options.status === 'LIVE' &&
   onChainMemberVerified &&
   news.status === 'LIVE' &&
-  news.headlines.length > 0;
+  news.headlines.length >= 3 &&
+  new Set(news.headlines.map(({ publisher }) => publisher)).size >= 2 &&
+  memberVotes[7]?.vote !== 'ABSTAIN';
 
 console.log(JSON.stringify({ ready, ...report }, null, 2));
 if (!ready) process.exitCode = 1;

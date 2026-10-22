@@ -435,20 +435,15 @@ export function validateSbkFreqtradeSignal(
     }
   } else {
     const requiredGateIds = new Set([
-      'STAGE_1_MARKET_DATA',
-      'STAGE_2_DATA_QUALITY',
-      'STAGE_3_MARKET_REGIME',
-      'STAGE_4_HTF_STRUCTURE',
-      'STAGE_5_SETUP_DETECTION',
-      'STAGE_6_LIQUIDITY_ANALYSIS',
-      'STAGE_7_ORDER_FLOW',
-      'STAGE_8_ENTRY_TRIGGER',
-      'STAGE_9_ENTRY_PRICE',
-      'STAGE_10_STOP_INVALIDATION',
-      'STAGE_11_TP_TARGETS',
-      'STAGE_12_EXPECTED_VALUE',
-      'STAGE_13_POSITION_SIZE',
-      'STAGE_14_EXECUTION',
+      'COUNCIL_REPORT',
+      'LIVE_DATA',
+      'REFERENCE_PRICE',
+      'EXECUTION_SPREAD',
+      'TRADE_LEVELS',
+      'STOP_AND_TARGET',
+      'PORTFOLIO_RISK',
+      'DAILY_LOSS',
+      'RISK_ALLOCATION',
     ]);
     const seenGates = new Set<string>();
     for (const gate of authorization.gates) {
@@ -466,72 +461,18 @@ export function validateSbkFreqtradeSignal(
       seenGates.add(gate.id);
     }
     if ([...requiredGateIds].some((id) => !seenGates.has(id))) {
-      throw new SbkSignalValidationError('The complete 14-stage decision pipeline is required for entry.', 'INCOMPLETE_AUTHORIZATION_GATES');
-    }
-    const eligibleModels = authorization.models.filter((model) =>
-      isRecord(model) &&
-      model.status === 'HEALTHY' &&
-      model.calibrated === true &&
-      model.independenceValidated === true &&
-      model.probabilityPct !== null &&
-      model.effectiveWeight > 0
-    );
-    if (
-      authorization.disagreementVeto ||
-      eligibleModels.length < 2 ||
-      eligibleModels.some((model) =>
-        (model.direction !== signal.direction) ||
-        !Number.isFinite(model.probabilityPct) ||
-        model.probabilityPct < 0 ||
-        model.probabilityPct > 100 ||
-        !Number.isSafeInteger(model.sampleSize) ||
-        model.sampleSize < 35 ||
-        !Number.isFinite(model.oosPrecisionPct) ||
-        model.oosPrecisionPct < 55 ||
-        !Number.isFinite(model.effectiveWeight) ||
-        model.effectiveWeight <= 0
-      ) ||
-      typeof authorization.ensembleProbabilityPct !== 'number' ||
-      !Number.isFinite(authorization.ensembleProbabilityPct) ||
-      authorization.ensembleProbabilityPct < 55 ||
-      authorization.ensembleProbabilityPct > 100
-    ) {
-      throw new SbkSignalValidationError('Two or more healthy, calibrated, agreeing models without a veto are required.', 'INVALID_MODEL_ENSEMBLE');
-    }
-    for (const model of authorization.models) {
-      if (
-        !isRecord(model) ||
-        typeof model.id !== 'string' ||
-        !model.id ||
-        !['HEALTHY', 'DEGRADED', 'SUSPENDED', 'RETIRED', 'UNAVAILABLE', 'UNVALIDATED'].includes(String(model.status)) ||
-        typeof model.calibrated !== 'boolean' ||
-        typeof model.independenceValidated !== 'boolean' ||
-        !['LONG', 'SHORT', 'NEUTRAL'].includes(String(model.direction)) ||
-        !Number.isSafeInteger(model.sampleSize) ||
-        model.sampleSize < 0 ||
-        !Number.isFinite(model.effectiveWeight) ||
-        model.effectiveWeight < 0 ||
-        (model.probabilityPct !== null && (
-          !Number.isFinite(model.probabilityPct) ||
-          model.probabilityPct < 0 ||
-          model.probabilityPct > 100
-        )) ||
-        (model.oosPrecisionPct !== null && (
-          !Number.isFinite(model.oosPrecisionPct) ||
-          model.oosPrecisionPct < 0 ||
-          model.oosPrecisionPct > 100
-        )) ||
-        ((model.status !== 'HEALTHY' || !model.calibrated || !model.independenceValidated) && model.effectiveWeight !== 0)
-      ) {
-        throw new SbkSignalValidationError('Model evidence is malformed or assigns weight to an unavailable model.', 'INVALID_MODEL_EVIDENCE');
-      }
+      throw new SbkSignalValidationError('All central execution-control gates are required for entry.', 'INCOMPLETE_AUTHORIZATION_GATES');
     }
   }
   const calculatedRiskRewardRatio = rewardDistance / riskDistance;
   if (
     Math.abs(authorization.riskRewardRatio - calculatedRiskRewardRatio) > 0.01 ||
     authorization.riskRewardRatio < 1 ||
-    authorization.allocatedRiskUsd > signal.riskLimits.maxStakeQuote * signal.riskLimits.riskBudgetPct / 100 + 0.01
+    authorization.allocatedRiskUsd >
+      signal.riskLimits.maxStakeQuote *
+        signal.riskLimits.maxLeverage *
+        riskDistance / signal.entryConditions.entryPrice +
+        0.01
   ) {
     throw new SbkSignalValidationError('Authorization risk, target, or risk/reward does not match the signal contract.', 'AUTHORIZATION_RISK_MISMATCH');
   }

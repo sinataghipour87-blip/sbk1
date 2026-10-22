@@ -136,7 +136,7 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
     questionFa: 'ساختار و شواهد تکنیکال به کدام جهت متمایل‌اند؟',
     inputIds: ['analysis.candles', 'analysis.rsi', 'analysis.mtf1h', 'analysis.mtf4h', 'dataQualityReport.feeds.candles'],
     moduleIds: [
-      'brains.brain01MacroTrend', 'brains.brain04PatternDivergence', 'brains.brain09BayesianProbabilistic',
+      'brains.brain01MacroTrend', 'brains.brain09BayesianProbabilistic',
       'technical.mtfStructuralReport',
       'sb.SB1', 'openSource.candlestickPatterns', 'openSource.marketRegime', 'openSource.marketAnomaly',
       'openSource.lightgbmForecast', 'openSource.xgboostForecast',
@@ -210,7 +210,7 @@ const MAX_OPTIONS_AGE_MS = 5 * 60_000;
 const MAX_ONCHAIN_AGE_MS = 10 * 60_000;
 const MAX_PUBLIC_ONCHAIN_AGE_MS = 20 * 60_000;
 const MAX_MACRO_AGE_MS = 5 * 24 * 60 * 60_000;
-const MAX_NEWS_AGE_MS = 24 * 60 * 60_000;
+const MAX_NEWS_AGE_MS = 6 * 60 * 60_000;
 const MAX_DIRECT_MACRO_AGE_MS = 5 * 24 * 60 * 60_000;
 const MAX_DXY_AGE_MS = 2 * 60_000;
 
@@ -953,6 +953,11 @@ function evaluateNews(
     isFiniteNumber(macro.newsSentimentScore) &&
     macro.newsHeadlinesStatus === 'LIVE' &&
     macro.recentHeadlines.length > 0;
+  const independentPublisherCount = new Set(
+    macro?.recentHeadlines.map((headline) => headline.source.trim().toLowerCase()).filter(Boolean) ?? [],
+  ).size;
+  const hasSufficientCoverage = (macro?.recentHeadlines.length ?? 0) >= 3 &&
+    independentPublisherCount >= 2;
   const latestFreshHeadline = macro?.recentHeadlines.reduce<number | null>((latest, headline) => {
     const publishedAt = Date.parse(headline.publishedAt);
     const ageMs = nowMs - publishedAt;
@@ -962,11 +967,12 @@ function evaluateNews(
   }, null) ?? null;
   const headlinesAreFresh = latestFreshHeadline !== null;
   const checks = [
+    { labelFa: 'پوشش ناشران مستقل', passed: hasSufficientCoverage, detailFa: hasSufficientCoverage ? `${macro!.recentHeadlines.length} خبر از ${independentPublisherCount} ناشر` : `حداقل ۳ خبر از ۲ ناشر لازم است؛ اکنون ${macro?.recentHeadlines.length ?? 0} خبر از ${independentPublisherCount} ناشر موجود است.` },
     { labelFa: 'ناشر و خبر معتبر', passed: hasLiveSentiment, detailFa: hasLiveSentiment ? `${macro!.recentHeadlines.length} خبر و امتیاز سنتیمنت زنده` : 'خبر معتبر یا امتیاز سنتیمنت زنده در دسترس نیست.' },
     { labelFa: 'تازگی خبر و داده', passed: freshness !== null && headlinesAreFresh, detailFa: freshness && latestFreshHeadline !== null ? `${Math.round((nowMs - latestFreshHeadline) / 60_000)} دقیقه از انتشار آخرین خبر` : 'زمان خبر/داده کهنه یا نامعتبر است.' },
   ];
-  if (!macro || !hasLiveSentiment || !freshness || !headlinesAreFresh || !isFiniteNumber(macro.newsSentimentScore)) {
-    return abstain(member, 'خبر زنده همراه با سنتیمنت تأییدشده موجود نیست؛ شایعه یا شمار پست‌ها رأی محسوب نمی‌شود.', checks, freshness?.timestampMs, freshness?.ageMs);
+  if (!macro || !hasLiveSentiment || !hasSufficientCoverage || !freshness || !headlinesAreFresh || !isFiniteNumber(macro.newsSentimentScore)) {
+    return abstain(member, 'خبر تازه از چند ناشر مستقل همراه با سنتیمنت تأییدشده موجود نیست؛ شایعه یا شمار پست‌ها رأی محسوب نمی‌شود.', checks, freshness?.timestampMs, freshness?.ageMs);
   }
 
   const score = macro.newsSentimentScore;
@@ -1012,6 +1018,7 @@ export function validateCouncilModuleOwnership(
 export const COUNCIL_COORDINATOR_MODULES = ['sb.SB5'] as const;
 
 export const CENTRAL_CONTROL_MODULES = [
+  'control.centralCandleResearch',
   'control.postCouncilTradeController',
   'control.decisionPipeline',
   'control.riskAllocator',

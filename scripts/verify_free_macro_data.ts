@@ -19,6 +19,19 @@ const live = await fetchFreeMacroData({
         headers: { 'Content-Type': 'text/csv' },
       });
     }
+    if (endpoint.hostname === 'query1.finance.yahoo.com') {
+      assert.equal(endpoint.pathname.endsWith('/DX-Y.NYB'), true);
+      return Response.json({
+        chart: {
+          result: [{
+            meta: { chartPreviousClose: 104, regularMarketPrice: 104.25 },
+            timestamp: [nowMs / 1_000],
+            indicators: { quote: [{ close: [104.25] }] },
+          }],
+          error: null,
+        },
+      });
+    }
     assert.equal(endpoint.hostname, 'community-api.coinmetrics.io');
     return Response.json({
       data: [{
@@ -30,7 +43,7 @@ const live = await fetchFreeMacroData({
   },
 });
 
-assert.equal(requestCount, 5);
+assert.equal(requestCount, 6);
 assert.equal(live.sp500.status, 'LIVE');
 assert.equal(live.sp500.value, 6500.25);
 assert.equal(live.sp500.changePct, (10 / 6490.25) * 100);
@@ -39,10 +52,66 @@ assert.ok(live.sp500.latencyMs !== null && live.sp500.latencyMs >= 0);
 assert.equal(live.bitcoinActiveAddresses.status, 'LIVE');
 assert.equal(live.bitcoinActiveAddresses.value, 650000);
 assert.equal(live.sp500.provider, 'FRED public CSV');
+assert.equal(live.dxy.status, 'LIVE');
+assert.equal(live.dxy.value, 104.25);
+assert.match(live.dxy.provider, /Yahoo Finance chart/);
+assert.equal(live.fedEffectiveRate.provider, 'FRED public CSV');
 assert.ok(!JSON.stringify(live).includes('api_key'));
 
+const nyFedFallbackNowMs = Date.parse('2026-10-21T20:00:00.000Z');
+const nyFedFallback = await fetchFreeMacroData({
+  nowMs: nyFedFallbackNowMs,
+  fetcher: async (input) => {
+    const endpoint = new URL(String(input));
+    if (endpoint.hostname === 'fred.stlouisfed.org') {
+      return new Response('<html>maintenance</html>', {
+        headers: { 'Content-Type': 'text/html' },
+      });
+    }
+    if (endpoint.hostname === 'markets.newyorkfed.org') {
+      assert.equal(endpoint.pathname, '/api/rates/unsecured/effr/search.json');
+      assert.equal(endpoint.searchParams.get('endDate'), '2026-10-21');
+      return Response.json({
+        refRates: [
+          { effectiveDate: '2026-10-20', type: 'EFFR', percentRate: 3.88 },
+          { effectiveDate: '2026-10-19', type: 'EFFR', percentRate: 3.87 },
+        ],
+      });
+    }
+    if (endpoint.hostname === 'query1.finance.yahoo.com') {
+      if (endpoint.pathname.endsWith('/^GSPC')) {
+        return Response.json({
+          chart: { result: [{
+            meta: { chartPreviousClose: 6500, regularMarketPrice: 6501 },
+            timestamp: [nyFedFallbackNowMs / 1_000],
+            indicators: { quote: [{ close: [6501] }] },
+          }] },
+        });
+      }
+      throw new Error('DXY quote is stale.');
+    }
+    return Response.json({
+      data: [{
+        asset: 'btc',
+        time: new Date(nyFedFallbackNowMs - 60 * 60_000).toISOString(),
+        AdrActCnt: '650000',
+      }],
+    });
+  },
+});
+assert.equal(nyFedFallback.fedEffectiveRate.status, 'LIVE');
+assert.equal(nyFedFallback.fedEffectiveRate.value, 3.88);
+assert.equal(nyFedFallback.fedEffectiveRate.observedAt, '2026-10-20');
+assert.equal(
+  nyFedFallback.fedEffectiveRate.provider,
+  'Federal Reserve Bank of New York reference rates API (EFFR)',
+);
+assert.equal(nyFedFallback.fedEffectiveRate.previousValue, 3.87);
+assert.equal(nyFedFallback.fedTargetUpperBound.status, 'UNAVAILABLE');
+
+const staleNowMs = Date.parse('2026-10-21T20:20:00.000Z');
 const stale = await fetchFreeMacroData({
-  nowMs: Date.parse('2026-10-21T20:00:00.000Z'),
+  nowMs: staleNowMs,
   fetcher: async (input) => {
     const endpoint = new URL(String(input));
     if (endpoint.hostname === 'fred.stlouisfed.org') {
@@ -179,11 +248,11 @@ const dxyUnavailable = await fetchFreeMacroData({
   nowMs: dxyNowMs,
   massiveApiKey: '',
   fetcher: async () => {
-    throw new Error('DXY must not make a request without a configured key.');
+    throw new Error('Yahoo DXY fallback unavailable.');
   },
 });
 assert.equal(dxyUnavailable.dxy.status, 'UNAVAILABLE');
-assert.match(dxyUnavailable.dxy.error ?? '', /MASSIVE_API_KEY is not configured/);
+assert.match(dxyUnavailable.dxy.error ?? '', /Yahoo DXY fallback unavailable/);
 
 const delayedDxy = await fetchFreeMacroData({
   nowMs: dxyNowMs + 60_000,
@@ -212,6 +281,9 @@ const dxyRequestFailed = await fetchFreeMacroData({
     const endpoint = new URL(String(input));
     if (endpoint.hostname === 'api.massive.com') {
       throw new Error('request failed: https://api.massive.com/?apiKey=verification-secret');
+    }
+    if (endpoint.hostname === 'query1.finance.yahoo.com') {
+      throw new Error('Yahoo fallback unavailable.');
     }
     throw new Error('cached non-DXY data unexpectedly missed cache');
   },

@@ -483,7 +483,6 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
     () => evaluateEightMemberCouncil({ analysis, macroContext, supportingModules }),
     [analysis, macroContext, supportingModules]
   );
-
   return (
     <CollapsibleCard
       title="شورای ۸ عضو تحلیل بازار"
@@ -606,6 +605,48 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
               </p>
             );
           })}
+        </section>
+
+        <section className="space-y-2 rounded-xl border border-cyan-800/50 bg-cyan-950/20 p-3">
+          <h3 className="font-bold text-cyan-200">کنترل مرکزی · پژوهش کندل تاریخی و افق نگهداری</h3>
+          {!brainReport ? (
+            <p className="text-[11px] text-slate-400">گزارش پژوهش تاریخی هنوز به کنترل مرکزی نرسیده است.</p>
+          ) : (
+            <>
+              <p className="text-[11px] leading-5 text-slate-300">
+                وضعیت {brainReport.centralCandleResearch.status} · منبع {brainReport.centralCandleResearch.source} ·
+                {' '}{brainReport.centralCandleResearch.timeframe ?? 'تایم‌فریم ناموجود'} ·
+                {' '}{brainReport.centralCandleResearch.candleCount} کندل ·
+                {' '}آموزش/آزمون {brainReport.centralCandleResearch.trainingCandleCount}/{brainReport.centralCandleResearch.testCandleCount} ·
+                {' '}شباهت {brainReport.centralCandleResearch.similarityThresholdPct}% ·
+                {' '}وزن زمینه {brainReport.centralCandleResearch.contextSimilarityWeightPct}% ·
+                {' '}حداقل {brainReport.centralCandleResearch.requiredReferenceMatches} مرجع مشابه و
+                {' '}{brainReport.centralCandleResearch.minimumOutOfSampleForecasts} پیش‌بینی خارج‌ازنمونه.
+              </p>
+              <p className="text-[11px] leading-5 text-cyan-100">
+                این گزارش پژوهشی فقط برای مشاهده و پایش کیفیت است؛ کنترل مرکزی از آن جهت یا افق معامله پیش‌بینی/پیشنهاد نمی‌کند.
+              </p>
+              <div className="grid gap-1 md:grid-cols-2">
+                {Object.values(brainReport.centralCandleResearch.horizons).map((horizon) => (
+                  <p key={horizon.horizonMinutes} className="rounded bg-black/20 p-2 text-[10px] leading-5 text-slate-300">
+                    {horizon.horizonMinutes} دقیقه (اندازه‌گیری {horizon.actualHorizonMinutes} دقیقه):{' '}
+                    {horizon.available
+                      ? `${horizon.outOfSampleForecastCount} نمونه · شباهت میانگین ${horizon.meanSimilarityPct?.toFixed(1) ?? 'ناموجود'}٪ · دقت جهت ${horizon.grossDirectionAccuracyPct?.toFixed(1) ?? 'ناموجود'}٪ · بازده ناخالص ${horizon.meanGrossPredictedReturnPct?.toFixed(4) ?? 'ناموجود'}٪ · بازده خالص ${horizon.meanNetPredictedReturnPct?.toFixed(4) ?? 'ناموجود'}٪ · برد خالص ${horizon.netWinRatePct?.toFixed(1) ?? 'ناموجود'}٪ · MFE/MAE ${horizon.meanMaximumFavorableMovePct?.toFixed(4) ?? 'ناموجود'}/${horizon.meanMaximumAdverseMovePct?.toFixed(4) ?? 'ناموجود'}٪ · نسبت هزینه‌تعدیل‌شده ${horizon.meanCostAdjustedRewardRiskRatio?.toFixed(2) ?? 'ناموجود'}`
+                      : `${horizon.outOfSampleForecastCount}/${horizon.minimumForecastsForMetrics} نمونه؛ معیار عملکرد فعلاً گزارش نمی‌شود`}
+                  </p>
+                ))}
+              </div>
+              <p className="text-[10px] leading-5 text-slate-400">
+                هزینه‌ها: {brainReport.centralCandleResearch.costs.configured
+                  ? `تنظیم شده؛ رفت‌وبرگشت ${brainReport.centralCandleResearch.costs.roundTripPercent.toFixed(4)}٪`
+                  : 'تنظیم نشده؛ بازده خالص قابل انتخاب نیست'}.
+                {' '}این گزارش مجوز معامله یا زمان‌بندی خروج نیست.
+              </p>
+              <p className="text-[10px] leading-5 text-slate-400">
+                روش و محدودیت‌ها: {brainReport.centralCandleResearch.note}
+              </p>
+            </>
+          )}
         </section>
 
         <p className="rounded-lg border border-slate-800 bg-slate-950/60 p-2 text-[10px] leading-5 text-slate-400">

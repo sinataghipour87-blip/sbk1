@@ -156,6 +156,7 @@ interface FreqtradeCredentials {
 
 class FreqtradeBridge {
   private readonly requestTimeoutMs = 5000;
+  private dailyLossCache: { dayStartMs: number; fetchedAtMs: number; lossUsd: number } | null = null;
   private accessToken: string | null = null;
   private loginRequest: Promise<string> | null = null;
 
@@ -359,6 +360,62 @@ class FreqtradeBridge {
       throw new FreqtradeRpcError('Freqtrade RPC returned an invalid open-trades response.');
     }
     return trades;
+  }
+
+  async getDailyRealizedLossUsd(dayStartMs: number, nowMs = Date.now()): Promise<number> {
+    if (!Number.isSafeInteger(dayStartMs) || dayStartMs < 0 || !Number.isSafeInteger(nowMs) || nowMs < dayStartMs) {
+      throw new FreqtradeRpcError('A valid UTC day range is required for daily-loss validation.');
+    }
+    if (
+      this.dailyLossCache?.dayStartMs === dayStartMs &&
+      nowMs - this.dailyLossCache.fetchedAtMs <= 5_000
+    ) {
+      return this.dailyLossCache.lossUsd;
+    }
+
+    const pageSize = 500;
+    const maxPages = 100;
+    const seenTradeIds = new Set<number>();
+    let netRealizedPnlUsd = 0;
+    for (let offset = 0, page = 0; page < maxPages; offset += pageSize, page += 1) {
+      const history = await this.request<FreqtradeTradesResponse>(
+        `/trades?limit=${pageSize}&offset=${offset}`,
+      );
+      if (!Array.isArray(history.trades)) {
+        throw new FreqtradeRpcError('Freqtrade RPC returned an invalid daily trade-history response.');
+      }
+      for (const trade of history.trades) {
+        if (!Number.isSafeInteger(trade?.trade_id) || seenTradeIds.has(trade.trade_id)) {
+          throw new FreqtradeRpcError('Freqtrade daily trade history contains invalid or duplicate trade IDs.');
+        }
+        seenTradeIds.add(trade.trade_id);
+        this.validateTrade(trade, trade.trade_id);
+        if (trade.is_open || trade.close_timestamp === null || trade.close_timestamp === undefined) {
+          throw new FreqtradeRpcError(`Freqtrade trade ${trade.trade_id} is not a valid closed-history record.`);
+        }
+        if (trade.close_timestamp > nowMs + 1_000) {
+          throw new FreqtradeRpcError('Freqtrade daily trade history contains a future close timestamp.');
+        }
+        if (trade.close_timestamp < dayStartMs) break;
+        const realizedPnl = trade.realized_profit ?? trade.close_profit_abs;
+        if (typeof realizedPnl !== 'number' || !Number.isFinite(realizedPnl)) {
+          throw new FreqtradeRpcError(`Freqtrade trade ${trade.trade_id} has no validated realized PnL.`);
+        }
+        netRealizedPnlUsd += realizedPnl;
+      }
+      const oldestTrade = history.trades.at(-1);
+      if (
+        history.trades.length < pageSize ||
+        (oldestTrade?.close_timestamp !== null &&
+          oldestTrade?.close_timestamp !== undefined &&
+          oldestTrade.close_timestamp < dayStartMs)
+      ) {
+        const lossUsd = Math.max(0, -netRealizedPnlUsd);
+        this.dailyLossCache = { dayStartMs, fetchedAtMs: nowMs, lossUsd };
+        return lossUsd;
+      }
+    }
+    throw new FreqtradeRpcError('Freqtrade daily trade history exceeded the safe pagination limit.');
   }
 
   async getTrade(tradeId: string | number): Promise<FreqtradeTrade> {

@@ -120,6 +120,7 @@ const mockFreqtrade = createServer(async (request, response) => {
           fee_close_cost: 0.03,
           open_fill_timestamp: 1_800_000_001_000,
           close_timestamp: 1_800_000_601_000,
+          realized_profit: index === 0 ? -2 : 0,
         }))
       : [{
           trade_id: 700,
@@ -138,6 +139,7 @@ const mockFreqtrade = createServer(async (request, response) => {
           close_timestamp: 1_800_000_601_000,
           close_rate: 61_000,
           close_profit_abs: 0.94,
+          realized_profit: 0.94,
         }];
     respond(response, 200, { trades: page });
     return;
@@ -188,6 +190,11 @@ try {
   const closedTrade = await freqtradeBridge.getTrade(700);
   assert.equal(closedTrade.trade_id, 700, 'closed trades beyond the first page are recoverable');
   assert.equal(closedTrade.close_profit_abs, 0.94);
+  assert.equal(
+    await freqtradeBridge.getDailyRealizedLossUsd(1_800_000_000_000, 1_800_000_700_000),
+    1.06,
+    'daily loss is the net realized loss across paginated closed-trade history',
+  );
   const balance = await freqtradeBridge.getBalance();
   assert.deepEqual(balance, { equity: 125, available: 100, currency: 'USDT' });
   assert.deepEqual(await freqtradeBridge.getWhitelist(), ['BTC/USDT:USDT']);

@@ -39,12 +39,18 @@ const sources = [
     publisher: 'Federal Reserve',
     endpoint: 'https://www.federalreserve.gov/feeds/press_all.xml',
     hostname: 'federalreserve.gov',
+    relevance: /\b(federal reserve|fomc|interest rates?|inflation|monetary policy|financial conditions|treasury)\b/i,
   },
   {
     publisher: 'U.S. Securities and Exchange Commission',
     endpoint: 'https://www.sec.gov/news/pressreleases.rss',
     hostname: 'sec.gov',
     relevance: /\b(bitcoin|crypto(?:currency|currencies)?|digital assets?|blockchain|tokens?|tokenization|spot etfs?)\b/i,
+  },
+  {
+    publisher: 'Decrypt',
+    endpoint: 'https://decrypt.co/feed',
+    hostname: 'decrypt.co',
   },
   {
     publisher: 'The Block',
@@ -56,7 +62,28 @@ const sources = [
     endpoint: 'https://bitcoinmagazine.com/.rss/full/',
     hostname: 'bitcoinmagazine.com',
   },
+  {
+    publisher: 'CNBC',
+    endpoint: 'https://www.cnbc.com/id/100003114/device/rss/rss.html',
+    hostname: 'cnbc.com',
+    relevance: /\b(bitcoin|crypto(?:currency|currencies)?|digital assets?|blockchain|federal reserve|fed policy|interest rates?|inflation|consumer prices?|treasury yields?|spot etfs?)\b/i,
+  },
+  {
+    publisher: 'The Wall Street Journal',
+    endpoint: 'https://feeds.a.dj.com/rss/RSSMarketsMain.xml',
+    hostname: 'wsj.com',
+    relevance: /\b(bitcoin|crypto(?:currency|currencies)?|digital assets?|blockchain|federal reserve|fed policy|interest rates?|inflation|consumer prices?|treasury yields?|spot etfs?)\b/i,
+  },
+  {
+    publisher: 'The Guardian',
+    endpoint: 'https://www.theguardian.com/uk/business/rss',
+    hostname: 'theguardian.com',
+    relevance: /\b(bitcoin|crypto(?:currency|currencies)?|digital assets?|blockchain|federal reserve|fed policy|interest rates?|inflation|consumer prices?|treasury yields?|spot etfs?)\b/i,
+  },
 ] as const;
+
+const MAX_HEADLINE_AGE_MS = 6 * 60 * 60_000;
+const MAX_RETURNED_HEADLINES = 24;
 
 function decodeXmlText(value: string): string {
   return value
@@ -100,7 +127,7 @@ function parseHeadlines(
     ) return [];
 
     const timestamp = Date.parse(publishedAt);
-    if (!Number.isFinite(timestamp) || timestamp > nowMs + 5 * 60_000 || nowMs - timestamp > 24 * 60 * 60_000) {
+    if (!Number.isFinite(timestamp) || timestamp > nowMs + 5 * 60_000 || nowMs - timestamp > MAX_HEADLINE_AGE_MS) {
       return [];
     }
 
@@ -171,7 +198,7 @@ export async function fetchDirectNewsHeadlines(
   const headlines = results.flatMap((result) => result.headlines);
   const uniqueHeadlines = [...new Map(headlines.map((headline) => [headline.url, headline])).values()]
     .sort((left, right) => Date.parse(right.publishedAt) - Date.parse(left.publishedAt))
-    .slice(0, 12);
+    .slice(0, MAX_RETURNED_HEADLINES);
   const retrievedAtMs = uniqueHeadlines.length > 0
     ? Math.max(...results.map((result) => result.sourceStatus.retrievedAtMs ?? 0))
     : null;

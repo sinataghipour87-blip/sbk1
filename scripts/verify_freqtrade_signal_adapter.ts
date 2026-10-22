@@ -27,20 +27,15 @@ const ids = deriveSbkSignalIds({
   takeProfit: 62_700,
 });
 const requiredGateIds = [
-  'STAGE_1_MARKET_DATA',
-  'STAGE_2_DATA_QUALITY',
-  'STAGE_3_MARKET_REGIME',
-  'STAGE_4_HTF_STRUCTURE',
-  'STAGE_5_SETUP_DETECTION',
-  'STAGE_6_LIQUIDITY_ANALYSIS',
-  'STAGE_7_ORDER_FLOW',
-  'STAGE_8_ENTRY_TRIGGER',
-  'STAGE_9_ENTRY_PRICE',
-  'STAGE_10_STOP_INVALIDATION',
-  'STAGE_11_TP_TARGETS',
-  'STAGE_12_EXPECTED_VALUE',
-  'STAGE_13_POSITION_SIZE',
-  'STAGE_14_EXECUTION',
+  'COUNCIL_REPORT',
+  'LIVE_DATA',
+  'REFERENCE_PRICE',
+  'EXECUTION_SPREAD',
+  'TRADE_LEVELS',
+  'STOP_AND_TARGET',
+  'PORTFOLIO_RISK',
+  'DAILY_LOSS',
+  'RISK_ALLOCATION',
 ];
 const signal = {
   contractVersion: SBK_SIGNAL_CONTRACT_VERSION,
@@ -82,34 +77,11 @@ const signal = {
     timeframe: '15m',
     direction: 'LONG',
     gates: requiredGateIds.map((id) => ({ id, status: 'PASSED', reason: 'CONTRACT_TEST_ONLY named isolated policy evidence.' })),
-    models: [
-      {
-        id: 'M1_CENTRAL_CALIBRATED',
-        status: 'HEALTHY',
-        calibrated: true,
-        independenceValidated: true,
-        direction: 'LONG',
-        probabilityPct: 70,
-        sampleSize: 40,
-        oosPrecisionPct: 60,
-        effectiveWeight: 0.4,
-      },
-      {
-        id: 'M2_BAYESIAN_MICRO',
-        status: 'HEALTHY',
-        calibrated: true,
-        independenceValidated: true,
-        direction: 'LONG',
-        probabilityPct: 68,
-        sampleSize: 40,
-        oosPrecisionPct: 60,
-        effectiveWeight: 0.3,
-      },
-    ],
+    models: [],
     disagreementVeto: false,
-    ensembleProbabilityPct: 69.14,
+    ensembleProbabilityPct: null,
     riskRewardRatio: 2,
-    allocatedRiskUsd: 1,
+    allocatedRiskUsd: 0.4,
   },
 } as const;
 
@@ -137,6 +109,15 @@ try {
   assert.throws(
     () => validateSbkFreqtradeSignal({ ...signal, riskLimits: { ...signal.riskLimits, riskBudgetPct: true } }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_RISK_LIMITS',
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      authorization: { ...signal.authorization, allocatedRiskUsd: 0.5 },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError &&
+      error.code === 'AUTHORIZATION_RISK_MISMATCH',
+    'authorization may not allocate more risk than the stake cap and stop distance can justify',
   );
 
   assert.throws(
@@ -173,46 +154,38 @@ try {
     () => validateSbkFreqtradeSignal({ ...signal, authorization: undefined }, { nowMs }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_AUTHORIZATION',
   );
-  assert.throws(
-    () => validateSbkFreqtradeSignal({
+  assert.equal(signal.authorization.models.length, 0, 'entry authorization does not require separate predictive models');
+  assert.equal(signal.authorization.ensembleProbabilityPct, null);
+  assert.equal(
+    validateSbkFreqtradeSignal({
       ...signal,
-      authorization: {
-        ...signal.authorization,
-        models: signal.authorization.models.map((model) => ({
-          ...model,
-          status: 'SUSPENDED',
-          effectiveWeight: 0.4,
-        })),
-      },
-    }, { nowMs }),
-    (error: unknown) => error instanceof SbkSignalValidationError &&
-      ['INVALID_MODEL_ENSEMBLE', 'INVALID_MODEL_EVIDENCE'].includes(error.code),
+      authorization: { ...signal.authorization, disagreementVeto: true },
+    }, { nowMs }).authorization.decision,
+    'APPROVE_ENTRY',
+    'an independent model veto must not override the council direction',
   );
   assert.throws(
     () => validateSbkFreqtradeSignal({
       ...signal,
       authorization: {
         ...signal.authorization,
-        models: signal.authorization.models.map((model) => ({
-          ...model,
-          independenceValidated: false,
-        })),
-      },
-    }, { nowMs }),
-    (error: unknown) => error instanceof SbkSignalValidationError &&
-      error.code === 'INVALID_MODEL_ENSEMBLE',
-  );
-  assert.throws(
-    () => validateSbkFreqtradeSignal({
-      ...signal,
-      authorization: {
-        ...signal.authorization,
-        gates: signal.authorization.gates.map((gate) => gate.id === 'STAGE_7_ORDER_FLOW'
+        gates: signal.authorization.gates.map((gate) => gate.id === 'TRADE_LEVELS'
           ? { ...gate, status: 'UNAVAILABLE' }
           : gate),
       },
     }, { nowMs }),
     (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'INVALID_AUTHORIZATION_GATES',
+  );
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      authorization: {
+        ...signal.authorization,
+        gates: signal.authorization.gates.filter((gate) => gate.id !== 'EXECUTION_SPREAD'),
+      },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError &&
+      error.code === 'INCOMPLETE_AUTHORIZATION_GATES',
   );
   const exitSignal = {
     contractVersion: SBK_SIGNAL_CONTRACT_VERSION,

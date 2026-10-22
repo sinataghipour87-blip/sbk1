@@ -43,6 +43,11 @@ const MAX_FEED_AGE_MS = {
   exchangeQuotes: 5_000,
 } as const;
 const MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT = 2;
+const MAX_EXCHANGE_CLOCK_SKEW_MS = 5_000;
+const MAX_HISTORICAL_CANDLE_LIMIT = {
+  spot: 1_000,
+  futures: 1_500,
+} as const;
 
 type MarketKind = 'spot' | 'futures';
 
@@ -332,7 +337,7 @@ async function fetchCrossExchangeQuotes(options: {
       );
       const quote = request.parse(payload, retrievedAtMs);
       const ageMs = Math.max(options.nowMs, Date.now()) - quote.sourceTimestampMs;
-      if (ageMs < 0 || ageMs > MAX_FEED_AGE_MS.exchangeQuotes) {
+      if (ageMs < -MAX_EXCHANGE_CLOCK_SKEW_MS || ageMs > MAX_FEED_AGE_MS.exchangeQuotes) {
         throw new Error(`${request.exchange} ticker is stale or future-dated.`);
       }
       return quote;
@@ -345,10 +350,14 @@ async function fetchCrossExchangeQuotes(options: {
         `Cross-exchange ticker spread ${spreadPct.toFixed(3)}% exceeds the ${MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT}% quality limit.`,
       );
     }
+    const evaluatedAtMs = Math.max(options.nowMs, Date.now());
     return freshFeed(
       quotes,
-      Math.min(...quotes.map(({ sourceTimestampMs }) => sourceTimestampMs)),
-      options.nowMs,
+      Math.min(
+        evaluatedAtMs,
+        ...quotes.map(({ sourceTimestampMs }) => sourceTimestampMs),
+      ),
+      evaluatedAtMs,
       MAX_FEED_AGE_MS.exchangeQuotes,
     );
   } catch (error) {
@@ -445,7 +454,7 @@ export async function fetchPublicMarketFallback(options: {
 
   const [candles, orderBook, tradeFlow, exchangeQuotes, fundingRate, openInterest] = await Promise.all([
     fetchFeed(endpoint(options.market === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines', {
-      symbol, interval, limit: '500',
+      symbol, interval, limit: String(MAX_HISTORICAL_CANDLE_LIMIT[options.market]),
     }), (payload) => {
       const maxAgeMs = candleMaxAgeMs(options.timeframe);
       const result = parseCandles(payload, nowMs, intervalMs, maxAgeMs);
