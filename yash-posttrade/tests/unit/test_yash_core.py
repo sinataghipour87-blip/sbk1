@@ -89,7 +89,7 @@ def make_request(
 
 class YashPhaseOneTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.engine = YashEngine()
+        self.engine = YashEngine(EngineConfig(enforcing=True))
 
     def test_long_and_short_breakeven_arms_only_after_threshold_and_covers_fees(self) -> None:
         cases = (
@@ -106,8 +106,8 @@ class YashPhaseOneTests(unittest.TestCase):
                 self.assertEqual(result.plan.decision.decision_type, DecisionType.ARM_BREAKEVEN)
                 self.assertAlmostEqual(result.plan.decision.new_stoploss or 0, expected_stop, places=6)
                 self.assertIn(ReasonCode.BREAKEVEN_THRESHOLD_REACHED, result.plan.decision.reason_codes)
-                self.assertFalse(result.plan.executable)
-                self.assertTrue(result.plan.observation_only)
+                self.assertTrue(result.plan.executable)
+                self.assertFalse(result.plan.observation_only)
 
     def test_long_and_short_below_breakeven_threshold_hold(self) -> None:
         cases = (("LONG", 101.99), ("SHORT", 98.01))
@@ -130,6 +130,8 @@ class YashPhaseOneTests(unittest.TestCase):
                 self.assertEqual(result.plan.decision.decision_type, DecisionType.EXIT)
                 self.assertEqual(result.plan.decision.custom_exit_reason, "yash_time_horizon_elapsed")
                 self.assertIn(ReasonCode.TIME_HORIZON_ELAPSED, result.plan.decision.reason_codes)
+                self.assertTrue(result.plan.executable)
+                self.assertFalse(result.plan.observation_only)
 
     def test_long_and_short_time_stop_does_not_trigger_early(self) -> None:
         for direction in ("LONG", "SHORT"):
@@ -158,6 +160,7 @@ class YashPhaseOneTests(unittest.TestCase):
                 self.assertEqual(result.plan.decision.decision_type, DecisionType.EXIT)
                 self.assertEqual(result.plan.decision.custom_exit_reason, "yash_invalidation_confirmed")
                 self.assertIn(ReasonCode.INVALIDATION_CONFIRMED, result.plan.decision.reason_codes)
+                self.assertTrue(result.plan.executable)
 
     def test_stale_primary_or_context_evidence_cannot_produce_action(self) -> None:
         stale_primary = make_candle(
@@ -319,11 +322,23 @@ class YashPhaseOneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             EngineConfig(freshness_limit_ms=15_001)
 
-    def test_observation_only_cannot_be_disabled_in_phase_one(self) -> None:
-        result = self.engine.evaluate(make_request("LONG", trade_overrides={"current_price": 103.0}))
+    def test_explicit_observation_only_mode_never_authorizes_actions(self) -> None:
+        engine = YashEngine(EngineConfig(enforcing=False))
+        result = engine.evaluate(make_request("LONG", trade_overrides={"current_price": 103.0}))
         self.assertFalse(result.plan.executable)
         self.assertTrue(result.plan.observation_only)
         self.assertIn(ReasonCode.OBSERVATION_ONLY, result.plan.decision.reason_codes)
+
+    def test_enforcing_mode_authorizes_valid_time_stop(self) -> None:
+        result = self.engine.evaluate(
+            make_request(
+                "LONG",
+                trade_overrides={"opened_at_ms": NOW_MS - 30 * 60_000},
+            )
+        )
+        self.assertTrue(result.plan.executable)
+        self.assertFalse(result.plan.observation_only)
+        self.assertNotIn(ReasonCode.OBSERVATION_ONLY, result.plan.decision.reason_codes)
 
 
 if __name__ == "__main__":

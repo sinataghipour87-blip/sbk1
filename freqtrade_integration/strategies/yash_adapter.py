@@ -1,4 +1,4 @@
-"""In-process, observation-only adapter between Freqtrade and Yash."""
+"""In-process enforcing adapter between Freqtrade and Yash."""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ from yash.contracts.models import (
     YashDecisionEnvelope,
     YashEvaluationRequest,
 )
-from yash.engine import YashEngine
+from yash.engine import EngineConfig, YashEngine
 
 logger = logging.getLogger("SbkSignalStrategy")
-_ENGINE = YashEngine()
+_ENGINE = YashEngine(EngineConfig(enforcing=True))
 _TIMEFRAME_MS = {"15m": 15 * 60_000, "1h": 60 * 60_000, "4h": 4 * 60 * 60_000}
 _FRESHNESS_LIMIT_MS = _ENGINE.config.freshness_limit_ms
 
@@ -121,15 +121,15 @@ def build_request_from_freqtrade(
         return None
 
 
-def evaluate_observation_only(request: YashEvaluationRequest) -> YashDecisionEnvelope:
-    """Evaluate locally; never enables execution of the returned plan."""
+def evaluate_enforcing(request: YashEvaluationRequest) -> YashDecisionEnvelope:
+    """Evaluate locally and mark only validated Phase 1 actions executable."""
     return _ENGINE.evaluate(request)
 
 
 def format_audit_log(envelope: YashDecisionEnvelope) -> str:
     decision = envelope.plan.decision
     evidence = decision.evidence_snapshot
-    return "YASH_OBSERVATION " + json.dumps(
+    return "YASH_ENFORCING " + json.dumps(
         {
             "request_id": envelope.request_id,
             "decision_id": envelope.decision_id,
@@ -140,6 +140,7 @@ def format_audit_log(envelope: YashDecisionEnvelope) -> str:
                 "candle_close_time_ms": evidence.candle_close_time_ms,
                 "candle_observed_at_ms": evidence.candle_observed_at_ms,
             },
+            "executable": envelope.plan.executable,
             "observation_only": envelope.plan.observation_only,
         },
         sort_keys=True,
@@ -247,4 +248,4 @@ def _valid_fee(value: Any) -> bool:
 
 
 def _log_skip(reason_code: str, detail: str) -> None:
-    logger.info("YASH_OBSERVATION_SKIPPED reason_code=%s detail=%s", reason_code, detail)
+    logger.info("YASH_ENFORCING_SKIPPED reason_code=%s detail=%s", reason_code, detail)

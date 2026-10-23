@@ -1,4 +1,4 @@
-"""Phase 1 engine with mandatory observation-only output."""
+"""Phase 1 engine with safe observation-only default and explicit enforcement."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ class EngineConfig:
     freshness_limit_ms: int = DEFAULT_FRESHNESS_LIMIT_MS
     decision_ttl_ms: int = DEFAULT_DECISION_TTL_MS
     breakeven_trigger_rate: float = 0.02
+    enforcing: bool = False
 
     def __post_init__(self) -> None:
         if self.freshness_limit_ms <= 0 or self.decision_ttl_ms <= 0:
@@ -47,7 +48,7 @@ class EngineConfig:
 
 
 class YashEngine:
-    """Evaluate Phase 1 policies; all plans are permanently observation-only."""
+    """Evaluate Phase 1 policies and optionally authorize their execution."""
 
     def __init__(self, config: EngineConfig | None = None) -> None:
         self.config = config or EngineConfig()
@@ -129,11 +130,14 @@ class YashEngine:
         )
 
     def _decision_from_action(self, request: YashEvaluationRequest, action: PolicyAction) -> Decision:
+        reason_codes = (action.reason_code,)
+        if not self.config.enforcing:
+            reason_codes += (ReasonCode.OBSERVATION_ONLY,)
         return Decision(
             decision_type=action.decision_type,
             new_stoploss=action.new_stoploss,
             custom_exit_reason=action.custom_exit_reason,
-            reason_codes=(action.reason_code, ReasonCode.OBSERVATION_ONLY),
+            reason_codes=reason_codes,
             confidence=1.0,
             evidence_snapshot=self._snapshot(request),
         )
@@ -146,7 +150,11 @@ class YashEngine:
     ) -> Decision:
         return Decision(
             decision_type=DecisionType.HOLD,
-            reason_codes=reason_codes + (ReasonCode.OBSERVATION_ONLY,),
+            reason_codes=(
+                reason_codes
+                if self.config.enforcing
+                else reason_codes + (ReasonCode.OBSERVATION_ONLY,)
+            ),
             confidence=confidence,
             evidence_snapshot=self._snapshot(request),
         )
@@ -177,7 +185,14 @@ class YashEngine:
             decision_id=decision_id,
             generated_at_ms=request.evaluated_at_ms,
             expires_at_ms=request.evaluated_at_ms + self.config.decision_ttl_ms,
-            plan=ExecutionPlan(decision=decision),
+            plan=ExecutionPlan(
+                executable=(
+                    self.config.enforcing
+                    and decision.decision_type != DecisionType.HOLD
+                ),
+                observation_only=not self.config.enforcing,
+                decision=decision,
+            ),
         )
 
     def _failure_envelope(
@@ -192,9 +207,12 @@ class YashEngine:
             else "invalid-request"
         )
         safe_time = max(0, generated_at_ms)
+        failure_codes = (reason,)
+        if not self.config.enforcing:
+            failure_codes += (ReasonCode.OBSERVATION_ONLY,)
         decision = Decision(
             decision_type=DecisionType.HOLD,
-            reason_codes=(reason, ReasonCode.OBSERVATION_ONLY),
+            reason_codes=failure_codes,
             confidence=0.0,
             evidence_snapshot=EvidenceSnapshot(),
         )
@@ -204,7 +222,11 @@ class YashEngine:
             decision_id=_decision_id(safe_request_id, decision),
             generated_at_ms=safe_time,
             expires_at_ms=safe_time + self.config.decision_ttl_ms,
-            plan=ExecutionPlan(decision=decision),
+            plan=ExecutionPlan(
+                executable=False,
+                observation_only=not self.config.enforcing,
+                decision=decision,
+            ),
         )
 
 

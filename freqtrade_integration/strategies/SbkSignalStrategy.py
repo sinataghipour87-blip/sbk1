@@ -9,6 +9,7 @@ from pandas import DataFrame
 
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
+from yash.contracts.models import YashDecisionEnvelope
 from sbk_signal_contract import (
     is_signal_runtime,
     is_valid_sbk_exit_signal,
@@ -18,7 +19,7 @@ from sbk_signal_contract import (
 )
 from yash_adapter import (
     build_request_from_freqtrade,
-    evaluate_observation_only,
+    evaluate_enforcing,
     format_audit_log,
 )
 
@@ -968,31 +969,28 @@ class SbkSignalStrategy(IStrategy):
         **kwargs: Any,
     ) -> float | None:
         try:
-            data_provider = getattr(self, "dp", None)
-            primary = data_provider.get_pair_dataframe(pair, self.timeframe) if data_provider else None
-            context_1h = data_provider.get_pair_dataframe(pair, "1h") if data_provider else None
-            context_4h = data_provider.get_pair_dataframe(pair, "4h") if data_provider else None
-            fee_open = getattr(trade, "fee_open", None)
-            fee_close = getattr(trade, "fee_close", None)
-            fees = (
-                {"entry_fee_rate": float(fee_open), "exit_fee_rate": float(fee_close)}
-                if isinstance(fee_open, (int, float)) and isinstance(fee_close, (int, float))
-                else None
-            )
-            request = build_request_from_freqtrade(
-                trade,
-                current_rate,
-                current_time,
-                primary,
-                context_1h,
-                context_4h,
-                fees,
-            )
-            if request is not None:
-                logger.info("%s", format_audit_log(evaluate_observation_only(request)))
+            envelope = self._evaluate_yash(trade, pair, current_rate, current_time)
+            if (
+                envelope is not None
+                and envelope.expires_at_ms > int(current_time.timestamp() * 1000)
+                and envelope.plan.executable
+                and envelope.plan.decision.new_stoploss is not None
+            ):
+                decision = envelope.plan.decision
+                logger.info(
+                    "YASH_ENFORCING_APPLIED decision_id=%s reason_codes=%s action=stop",
+                    envelope.decision_id,
+                    ",".join(reason.value for reason in decision.reason_codes),
+                )
+                return stoploss_from_absolute(
+                    decision.new_stoploss,
+                    current_rate,
+                    is_short=trade.is_short,
+                    leverage=trade.leverage,
+                )
         except Exception:
             logger.exception(
-                "YASH_OBSERVATION_SKIPPED reason_code=DATA_INCOMPLETE "
+                "YASH_ENFORCING_SKIPPED reason_code=DATA_INCOMPLETE "
                 "callback=custom_stoploss; existing stop behavior is unchanged."
             )
 
@@ -1027,31 +1025,23 @@ class SbkSignalStrategy(IStrategy):
         **kwargs: Any,
     ) -> str | None:
         try:
-            data_provider = getattr(self, "dp", None)
-            primary = data_provider.get_pair_dataframe(pair, self.timeframe) if data_provider else None
-            context_1h = data_provider.get_pair_dataframe(pair, "1h") if data_provider else None
-            context_4h = data_provider.get_pair_dataframe(pair, "4h") if data_provider else None
-            fee_open = getattr(trade, "fee_open", None)
-            fee_close = getattr(trade, "fee_close", None)
-            fees = (
-                {"entry_fee_rate": float(fee_open), "exit_fee_rate": float(fee_close)}
-                if isinstance(fee_open, (int, float)) and isinstance(fee_close, (int, float))
-                else None
-            )
-            request = build_request_from_freqtrade(
-                trade,
-                current_rate,
-                current_time,
-                primary,
-                context_1h,
-                context_4h,
-                fees,
-            )
-            if request is not None:
-                logger.info("%s", format_audit_log(evaluate_observation_only(request)))
+            envelope = self._evaluate_yash(trade, pair, current_rate, current_time)
+            if (
+                envelope is not None
+                and envelope.expires_at_ms > int(current_time.timestamp() * 1000)
+                and envelope.plan.executable
+                and envelope.plan.decision.custom_exit_reason is not None
+            ):
+                decision = envelope.plan.decision
+                logger.info(
+                    "YASH_ENFORCING_APPLIED decision_id=%s reason_codes=%s action=exit",
+                    envelope.decision_id,
+                    ",".join(reason.value for reason in decision.reason_codes),
+                )
+                return decision.custom_exit_reason
         except Exception:
             logger.exception(
-                "YASH_OBSERVATION_SKIPPED reason_code=DATA_INCOMPLETE "
+                "YASH_ENFORCING_SKIPPED reason_code=DATA_INCOMPLETE "
                 "callback=custom_exit; existing exit behavior is unchanged."
             )
 
@@ -1097,6 +1087,39 @@ class SbkSignalStrategy(IStrategy):
                 return f"sbk_exit_{exit_id}"
         return None
 
+    def _evaluate_yash(
+        self,
+        trade: Any,
+        pair: str,
+        current_rate: float,
+        current_time: datetime,
+    ) -> YashDecisionEnvelope | None:
+        data_provider = getattr(self, "dp", None)
+        primary = data_provider.get_pair_dataframe(pair, self.timeframe) if data_provider else None
+        context_1h = data_provider.get_pair_dataframe(pair, "1h") if data_provider else None
+        context_4h = data_provider.get_pair_dataframe(pair, "4h") if data_provider else None
+        fee_open = getattr(trade, "fee_open", None)
+        fee_close = getattr(trade, "fee_close", None)
+        fees = (
+            {"entry_fee_rate": float(fee_open), "exit_fee_rate": float(fee_close)}
+            if isinstance(fee_open, (int, float)) and isinstance(fee_close, (int, float))
+            else None
+        )
+        request = build_request_from_freqtrade(
+            trade,
+            current_rate,
+            current_time,
+            primary,
+            context_1h,
+            context_4h,
+            fees,
+        )
+        if request is None:
+            return None
+        envelope = evaluate_enforcing(request)
+        logger.info("%s", format_audit_log(envelope))
+        return envelope
+
     def confirm_trade_exit(
         self,
         pair: str,
@@ -1111,6 +1134,21 @@ class SbkSignalStrategy(IStrategy):
     ) -> bool:
         if exit_reason in ("stop_loss", "stoploss_on_exchange", "emergency_exit", "force_exit", "sbk_time_horizon"):
             return True
+        if exit_reason in ("yash_time_horizon_elapsed", "yash_invalidation_confirmed"):
+            try:
+                envelope = self._evaluate_yash(trade, pair, rate, current_time)
+                return bool(
+                    envelope is not None
+                    and envelope.expires_at_ms > int(current_time.timestamp() * 1000)
+                    and envelope.plan.executable
+                    and envelope.plan.decision.custom_exit_reason == exit_reason
+                )
+            except Exception:
+                logger.exception(
+                    "YASH_ENFORCING_SKIPPED reason_code=DATA_INCOMPLETE "
+                    "callback=confirm_trade_exit; rejecting unverified Yash exit."
+                )
+                return False
         if exit_reason == "sbk_take_profit":
             entry_signal = trade.get_custom_data("sbk_signal")
             entry_conditions = entry_signal.get("entryConditions") if isinstance(entry_signal, dict) else None

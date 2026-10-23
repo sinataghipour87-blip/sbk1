@@ -233,9 +233,17 @@ class Decision(StrictModel):
 
 
 class ExecutionPlan(StrictModel):
-    executable: Literal[False] = False
-    observation_only: Literal[True] = True
+    executable: bool = False
+    observation_only: bool = True
     decision: Decision
+
+    @model_validator(mode="after")
+    def execution_mode_matches_decision(self) -> ExecutionPlan:
+        if self.executable and self.observation_only:
+            raise ValueError("An executable plan cannot be observation-only.")
+        if self.executable and self.decision.decision_type == DecisionType.HOLD:
+            raise ValueError("HOLD decisions cannot be executable.")
+        return self
 
 
 class YashDecisionEnvelope(StrictModel):
@@ -250,6 +258,4 @@ class YashDecisionEnvelope(StrictModel):
     def expiry_follows_generation(self) -> YashDecisionEnvelope:
         if self.expires_at_ms <= self.generated_at_ms:
             raise ValueError("Decision expiry must follow its generation time.")
-        if self.plan.executable or not self.plan.observation_only:
-            raise ValueError("Phase 1 decisions must remain observation-only.")
         return self

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "freqtrade_integration" / "strategies"))
 from SbkSignalStrategy import SbkSignalStrategy
 from yash_adapter import (
     build_request_from_freqtrade,
-    evaluate_observation_only,
+    evaluate_enforcing,
     format_audit_log,
 )
 
@@ -108,16 +108,17 @@ class YashAdapterIntegrationTests(unittest.TestCase):
                 self.assertIsNone(exit_reason)
                 self.assertTrue(any(expected_reason in record for record in logs.output))
 
-    def test_valid_request_emits_reason_codes_and_evidence_timestamps(self) -> None:
+    def test_valid_request_emits_enforcing_audit_and_evidence_timestamps(self) -> None:
         request = self._build(self.closed_frame)
         self.assertIsNotNone(request)
-        envelope = evaluate_observation_only(request)
+        envelope = evaluate_enforcing(request)
         audit = format_audit_log(envelope)
         self.assertIn("reason_codes", audit)
         self.assertIn("POLICY_NO_CHANGE", audit)
         self.assertIn("candle_close_time_ms", audit)
         self.assertIn(str(request.market.primary_candle.close_time_ms), audit)
         self.assertFalse(envelope.plan.executable)
+        self.assertFalse(envelope.plan.observation_only)
         with self.assertLogs("SbkSignalStrategy", level="INFO") as logs:
             stop = self.strategy.custom_stoploss(
                 self.trade.pair,
@@ -128,9 +129,9 @@ class YashAdapterIntegrationTests(unittest.TestCase):
                 False,
             )
         self.assertEqual(stop, -0.05)
-        self.assertTrue(any("YASH_OBSERVATION" in item and "reason_codes" in item for item in logs.output))
+        self.assertTrue(any("YASH_ENFORCING" in item and "reason_codes" in item for item in logs.output))
 
-    def test_breakeven_observation_does_not_change_custom_stoploss(self) -> None:
+    def test_breakeven_enforcing_adjusts_stop_only_after_valid_signal(self) -> None:
         with self.assertLogs("SbkSignalStrategy", level="INFO") as logs:
             stop = self.strategy.custom_stoploss(
                 self.trade.pair,
@@ -140,8 +141,60 @@ class YashAdapterIntegrationTests(unittest.TestCase):
                 0.03,
                 False,
             )
-        self.assertEqual(stop, -0.05)
-        self.assertTrue(any("ARM_BREAKEVEN" in item for item in logs.output))
+        self.assertGreater(stop, -0.05)
+        self.assertTrue(any("YASH_ENFORCING_APPLIED" in item and "action=stop" in item for item in logs.output))
+
+    def test_short_breakeven_enforcing_returns_tighter_stop(self) -> None:
+        self.trade.is_short = True
+        self.trade.stop_loss = 105.0
+        with self.assertLogs("SbkSignalStrategy", level="INFO") as logs:
+            stop = self.strategy.custom_stoploss(
+                self.trade.pair,
+                self.trade,
+                self.now,
+                97.0,
+                0.03,
+                False,
+            )
+        self.assertGreater(stop, -0.05)
+        self.assertTrue(any("YASH_ENFORCING_APPLIED" in item and "action=stop" in item for item in logs.output))
+
+    def test_time_stop_enforcing_returns_yash_exit_reason(self) -> None:
+        self.assertFalse(
+            self.strategy.confirm_trade_exit(
+                self.trade.pair,
+                self.trade,
+                "market",
+                0.01,
+                101.0,
+                "gtc",
+                "yash_time_horizon_elapsed",
+                self.now,
+            )
+        )
+        self.trade.open_date_utc = self.now - timedelta(minutes=35)
+        with self.assertLogs("SbkSignalStrategy", level="INFO") as logs:
+            exit_reason = self.strategy.custom_exit(
+                self.trade.pair,
+                self.trade,
+                self.now,
+                101.0,
+                0.01,
+            )
+        self.assertEqual(exit_reason, "yash_time_horizon_elapsed")
+        self.assertTrue(any("YASH_ENFORCING_APPLIED" in item and "action=exit" in item for item in logs.output))
+        self.assertTrue(
+            self.strategy.confirm_trade_exit(
+                self.trade.pair,
+                self.trade,
+                "market",
+                0.01,
+                101.0,
+                "gtc",
+                exit_reason,
+                self.now,
+            )
+        )
 
 
 if __name__ == "__main__":

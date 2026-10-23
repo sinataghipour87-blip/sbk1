@@ -2,8 +2,9 @@
 
 Yash is a deterministic, in-process post-trade decision package. It does not
 place orders, authorize entries, or make network requests. Phase 1 supports
-breakeven, time-stop, and confirmed invalidation decisions. Every decision is
-observation-only; a Freqtrade adapter must not execute its plans.
+breakeven, time-stop, and confirmed invalidation decisions. The core engine is
+observation-only by default; an explicitly enforcing adapter may act on valid
+Phase 1 decisions after applying the stop ratchet and evidence guards.
 
 ## Safety boundaries
 
@@ -13,7 +14,7 @@ observation-only; a Freqtrade adapter must not execute its plans.
   host's existing freshness limit. The caller must not use a more permissive
   value than its own gate.
 - Invalid, incomplete, stale, unsupported, or future-dated evidence cannot
-  produce an executable decision.
+  produce an actionable decision.
 - `new_stoploss` is an absolute price in quote units. It is not a percentage
   or Freqtrade stoploss ratio.
 - Stop proposals pass a direction-aware ratchet guard. LONG stops can only
@@ -44,7 +45,6 @@ python -m pip install -e ".[test]"
 python -m pytest
 ```
 
-The unit tests use deterministic values and do not contact exchanges. A
-passing unit suite does not authorize live execution. Integration tests with
-Freqtrade and an out-of-sample backtest are required before a future adapter
-may act on a Yash plan.
+The unit tests use deterministic values and do not contact exchanges.
+Integration tests verify the Freqtrade adapter. Historical out-of-sample
+results have not been established by this package's test suite.
