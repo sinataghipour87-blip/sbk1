@@ -395,7 +395,12 @@ class SbkSignalStrategy(IStrategy):
             return None
 
         trades = []
-        seen_ids = set()
+        seen_ids = {}
+        duplicate_count = 0
+        venue = str(self.config.get("exchange", {}).get("name", "")).strip().lower()
+        if not venue:
+            logger.warning("Freqtrade exchange identity is unavailable for recent trades on %s.", pair)
+            return None
         for trade in raw_trades:
             if not isinstance(trade, dict):
                 logger.warning("Freqtrade CCXT returned a malformed trade for %s.", pair)
@@ -425,20 +430,32 @@ class SbkSignalStrategy(IStrategy):
             trade_id = str(trade_id)
             timestamp_ms = int(timestamp_ms)
             if trade_id in seen_ids:
+                previous = seen_ids[trade_id]
+                if previous != (timestamp_ms, side, float(price), float(amount)):
+                    logger.warning("Freqtrade CCXT returned conflicting records for trade id %s on %s.", trade_id, pair)
+                    return None
+                duplicate_count += 1
                 continue
-            seen_ids.add(trade_id)
+            seen_ids[trade_id] = (timestamp_ms, side, float(price), float(amount))
             if timestamp_ms <= now_ms and now_ms - timestamp_ms <= 5_000:
                 trades.append({
                     "timestampMs": timestamp_ms,
                     "side": side,
                     "price": float(price),
                     "amount": float(amount),
+                    "venue": venue,
+                    "symbol": pair,
+                    "tradeId": trade_id,
                 })
         trades.sort(key=lambda item: item["timestampMs"])
         if not trades:
             logger.warning("No fresh identified trades are available for %s.", pair)
             return None
-        return {"retrievedAtMs": int(datetime.now(UTC).timestamp() * 1000), "trades": trades}
+        return {
+            "retrievedAtMs": int(datetime.now(UTC).timestamp() * 1000),
+            "duplicateCount": duplicate_count,
+            "trades": trades,
+        }
 
     def _snapshot_ticker(self, data_provider: Any, pair: str) -> dict[str, Any] | None:
         try:
@@ -656,7 +673,17 @@ class SbkSignalStrategy(IStrategy):
         if not bid_levels or not ask_levels or bid_levels[0]["price"] >= ask_levels[0]["price"]:
             logger.warning("Freqtrade DataProvider order book is empty or crossed for %s.", pair)
             return None
-        return {"timestampMs": timestamp_ms, "bids": bid_levels, "asks": ask_levels}
+        snapshot = {
+            "timestampMs": timestamp_ms,
+            "venue": str(self.config.get("exchange", {}).get("name", "")).strip().lower(),
+            "symbol": pair,
+            "bids": bid_levels,
+            "asks": ask_levels,
+        }
+        sequence_id = order_book.get("nonce")
+        if isinstance(sequence_id, int) and not isinstance(sequence_id, bool) and sequence_id >= 0:
+            snapshot["sequenceId"] = sequence_id
+        return snapshot
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe

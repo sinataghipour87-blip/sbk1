@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import {
+  validateFreqtradeMarketSnapshot,
+  FreqtradeMarketSnapshotValidationError,
+} from '../src/services/freqtradeMarketDataBridge';
 
 const nowMs = Date.now();
 const makeCandles = (timeframeMs: number, count: number) => {
@@ -52,6 +56,44 @@ const marketSnapshot = {
   openInterest: null,
   tradeFlow: null,
 };
+
+const snapshotWithRepeatedTrades = validateFreqtradeMarketSnapshot({
+  ...marketSnapshot,
+  tradeFlow: {
+    retrievedAtMs: nowMs - 100,
+    trades: [
+      { timestampMs: nowMs - 300, side: 'buy', price: 60_000, amount: 1, tradeId: '42' },
+      { timestampMs: nowMs - 300, side: 'buy', price: 60_000, amount: 1, tradeId: '42' },
+      { timestampMs: nowMs - 300, side: 'buy', price: 60_000, amount: 1, tradeId: '43' },
+    ],
+  },
+}, {
+  exchange: 'bybit',
+  market: 'futures',
+  pair: 'BTC/USDT:USDT',
+  timeframe: '15m',
+}, nowMs);
+assert.equal(snapshotWithRepeatedTrades.tradeFlow?.trades.length, 2,
+  'same event ids must not double-count in the trade-flow evidence sent to member 2');
+assert.equal(snapshotWithRepeatedTrades.tradeFlow?.duplicateCount, 1);
+assert.equal(snapshotWithRepeatedTrades.tradeFlow?.trades[0].venue, 'bybit');
+assert.equal(snapshotWithRepeatedTrades.tradeFlow?.trades[0].symbol, 'BTC/USDT:USDT');
+assert.throws(() => validateFreqtradeMarketSnapshot({
+  ...marketSnapshot,
+  tradeFlow: {
+    retrievedAtMs: nowMs - 100,
+    trades: [
+      { timestampMs: nowMs - 300, side: 'buy', price: 60_000, amount: 1, tradeId: '42' },
+      { timestampMs: nowMs - 200, side: 'sell', price: 60_001, amount: 2, tradeId: '42' },
+    ],
+  },
+}, {
+  exchange: 'bybit',
+  market: 'futures',
+  pair: 'BTC/USDT:USDT',
+  timeframe: '15m',
+}, nowMs), FreqtradeMarketSnapshotValidationError,
+'conflicting records with the same trade identity must fail closed');
 
 Object.defineProperty(globalThis, 'window', { value: {}, configurable: true });
 let requestCount = 0;

@@ -52,6 +52,7 @@ const data = await fetchPublicBitcoinWhaleData({
   sleep: async () => {},
 });
 assert.equal(data.status, 'LIVE');
+assert.equal(typeof data.retrievedAtMs, 'number');
 assert.equal(data.provider.includes('mempool.space'), true);
 assert.equal(data.coverageStatus, 'SAMPLED');
 assert.equal(data.largeTransfers?.length, 1, 'duplicate tx outputs across sampled blocks are deduplicated');
@@ -107,6 +108,39 @@ assert.equal(concurrentlySampled.status, 'LIVE');
 assert.ok(maximumConcurrentBlockRequests > 1, 'sampled block transaction pages are requested concurrently');
 
 resetPublicBitcoinWhaleDataCacheForTests();
+let singleFlightRequests = 0;
+const singleFlightFetcher: typeof fetch = async (input) => {
+  singleFlightRequests += 1;
+  const url = new URL(String(input));
+  if (url.pathname.endsWith('/v1/blocks')) return Response.json(blocks);
+  return Response.json([{
+    txid: duplicateTxHash,
+    status: { confirmed: true, block_height: 900_003, block_time: blockTimestamp },
+    vout: [{ value: 1_200_000_000 }],
+  }]);
+};
+const [firstSingleFlight, secondSingleFlight] = await Promise.all([
+  fetchPublicBitcoinWhaleData({
+    nowMs,
+    btcPriceUsd: 60_000,
+    fetcher: singleFlightFetcher,
+    sleep: async () => {},
+    forceRefresh: true,
+  }),
+  fetchPublicBitcoinWhaleData({
+    nowMs,
+    btcPriceUsd: 70_000,
+    fetcher: singleFlightFetcher,
+    sleep: async () => {},
+    forceRefresh: true,
+  }),
+]);
+assert.equal(singleFlightRequests, 4, 'foreground council reads share the background in-flight refresh');
+assert.equal(firstSingleFlight.largeTransfers?.[0].estimatedUsd, 720_000);
+assert.equal(secondSingleFlight.largeTransfers?.[0].estimatedUsd, 840_000,
+  'shared prefetched transfers use the current caller price for optional USD estimates');
+
+resetPublicBitcoinWhaleDataCacheForTests();
 const noPrice = await fetchPublicBitcoinWhaleData({
   nowMs,
   fetcher: successfulFetcher,
@@ -155,7 +189,36 @@ const rateLimited = await fetchPublicBitcoinWhaleData({
 });
 assert.equal(rateLimited.status, 'LIVE');
 assert.equal(attempts, 2);
-assert.equal(retryDelays[0], 1_000, 'Retry-After seconds are respected');
+assert.equal(retryDelays[0], 500, 'Retry-After is capped to keep source recovery bounded');
+
+resetPublicBitcoinWhaleDataCacheForTests();
+const mirrorRequests: string[] = [];
+const mirrorData = await fetchPublicBitcoinWhaleData({
+  nowMs,
+  fetcher: async (input) => {
+    const url = new URL(String(input));
+    mirrorRequests.push(`${url.hostname}${url.pathname}`);
+    if (url.hostname === 'mempool.space') return new Response('', { status: 503 });
+    if (url.pathname === '/api/blocks') return Response.json(blocks);
+    if (url.pathname.includes('/api/block/')) {
+      return Response.json([{
+        txid: 'd'.repeat(64),
+        status: { confirmed: true, block_height: 900_003, block_time: blockTimestamp },
+        vout: [{ value: 1_500_000_000 }],
+      }]);
+    }
+    throw new Error(`Unexpected mirror request ${url.toString()}`);
+  },
+  sleep: async () => {},
+  forceRefresh: true,
+});
+assert.equal(mirrorData.status, 'LIVE');
+assert.match(mirrorData.provider, /Blockstream/);
+assert.equal(mirrorData.largeTransfers?.[0].sourceProvider, 'Blockstream');
+assert.equal(mirrorData.largeTransfers?.[0].amount, 15);
+assert.equal(mirrorRequests.filter((request) => request.startsWith('mempool.space')).length, 2,
+  'one fast retry is made before switching to the mirror');
+assert.equal(mirrorRequests.some((request) => request.startsWith('blockstream.info/api/blocks')), true);
 
 resetPublicBitcoinWhaleDataCacheForTests();
 let timeoutAttempts = 0;
@@ -169,7 +232,7 @@ const timeoutData = await fetchPublicBitcoinWhaleData({
   forceRefresh: true,
 });
 assert.equal(timeoutData.status, 'UNAVAILABLE');
-assert.equal(timeoutAttempts, 3, 'timeouts receive bounded exponential retries');
+assert.equal(timeoutAttempts, 4, 'each public source gets one bounded retry');
 
 resetPublicBitcoinWhaleDataCacheForTests();
 const malformed = await fetchPublicBitcoinWhaleData({
@@ -248,6 +311,8 @@ const cachedOnProviderError = await fetchPublicBitcoinWhaleData({
   forceRefresh: true,
 });
 assert.equal(cachedOnProviderError.status, 'LIVE');
+assert.equal(cachedOnProviderError.retrievedAtMs, cachedFreshSample.retrievedAtMs,
+  'a failed refresh retains the timestamp of the successful source retrieval');
 assert.match(cachedOnProviderError.unavailableReason ?? '', /using the last successful sample/);
 assert.equal(
   evaluateEightMemberCouncil({ whaleFlowData: cachedOnProviderError, nowMs: nowMs + 2 * 60_000 }).members[5].vote,
@@ -290,9 +355,11 @@ const failedFallback = await fetchOnChainWhaleData({
   },
 });
 assert.equal(failedFallback.status, 'UNAVAILABLE');
-assert.equal(fallbackCalls.length, 3, 'the public source makes bounded retries after HTTP 503');
-assert.equal(fallbackCalls.every((hostname) => hostname === 'mempool.space'), true,
-  'Whale Alert remains untouched when its optional API key is absent');
+assert.equal(fallbackCalls.length, 4, 'primary and mirror each make bounded retries after HTTP 503');
+assert.deepEqual(
+  fallbackCalls.filter((hostname) => hostname === 'mempool.space' || hostname === 'blockstream.info'),
+  ['mempool.space', 'mempool.space', 'blockstream.info', 'blockstream.info'],
+);
 if (previousWhaleAlertKey === undefined) delete process.env.WHALE_ALERT_API_KEY;
 else process.env.WHALE_ALERT_API_KEY = previousWhaleAlertKey;
 

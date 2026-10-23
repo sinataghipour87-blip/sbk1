@@ -1,4 +1,5 @@
 import type { CouncilOptionsData } from './eightMemberCouncil';
+import { deduplicateOptionContracts } from './councilEvidenceDeduplication';
 
 const DERIBIT_SUMMARY_ENDPOINT =
   'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option';
@@ -47,6 +48,7 @@ function unavailable(status: CouncilOptionsData['status'] = 'UNAVAILABLE'): Coun
   return {
     status,
     timestampMs: null,
+    retrievedAtMs: null,
     ageMs: null,
     qualityPct: 0,
     impliedVolatilityPct: null,
@@ -139,14 +141,47 @@ export async function fetchDeribitOptionsData(options: {
         !('result' in payload) || !Array.isArray(payload.result)) {
       throw new Error('Deribit options response is malformed.');
     }
-    const summaries = payload.result.filter(isSummary);
-    const eligible = summaries.flatMap((summary) => {
+    const summariesByInstrument = new Map<string, DeribitOptionSummary>();
+    for (const candidate of payload.result) {
+      if (!isSummary(candidate)) continue;
+      const previous = summariesByInstrument.get(candidate.instrument_name);
+      if (previous && (
+        previous.open_interest !== candidate.open_interest ||
+        previous.mark_iv !== candidate.mark_iv ||
+        previous.underlying_price !== candidate.underlying_price ||
+        previous.creation_timestamp !== candidate.creation_timestamp
+      )) {
+        throw new Error(
+          `Deribit returned conflicting duplicate summaries for ${candidate.instrument_name}.`,
+        );
+      }
+      summariesByInstrument.set(candidate.instrument_name, candidate);
+    }
+    const summaries = [...summariesByInstrument.values()];
+    const candidates = summaries.flatMap((summary) => {
       const parsed = parseOption(summary, evaluatedAtMs);
       return parsed && parsed.strikePrice >= parsed.underlyingPrice * 0.75 &&
         parsed.strikePrice <= parsed.underlyingPrice * 1.25
-        ? [parsed]
+        ? [{
+          ...parsed,
+          instrumentName: summary.instrument_name,
+          summary,
+        }]
         : [];
     });
+    const uniqueContracts = deduplicateOptionContracts(candidates.map((candidate) => ({
+      venue: 'deribit',
+      instrumentName: candidate.instrumentName,
+      expiryTimestampMs: candidate.expiryTimestampMs,
+      strikePrice: candidate.strikePrice,
+      side: candidate.optionType,
+      contractData: candidate,
+      candidate,
+    })));
+    if (uniqueContracts.conflictingIdentity) {
+      throw new Error('Deribit returned conflicting summaries for the same option contract identity.');
+    }
+    const eligible = uniqueContracts.values.map(({ candidate }) => candidate);
     const valid = retrievedAtMs <= nowMs + 1_000 &&
       nowMs - retrievedAtMs <= MAX_SOURCE_AGE_MS
       ? eligible
@@ -183,6 +218,7 @@ export async function fetchDeribitOptionsData(options: {
     const result: CouncilOptionsData = {
       status: 'LIVE',
       timestampMs,
+      retrievedAtMs,
       ageMs,
       qualityPct: Math.round(valid.length / Math.max(eligible.length, 1) * 100),
       impliedVolatilityPct: Math.round(weightedIv(valid) * 100) / 100,

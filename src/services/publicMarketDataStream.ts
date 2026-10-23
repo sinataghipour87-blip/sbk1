@@ -5,6 +5,7 @@ import type {
   FreqtradeMarketTrade,
   FreqtradeMarketTradeFlow,
 } from './freqtradeMarketDataBridge';
+import { deduplicateOrderBookSnapshots } from './councilEvidenceDeduplication';
 
 const MAX_STREAM_AGE_MS = 5_000;
 const MAX_STORED_TRADES = 2_000;
@@ -106,11 +107,14 @@ export class BinancePublicMarketDataStream {
   private lastMessageAtMs = new Map<StreamChannel, number>();
   private stopped = true;
   private urls: Record<StreamChannel, string> | null = null;
+  private symbol: string | null = null;
   private latestPrice: StreamSnapshot['price'] = null;
   private latestOrderBook: FreqtradeMarketOrderBook | null = null;
   private partialFastCandle: StreamSnapshot['partialFastCandle'] = null;
   private trades: FreqtradeMarketTrade[] = [];
   private lastTradeId: number | null = null;
+  private duplicateTradeCount = 0;
+  private lastOrderBookSequenceId: number | null = null;
 
   constructor(
     private readonly createSocket: (url: string) => PublicMarketSocket = (url) =>
@@ -120,12 +124,16 @@ export class BinancePublicMarketDataStream {
   start(pair: string, market: MarketKind): void {
     if (!this.stopped) return;
     this.urls = makeStreamUrls(pair, market);
+    const symbolMatch = /^([A-Z0-9]+)\/USDT(?::USDT)?$/i.exec(pair.trim());
+    this.symbol = symbolMatch ? `${symbolMatch[1].toUpperCase()}USDT` : null;
     this.stopped = false;
     this.latestPrice = null;
     this.latestOrderBook = null;
     this.partialFastCandle = null;
     this.trades = [];
     this.lastTradeId = null;
+    this.duplicateTradeCount = 0;
+    this.lastOrderBookSequenceId = null;
     this.connect('trades');
     this.connect('orderBook');
     this.monitorTimer = setInterval(() => {
@@ -168,7 +176,7 @@ export class BinancePublicMarketDataStream {
         ? { ...this.latestPrice }
         : null,
       tradeFlow: recentTrades.length > 0
-        ? { retrievedAtMs: nowMs, trades: recentTrades }
+        ? { retrievedAtMs: nowMs, duplicateCount: this.duplicateTradeCount, trades: recentTrades }
         : null,
       orderBook: this.latestOrderBook && isFresh(this.latestOrderBook.timestampMs)
         ? structuredClone(this.latestOrderBook)
@@ -254,12 +262,15 @@ export class BinancePublicMarketDataStream {
         timestampMs === null ||
         !Number.isSafeInteger(tradeId) ||
         tradeId! <= 0 ||
-        (this.lastTradeId !== null && tradeId! <= this.lastTradeId) ||
         timestampMs > receivedAtMs + 1_000 ||
         price === null ||
         amount === null ||
         typeof event.m !== 'boolean'
       ) return;
+      if (this.lastTradeId !== null && tradeId! <= this.lastTradeId) {
+        if (tradeId === this.lastTradeId) this.duplicateTradeCount += 1;
+        return;
+      }
       this.lastTradeId = tradeId!;
       this.latestPrice = { sourceTimestampMs: timestampMs, retrievedAtMs: receivedAtMs, price };
       this.trades.push({
@@ -267,6 +278,9 @@ export class BinancePublicMarketDataStream {
         side: event.m ? 'sell' : 'buy',
         price,
         amount,
+        venue: 'binance',
+        symbol: this.symbol ?? undefined,
+        tradeId: tradeId!,
       });
       this.updatePartialCandle(timestampMs, price, amount);
       if (this.trades.length > MAX_STORED_TRADES) {
@@ -278,8 +292,50 @@ export class BinancePublicMarketDataStream {
     if (event.e === 'depthUpdate') {
       const bids = parseLevels(event.b);
       const asks = parseLevels(event.a);
-      if (!bids || !asks || bids[0].price >= asks[0].price) return;
-      this.latestOrderBook = { timestampMs: eventTimeMs, bids, asks };
+      const sequenceId = finiteNumber(event.u);
+      if (!bids || !asks || bids[0].price >= asks[0].price ||
+          (sequenceId !== null && !Number.isSafeInteger(sequenceId)) ||
+          (sequenceId !== null && this.lastOrderBookSequenceId !== null &&
+            sequenceId < this.lastOrderBookSequenceId)) return;
+      const candidate = {
+        timestampMs: eventTimeMs,
+        venue: 'binance',
+        symbol: this.symbol ?? '',
+        ...(sequenceId === null ? {} : { sequenceId }),
+        bids,
+        asks,
+      };
+      if (this.latestOrderBook) {
+        const duplicate = deduplicateOrderBookSnapshots([
+          {
+          timestampMs: this.latestOrderBook.timestampMs,
+          venue: this.latestOrderBook.venue ?? 'binance',
+          symbol: this.latestOrderBook.symbol ?? this.symbol ?? '',
+          ...(this.latestOrderBook.sequenceId === undefined
+            ? {}
+            : { sequenceId: this.latestOrderBook.sequenceId }),
+          bids: this.latestOrderBook.bids,
+          asks: this.latestOrderBook.asks,
+          },
+          candidate,
+        ]);
+        if (duplicate.duplicateCount > 0) {
+          if (duplicate.conflictingIdentity) {
+            this.latestOrderBook = null;
+            console.error('[PublicMarketDataStream] Conflicting order-book levels share a Binance snapshot identity.');
+          } else {
+            this.latestOrderBook = {
+              ...this.latestOrderBook,
+              duplicateSnapshotCount: (this.latestOrderBook.duplicateSnapshotCount ?? 0) + 1,
+            };
+          }
+          return;
+        }
+      }
+      this.latestOrderBook = {
+        ...candidate,
+      };
+      if (sequenceId !== null) this.lastOrderBookSequenceId = sequenceId;
       return;
     }
 

@@ -40,6 +40,7 @@ assert.equal(data.impliedVolatilityPct, 46.67);
 assert.equal(data.skewPct, 10);
 assert.equal(data.qualityPct, 100);
 assert.ok(data.timestampMs !== null && data.timestampMs <= Date.now());
+assert.ok(data.retrievedAtMs !== null && data.retrievedAtMs >= nowMs);
 assert.ok(data.ageMs !== null && data.ageMs <= 1_000);
 
 const freshFeed: MarketFeedQuality = {
@@ -80,6 +81,33 @@ const council = evaluateEightMemberCouncil({
 });
 assert.equal(council.members[4].vote, 'SHORT');
 assert.match(council.members[4].rationaleFa, /Deribit public options API/);
+
+resetDeribitOptionsDataCacheForTests();
+const duplicateContracts = await fetchDeribitOptionsData({
+  nowMs,
+  fetcher: async () => Response.json({
+    jsonrpc: '2.0',
+    result: [...summaries, ...summaries],
+  }),
+});
+assert.equal(duplicateContracts.status, 'LIVE');
+assert.equal(duplicateContracts.contractsCount, 24);
+assert.equal(duplicateContracts.putCallRatio, data.putCallRatio);
+assert.equal(duplicateContracts.impliedVolatilityPct, data.impliedVolatilityPct);
+const duplicateContractsCouncil = evaluateEightMemberCouncil({
+  optionsData: duplicateContracts,
+  analysis: {
+    price: 100_000,
+    scoreLong: 0,
+    scoreShort: 0,
+    candles: [],
+    dataQualityReport,
+  },
+  nowMs: Date.now(),
+});
+assert.equal(duplicateContractsCouncil.members[4].vote, council.members[4].vote,
+  'member 5 vote and contract evidence count must not change when Deribit repeats option rows');
+assert.equal(duplicateContractsCouncil.members[4].dataQualityPct, council.members[4].dataQualityPct);
 
 const lowQualityCouncil = evaluateEightMemberCouncil({
   optionsData: { ...data, qualityPct: 79 },

@@ -138,6 +138,10 @@ export interface DataQualityReport {
 }
 
 export interface RealOrderBookImbalance {
+  venue?: string;
+  symbol?: string;
+  sequenceId?: number;
+  duplicateSnapshotCount?: number;
   obi: number | null; // Real depth imbalance (bids - asks)/(bids + asks) from orderbook levels
   bidDepthUsd: number;
   askDepthUsd: number;
@@ -182,6 +186,8 @@ export interface OrderFlowFeatures {
   cumulativeDelta?: number | null; // Cumulative signed delta over the supplied recent-trade window
   deltaVelocity?: number | null; // Delta velocity (volume/sec) (Item 11)
   isRealTradeFlow?: boolean; // True if from live trade feed, false if unavailable (Item 11)
+  uniqueTradeCount?: number;
+  duplicateTradeCount?: number;
   status?: FeedStatus; // LIVE / UNAVAILABLE (Item 11)
   timestampUtc?: number;
   ageMs?: number;

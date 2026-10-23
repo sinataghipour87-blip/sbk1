@@ -15,6 +15,7 @@ const forbiddenStrings = [
   'nobitex',
 ];
 const publicMarketFeedPath = path.join('src', 'services', 'publicMarketDataFallback.ts');
+const sourceRegistryPath = path.join('src', 'services', 'councilSourceRegistry.ts');
 const approvedPublicMarketEndpoints = [
   'fapi.binance.com',
   'api.binance.com',
@@ -42,11 +43,16 @@ files.push(path.join(repositoryRoot, 'server.ts'));
 
 const findings: string[] = [];
 let publicMarketFeedContents: string | null = null;
+let sourceRegistryContents: string | null = null;
 for (const file of files) {
   const relativePath = path.relative(repositoryRoot, file);
   const contents = readFileSync(file, 'utf8');
   if (relativePath === publicMarketFeedPath) {
     publicMarketFeedContents = contents;
+    continue;
+  }
+  if (relativePath === sourceRegistryPath) {
+    sourceRegistryContents = contents;
     continue;
   }
   const lines = contents.split(/\r?\n/);
@@ -69,6 +75,12 @@ assert.doesNotMatch(
   publicMarketFeedContents,
   /(?:createOrder|cancelOrder|placeOrder|private\/|trade\/order)/i,
   'Direct exchange adapters must remain public-market-data-only.',
+);
+assert.ok(sourceRegistryContents, 'The council source inventory must remain present.');
+assert.doesNotMatch(
+  sourceRegistryContents,
+  /(?:fetch\s*\(|new\s+WebSocket|createOrder|cancelOrder|placeOrder)/i,
+  'The source registry must remain descriptive metadata, not an exchange connector.',
 );
 
 if (findings.length > 0) {

@@ -1,4 +1,5 @@
 import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { AnalysisResult } from '../types/trading';
 import type { MultiBrainConsensusReport } from './multiBrainEnsemble';
@@ -8,6 +9,7 @@ import {
   evaluateEightMemberCouncil,
   type CouncilMacroContext,
   type CouncilMemberVote,
+  type CouncilMemberEvidenceCacheEntry,
   type CouncilModuleEvidence,
   type CouncilOptionsData,
   type CouncilWhaleFlowData,
@@ -17,6 +19,11 @@ import type { OpenSourceAdvisoryReport } from './openSourceAdvisoryService';
 import type { PublicMarketFallbackData } from './publicMarketDataFallback';
 import type { SbPentagonOutput } from './sbFiveModelsEngine';
 import type { SignalToExecutionResult } from './signalToExecution';
+import {
+  deduplicateCandles,
+  deduplicateNews,
+  deduplicateOnChainTransfers,
+} from './councilEvidenceDeduplication';
 export interface CouncilMemberRepositoryEntry {
   snapshotId: string;
   evaluatedAtMs: number;
@@ -27,6 +34,8 @@ export interface CouncilMemberRepositoryEntry {
   vote: CouncilMemberVote['vote'];
   rationaleFa: string;
   qualityChecks: CouncilMemberVote['qualityChecks'];
+  evidenceFingerprint?: string;
+  voteResult?: CouncilMemberVote;
 }
 
 interface RuntimeInput {
@@ -57,6 +66,69 @@ const COUNCIL_RETENTION_MS = 5 * 60 * 60_000;
 const COUNCIL_RETENTION_SWEEP_INTERVAL_MS = 60_000;
 const councilRetentionTimers = new Map<string, NodeJS.Timeout>();
 const councilRetentionLocks = new Map<string, Promise<void>>();
+const TRANSIENT_EVIDENCE_KEYS = new Set([
+  'ageMs',
+  'detailsFa',
+  'duplicateCount',
+  'candleDuplicateCount',
+  'oneMinuteCandleDuplicateCount',
+  'duplicateTradeCount',
+  'duplicateSnapshotCount',
+  'duplicateCandleCount',
+  'error',
+  'latencyMs',
+  'retrievedAtMs',
+  'summaryFa',
+  'sourceAgeMs',
+]);
+
+function stableEvidence(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableEvidence);
+  if (!isObject(value)) return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .filter((key) => !TRANSIENT_EVIDENCE_KEYS.has(key))
+      .sort()
+      .map((key) => [key, stableEvidence(value[key])]),
+  );
+}
+
+function evidenceFingerprint(value: Record<string, unknown>): string {
+  return createHash('sha256').update(JSON.stringify(stableEvidence(value))).digest('hex');
+}
+
+async function readPreviousMemberEvidence(
+  repositoryDir: string,
+  memberId: number,
+): Promise<CouncilMemberEvidenceCacheEntry | null> {
+  const filePath = path.join(repositoryDir, `member-${String(memberId).padStart(2, '0')}.jsonl`);
+  let content: string;
+  try {
+    content = await readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const latestLine = content.split('\n').filter((line) => line.length > 0).at(-1);
+  if (!latestLine) return null;
+  let latest: unknown;
+  try {
+    latest = JSON.parse(latestLine);
+  } catch (error) {
+    throw new Error(`Could not read the latest council member ${memberId} record.`, { cause: error });
+  }
+  if (
+    !isObject(latest) ||
+    typeof latest.evidenceFingerprint !== 'string' ||
+    !isFiniteNumber(latest.evaluatedAtMs) ||
+    !isCouncilMemberVote(latest.voteResult)
+  ) return null;
+  return {
+    evidenceFingerprint: latest.evidenceFingerprint,
+    evaluatedAtMs: latest.evaluatedAtMs,
+    voteResult: latest.voteResult,
+  };
+}
 
 function timestampForCouncilRecord(record: unknown): number | null {
   if (!isObject(record)) return null;
@@ -160,6 +232,20 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isCouncilMemberVote(value: unknown): value is CouncilMemberVote {
+  if (!isObject(value)) return false;
+  return Number.isInteger(value.id) &&
+    typeof value.nameFa === 'string' &&
+    typeof value.nameEn === 'string' &&
+    typeof value.questionFa === 'string' &&
+    Array.isArray(value.inputIds) &&
+    Array.isArray(value.moduleIds) &&
+    ['LONG', 'SHORT', 'NEUTRAL', 'ABSTAIN'].includes(String(value.vote)) &&
+    typeof value.rationaleFa === 'string' &&
+    Array.isArray(value.qualityChecks) &&
+    Array.isArray(value.supportingEvidence);
 }
 
 function brainEvidenceAvailability(
@@ -367,19 +453,44 @@ function sourceDataForMember(
     value: unknown;
     error?: string;
     isPartial?: boolean;
-  }) => ({
-    status: feed.status,
-    sourceTimestampMs: feed.sourceTimestampMs,
-    isPartial: feed.isPartial === true,
-    observationCount: Array.isArray(feed.value)
-      ? feed.value.length
+  }) => {
+    const uniqueCount = (items: readonly unknown[], identity: (item: unknown, index: number) => string) =>
+      new Set(items.map(identity)).size;
+    const observationCount = Array.isArray(feed.value)
+      ? uniqueCount(feed.value, (item, index) =>
+        isObject(item) && isFiniteNumber(item.timestampMs)
+          ? `timestamp:${item.timestampMs}`
+          : `unidentified:${index}`,
+      )
       : isObject(feed.value) && Array.isArray(feed.value.trades)
-        ? feed.value.trades.length
+        ? uniqueCount(feed.value.trades, (item, index) => {
+          if (!isObject(item)) return `unidentified:${index}`;
+          const eventId = item.tradeId ?? item.exchangeEventId;
+          if (
+            typeof item.venue !== 'string' ||
+            typeof item.symbol !== 'string' ||
+            (typeof eventId !== 'string' && typeof eventId !== 'number')
+          ) return `unidentified:${index}`;
+          return `${item.venue.trim().toLowerCase()}:${item.symbol.trim().toLowerCase()}:${String(eventId).trim().toLowerCase()}`;
+        })
         : feed.value === null
           ? 0
-          : 1,
-    error: feed.error,
-  });
+          : 1;
+    return {
+      status: feed.status,
+      sourceTimestampMs: feed.sourceTimestampMs,
+      isPartial: feed.isPartial === true,
+      observationCount,
+      duplicateCount: isObject(feed.value)
+        ? isFiniteNumber(feed.value.duplicateCount)
+          ? feed.value.duplicateCount
+          : isFiniteNumber(feed.value.duplicateSnapshotCount)
+            ? feed.value.duplicateSnapshotCount
+            : 0
+        : 0,
+      error: feed.error,
+    };
+  };
   const fallback = publicMarketFallback
     ? {
       provider: publicMarketFallback.provider,
@@ -399,10 +510,16 @@ function sourceDataForMember(
     }
     : null;
   switch (memberId) {
-    case 1:
+    case 1: {
+      const technicalCandles = deduplicateCandles(analysis.candles);
+      const oneMinuteCandles = deduplicateCandles(analysis.htfCandles?.['1m'] ?? []);
       return {
-        candles: analysis.candles.slice(-30),
-        oneMinuteCandles: analysis.htfCandles?.['1m']?.slice(-30) ?? [],
+        candles: technicalCandles.values,
+        candleDuplicateCount: technicalCandles.duplicateCount,
+        candleIdentityConflict: technicalCandles.conflictingIdentity,
+        oneMinuteCandles: oneMinuteCandles.values,
+        oneMinuteCandleDuplicateCount: oneMinuteCandles.duplicateCount,
+        oneMinuteCandleIdentityConflict: oneMinuteCandles.conflictingIdentity,
         scoreLong: analysis.scoreLong,
         scoreShort: analysis.scoreShort,
         indicators: {
@@ -431,6 +548,7 @@ function sourceDataForMember(
           fourHourCandles: fallbackFeedSummary(publicMarketFallback!.higherTimeframeCandles['4h']),
         },
       };
+    }
     case 2:
       return {
         orderFlow: analysis.orderFlowFeatures,
@@ -475,15 +593,28 @@ function sourceDataForMember(
         optionsData: optionsData ?? null,
         sourceStatus: optionsData?.status ?? 'UNAVAILABLE: no verified options feed is configured',
       };
-    case 6:
+    case 6: {
+      const onchainEvidence = whaleFlowData?.largeTransfers
+        ? deduplicateOnChainTransfers(whaleFlowData.largeTransfers)
+        : null;
       return {
         whaleFlowStatus: macro.whaleFlowStatus,
         whaleSentiment: macro.whaleSentiment,
         whaleNetflowBtc: macro.whaleNetflowBtc,
         provenance: 'macroContext',
         bitcoinActiveAddresses: freeMacroData?.bitcoinActiveAddresses ?? null,
-        publicOnChainData: whaleFlowData ?? null,
+        publicOnChainData: whaleFlowData
+          ? {
+            ...whaleFlowData,
+            ...(onchainEvidence ? {
+              largeTransfers: onchainEvidence.values,
+              duplicateCount: onchainEvidence.duplicateCount,
+              identityConflict: onchainEvidence.conflictingIdentity,
+            } : {}),
+          }
+          : null,
       };
+    }
     case 7:
       return {
         overallDataStatus: macro.overallDataStatus,
@@ -494,13 +625,16 @@ function sourceDataForMember(
         lastUpdatedTime: macro.lastUpdatedTime,
         directSources: freeMacroData ?? null,
       };
-    case 8:
+    case 8: {
+      const newsEvidence = deduplicateNews(macro.recentHeadlines ?? []);
       return {
-        recentHeadlines: macro.recentHeadlines,
+        recentHeadlines: newsEvidence.values,
+        duplicateCount: newsEvidence.duplicateCount,
         newsSentimentStatus: macro.newsSentimentStatus,
         newsSentimentScore: macro.newsSentimentScore,
         newsHeadlinesStatus: macro.newsHeadlinesStatus,
       };
+    }
     default:
       throw new Error(`Unknown eight-member council member id: ${memberId}`);
   }
@@ -852,6 +986,9 @@ async function persistMemberRecords(
   await mkdir(repositoryDir, { recursive: true });
   await pruneExpiredCouncilRecords(repositoryDir);
   for (const entry of entries) {
+    if (entry.qualityChecks.some(({ labelFa, passed }) =>
+      labelFa === 'فیلتر داده تکراری' && passed
+    )) continue;
     const memberFile = path.join(repositoryDir, `member-${String(entry.memberId).padStart(2, '0')}.jsonl`);
     await appendFile(memberFile, `${JSON.stringify(entry)}\n`, { encoding: 'utf8', mode: 0o600 });
   }
@@ -919,12 +1056,43 @@ export async function runEightMemberCouncilRuntime(
   }
 
   const macroContext = makeMacroContext(input.macroContext, input.analysis.openSourceAdvisories);
+  const repositoryDir = input.repositoryDir ??
+    process.env.SBK1_COUNCIL_REPOSITORY_DIR ??
+    path.resolve(process.cwd(), 'data', 'council-members');
+  const memberSourceData = new Map(EIGHT_MEMBER_COUNCIL.map((member) => [
+    member.id,
+    sourceDataForMember(
+      member.id,
+      input.analysis,
+      macroContext,
+      input.freeMacroData,
+      input.optionsData,
+      input.whaleFlowData,
+      input.publicMarketFallback,
+    ),
+  ]));
+  const evidenceFingerprints = Object.fromEntries(
+    [...memberSourceData].map(([memberId, sourceData]) => [
+      memberId,
+      evidenceFingerprint(sourceData),
+    ]),
+  );
+  const previousEntries = await Promise.all(EIGHT_MEMBER_COUNCIL.map(async (member) => [
+    member.id,
+    await readPreviousMemberEvidence(repositoryDir, member.id),
+  ] as const));
+  const previousMemberEvidence: Record<number, CouncilMemberEvidenceCacheEntry> =
+    Object.fromEntries(previousEntries.flatMap(([memberId, entry]) =>
+      entry ? [[memberId, entry]] : []
+    ));
   const baseReport = input.councilReport ?? evaluateEightMemberCouncil({
     analysis: input.analysis,
     macroContext,
     directMacroData: input.freeMacroData,
     optionsData: input.optionsData,
     whaleFlowData: input.whaleFlowData,
+    evidenceFingerprints,
+    previousMemberEvidence,
     nowMs,
   });
   const report: EightMemberCouncilReport = {
@@ -946,15 +1114,7 @@ export async function runEightMemberCouncilRuntime(
     memberId: member.id,
     memberName: member.nameFa,
     sourceData: {
-      ...sourceDataForMember(
-        member.id,
-        input.analysis,
-        macroContext,
-        input.freeMacroData,
-        input.optionsData,
-        input.whaleFlowData,
-        input.publicMarketFallback,
-      ),
+      ...memberSourceData.get(member.id)!,
       peerCouncilSummary: report.members.map((peer) => ({
         memberId: peer.id,
         memberName: peer.nameFa,
@@ -965,14 +1125,13 @@ export async function runEightMemberCouncilRuntime(
         dataQualityPct: peer.dataQualityPct,
       })),
     },
+    evidenceFingerprint: evidenceFingerprints[member.id],
+    voteResult: member,
     moduleOutputs: member.supportingEvidence,
     vote: member.vote,
     rationaleFa: member.rationaleFa,
     qualityChecks: member.qualityChecks,
   }));
-  const repositoryDir = input.repositoryDir ??
-    process.env.SBK1_COUNCIL_REPOSITORY_DIR ??
-    path.resolve(process.cwd(), 'data', 'council-members');
   const coordinatorOutput = input.sbReport?.models.find(({ id }) => id === 'SB5') ?? null;
   await persistMemberRecords(entries, report, snapshotId, coordinatorOutput, repositoryDir);
   const operationalRepositoryDir = process.env.SBK1_COUNCIL_REPOSITORY_DIR ??

@@ -16,9 +16,21 @@ import {
 import type { SbPentagonOutput } from '../src/services/sbFiveModelsEngine';
 import type { SignalToExecutionResult } from '../src/services/signalToExecution';
 import type { FreeMacroDataResult, DirectMetricResult } from '../src/services/freeMacroData';
+import type { PublicMarketFallbackData } from '../src/services/publicMarketDataFallback';
+import type { FreqtradeMarketTrade } from '../src/services/freqtradeMarketDataBridge';
 
 const nowMs = Date.now();
 const sourceTimestampMs = nowMs - 1_000;
+
+async function readLatestJsonLine<T>(filePath: string): Promise<T> {
+  const content = await readFile(filePath, 'utf8');
+  const line = content.split('\n').filter(Boolean).at(-1);
+  assert.ok(line, `expected JSONL record in ${filePath}`);
+  const value: unknown = JSON.parse(line);
+  assert.equal(typeof value, 'object');
+  assert.ok(value !== null && !Array.isArray(value));
+  return value as T;
+}
 
 function feed(feedName: string): MarketFeedQuality {
   return {
@@ -324,6 +336,7 @@ const freeMacroData: FreeMacroDataResult = {
 };
 
 const repositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-council-runtime-'));
+const memberTwoRepositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-council-member-02-'));
 try {
   const report = await runEightMemberCouncilRuntime({
     analysis,
@@ -359,6 +372,220 @@ try {
   assert.deepEqual(
     technicalMember.sourceData.peerCouncilSummary.map((peer: { memberId: number }) => peer.memberId),
     EIGHT_MEMBER_COUNCIL.map(({ id }) => id),
+  );
+  assert.match(technicalMember.evidenceFingerprint, /^[a-f0-9]{64}$/);
+
+  const memberTwoTrade: FreqtradeMarketTrade = {
+    timestampMs: sourceTimestampMs,
+    side: 'buy',
+    price: 100,
+    amount: 1,
+    venue: 'binance',
+    symbol: 'BTCUSDT',
+    tradeId: 9001,
+  };
+  const marketFallbackWithTrades = (trades: FreqtradeMarketTrade[]): PublicMarketFallbackData => {
+    const unavailable = <T,>() => ({
+      status: 'UNAVAILABLE' as const,
+      sourceTimestampMs: null,
+      value: null as T | null,
+      error: 'Not used in this member-2 fixture.',
+    });
+    return {
+      provider: 'Binance public REST API',
+      venue: 'binance',
+      market: 'futures',
+      pair: 'BTC/USDT:USDT',
+      timeframe: '1m',
+      retrievedAtMs: nowMs,
+      exchangeQuotes: unavailable(),
+      exchangeQuoteSources: [],
+      candles: unavailable(),
+      fastCandles: unavailable(),
+      higherTimeframeCandles: {
+        '1h': unavailable(),
+        '4h': unavailable(),
+      },
+      orderBook: unavailable(),
+      tradeFlow: {
+        status: 'LIVE',
+        sourceTimestampMs,
+        value: { retrievedAtMs: nowMs, trades },
+      },
+      fundingRate: unavailable(),
+      openInterest: unavailable(),
+      liveOpenInterest: unavailable(),
+    };
+  };
+  const memberTwoBaseReport = await runEightMemberCouncilRuntime({
+    analysis,
+    multiBrainReport,
+    sbReport,
+    pillars,
+    macroContext,
+    freeMacroData,
+    publicMarketFallback: marketFallbackWithTrades([memberTwoTrade]),
+    repositoryDir: memberTwoRepositoryDir,
+    nowMs,
+  });
+  const memberTwoBaseRecord = await readLatestJsonLine<{ evidenceFingerprint: string }>(
+    path.join(memberTwoRepositoryDir, 'member-02.jsonl'),
+  );
+  const memberTwoDuplicateReport = await runEightMemberCouncilRuntime({
+    analysis,
+    multiBrainReport,
+    sbReport,
+    pillars,
+    macroContext,
+    freeMacroData,
+    publicMarketFallback: marketFallbackWithTrades([memberTwoTrade, memberTwoTrade]),
+    repositoryDir: memberTwoRepositoryDir,
+    nowMs: nowMs + 1_000,
+  });
+  assert.equal(memberTwoDuplicateReport.members[1].vote, memberTwoBaseReport.members[1].vote);
+  assert.equal(
+    (await readLatestJsonLine<{ evidenceFingerprint: string }>(
+      path.join(memberTwoRepositoryDir, 'member-02.jsonl'),
+    )).evidenceFingerprint,
+    memberTwoBaseRecord.evidenceFingerprint,
+    'member 2 fingerprint must use unique trade ids rather than repeated trade rows',
+  );
+  const memberTwoRecord = await readLatestJsonLine<{
+    sourceData: { marketFallback: { feed: { observationCount: number } } };
+  }>(path.join(memberTwoRepositoryDir, 'member-02.jsonl'));
+  assert.equal(memberTwoRecord.sourceData.marketFallback.feed.observationCount, 1);
+  const technicalRecordCount = (await readFile(path.join(repositoryDir, 'member-01.jsonl'), 'utf8'))
+    .split('\n').filter(Boolean).length;
+  const repeatedSnapshot = await runEightMemberCouncilRuntime({
+    analysis,
+    multiBrainReport,
+    sbReport,
+    pillars,
+    macroContext,
+    freeMacroData,
+    repositoryDir,
+    nowMs: nowMs + 1_000,
+  });
+  assert.equal(repeatedSnapshot.members[0].vote, report.members[0].vote);
+  assert.equal(
+    repeatedSnapshot.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'فیلتر داده تکراری')?.passed,
+    true,
+    'an identical fresh per-member evidence snapshot must reuse its previous vote without reevaluation',
+  );
+  assert.match(repeatedSnapshot.members[0].rationaleFa, /رأی قبلی بدون تحلیل مجدد استفاده شد/);
+  assert.equal(
+    (await readFile(path.join(repositoryDir, 'member-01.jsonl'), 'utf8')).split('\n').filter(Boolean).length,
+    technicalRecordCount,
+    'identical member evidence must not create duplicate member-analysis records',
+  );
+  const newsRecordCount = (await readFile(path.join(repositoryDir, 'member-08.jsonl'), 'utf8'))
+    .split('\n').filter(Boolean).length;
+  const baselineFingerprints = new Map<number, string>();
+  for (const memberId of [1, 3, 4, 7, 8]) {
+    const record = await readLatestJsonLine<{ evidenceFingerprint: string }>(
+      path.join(repositoryDir, `member-${String(memberId).padStart(2, '0')}.jsonl`),
+    );
+    baselineFingerprints.set(memberId, record.evidenceFingerprint);
+  }
+  const duplicateEvidenceSnapshot = await runEightMemberCouncilRuntime({
+    analysis: {
+      ...analysis,
+      candles: [...analysis.candles, analysis.candles.at(-1)!],
+      openSourceAdvisories: {
+        ...analysis.openSourceAdvisories!,
+        sourceHeadlines: [
+          ...analysis.openSourceAdvisories!.sourceHeadlines!,
+          {
+            ...analysis.openSourceAdvisories!.sourceHeadlines![0],
+            id: 'duplicate-syndicated-headline',
+            url: 'https://different.example.invalid/same-story',
+          },
+        ],
+      },
+    },
+    multiBrainReport,
+    sbReport,
+    pillars,
+    macroContext,
+    freeMacroData,
+    repositoryDir,
+    nowMs: nowMs + 2_000,
+  });
+  for (const memberId of [1, 8]) {
+    assert.equal(
+      duplicateEvidenceSnapshot.members[memberId - 1].qualityChecks.find(
+        ({ labelFa }) => labelFa === 'فیلتر داده تکراری',
+      )?.passed,
+      true,
+      `member ${memberId} must fingerprint the unique evidence rather than repeated input rows`,
+    );
+  }
+  for (const memberId of [1, 8]) {
+    const record = await readLatestJsonLine<{ evidenceFingerprint: string }>(
+      path.join(repositoryDir, `member-${String(memberId).padStart(2, '0')}.jsonl`),
+    );
+    assert.equal(record.evidenceFingerprint, baselineFingerprints.get(memberId));
+  }
+  assert.equal(
+    (await readFile(path.join(repositoryDir, 'member-08.jsonl'), 'utf8')).split('\n').filter(Boolean).length,
+    newsRecordCount,
+    'a syndicated copy of an existing headline must not trigger duplicate member-8 analysis or persistence',
+  );
+  const duplicateTelemetrySnapshot = await runEightMemberCouncilRuntime({
+    analysis: {
+      ...analysis,
+      realObiData: { ...analysis.realObiData, duplicateSnapshotCount: 1 },
+      dataQualityReport: {
+        ...analysis.dataQualityReport,
+        feeds: {
+          ...analysis.dataQualityReport.feeds,
+          derivatives: {
+            ...analysis.dataQualityReport.feeds.derivatives,
+            duplicateCount: 1,
+          } as MarketFeedQuality & { duplicateCount: number },
+        },
+      },
+    },
+    multiBrainReport,
+    sbReport,
+    pillars,
+    macroContext,
+    freeMacroData: {
+      ...freeMacroData,
+      sp500: {
+        ...freeMacroData.sp500,
+        duplicateCount: 1,
+      } as DirectMetricResult & { duplicateCount: number },
+    },
+    repositoryDir,
+    nowMs: nowMs + 3_000,
+  });
+  for (const memberId of [3, 4, 7]) {
+    const record = await readLatestJsonLine<{ evidenceFingerprint: string }>(
+      path.join(repositoryDir, `member-${String(memberId).padStart(2, '0')}.jsonl`),
+    );
+    assert.equal(
+      record.evidenceFingerprint,
+      baselineFingerprints.get(memberId),
+      `member ${memberId} fingerprint must ignore duplicate-count telemetry while retaining normalized evidence`,
+    );
+    assert.equal(duplicateTelemetrySnapshot.members[memberId - 1].vote, report.members[memberId - 1].vote);
+  }
+  const expiredDuplicate = await runEightMemberCouncilRuntime({
+    analysis,
+    multiBrainReport,
+    sbReport,
+    pillars,
+    macroContext,
+    freeMacroData,
+    repositoryDir,
+    nowMs: nowMs + 66_000,
+  });
+  assert.equal(expiredDuplicate.members[0].vote, 'ABSTAIN');
+  assert.equal(
+    expiredDuplicate.members[0].qualityChecks.find(({ labelFa }) => labelFa === 'فیلتر داده تکراری'),
+    undefined,
+    'an expired duplicate must be reevaluated and abstain under the existing candle freshness limit',
   );
   const technicalAdvisoryIds = [
     'openSource.candlestickPatterns',
@@ -480,19 +707,39 @@ try {
     'fresh advisory headlines without a successful matching sentiment score must not reuse a cached score',
   );
 
-  const newsMember = JSON.parse(await readFile(path.join(repositoryDir, 'member-08.jsonl'), 'utf8').then((value) => value.trim()));
+  const newsMember = await readLatestJsonLine<{
+    moduleOutputs: Array<{ moduleId: string; status: string }>;
+    sourceData: { newsSentimentScore: number; recentHeadlines: Array<{ url: string }> };
+  }>(path.join(repositoryDir, 'member-08.jsonl'));
+  assert.equal(typeof report.members[7].dataQualityPct, 'number',
+    'member 8 quality must be calculated rather than serialized as null');
+  assert.ok(report.members[7].dataQualityPct! >= 0 && report.members[7].dataQualityPct! <= 100);
   assert.equal(newsMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'openSource.newsSentiment').status, 'AVAILABLE');
   assert.equal('output' in newsMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'openSource.newsSentiment'), false);
   assert.equal(newsMember.sourceData.newsSentimentScore, 25);
   assert.equal(newsMember.sourceData.recentHeadlines[0].url, 'https://example.invalid/verified-headline');
 
-  const onchainMember = JSON.parse(await readFile(path.join(repositoryDir, 'member-06.jsonl'), 'utf8').then((value) => value.trim()));
+  const onchainMember = await readLatestJsonLine<{
+    moduleOutputs: Array<{ moduleId: string; status: string }>;
+    vote: string;
+  }>(path.join(repositoryDir, 'member-06.jsonl'));
   assert.equal(onchainMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinActiveAddresses').status, 'AVAILABLE');
   assert.equal('output' in onchainMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinActiveAddresses'), false);
   assert.equal(onchainMember.vote, 'ABSTAIN');
 
-  const macroMember = JSON.parse(await readFile(path.join(repositoryDir, 'member-07.jsonl'), 'utf8').then((value) => value.trim()));
+  const macroMember = await readLatestJsonLine<{
+    vote: string;
+    rationaleFa: string;
+    moduleOutputs: Array<{
+      moduleId: string;
+      status: string;
+      summaryFa: string;
+      sourceTimestampMs: number | null;
+    }>;
+  }>(path.join(repositoryDir, 'member-07.jsonl'));
   assert.equal(macroMember.vote, 'LONG', 'member 7 must use the fresh direct macro sources provided to the server runtime');
+  assert.equal(report.members[6].dataQualityPct, 100,
+    'member 7 quality must reflect its three available macro source groups');
   assert.match(macroMember.rationaleFa, /TradingView TVC:DXY/);
   assert.match(macroMember.rationaleFa, /CFD proxy/);
   assert.equal(macroMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'macro.broadDollarProxy').status, 'AVAILABLE');
@@ -507,11 +754,54 @@ try {
     'fresh daily macro observations remain available when their observation time differs from the candle snapshot',
   );
 
-  const councilRecord = JSON.parse(await readFile(path.join(repositoryDir, 'council-votes.jsonl'), 'utf8').then((value) => value.trim()));
+  const councilRecord = await readLatestJsonLine<{
+    coordinator: { moduleId: string; excludedFromMemberVotes: boolean };
+  }>(path.join(repositoryDir, 'council-votes.jsonl'));
   assert.equal(councilRecord.coordinator.moduleId, 'sb.SB5');
   assert.equal(councilRecord.coordinator.excludedFromMemberVotes, true);
 
   const connectedSourcesDir = path.join(repositoryDir, 'connected-sources');
+  const connectedDuplicateDir = path.join(repositoryDir, 'connected-duplicates');
+  const connectedOptionsData = {
+    status: 'LIVE' as const,
+    provider: 'Deribit public options API',
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 100,
+    contractsCount: 24,
+    impliedVolatilityPct: 50,
+    putCallRatio: 1,
+    expiryTimestampMs: nowMs + 15 * 24 * 60 * 60_000,
+    strikePrice: 100_000,
+    skewPct: 2,
+  };
+  const connectedTransfers = [{
+    transactionHash: 'test-tx',
+    blockchain: 'bitcoin',
+    blockHeight: 900_000,
+    timestampMs: nowMs - 1_000,
+    sourceProvider: 'mempool.space',
+    asset: 'BTC',
+    amount: 12,
+    estimatedUsd: null,
+    confirmationStatus: 'CONFIRMED' as const,
+    transferId: 'vout:0',
+  }];
+  const connectedWhaleFlowData = {
+    status: 'LIVE' as const,
+    provider: 'mempool.space public REST API (sampled confirmed BTC outputs)',
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 85,
+    coverageStatus: 'SAMPLED' as const,
+    largeTransfers: connectedTransfers,
+    exchangeInflowsBtc: null,
+    exchangeOutflowsBtc: null,
+    netExchangeFlowBtc: null,
+    transactionCount: 1,
+    windowStartHeight: 899_989,
+    windowEndHeight: 900_000,
+  };
   const connectedSourcesReport = await runEightMemberCouncilRuntime({
     analysis,
     multiBrainReport,
@@ -519,50 +809,51 @@ try {
     pillars,
     macroContext,
     freeMacroData,
-    optionsData: {
-      status: 'LIVE',
-      provider: 'Deribit public options API',
-      timestampMs: nowMs - 1_000,
-      ageMs: 1_000,
-      qualityPct: 100,
-      contractsCount: 24,
-      impliedVolatilityPct: 50,
-      putCallRatio: 1,
-      expiryTimestampMs: nowMs + 15 * 24 * 60 * 60_000,
-      strikePrice: 100_000,
-      skewPct: 2,
-    },
-    whaleFlowData: {
-      status: 'LIVE',
-      provider: 'mempool.space public REST API (sampled confirmed BTC outputs)',
-      timestampMs: nowMs - 1_000,
-      ageMs: 1_000,
-      qualityPct: 85,
-      coverageStatus: 'SAMPLED',
-      largeTransfers: [{
-        transactionHash: 'test-tx',
-        blockchain: 'bitcoin',
-        blockHeight: 900_000,
-        timestampMs: nowMs - 1_000,
-        sourceProvider: 'mempool.space',
-        asset: 'BTC',
-        amount: 12,
-        estimatedUsd: null,
-        confirmationStatus: 'CONFIRMED',
-        transferId: 'vout:0',
-      }],
-      exchangeInflowsBtc: null,
-      exchangeOutflowsBtc: null,
-      netExchangeFlowBtc: null,
-      transactionCount: 1,
-      windowStartHeight: 899_989,
-      windowEndHeight: 900_000,
-    },
+    optionsData: connectedOptionsData,
+    whaleFlowData: connectedWhaleFlowData,
     decisionSnapshotTimestampMs: sourceTimestampMs,
     repositoryDir: connectedSourcesDir,
     nowMs,
   });
   assert.equal(connectedSourcesReport.members.length, 8);
+  const connectedFiveBaseline = await readLatestJsonLine<{ evidenceFingerprint: string }>(
+    path.join(connectedSourcesDir, 'member-05.jsonl'),
+  );
+  const connectedSixBaseline = await readLatestJsonLine<{ evidenceFingerprint: string }>(
+    path.join(connectedSourcesDir, 'member-06.jsonl'),
+  );
+  const duplicatedConnectedReport = await runEightMemberCouncilRuntime({
+    analysis,
+    multiBrainReport,
+    sbReport,
+    pillars,
+    macroContext,
+    freeMacroData,
+    optionsData: Object.assign({}, connectedOptionsData, { duplicateCount: 1 }),
+    whaleFlowData: {
+      ...connectedWhaleFlowData,
+      largeTransfers: [...connectedTransfers, { ...connectedTransfers[0], sourceProvider: 'mirror' }],
+    },
+    decisionSnapshotTimestampMs: sourceTimestampMs,
+    repositoryDir: connectedDuplicateDir,
+    nowMs: nowMs + 1_000,
+  });
+  assert.equal(duplicatedConnectedReport.members[4].vote, connectedSourcesReport.members[4].vote);
+  assert.equal(duplicatedConnectedReport.members[5].vote, connectedSourcesReport.members[5].vote);
+  assert.equal(
+    (await readLatestJsonLine<{ evidenceFingerprint: string }>(
+      path.join(connectedDuplicateDir, 'member-05.jsonl'),
+    )).evidenceFingerprint,
+    connectedFiveBaseline.evidenceFingerprint,
+    'member 5 fingerprint must remain stable when duplicate-option telemetry is added after option normalization',
+  );
+  assert.equal(
+    (await readLatestJsonLine<{ evidenceFingerprint: string }>(
+      path.join(connectedDuplicateDir, 'member-06.jsonl'),
+    )).evidenceFingerprint,
+    connectedSixBaseline.evidenceFingerprint,
+    'member 6 fingerprint must use unique transaction outputs across providers',
+  );
   const expectedConnectedVotes = [
     'LONG',
     'LONG',
@@ -578,9 +869,11 @@ try {
     expectedConnectedVotes,
     'all eight votes must follow their specialized fixture evidence',
   );
-  const connectedVoteRecord = JSON.parse(
-    await readFile(path.join(connectedSourcesDir, 'council-votes.jsonl'), 'utf8').then((value) => value.trim()),
-  );
+  const connectedVoteRecord = await readLatestJsonLine<{
+    coordinator: { moduleId: string; excludedFromMemberVotes: boolean };
+    report: { members: Array<{ id: number; vote: string }>; quorumRequired: number };
+    snapshotId: string;
+  }>(path.join(connectedSourcesDir, 'council-votes.jsonl'));
   const connectedMemberRecords = new Map<number, {
     snapshotId: string;
     memberId: number;
@@ -590,12 +883,14 @@ try {
     moduleOutputs: Array<{ moduleId: string; status: string; sourceTimestampMs: number | null }>;
   }>();
   for (const member of connectedSourcesReport.members) {
-    const memberRecord = JSON.parse(
-      await readFile(
-        path.join(connectedSourcesDir, `member-${String(member.id).padStart(2, '0')}.jsonl`),
-        'utf8',
-      ).then((value) => value.trim()),
-    );
+    const memberRecord = await readLatestJsonLine<{
+      snapshotId: string;
+      memberId: number;
+      vote: string;
+      rationaleFa: string;
+      sourceData: Record<string, unknown>;
+      moduleOutputs: Array<{ moduleId: string; status: string; sourceTimestampMs: number | null }>;
+    }>(path.join(connectedSourcesDir, `member-${String(member.id).padStart(2, '0')}.jsonl`));
     assert.equal(memberRecord.memberId, member.id);
     assert.equal(memberRecord.snapshotId, connectedVoteRecord.snapshotId);
     assert.equal(memberRecord.vote, member.vote);
@@ -716,6 +1011,7 @@ try {
   assert.equal(noQuorumVote.report.quorumMet, false);
 } finally {
   await rm(repositoryDir, { recursive: true, force: true });
+  await rm(memberTwoRepositoryDir, { recursive: true, force: true });
 }
 
 const retentionDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-council-retention-'));

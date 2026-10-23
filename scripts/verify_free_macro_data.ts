@@ -343,7 +343,7 @@ for (const invalidResponse of invalidTradingViewResponses) {
   assert.match(tradingViewUnavailable.dxyProxy?.error ?? '', invalidResponse.error);
 }
 
-const closedSessionNowMs = Date.now() + 3 * 60_000;
+const closedSessionNowMs = Date.parse('2026-10-22T12:00:00.000Z');
 const closedSessionDxyTimestampMs =
   Math.floor((closedSessionNowMs - 3 * 24 * 60 * 60_000) / 1_000) * 1_000;
 const closedSessionDxy = await fetchFreeMacroData({

@@ -37,6 +37,7 @@ import { freqtradeBridge } from './freqtradeBridge';
 import { operationalTradeArchive, type OperationalTradeArchiveMetadata } from './operationalTradeArchive';
 import { centralTradeDatasetService } from './centralTradeDataset';
 import { fetchDirectNewsHeadlines } from './directNewsFeeds';
+import { deduplicateTrades } from './councilEvidenceDeduplication';
 import {
   openSourceAdvisoryService,
   type OpenSourceAdvisoryReport,
@@ -50,7 +51,11 @@ import { macroContextBrainService } from './macroContextBrain';
 import { sbFiveModelsEngine } from './sbFiveModelsEngine';
 import { fetchFreeMacroData } from './freeMacroData';
 import { fetchDeribitOptionsData } from './deribitOptionsData';
-import { fetchOnChainWhaleData } from './publicBitcoinWhaleData';
+import {
+  fetchOnChainWhaleData,
+  startPublicBitcoinWhaleDataPrefetch,
+  stopPublicBitcoinWhaleDataPrefetch,
+} from './publicBitcoinWhaleData';
 import { fetchPublicMarketFallback } from './publicMarketDataFallback';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -312,6 +317,10 @@ function makeSnapshotAnalysisInputs(
     : null;
   const orderBook: RealOrderBookImbalance | undefined = orderBookSnapshot
     ? {
+      venue: orderBookSnapshot.venue ?? snapshot.exchange,
+      symbol: orderBookSnapshot.symbol ?? snapshot.pair,
+      ...(orderBookSnapshot.sequenceId === undefined ? {} : { sequenceId: orderBookSnapshot.sequenceId }),
+      duplicateSnapshotCount: orderBookSnapshot.duplicateSnapshotCount ?? 0,
       obi: orderBookObi,
       bidDepthUsd: bidDepthUsd ?? 0,
       askDepthUsd: askDepthUsd ?? 0,
@@ -359,20 +368,30 @@ function makeSnapshotAnalysisInputs(
 
   const tradeFlow = snapshot.tradeFlow;
   const tradeFlowAgeMs = tradeFlow ? nowMs - tradeFlow.retrievedAtMs : Number.POSITIVE_INFINITY;
+  const deduplicatedPrimaryTrades = tradeFlow
+    ? deduplicateTrades(tradeFlow.trades.map((trade) => ({
+      ...trade,
+      venue: trade.venue ?? snapshot.exchange,
+      symbol: trade.symbol ?? snapshot.pair,
+    })))
+    : null;
   const hasFreshTradeFlow = Boolean(
     tradeFlow &&
+    deduplicatedPrimaryTrades &&
+    !deduplicatedPrimaryTrades.conflictingIdentity &&
     tradeFlowAgeMs >= 0 &&
     tradeFlowAgeMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS &&
-    tradeFlow.trades.length > 0 &&
-    tradeFlow.trades.every((trade) =>
+    deduplicatedPrimaryTrades.values.length > 0 &&
+    deduplicatedPrimaryTrades.values.every((trade) =>
       nowMs - trade.timestampMs >= 0 &&
       nowMs - trade.timestampMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS &&
       Number.isFinite(trade.price) &&
       Number.isFinite(trade.amount)
     )
   );
-  const buyTrades = hasFreshTradeFlow ? tradeFlow!.trades.filter((trade) => trade.side === 'buy') : [];
-  const sellTrades = hasFreshTradeFlow ? tradeFlow!.trades.filter((trade) => trade.side === 'sell') : [];
+  const uniqueTrades = hasFreshTradeFlow ? deduplicatedPrimaryTrades!.values : [];
+  const buyTrades = uniqueTrades.filter((trade) => trade.side === 'buy');
+  const sellTrades = uniqueTrades.filter((trade) => trade.side === 'sell');
   const takerBuyVol = buyTrades.reduce((total, trade) => total + trade.amount, 0);
   const takerSellVol = sellTrades.reduce((total, trade) => total + trade.amount, 0);
   const cvdDelta = takerBuyVol - takerSellVol;
@@ -380,7 +399,7 @@ function makeSnapshotAnalysisInputs(
     sellTrades.reduce((total, trade) => total + trade.amount * trade.price, 0);
   const totalTakerVolume = takerBuyVol + takerSellVol;
   const latestTradeTimestampMs = hasFreshTradeFlow
-    ? tradeFlow!.trades[tradeFlow!.trades.length - 1].timestampMs
+    ? uniqueTrades[uniqueTrades.length - 1].timestampMs
     : null;
   const orderFlow: OrderFlowFeatures = {
     cvdDelta: hasFreshTradeFlow ? cvdDelta : null,
@@ -393,9 +412,12 @@ function makeSnapshotAnalysisInputs(
     delta: hasFreshTradeFlow ? cvdDelta : null,
     cumulativeDelta: hasFreshTradeFlow ? cvdDelta : null,
     deltaVelocity: hasFreshTradeFlow
-      ? cvdDelta / Math.max(1, (tradeFlow!.retrievedAtMs - tradeFlow!.trades[0].timestampMs) / 1_000)
+      ? cvdDelta / Math.max(1, (tradeFlow!.retrievedAtMs - uniqueTrades[0].timestampMs) / 1_000)
       : null,
     isRealTradeFlow: hasFreshTradeFlow,
+    uniqueTradeCount: hasFreshTradeFlow ? uniqueTrades.length : 0,
+    duplicateTradeCount: (tradeFlow?.duplicateCount ?? 0) +
+      (deduplicatedPrimaryTrades?.duplicateCount ?? 0),
     status: hasFreshTradeFlow ? 'LIVE' : 'UNAVAILABLE',
     timestampUtc: latestTradeTimestampMs ?? snapshot.generatedAtMs,
     ageMs: latestTradeTimestampMs === null ? Number.POSITIVE_INFINITY : nowMs - latestTradeTimestampMs,
@@ -724,8 +746,18 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
     candlesFallback &&
     fallback.candles.value!.length >= 30;
 
+  const fallbackTradeDeduplication = fallback.tradeFlow.value
+    ? deduplicateTrades(fallback.tradeFlow.value.trades.map((trade) => ({
+      ...trade,
+      venue: trade.venue ?? fallback.venue,
+      symbol: trade.symbol ?? fallback.pair,
+    })))
+    : null;
   const tradeFallback = fallback.tradeFlow.status === 'LIVE' &&
     fallback.tradeFlow.value !== null &&
+    fallbackTradeDeduplication !== null &&
+    !fallbackTradeDeduplication.conflictingIdentity &&
+    fallbackTradeDeduplication.values.length > 0 &&
     fallback.tradeFlow.sourceTimestampMs !== null;
   const primaryTrades = analysis.orderFlowFeatures;
   const primaryTradesUsable = isPrimaryFeedFresh(existingFeeds?.orderFlow, FREQTRADE_TRADE_FLOW_MAX_AGE_MS) &&
@@ -833,7 +865,12 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
   });
 
   const fallbackCandles = useFallbackCandles ? fallback.candles.value! : null;
-  const fallbackTrades = useFallbackTrades ? fallback.tradeFlow.value! : null;
+  const fallbackTrades = useFallbackTrades
+    ? {
+      ...fallback.tradeFlow.value!,
+      trades: fallbackTradeDeduplication!.values,
+    }
+    : null;
   const fallbackBook = useFallbackBook ? fallback.orderBook.value! : null;
   const fallbackFunding = useFallbackDerivatives ? fallback.fundingRate.value! : null;
   const fallbackOi = useFallbackDerivatives ? fallback.liveOpenInterest.value! : null;
@@ -850,7 +887,7 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
       `${fallback.provider} recent aggregate trades`,
       fallback.tradeFlow.sourceTimestampMs!,
       FREQTRADE_TRADE_FLOW_MAX_AGE_MS,
-      `${fallbackTrades.trades.length} معاملهٔ اجراشدهٔ تازه برای محاسبهٔ CVD عضو ۲.`,
+      `${fallbackTrades.trades.length} معاملهٔ یکتا از ${(fallback.tradeFlow.value?.duplicateCount ?? 0) + (fallbackTradeDeduplication?.duplicateCount ?? 0)} تکراری برای محاسبهٔ CVD عضو ۲.`,
     );
   }
   if (feeds && fallbackBook) {
@@ -963,6 +1000,9 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
         cumulativeDelta: buyVolume - sellVolume,
         deltaVelocity: buyVolume - sellVolume,
         isRealTradeFlow: true,
+        uniqueTradeCount: fallbackTrades.trades.length,
+        duplicateTradeCount: (fallback.tradeFlow.value?.duplicateCount ?? 0) +
+          (fallbackTradeDeduplication?.duplicateCount ?? 0),
         status: 'LIVE',
         timestampUtc: latestTradeTimestampMs,
         ageMs: nowMs - latestTradeTimestampMs,
@@ -972,6 +1012,10 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
     } : {}),
     ...(fallbackBook && bidDepthUsd !== undefined && askDepthUsd !== undefined ? {
       realObiData: {
+        venue: fallback.venue,
+        symbol: fallback.pair,
+        ...(fallbackBook.sequenceId === undefined ? {} : { sequenceId: fallbackBook.sequenceId }),
+        duplicateSnapshotCount: fallbackBook.duplicateSnapshotCount ?? 0,
         obi: bidDepthUsd + askDepthUsd > 0
           ? (bidDepthUsd - askDepthUsd) / (bidDepthUsd + askDepthUsd)
           : null,
@@ -1316,6 +1360,7 @@ export class ServerSignalRunner {
 
   start(): void {
     if (this.timer) return;
+    startPublicBitcoinWhaleDataPrefetch();
     void this.runOnce();
     this.timer = setInterval(() => void this.runOnce(), this.pollIntervalMs);
     this.timer.unref();
@@ -1324,7 +1369,7 @@ export class ServerSignalRunner {
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    await this.inFlight;
+    await Promise.all([this.inFlight, stopPublicBitcoinWhaleDataPrefetch()]);
   }
 
   async runOnce(): Promise<void> {

@@ -1,3 +1,5 @@
+import { deduplicateNews } from './councilEvidenceDeduplication';
+
 export interface DirectNewsHeadline {
   id: string;
   headline: string;
@@ -10,6 +12,7 @@ export interface DirectNewsSourceStatus {
   publisher: string;
   endpoint: string;
   status: 'LIVE' | 'UNAVAILABLE';
+  responseTimestampMs: number | null;
   retrievedAtMs: number | null;
   latencyMs: number | null;
   ageMs: number | null;
@@ -169,6 +172,10 @@ export async function fetchDirectNewsHeadlines(
           publisher: source.publisher,
           endpoint: source.endpoint,
           status: 'LIVE',
+          responseTimestampMs: headlines.reduce(
+            (latest, headline) => Math.max(latest, Date.parse(headline.publishedAt)),
+            0,
+          ) || null,
           retrievedAtMs,
           latencyMs: Math.max(0, retrievedAtMs - startedAtMs),
           ageMs: 0,
@@ -182,6 +189,7 @@ export async function fetchDirectNewsHeadlines(
           publisher: source.publisher,
           endpoint: source.endpoint,
           status: 'UNAVAILABLE',
+          responseTimestampMs: null,
           retrievedAtMs: null,
           latencyMs: Math.max(0, Date.now() - startedAtMs),
           ageMs: null,
@@ -196,7 +204,7 @@ export async function fetchDirectNewsHeadlines(
   }));
 
   const headlines = results.flatMap((result) => result.headlines);
-  const uniqueHeadlines = [...new Map(headlines.map((headline) => [headline.url, headline])).values()]
+  const uniqueHeadlines = deduplicateNews(headlines).values
     .sort((left, right) => Date.parse(right.publishedAt) - Date.parse(left.publishedAt))
     .slice(0, MAX_RETURNED_HEADLINES);
   const retrievedAtMs = uniqueHeadlines.length > 0

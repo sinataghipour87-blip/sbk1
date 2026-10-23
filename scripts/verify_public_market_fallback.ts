@@ -53,14 +53,17 @@ const payloads = new Map<string, unknown>([
     time: nowMs - 500,
   }],
   ['/fapi/v1/depth', {
+    lastUpdateId: 77,
     bids: [['100', '5'], ['99', '3']],
     asks: [['101', '2'], ['102', '2']],
   }],
   ['/fapi/v1/aggTrades', [
-    { T: nowMs - 1_500, p: '100', q: '2', m: false },
-    { T: nowMs - 1_000, p: '101', q: '1', m: true },
+    { a: 1, T: nowMs - 1_500, p: '100', q: '2', m: false },
+    { a: 1, T: nowMs - 1_500, p: '100', q: '2', m: false },
+    { a: 2, T: nowMs - 1_000, p: '101', q: '1', m: true },
   ]],
   ['/fapi/v1/premiumIndex', {
+    symbol: 'BTCUSDT',
     lastFundingRate: '-0.0002',
     time: nowMs - 500,
   }],
@@ -122,10 +125,25 @@ assert.ok(candleRequestLimits.includes(500), 'historical candles are capped at 5
 assert.ok(candleRequestLimits.every((limit) => limit <= 500));
 assert.equal(fallback.tradeFlow.status, 'LIVE');
 assert.equal(aggTradeRequestCount, 2, '429 responses must receive one bounded retry');
+assert.match(fallback.tradeFlow.endpoint ?? '', /fapi\.binance\.com\/fapi\/v1\/aggTrades/);
+assert.equal(fallback.tradeFlow.receivedAtMs, nowMs);
+assert.equal(fallback.tradeFlow.value?.trades[0].side, 'buy');
+assert.equal(fallback.tradeFlow.value?.trades[1].side, 'sell');
+assert.equal(fallback.tradeFlow.value?.trades.length, 2,
+  'aggregate trades with the same Binance event id must contribute only once');
+assert.equal(fallback.tradeFlow.value?.duplicateCount, 1);
+assert.equal(fallback.tradeFlow.value?.trades[0].tradeId, 1);
 assert.equal(fallback.orderBook.status, 'LIVE');
+assert.match(fallback.orderBook.endpoint ?? '', /fapi\.binance\.com\/fapi\/v1\/depth/);
+assert.equal(fallback.orderBook.receivedAtMs, nowMs);
+assert.deepEqual(fallback.orderBook.value?.bids[0], { price: 100, amount: 5 });
+assert.equal(fallback.orderBook.value?.sequenceId, 77);
 assert.equal(fallback.fundingRate.status, 'LIVE');
+assert.match(fallback.fundingRate.endpoint ?? '', /fapi\.binance\.com\/fapi\/v1\/premiumIndex/);
 assert.equal(fallback.openInterest.status, 'LIVE');
+assert.match(fallback.openInterest.endpoint ?? '', /fapi\.binance\.com\/futures\/data\/openInterestHist/);
 assert.equal(fallback.liveOpenInterest.status, 'LIVE');
+assert.match(fallback.liveOpenInterest.endpoint ?? '', /fapi\.binance\.com\/fapi\/v1\/openInterest/);
 assert.equal(fallback.liveOpenInterest.value?.amount, 10_025);
 assert.equal(fallback.exchangeQuotes.status, 'LIVE');
 assert.deepEqual(
@@ -135,6 +153,20 @@ assert.deepEqual(
 assert.ok(fallback.exchangeQuotes.value?.every(({ sourceTimestampMs }) =>
   nowMs - sourceTimestampMs <= 5_000
 ));
+assert.ok(fallback.exchangeQuotes.value?.every((quote) =>
+  quote.market === 'futures' &&
+  quote.baseAsset === 'BTC' &&
+  quote.quoteAsset === 'USDT' &&
+  quote.priceUnit === 'USDT per BTC' &&
+  quote.price > 0 &&
+  quote.retrievedAtMs <= nowMs &&
+  quote.endpoint.startsWith('https://') &&
+  quote.symbol.length > 0
+));
+assert.deepEqual(
+  fallback.exchangeQuoteSources.map(({ exchange, status }) => [exchange, status]),
+  [['binance', 'LIVE'], ['bybit', 'LIVE'], ['okx', 'LIVE']],
+);
 const fiveMinuteCloseMs = Math.floor(nowMs / (5 * 60_000)) * 5 * 60_000;
 const fiveMinuteRows = Array.from({ length: 40 }, (_, index) => {
   const openTimestamp = fiveMinuteCloseMs - (40 - index) * 5 * 60_000;
@@ -228,7 +260,12 @@ const excessiveClockSkewQuotes = await fetchPublicMarketFallback({
   fetcher: excessiveClockSkewFetcher,
   timeoutMs: 100,
 });
-assert.equal(excessiveClockSkewQuotes.exchangeQuotes.status, 'UNAVAILABLE');
+assert.equal(excessiveClockSkewQuotes.exchangeQuotes.status, 'LIVE');
+assert.equal(excessiveClockSkewQuotes.exchangeQuotes.value?.length, 2);
+assert.equal(
+  excessiveClockSkewQuotes.exchangeQuoteSources.find(({ exchange }) => exchange === 'binance')?.status,
+  'UNAVAILABLE',
+);
 const staleClockSkewFetcher: typeof fetch = async (input, init) => {
   const url = new URL(String(input));
   if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
@@ -248,7 +285,55 @@ const staleClockSkewQuotes = await fetchPublicMarketFallback({
   fetcher: staleClockSkewFetcher,
   timeoutMs: 100,
 });
-assert.equal(staleClockSkewQuotes.exchangeQuotes.status, 'UNAVAILABLE');
+assert.equal(staleClockSkewQuotes.exchangeQuotes.status, 'LIVE');
+assert.equal(staleClockSkewQuotes.exchangeQuotes.value?.length, 2);
+assert.equal(
+  staleClockSkewQuotes.exchangeQuoteSources.find(({ exchange }) => exchange === 'binance')?.status,
+  'UNAVAILABLE',
+);
+const missingTimestampQuotes = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/ticker/price') {
+      return Response.json({ symbol: 'BTCUSDT', price: '101' });
+    }
+    return fixtureFetcher(input, init);
+  },
+  timeoutMs: 100,
+});
+assert.equal(missingTimestampQuotes.exchangeQuotes.status, 'LIVE');
+assert.equal(
+  missingTimestampQuotes.exchangeQuoteSources.find(({ exchange }) => exchange === 'binance')?.status,
+  'UNAVAILABLE',
+);
+assert.match(
+  missingTimestampQuotes.exchangeQuoteSources.find(({ exchange }) => exchange === 'binance')?.error ?? '',
+  /timestamp is invalid/,
+);
+
+const oneExchangeUnavailable = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'api.bybit.com') return new Response('unavailable', { status: 503 });
+    return fixtureFetcher(input, init);
+  },
+  timeoutMs: 100,
+});
+assert.equal(oneExchangeUnavailable.exchangeQuotes.status, 'LIVE');
+assert.equal(oneExchangeUnavailable.exchangeQuotes.value?.length, 2);
+assert.equal(oneExchangeUnavailable.exchangeQuotes.isPartial, true);
+assert.equal(
+  oneExchangeUnavailable.exchangeQuoteSources.find(({ exchange }) => exchange === 'bybit')?.status,
+  'UNAVAILABLE',
+);
 
 let binanceTickerRequests = 0;
 const websocketReferenceQuotes = await fetchPublicMarketFallback({

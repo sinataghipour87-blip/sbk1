@@ -1,3 +1,5 @@
+import { deduplicateTrades } from './councilEvidenceDeduplication';
+
 export const FREQTRADE_MARKET_SNAPSHOT_VERSION = 'sbk1.freqtrade.market-snapshot.v5';
 export const FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS = 15_000;
 export const FREQTRADE_TICKER_MAX_AGE_MS = 5_000;
@@ -31,6 +33,10 @@ export interface FreqtradeMarketFundingRate {
 
 export interface FreqtradeMarketOrderBook {
   timestampMs: number;
+  venue?: string;
+  symbol?: string;
+  sequenceId?: number;
+  duplicateSnapshotCount?: number;
   bids: Array<{ price: number; amount: number }>;
   asks: Array<{ price: number; amount: number }>;
 }
@@ -40,10 +46,15 @@ export interface FreqtradeMarketTrade {
   side: 'buy' | 'sell';
   price: number;
   amount: number;
+  venue?: string;
+  symbol?: string;
+  tradeId?: string | number;
+  exchangeEventId?: string | number;
 }
 
 export interface FreqtradeMarketTradeFlow {
   retrievedAtMs: number;
+  duplicateCount?: number;
   trades: FreqtradeMarketTrade[];
 }
 
@@ -159,6 +170,9 @@ function validateTradeFlowShape(value: unknown, generatedAtMs: number, nowMs: nu
   if (value === null) return true;
   if (!isRecord(value) || !isTimestamp(value.retrievedAtMs) ||
     value.retrievedAtMs > nowMs + 1_000 || value.retrievedAtMs > generatedAtMs + 1_000 ||
+    (value.duplicateCount !== undefined &&
+      (typeof value.duplicateCount !== 'number' ||
+        !Number.isSafeInteger(value.duplicateCount) || value.duplicateCount < 0)) ||
     !Array.isArray(value.trades) || value.trades.length === 0 || value.trades.length > 200) return false;
   let previousTimestampMs = 0;
   for (const trade of value.trades) {
@@ -168,6 +182,16 @@ function validateTradeFlowShape(value: unknown, generatedAtMs: number, nowMs: nu
       trade.timestampMs < previousTimestampMs ||
       trade.timestampMs > value.retrievedAtMs + 1_000 ||
       (trade.side !== 'buy' && trade.side !== 'sell') ||
+      (trade.venue !== undefined && (typeof trade.venue !== 'string' || trade.venue.trim().length === 0)) ||
+      (trade.symbol !== undefined && (typeof trade.symbol !== 'string' || trade.symbol.trim().length === 0)) ||
+      (trade.tradeId !== undefined && !(
+        (typeof trade.tradeId === 'string' && trade.tradeId.trim().length > 0) ||
+        (typeof trade.tradeId === 'number' && Number.isSafeInteger(trade.tradeId))
+      )) ||
+      (trade.exchangeEventId !== undefined && !(
+        (typeof trade.exchangeEventId === 'string' && trade.exchangeEventId.trim().length > 0) ||
+        (typeof trade.exchangeEventId === 'number' && Number.isSafeInteger(trade.exchangeEventId))
+      )) ||
       !isPositive(trade.price) ||
       !isPositive(trade.amount)
     ) return false;
@@ -216,6 +240,12 @@ function validateOrderBookShape(value: unknown, nowMs: number): value is Freqtra
     !isRecord(value) ||
     !isTimestamp(value.timestampMs) ||
     value.timestampMs > nowMs + 1_000 ||
+    (value.venue !== undefined && typeof value.venue !== 'string') ||
+    (value.symbol !== undefined && typeof value.symbol !== 'string') ||
+    (value.sequenceId !== undefined && !Number.isSafeInteger(value.sequenceId)) ||
+    (value.duplicateSnapshotCount !== undefined &&
+      (typeof value.duplicateSnapshotCount !== 'number' ||
+        !Number.isSafeInteger(value.duplicateSnapshotCount) || value.duplicateSnapshotCount < 0)) ||
     !validateLevels(value.bids, true) ||
     !validateLevels(value.asks, false)
   ) return false;
@@ -342,6 +372,15 @@ export function validateFreqtradeMarketSnapshot(
   if (!validateOrderBookShape(orderBook, nowMs)) {
     throw new FreqtradeMarketSnapshotValidationError('Order book is invalid or stale.', 'INVALID_ORDER_BOOK');
   }
+  if (orderBook && (
+    (orderBook.venue !== undefined && orderBook.venue.toLowerCase() !== expected.exchange.toLowerCase()) ||
+    (orderBook.symbol !== undefined && orderBook.symbol.toLowerCase() !== expected.pair.toLowerCase())
+  )) {
+    throw new FreqtradeMarketSnapshotValidationError(
+      'Order book venue or symbol does not match the requested market.',
+      'INVALID_ORDER_BOOK_IDENTITY',
+    );
+  }
   if (isRecord(orderBook) && orderBook.timestampMs > value.generatedAtMs + 1_000) {
     throw new FreqtradeMarketSnapshotValidationError('Order book is future-dated.', 'INVALID_ORDER_BOOK');
   }
@@ -381,11 +420,33 @@ export function validateFreqtradeMarketSnapshot(
   if (!validateTradeFlowShape(tradeFlow, value.generatedAtMs, nowMs)) {
     throw new FreqtradeMarketSnapshotValidationError('Trade flow is invalid, empty, or stale.', 'INVALID_TRADE_FLOW');
   }
+  if (tradeFlow && tradeFlow.trades.some((trade) =>
+    (trade.venue !== undefined && trade.venue.toLowerCase() !== expected.exchange.toLowerCase()) ||
+    (trade.symbol !== undefined && trade.symbol.toLowerCase() !== expected.pair.toLowerCase())
+  )) {
+    throw new FreqtradeMarketSnapshotValidationError(
+      'Trade flow venue or symbol does not match the requested market.',
+      'INVALID_TRADE_FLOW_IDENTITY',
+    );
+  }
   const verifiedTradeFlow = tradeFlow !== null &&
     nowMs - tradeFlow.retrievedAtMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS &&
     tradeFlow.trades.every((trade) => nowMs - trade.timestampMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS)
     ? tradeFlow
     : null;
+  const deduplicatedTradeFlow = verifiedTradeFlow
+    ? deduplicateTrades(verifiedTradeFlow.trades.map((trade) => ({
+      ...trade,
+      venue: trade.venue ?? expected.exchange,
+      symbol: trade.symbol ?? expected.pair,
+    })))
+    : null;
+  if (deduplicatedTradeFlow?.conflictingIdentity) {
+    throw new FreqtradeMarketSnapshotValidationError(
+      'Trade flow contains conflicting records for the same venue, symbol, and exchange trade id.',
+      'DUPLICATE_TRADE_IDENTITY_CONFLICT',
+    );
+  }
   return {
     contractVersion: FREQTRADE_MARKET_SNAPSHOT_VERSION,
     source: 'freqtrade.dataprovider',
@@ -399,14 +460,21 @@ export function validateFreqtradeMarketSnapshot(
     ticker: verifiedTicker && { ...verifiedTicker },
     orderBook: verifiedOrderBook && {
       timestampMs: verifiedOrderBook.timestampMs,
+      venue: verifiedOrderBook.venue ?? expected.exchange,
+      symbol: verifiedOrderBook.symbol ?? expected.pair,
+      ...(verifiedOrderBook.sequenceId === undefined ? {} : { sequenceId: verifiedOrderBook.sequenceId }),
+      ...(verifiedOrderBook.duplicateSnapshotCount === undefined
+        ? {}
+        : { duplicateSnapshotCount: verifiedOrderBook.duplicateSnapshotCount }),
       bids: verifiedOrderBook.bids.map((level) => ({ ...level })),
       asks: verifiedOrderBook.asks.map((level) => ({ ...level })),
     },
     fundingRate: verifiedFundingRate && { ...verifiedFundingRate },
     openInterest: verifiedOpenInterest && { ...verifiedOpenInterest },
-    tradeFlow: verifiedTradeFlow && {
+    tradeFlow: verifiedTradeFlow && deduplicatedTradeFlow && {
       retrievedAtMs: verifiedTradeFlow.retrievedAtMs,
-      trades: verifiedTradeFlow.trades.map((trade) => ({ ...trade })),
+      duplicateCount: (verifiedTradeFlow.duplicateCount ?? 0) + deduplicatedTradeFlow.duplicateCount,
+      trades: deduplicatedTradeFlow.values.map((trade) => ({ ...trade })),
     },
   };
 }

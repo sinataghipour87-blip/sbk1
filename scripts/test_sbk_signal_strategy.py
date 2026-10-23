@@ -196,6 +196,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             fetch_trades=Mock(return_value=[
                 {"id": "t1", "timestamp": now_ms - 500, "side": "buy", "price": 60_150, "amount": 0.01},
                 {"id": "t2", "timestamp": now_ms - 200, "side": "sell", "price": 60_149, "amount": 0.005},
+                {"id": "t2", "timestamp": now_ms - 200, "side": "sell", "price": 60_149, "amount": 0.005},
             ]),
         ))
         response = Mock()
@@ -232,6 +233,10 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["fundingRate"]["rate"], -0.0001)
         self.assertEqual(payload["contractVersion"], "sbk1.freqtrade.market-snapshot.v5")
         self.assertEqual(len(payload["tradeFlow"]["trades"]), 2)
+        self.assertEqual(payload["tradeFlow"]["duplicateCount"], 1)
+        self.assertEqual(payload["tradeFlow"]["trades"][0]["tradeId"], "t1")
+        self.assertEqual(payload["tradeFlow"]["trades"][0]["venue"], "bybit")
+        self.assertEqual(payload["tradeFlow"]["trades"][0]["symbol"], "BTC/USDT:USDT")
         self.assertEqual(payload["tradeFlow"]["trades"][0]["side"], "buy")
         self.assertEqual(set(payload["additionalCandles"]), {"1m", "5m", "1h", "4h"})
 

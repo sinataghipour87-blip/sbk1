@@ -1,17 +1,20 @@
 import type { CouncilWhaleFlowData, CouncilWhaleTransfer } from './eightMemberCouncil';
 import { fetchEtherscanWhaleTransfers } from './etherscanWhaleData';
+import { deduplicateOnChainTransfers } from './councilEvidenceDeduplication';
 import { fetchWhaleAlertFlow } from './whaleAlertFlow';
 
 const MEMPOOL_API = 'https://mempool.space/api';
+const BLOCKSTREAM_API = 'https://blockstream.info/api';
 const CACHE_TTL_MS = 60_000;
 const LAST_SUCCESSFUL_CACHE_TTL_MS = 20 * 60_000;
 const MAX_ONCHAIN_VOTE_AGE_MS = 5 * 60_000;
-const DEFAULT_TIMEOUT_MS = 5_000;
+const DEFAULT_TIMEOUT_MS = 2_500;
 const DEFAULT_MAX_AGE_MS = 20 * 60_000;
 const DEFAULT_BTC_THRESHOLD = 10;
 const DEFAULT_BLOCK_SAMPLE_COUNT = 3;
-const RETRIES = 2;
+const RETRIES = 1;
 const MIN_REQUEST_INTERVAL_MS = 100;
+const PREFETCH_INTERVAL_MS = 60_000;
 
 interface MempoolBlock {
   id: string;
@@ -40,6 +43,9 @@ let lastSuccessfulAtMs = 0;
 let lastSuccessfulResult: CouncilWhaleFlowData | null = null;
 let lastRequestStartedAtMs = 0;
 let requestStartQueue: Promise<void> = Promise.resolve();
+let activeRefreshPromise: Promise<CouncilWhaleFlowData> | null = null;
+let prefetchTimer: NodeJS.Timeout | null = null;
+let prefetchInFlight: Promise<CouncilWhaleFlowData> | null = null;
 
 function finiteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -76,6 +82,7 @@ function unavailable(
     status,
     provider: 'mempool.space public REST API',
     timestampMs: null,
+    retrievedAtMs: null,
     ageMs: null,
     qualityPct: 0,
     coverageStatus: 'UNAVAILABLE',
@@ -105,6 +112,7 @@ async function requestJson(
   fetcher: typeof fetch,
   timeoutMs: number,
   sleep: (ms: number) => Promise<void>,
+  providerName: string,
 ): Promise<unknown> {
   for (let attempt = 0; attempt <= RETRIES; attempt += 1) {
     const startRequest = requestStartQueue.then(async () => {
@@ -129,15 +137,15 @@ async function requestJson(
         if (attempt < RETRIES) {
           const retryAfter = Number(response.headers.get('retry-after'));
           await sleep(Number.isFinite(retryAfter) && retryAfter > 0
-            ? Math.min(retryAfter * 1_000, 5_000)
+            ? Math.min(retryAfter * 1_000, 500)
             : 250 * (2 ** attempt));
           continue;
         }
       }
-      if (!response.ok) throw new Error(`mempool.space returned HTTP ${response.status}.`);
+      if (!response.ok) throw new Error(`${providerName} returned HTTP ${response.status}.`);
       return await response.json();
     } catch (error) {
-      if (attempt < RETRIES && !(error instanceof Error && error.message.startsWith('mempool.space returned HTTP'))) {
+      if (attempt < RETRIES && !(error instanceof Error && error.message.startsWith(`${providerName} returned HTTP`))) {
         await sleep(250 * (2 ** attempt));
         continue;
       }
@@ -146,10 +154,10 @@ async function requestJson(
       clearTimeout(timeout);
     }
   }
-  throw new Error('mempool.space retries were exhausted.');
+  throw new Error(`${providerName} retries were exhausted.`);
 }
 
-export async function fetchPublicBitcoinWhaleData(options: {
+async function refreshPublicBitcoinWhaleData(options: {
   nowMs?: number;
   btcPriceUsd?: number | null;
   fetcher?: typeof fetch;
@@ -177,32 +185,63 @@ export async function fetchPublicBitcoinWhaleData(options: {
   const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
   try {
-    const timeoutMs = readPositiveEnv('SBK1_WHALE_REQUEST_TIMEOUT_MS', DEFAULT_TIMEOUT_MS, 30_000);
+    const timeoutMs = readPositiveEnv('SBK1_WHALE_REQUEST_TIMEOUT_MS', DEFAULT_TIMEOUT_MS, 3_000);
     const maxAgeMs = readPositiveEnv('SBK1_WHALE_MAX_AGE_MS', DEFAULT_MAX_AGE_MS, 20 * 60_000);
     const thresholdBtc = readPositiveEnv('SBK1_WHALE_MIN_TRANSFER_BTC', DEFAULT_BTC_THRESHOLD, 1_000_000);
     const blockSampleCount = Math.floor(readPositiveEnv(
       'SBK1_WHALE_BLOCK_SAMPLE_COUNT', DEFAULT_BLOCK_SAMPLE_COUNT, 10,
     ));
-    const rawBlocks = await requestJson(`${MEMPOOL_API}/v1/blocks`, fetcher, timeoutMs, sleep);
-    if (!Array.isArray(rawBlocks) || rawBlocks.length < blockSampleCount ||
-        rawBlocks.some((block) => !isBlock(block))) {
-      throw new Error('mempool.space block response is malformed or incomplete.');
+    const sourceErrors: string[] = [];
+    let sourceName = '';
+    let blocks: MempoolBlock[] = [];
+    let transactionsByBlock: Array<{ block: MempoolBlock; transactions: MempoolTransaction[] }> = [];
+    for (const source of [
+      { name: 'mempool.space', api: MEMPOOL_API, blocksPath: '/v1/blocks' },
+      { name: 'Blockstream', api: BLOCKSTREAM_API, blocksPath: '/blocks' },
+    ]) {
+      try {
+        const rawBlocks = await requestJson(
+          `${source.api}${source.blocksPath}`,
+          fetcher,
+          timeoutMs,
+          sleep,
+          source.name,
+        );
+        if (!Array.isArray(rawBlocks) || rawBlocks.length < blockSampleCount ||
+            rawBlocks.some((block) => !isBlock(block))) {
+          throw new Error(`${source.name} block response is malformed or incomplete.`);
+        }
+        const sourceBlocks = (rawBlocks as MempoolBlock[]).slice(0, blockSampleCount);
+        const sourceTransactions = await Promise.all(sourceBlocks.map(async (block) => {
+          const rawTransactions = await requestJson(
+            `${source.api}/block/${encodeURIComponent(block.id)}/txs`,
+            fetcher,
+            timeoutMs,
+            sleep,
+            source.name,
+          );
+          if (!Array.isArray(rawTransactions) || rawTransactions.some((transaction) => !isTransaction(transaction))) {
+            throw new Error(`${source.name} transactions for block ${block.height} are malformed.`);
+          }
+          return { block, transactions: rawTransactions as MempoolTransaction[] };
+        }));
+        sourceName = source.name;
+        blocks = sourceBlocks;
+        transactionsByBlock = sourceTransactions;
+        break;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        sourceErrors.push(reason);
+        if (source.name === 'mempool.space') {
+          console.warn(`[PublicBitcoinWhaleData] Primary source failed; trying Blockstream mirror: ${reason}`);
+        }
+      }
     }
-    const blocks = (rawBlocks as MempoolBlock[]).slice(0, blockSampleCount);
+    if (!sourceName) {
+      throw new Error(`All public Bitcoin block sources failed: ${sourceErrors.join('; ')}`);
+    }
     const transfers: CouncilWhaleTransfer[] = [];
     const seen = new Set<string>();
-    const transactionsByBlock = await Promise.all(blocks.map(async (block) => {
-      const rawTransactions = await requestJson(
-        `${MEMPOOL_API}/block/${encodeURIComponent(block.id)}/txs`,
-        fetcher,
-        timeoutMs,
-        sleep,
-      );
-      if (!Array.isArray(rawTransactions) || rawTransactions.some((transaction) => !isTransaction(transaction))) {
-        throw new Error(`mempool.space transactions for block ${block.height} are malformed.`);
-      }
-      return { block, transactions: rawTransactions as MempoolTransaction[] };
-    }));
     for (const { block, transactions } of transactionsByBlock) {
       for (const transaction of transactions) {
         if (!transaction.status.confirmed) continue;
@@ -219,7 +258,7 @@ export async function fetchPublicBitcoinWhaleData(options: {
             blockchain: 'bitcoin',
             blockHeight: transaction.status.block_height ?? block.height,
             timestampMs,
-            sourceProvider: 'mempool.space',
+            sourceProvider: sourceName,
             asset: 'BTC',
             amount,
             estimatedUsd: finiteNumber(options.btcPriceUsd) && options.btcPriceUsd > 0
@@ -236,12 +275,13 @@ export async function fetchPublicBitcoinWhaleData(options: {
     const timestampMs = latestBlock.timestamp * 1_000;
     const ageMs = nowMs - timestampMs;
     if (ageMs < 0 || ageMs > maxAgeMs) {
-      return unavailable('mempool.space latest sampled block is stale or has a future timestamp.', 'STALE');
+      return unavailable(`${sourceName} latest sampled block is stale or has a future timestamp.`, 'STALE');
     }
     cachedResult = {
       status: ageMs <= MAX_ONCHAIN_VOTE_AGE_MS ? 'LIVE' : 'STALE',
-      provider: 'mempool.space public REST API (sampled confirmed BTC outputs)',
+      provider: `${sourceName} public REST API (sampled confirmed BTC outputs)`,
       timestampMs,
+      retrievedAtMs: Date.now(),
       ageMs,
       qualityPct: 85,
       coverageStatus: 'SAMPLED',
@@ -258,7 +298,7 @@ export async function fetchPublicBitcoinWhaleData(options: {
     lastSuccessfulResult = { ...cachedResult, largeTransfers: [...transfers] };
     return { ...cachedResult, largeTransfers: [...transfers] };
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'Unknown mempool.space provider error.';
+    const reason = error instanceof Error ? error.message : 'Unknown public Bitcoin provider error.';
     console.error('[PublicBitcoinWhaleData] Source unavailable:', reason);
     if (
       lastSuccessfulResult &&
@@ -271,14 +311,70 @@ export async function fetchPublicBitcoinWhaleData(options: {
         ...lastSuccessfulResult,
         status: ageMs !== null && ageMs <= MAX_ONCHAIN_VOTE_AGE_MS ? 'LIVE' : 'STALE',
         ageMs,
-        unavailableReason: `mempool.space refresh failed (${reason}); using the last successful sample from ${Math.round((nowMs - lastSuccessfulAtMs) / 60_000)} minutes ago.`,
+        unavailableReason: `Public Bitcoin refresh failed (${reason}); using the last successful sample from ${Math.round((nowMs - lastSuccessfulAtMs) / 60_000)} minutes ago.`,
         largeTransfers: [...(lastSuccessfulResult.largeTransfers ?? [])],
       };
     }
-    cachedResult = unavailable(reason);
+
+    cachedResult = {
+      ...unavailable(reason),
+      retrievedAtMs: Date.now(),
+    };
     cachedAtMs = nowMs;
     return cachedResult;
   }
+}
+
+export async function fetchPublicBitcoinWhaleData(options: {
+  nowMs?: number;
+  btcPriceUsd?: number | null;
+  fetcher?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  forceRefresh?: boolean;
+} = {}): Promise<CouncilWhaleFlowData> {
+  const refresh = activeRefreshPromise ?? refreshPublicBitcoinWhaleData(options);
+  if (!activeRefreshPromise) activeRefreshPromise = refresh;
+  try {
+    const result = await refresh;
+    return {
+      ...result,
+      largeTransfers: (result.largeTransfers ?? []).map((transfer) => ({
+        ...transfer,
+        estimatedUsd: finiteNumber(options.btcPriceUsd) && options.btcPriceUsd > 0
+          ? transfer.amount * options.btcPriceUsd
+          : null,
+      })),
+    };
+  } finally {
+    if (activeRefreshPromise === refresh) activeRefreshPromise = null;
+  }
+}
+
+export function startPublicBitcoinWhaleDataPrefetch(): void {
+  if (prefetchTimer) return;
+  const refresh = (): void => {
+    if (prefetchInFlight) return;
+    const prefetch = fetchPublicBitcoinWhaleData({ forceRefresh: true });
+    prefetchInFlight = prefetch;
+    void prefetch.then(
+      () => {
+        if (prefetchInFlight === prefetch) prefetchInFlight = null;
+      },
+      (error: unknown) => {
+        console.error('[PublicBitcoinWhaleData] Background prefetch failed:', error);
+        if (prefetchInFlight === prefetch) prefetchInFlight = null;
+      },
+    );
+  };
+  refresh();
+  prefetchTimer = setInterval(refresh, PREFETCH_INTERVAL_MS);
+  prefetchTimer.unref();
+}
+
+export async function stopPublicBitcoinWhaleDataPrefetch(): Promise<void> {
+  if (prefetchTimer) clearInterval(prefetchTimer);
+  prefetchTimer = null;
+  await prefetchInFlight;
 }
 
 export async function fetchOnChainWhaleData(options: {
@@ -302,11 +398,14 @@ export async function fetchOnChainWhaleData(options: {
     console.error('[PublicBitcoinWhaleData] Optional Etherscan source unavailable:', reason);
   }
   if (primary.status === 'LIVE' || ethTransfers.length > 0) {
-    const combined = new Map<string, CouncilWhaleTransfer>();
-    for (const transfer of [...(primary.largeTransfers ?? []), ...ethTransfers]) {
-      combined.set(`${transfer.blockchain}:${transfer.transactionHash}:${transfer.transferId ?? ''}`, transfer);
+    const deduplicatedTransfers = deduplicateOnChainTransfers([
+      ...(primary.largeTransfers ?? []),
+      ...ethTransfers,
+    ]);
+    if (deduplicatedTransfers.conflictingIdentity) {
+      console.error('[PublicBitcoinWhaleData] Conflicting provider observations share an on-chain transfer identity.');
     }
-    const transfers = [...combined.values()];
+    const transfers = deduplicatedTransfers.values;
     const timestampMs = Math.max(
       primary.status === 'LIVE' ? primary.timestampMs ?? 0 : 0,
       ...ethTransfers.map((item) => item.timestampMs),
@@ -318,6 +417,7 @@ export async function fetchOnChainWhaleData(options: {
         ? `${primary.status === 'LIVE' ? primary.provider : 'Etherscan configured address watchlist'} + Etherscan`
         : primary.provider,
       timestampMs,
+      retrievedAtMs: Math.max(primary.retrievedAtMs ?? 0, Date.now()),
       ageMs: (options.nowMs ?? Date.now()) - timestampMs,
       qualityPct: Math.min(primary.status === 'LIVE' ? primary.qualityPct : 80, 85),
       coverageStatus: 'SAMPLED',
@@ -342,10 +442,14 @@ export async function fetchOnChainWhaleData(options: {
 }
 
 export function resetPublicBitcoinWhaleDataCacheForTests(): void {
+  if (prefetchTimer) clearInterval(prefetchTimer);
+  prefetchTimer = null;
+  prefetchInFlight = null;
   cachedAtMs = 0;
   cachedResult = null;
   lastSuccessfulAtMs = 0;
   lastSuccessfulResult = null;
   lastRequestStartedAtMs = 0;
   requestStartQueue = Promise.resolve();
+  activeRefreshPromise = null;
 }

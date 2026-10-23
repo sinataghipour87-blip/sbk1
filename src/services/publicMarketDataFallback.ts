@@ -5,10 +5,13 @@ import type {
   FreqtradeMarketTradeFlow,
 } from './freqtradeMarketDataBridge';
 import { binancePublicMarketDataStream } from './publicMarketDataStream';
+import { deduplicateQuotes, deduplicateTrades } from './councilEvidenceDeduplication';
 
 export interface PublicMarketFallbackFeed<T> {
   status: 'LIVE' | 'UNAVAILABLE';
   sourceTimestampMs: number | null;
+  endpoint?: string;
+  receivedAtMs?: number | null;
   value: T | null;
   error?: string;
   isPartial?: boolean;
@@ -16,10 +19,25 @@ export interface PublicMarketFallbackFeed<T> {
 
 export interface PublicExchangeQuote {
   exchange: 'binance' | 'bybit' | 'okx';
+  market: MarketKind;
   symbol: string;
+  baseAsset: string;
+  quoteAsset: 'USDT';
+  priceUnit: string;
   price: number;
   sourceTimestampMs: number;
   retrievedAtMs: number;
+  endpoint: string;
+}
+
+export interface PublicExchangeQuoteSource {
+  exchange: 'binance' | 'bybit' | 'okx';
+  symbol: string;
+  endpoint: string;
+  status: 'LIVE' | 'UNAVAILABLE';
+  responseTimestampMs: number | null;
+  receivedAtMs: number | null;
+  error?: string;
 }
 
 export interface PublicMarketFallbackData {
@@ -30,6 +48,7 @@ export interface PublicMarketFallbackData {
   timeframe: string;
   retrievedAtMs: number;
   exchangeQuotes: PublicMarketFallbackFeed<PublicExchangeQuote[]>;
+  exchangeQuoteSources: PublicExchangeQuoteSource[];
   candles: PublicMarketFallbackFeed<FreqtradeMarketCandle[]>;
   fastCandles: PublicMarketFallbackFeed<FreqtradeMarketCandle[]>;
   higherTimeframeCandles: {
@@ -215,7 +234,11 @@ function parseCandles(
   return { candles: parsed, latestCloseMs };
 }
 
-function parseOrderBook(payload: unknown, retrievedAtMs: number): FreqtradeMarketOrderBook {
+function parseOrderBook(
+  payload: unknown,
+  retrievedAtMs: number,
+  symbol: string,
+): FreqtradeMarketOrderBook {
   if (!isRecord(payload) || !Array.isArray(payload.bids) || !Array.isArray(payload.asks)) {
     throw new Error('Binance depth response is malformed.');
   }
@@ -234,15 +257,29 @@ function parseOrderBook(payload: unknown, retrievedAtMs: number): FreqtradeMarke
   if (bids.length === 0 || asks.length === 0 || bids[0].price >= asks[0].price) {
     throw new Error('Binance depth has empty or crossed bid/ask levels.');
   }
-  return { timestampMs: retrievedAtMs, bids, asks };
+  const sequenceId = Number(payload.lastUpdateId);
+  return {
+    timestampMs: retrievedAtMs,
+    venue: 'binance',
+    symbol,
+    ...(Number.isSafeInteger(sequenceId) && sequenceId >= 0 ? { sequenceId } : {}),
+    bids,
+    asks,
+  };
 }
 
-function parseTrades(payload: unknown, retrievedAtMs: number, nowMs: number): FreqtradeMarketTradeFlow {
+function parseTrades(
+  payload: unknown,
+  retrievedAtMs: number,
+  nowMs: number,
+  symbol: string,
+): FreqtradeMarketTradeFlow {
   if (!Array.isArray(payload) || payload.length === 0) {
     throw new Error('Binance recent trades response is empty.');
   }
   const trades = payload.flatMap((trade: unknown) => {
     if (!isRecord(trade) || !finiteNumber(Number(trade.T)) ||
+        !Number.isSafeInteger(Number(trade.a)) ||
         !finiteNumber(Number(trade.p)) || !finiteNumber(Number(trade.q)) ||
         typeof trade.m !== 'boolean') return [];
     const timestampMs = Number(trade.T);
@@ -260,10 +297,21 @@ function parseTrades(payload: unknown, retrievedAtMs: number, nowMs: number): Fr
       side: trade.m ? 'sell' as const : 'buy' as const,
       price,
       amount,
+      venue: 'binance',
+      symbol,
+      tradeId: Number(trade.a),
     }];
   }).sort((left, right) => left.timestampMs - right.timestampMs);
   if (trades.length === 0) throw new Error('Binance has no fresh, valid recent trades.');
-  return { retrievedAtMs, trades };
+  const uniqueTrades = deduplicateTrades(trades);
+  if (uniqueTrades.conflictingIdentity) {
+    throw new Error('Binance returned conflicting aggregate trades for the same trade id.');
+  }
+  return {
+    retrievedAtMs,
+    duplicateCount: uniqueTrades.duplicateCount,
+    trades: uniqueTrades.values,
+  };
 }
 
 async function fetchCrossExchangeQuotes(options: {
@@ -277,34 +325,55 @@ async function fetchCrossExchangeQuotes(options: {
     retrievedAtMs: number;
     price: number;
   } | null;
-}): Promise<PublicMarketFallbackFeed<PublicExchangeQuote[]>> {
+}): Promise<{
+  feed: PublicMarketFallbackFeed<PublicExchangeQuote[]>;
+  sources: PublicExchangeQuoteSource[];
+}> {
   const baseAsset = options.symbol.slice(0, -4);
   const okxSymbol = options.market === 'futures'
     ? `${baseAsset}-USDT-SWAP`
     : `${baseAsset}-USDT`;
+  const normalizeQuote = (
+    exchange: PublicExchangeQuote['exchange'],
+    symbol: string,
+    price: number,
+    sourceTimestampMs: number,
+    retrievedAtMs: number,
+    endpoint: string,
+  ): PublicExchangeQuote => ({
+    exchange,
+    market: options.market,
+    symbol,
+    baseAsset,
+    quoteAsset: 'USDT',
+    priceUnit: `USDT per ${baseAsset}`,
+    price,
+    sourceTimestampMs,
+    retrievedAtMs,
+    endpoint,
+  });
   const requests = [
     {
       exchange: 'binance' as const,
       symbol: options.symbol,
       url: `https://${options.market === 'futures' ? 'fapi.binance.com' : 'api.binance.com'}${options.market === 'futures' ? '/fapi/v1' : '/api/v3'}/ticker/price?symbol=${options.symbol}`,
-      parse(payload: unknown, retrievedAtMs: number): PublicExchangeQuote {
+      parse(payload: unknown, retrievedAtMs: number, endpoint: string): PublicExchangeQuote {
         if (!isRecord(payload) || payload.symbol !== options.symbol) {
           throw new Error('Binance ticker response is malformed or has the wrong symbol.');
         }
         const price = Number(payload.price);
         const timestamp = Number(payload.time);
-        const sourceTimestampMs = Number.isSafeInteger(timestamp) ? timestamp : retrievedAtMs;
-        if (!Number.isFinite(price) || price <= 0) {
-          throw new Error('Binance ticker price is invalid.');
+        if (!Number.isSafeInteger(timestamp) || timestamp <= 0 || !Number.isFinite(price) || price <= 0) {
+          throw new Error('Binance ticker price or exchange timestamp is invalid.');
         }
-        return { exchange: 'binance', symbol: options.symbol, price, sourceTimestampMs, retrievedAtMs };
+        return normalizeQuote('binance', options.symbol, price, timestamp, retrievedAtMs, endpoint);
       },
     },
     {
       exchange: 'bybit' as const,
       symbol: options.symbol,
       url: `https://api.bybit.com/v5/market/tickers?category=${options.market === 'futures' ? 'linear' : 'spot'}&symbol=${options.symbol}`,
-      parse(payload: unknown, retrievedAtMs: number): PublicExchangeQuote {
+      parse(payload: unknown, retrievedAtMs: number, endpoint: string): PublicExchangeQuote {
         if (!isRecord(payload) || Number(payload.retCode) !== 0 ||
             !isRecord(payload.result) || !Array.isArray(payload.result.list)) {
           throw new Error('Bybit ticker response is malformed or unsuccessful.');
@@ -315,16 +384,17 @@ async function fetchCrossExchangeQuotes(options: {
         if (!isRecord(ticker)) throw new Error('Bybit returned no ticker for the requested symbol.');
         const price = Number(ticker.lastPrice);
         const timestamp = Number(payload.time);
-        const sourceTimestampMs = Number.isSafeInteger(timestamp) ? timestamp : retrievedAtMs;
-        if (!Number.isFinite(price) || price <= 0) throw new Error('Bybit ticker price is invalid.');
-        return { exchange: 'bybit', symbol: options.symbol, price, sourceTimestampMs, retrievedAtMs };
+        if (!Number.isSafeInteger(timestamp) || timestamp <= 0 || !Number.isFinite(price) || price <= 0) {
+          throw new Error('Bybit ticker price or exchange timestamp is invalid.');
+        }
+        return normalizeQuote('bybit', options.symbol, price, timestamp, retrievedAtMs, endpoint);
       },
     },
     {
       exchange: 'okx' as const,
       symbol: okxSymbol,
       url: `https://www.okx.com/api/v5/market/ticker?instId=${okxSymbol}`,
-      parse(payload: unknown, retrievedAtMs: number): PublicExchangeQuote {
+      parse(payload: unknown, retrievedAtMs: number, endpoint: string): PublicExchangeQuote {
         if (!isRecord(payload) || payload.code !== '0' || !Array.isArray(payload.data)) {
           throw new Error('OKX ticker response is malformed or unsuccessful.');
         }
@@ -337,64 +407,132 @@ async function fetchCrossExchangeQuotes(options: {
         if (!Number.isSafeInteger(sourceTimestampMs) || !Number.isFinite(price) || price <= 0) {
           throw new Error('OKX ticker price or exchange timestamp is invalid.');
         }
-        return { exchange: 'okx', symbol: okxSymbol, price, sourceTimestampMs, retrievedAtMs };
+        return normalizeQuote('okx', okxSymbol, price, sourceTimestampMs, retrievedAtMs, endpoint);
       },
     },
   ].filter((request) => !(request.exchange === 'binance' && options.liveBinancePrice));
+  const sources: PublicExchangeQuoteSource[] = [];
+  const quotes: PublicExchangeQuote[] = [];
+  if (options.liveBinancePrice) {
+    const endpoint = `wss://${options.market === 'futures' ? 'fstream.binance.com' : 'stream.binance.com:9443'}/ws/${options.symbol.toLowerCase()}@trade`;
+    const quote = normalizeQuote(
+      'binance',
+      options.symbol,
+      options.liveBinancePrice.price,
+      options.liveBinancePrice.sourceTimestampMs,
+      options.liveBinancePrice.retrievedAtMs,
+      endpoint,
+    );
+    const error = validateQuoteFreshness(quote, options.nowMs);
+    sources.push({
+      exchange: 'binance',
+      symbol: options.symbol,
+      endpoint,
+      status: error ? 'UNAVAILABLE' : 'LIVE',
+      responseTimestampMs: quote.sourceTimestampMs,
+      receivedAtMs: quote.retrievedAtMs,
+      ...(error ? { error } : {}),
+    });
+    if (!error) quotes.push(quote);
+  }
 
-  try {
-    const restQuotes = await Promise.all(requests.map(async (request) => {
+  await Promise.all(requests.map(async (request) => {
+    try {
       const { payload, retrievedAtMs } = await requestJson(
         request.url,
         options.fetcher,
         options.nowMs,
         options.timeoutMs,
       );
-      const quote = request.parse(payload, retrievedAtMs);
-      const evaluatedAtMs = Math.max(options.nowMs, Date.now());
-      const ageMs = evaluatedAtMs - quote.retrievedAtMs;
-      if (
-        Math.abs(quote.sourceTimestampMs - quote.retrievedAtMs) > MAX_EXCHANGE_CLOCK_SKEW_MS ||
-        ageMs < 0 ||
-        ageMs > MAX_FEED_AGE_MS.exchangeQuotes
-      ) {
-        throw new Error(`${request.exchange} ticker is stale or future-dated.`);
-      }
-      return quote;
-    }));
-    const quotes = options.liveBinancePrice
-      ? [
-        {
-          exchange: 'binance' as const,
-          symbol: options.symbol,
-          price: options.liveBinancePrice.price,
-          sourceTimestampMs: options.liveBinancePrice.sourceTimestampMs,
-          retrievedAtMs: options.liveBinancePrice.retrievedAtMs,
-        },
-        ...restQuotes,
-      ]
-      : restQuotes;
-    const sortedPrices = quotes.map(({ price }) => price).sort((left, right) => left - right);
-    const medianPrice = sortedPrices[1];
-    const spreadPct = ((sortedPrices[2] - sortedPrices[0]) / medianPrice) * 100;
-    if (spreadPct > MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT) {
-      throw new Error(
-        `Cross-exchange ticker spread ${spreadPct.toFixed(3)}% exceeds the ${MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT}% quality limit.`,
-      );
+      const quote = request.parse(payload, retrievedAtMs, request.url);
+      const error = validateQuoteFreshness(quote, options.nowMs);
+      if (error) throw new Error(error);
+      quotes.push(quote);
+      sources.push({
+        exchange: request.exchange,
+        symbol: request.symbol,
+        endpoint: request.url,
+        status: 'LIVE',
+        responseTimestampMs: quote.sourceTimestampMs,
+        receivedAtMs: retrievedAtMs,
+      });
+    } catch (error) {
+      sources.push({
+        exchange: request.exchange,
+        symbol: request.symbol,
+        endpoint: request.url,
+        status: 'UNAVAILABLE',
+        responseTimestampMs: null,
+        receivedAtMs: null,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
-    const evaluatedAtMs = Math.max(options.nowMs, Date.now());
-    return freshFeed(
-      quotes,
-      Math.min(
-        evaluatedAtMs,
-        ...quotes.map(({ retrievedAtMs }) => retrievedAtMs),
+  }));
+  sources.sort((left, right) => left.exchange.localeCompare(right.exchange));
+  const uniqueQuotes = deduplicateQuotes(quotes);
+  if (uniqueQuotes.conflictingIdentity) {
+    return {
+      feed: unavailable<PublicExchangeQuote[]>(
+        'A venue returned conflicting quote values for the same symbol and source timestamp.',
       ),
-      evaluatedAtMs,
-      MAX_FEED_AGE_MS.exchangeQuotes,
-    );
-  } catch (error) {
-    return unavailable<PublicExchangeQuote[]>(error);
+      sources,
+    };
   }
+  quotes.splice(0, quotes.length, ...uniqueQuotes.values);
+
+  if (quotes.length < 2) {
+    return {
+      feed: {
+        ...unavailable<PublicExchangeQuote[]>(
+          `Fewer than two fresh normalized exchange prices are available (${quotes.length}/2 minimum).`,
+        ),
+        isPartial: sources.some((source) => source.status === 'LIVE'),
+      },
+      sources,
+    };
+  }
+  const sortedPrices = quotes.map(({ price }) => price).sort((left, right) => left - right);
+  const medianPrice = sortedPrices.length === 2
+    ? (sortedPrices[0] + sortedPrices[1]) / 2
+    : sortedPrices[Math.floor(sortedPrices.length / 2)];
+  const spreadPct = ((sortedPrices.at(-1)! - sortedPrices[0]) / medianPrice) * 100;
+  if (spreadPct > MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT) {
+    return {
+      feed: {
+        ...unavailable<PublicExchangeQuote[]>(
+          `Cross-exchange ticker spread ${spreadPct.toFixed(3)}% exceeds the ${MAX_CROSS_EXCHANGE_PRICE_SPREAD_PCT}% quality limit.`,
+        ),
+      },
+      sources,
+    };
+  }
+  const evaluatedAtMs = Math.max(options.nowMs, Date.now());
+  return {
+    feed: {
+      ...freshFeed(
+        quotes,
+        Math.min(evaluatedAtMs, ...quotes.map(({ retrievedAtMs }) => retrievedAtMs)),
+        evaluatedAtMs,
+        MAX_FEED_AGE_MS.exchangeQuotes,
+      ),
+      isPartial: sources.some((source) => source.status === 'UNAVAILABLE'),
+    },
+    sources,
+  };
+}
+
+function validateQuoteFreshness(quote: PublicExchangeQuote, nowMs: number): string | null {
+  const evaluatedAtMs = Math.max(nowMs, Date.now());
+  const ageMs = evaluatedAtMs - quote.retrievedAtMs;
+  if (
+    !Number.isSafeInteger(quote.sourceTimestampMs) ||
+    Math.abs(quote.sourceTimestampMs - quote.retrievedAtMs) > MAX_EXCHANGE_CLOCK_SKEW_MS ||
+    ageMs < 0 ||
+    ageMs > MAX_FEED_AGE_MS.exchangeQuotes
+  ) {
+    return `${quote.exchange} ticker is stale or future-dated.`;
+  }
+  return null;
 }
 
 export async function fetchPublicMarketFallback(options: {
@@ -427,18 +565,30 @@ export async function fetchPublicMarketFallback(options: {
   ): Promise<PublicMarketFallbackFeed<T>> => {
     try {
       const { payload, retrievedAtMs } = await fetchJsonEndpoint(url, fetcher, nowMs, timeoutMs);
-      return parse(payload, retrievedAtMs);
+      return {
+        ...parse(payload, retrievedAtMs),
+        endpoint: url,
+        receivedAtMs: retrievedAtMs,
+      };
     } catch (error) {
-      return unavailable<T>(error);
+      return {
+        ...unavailable<T>(error),
+        endpoint: url,
+        receivedAtMs: null,
+      };
     }
   };
 
   const fundingRateRequest = options.market === 'futures'
     ? fetchFeed(endpoint('/fapi/v1/premiumIndex', { symbol }), (payload, retrievedAtMs) => {
-      if (!isRecord(payload) || !finiteNumber(Number(payload.lastFundingRate))) {
-        throw new Error('Binance premium-index response has no valid funding rate.');
+      if (!isRecord(payload) || payload.symbol !== symbol ||
+          !finiteNumber(Number(payload.lastFundingRate))) {
+        throw new Error('Binance premium-index response has no valid symbol or funding rate.');
       }
-      const sourceTimestampMs = finiteNumber(Number(payload.time)) ? Number(payload.time) : retrievedAtMs;
+      const sourceTimestampMs = Number(payload.time);
+      if (!Number.isSafeInteger(sourceTimestampMs) || sourceTimestampMs <= 0) {
+        throw new Error('Binance premium-index response has no valid exchange timestamp.');
+      }
       return freshFeed(
         { retrievedAtMs, rate: Number(payload.lastFundingRate) },
         sourceTimestampMs,
@@ -537,7 +687,7 @@ export async function fetchPublicMarketFallback(options: {
     fourHourlyCandles,
     orderBook,
     tradeFlow,
-    exchangeQuotes,
+    exchangeQuoteResult,
     fundingRate,
     openInterest,
     liveOpenInterest,
@@ -549,14 +699,14 @@ export async function fetchPublicMarketFallback(options: {
     fetchFeed(endpoint(options.market === 'futures' ? '/fapi/v1/depth' : '/api/v3/depth', {
       symbol, limit: '20',
     }), (payload, retrievedAtMs) =>
-      freshFeed(parseOrderBook(payload, retrievedAtMs), retrievedAtMs, nowMs, MAX_FEED_AGE_MS.orderBook)),
+      freshFeed(      parseOrderBook(payload, retrievedAtMs, symbol), retrievedAtMs, nowMs, MAX_FEED_AGE_MS.orderBook)),
     fetchFeed(endpoint(options.market === 'futures' ? '/fapi/v1/aggTrades' : '/api/v3/aggTrades', {
       symbol,
       startTime: String(tradeQueryNowMs - MAX_FEED_AGE_MS.tradeFlow),
       endTime: String(tradeQueryNowMs),
       limit: '1000',
     }), (payload, retrievedAtMs) => {
-      const tradeFlow = parseTrades(payload, retrievedAtMs, tradeQueryNowMs);
+      const tradeFlow = parseTrades(payload, retrievedAtMs, tradeQueryNowMs, symbol);
       const sourceTimestampMs = tradeFlow.trades.at(-1)!.timestampMs;
       return freshFeed(
         tradeFlow,
@@ -577,10 +727,13 @@ export async function fetchPublicMarketFallback(options: {
     openInterestRequest,
     liveOpenInterestRequest,
   ]);
+  const exchangeQuotes = exchangeQuoteResult.feed;
   if (liveStream.orderBook) {
     orderBook = {
       status: 'LIVE',
       sourceTimestampMs: liveStream.orderBook.timestampMs,
+      endpoint: `wss://${options.market === 'futures' ? 'fstream.binance.com' : 'stream.binance.com:9443'}/ws/${symbol.toLowerCase()}@depth20@100ms`,
+      receivedAtMs: liveStream.orderBook.timestampMs,
       value: liveStream.orderBook,
     };
   }
@@ -588,6 +741,8 @@ export async function fetchPublicMarketFallback(options: {
     tradeFlow = {
       status: 'LIVE',
       sourceTimestampMs: liveStream.tradeFlow.trades.at(-1)!.timestampMs,
+      endpoint: `wss://${options.market === 'futures' ? 'fstream.binance.com' : 'stream.binance.com:9443'}/ws/${symbol.toLowerCase()}@trade`,
+      receivedAtMs: liveStream.tradeFlow.retrievedAtMs,
       value: liveStream.tradeFlow,
     };
   }
@@ -602,6 +757,8 @@ export async function fetchPublicMarketFallback(options: {
     fastCandles = {
       status: 'LIVE',
       sourceTimestampMs: partialCandle.sourceTimestampMs,
+      endpoint: `wss://${options.market === 'futures' ? 'fstream.binance.com' : 'stream.binance.com:9443'}/ws/${symbol.toLowerCase()}@kline_1m`,
+      receivedAtMs: partialCandle.sourceTimestampMs,
       value: [
         ...completedFastCandles,
         partialCandle.candle,
@@ -618,6 +775,7 @@ export async function fetchPublicMarketFallback(options: {
     timeframe: options.timeframe,
     retrievedAtMs: nowMs,
     exchangeQuotes,
+    exchangeQuoteSources: exchangeQuoteResult.sources,
     candles,
     fastCandles,
     higherTimeframeCandles: {

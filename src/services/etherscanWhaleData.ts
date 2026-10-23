@@ -254,7 +254,7 @@ export async function fetchEtherscanWhaleTransfers(options: {
       const amount = unitsToAmount(transaction.value, 18);
       if (amount >= ethThreshold) {
         const ethPriceUsd = options.ethPriceUsd;
-        add(transaction, 'ETH', amount, 'native', typeof ethPriceUsd === 'number' &&
+        add(transaction, 'ETH', amount, 'native:0', typeof ethPriceUsd === 'number' &&
           Number.isFinite(ethPriceUsd) && ethPriceUsd > 0 ? amount * ethPriceUsd : null);
       }
     }

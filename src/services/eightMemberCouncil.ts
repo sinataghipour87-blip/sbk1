@@ -1,6 +1,13 @@
 import type { AnalysisResult, DataQualityReport, MarketFeedQuality } from '../types/trading';
 import type { MacroCorrelationData } from './macroContextBrain';
 import type { FreeMacroDataResult } from './freeMacroData';
+import {
+  deduplicateCandles,
+  deduplicateDerivativeObservations,
+  deduplicateMacroObservations,
+  deduplicateNews,
+  deduplicateOnChainTransfers,
+} from './councilEvidenceDeduplication';
 
 export type CouncilVote = 'LONG' | 'SHORT' | 'NEUTRAL' | 'ABSTAIN';
 export type CouncilDirection = 'LONG' | 'SHORT' | null;
@@ -8,6 +15,7 @@ export type CouncilDirection = 'LONG' | 'SHORT' | null;
 export interface CouncilOptionsData {
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   timestampMs: number | null;
+  retrievedAtMs?: number | null;
   ageMs: number | null;
   qualityPct: number;
   impliedVolatilityPct: number | null;
@@ -26,6 +34,7 @@ export interface CouncilWhaleFlowData {
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   provider: string;
   timestampMs: number | null;
+  retrievedAtMs?: number | null;
   ageMs: number | null;
   qualityPct: number;
   coverageStatus?: 'SAMPLED' | 'COMPLETE' | 'UNAVAILABLE';
@@ -128,6 +137,49 @@ export interface EightMemberCouncilReport {
   summaryFa: string;
 }
 
+export interface CouncilMemberEvidenceCacheEntry {
+  evidenceFingerprint: string;
+  evaluatedAtMs: number;
+  voteResult: CouncilMemberVote;
+}
+
+function reuseCachedMemberVote(
+  cached: CouncilMemberEvidenceCacheEntry | undefined,
+  evidenceFingerprint: string | undefined,
+  nowMs: number,
+): CouncilMemberVote | null {
+  if (
+    !cached ||
+    !evidenceFingerprint ||
+    cached.evidenceFingerprint !== evidenceFingerprint ||
+    cached.voteResult.vote === 'ABSTAIN' ||
+    !isFiniteNumber(cached.voteResult.sourceAgeMs) ||
+    !isFiniteNumber(cached.evaluatedAtMs)
+  ) return null;
+  const elapsedMs = nowMs - cached.evaluatedAtMs;
+  const sourceAgeMs = cached.voteResult.sourceAgeMs + elapsedMs;
+  if (
+    elapsedMs < 0 ||
+    sourceAgeMs < 0 ||
+    elapsedMs > 5 * 60 * 60_000 ||
+    sourceAgeMs > (MEMBER_EVIDENCE_MAX_AGE_MS[cached.voteResult.id] ?? 0)
+  ) return null;
+  const reuseNote = ' شواهد این عضو با دادهٔ پیشین یکسان بود؛ رأی قبلی بدون تحلیل مجدد استفاده شد.';
+  return {
+    ...cached.voteResult,
+    sourceAgeMs,
+    rationaleFa: `${cached.voteResult.rationaleFa.replaceAll(reuseNote, '')}${reuseNote}`,
+    qualityChecks: [
+      ...cached.voteResult.qualityChecks.filter(({ labelFa }) => labelFa !== 'فیلتر داده تکراری'),
+      {
+        labelFa: 'فیلتر داده تکراری',
+        passed: true,
+        detailFa: `fingerprint شواهد عضو ${cached.voteResult.id} تغییر نکرده است؛ تحلیل تکراری اجرا نشد.`,
+      },
+    ],
+  };
+}
+
 export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
   {
     id: 1,
@@ -215,6 +267,16 @@ const MAX_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_NEWS_AGE_MS = 6 * 60 * 60_000;
 const MAX_DIRECT_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_DXY_AGE_MS = 7 * 24 * 60 * 60_000;
+const MEMBER_EVIDENCE_MAX_AGE_MS: Readonly<Record<number, number>> = {
+  1: 65_000,
+  2: 5_000,
+  3: 5_000,
+  4: 10_000,
+  5: MAX_OPTIONS_AGE_MS,
+  6: MAX_PUBLIC_ONCHAIN_AGE_MS,
+  7: MAX_DIRECT_MACRO_AGE_MS,
+  8: MAX_NEWS_AGE_MS,
+};
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -391,13 +453,18 @@ function evaluateTechnical(
   const candleFeed = dataQuality?.feeds.candles;
   const usesOneMinuteCandles = Array.isArray(analysis?.htfCandles?.['1m']) &&
     analysis.htfCandles['1m'].length >= 30;
-  const candles = usesOneMinuteCandles
+  const sourceCandles = usesOneMinuteCandles
     ? analysis!.htfCandles!['1m']
     : Array.isArray(analysis?.candles) ? analysis.candles : [];
+  const candleDeduplication = deduplicateCandles(sourceCandles);
+  const candles = candleDeduplication.values;
+  const conflictingCandleTimestamp = candleDeduplication.conflictingIdentity;
   const closes = candles
     .map((candle) => candle.length >= 6 ? candle[4] : candle[3])
     .filter((close): close is number => isFiniteNumber(close) && close > 0);
-  const hasCandles = candles.length >= 30 && closes.length === candles.length;
+  const hasCandles = !conflictingCandleTimestamp &&
+    candles.length >= 30 &&
+    closes.length === candles.length;
   const candleTimestampMs = usesOneMinuteCandles
     ? analysis?.signalDataTimestamps?.mtf1mMs
     : candleFeed?.timestamp;
@@ -438,6 +505,7 @@ function evaluateTechnical(
   const checks = [
     { labelFa: 'تازگی کندل رأی', passed: candleFreshness !== null && candleFeedIsValid, detailFa: candleFreshness && candleFeedIsValid ? `${usesOneMinuteCandles ? analysis?.signalDataTimestamps?.mtf1mIsPartial ? 'کندل ۱m در حال تشکیل' : 'کندل ۱m تکمیل‌شده' : 'کندل اصلی'}؛ سن ${Math.round(candleFreshness.ageMs)}ms` : 'فید معتبر یا کندل تازهٔ حداکثر ۶۵ ثانیه‌ای موجود نیست.' },
     { labelFa: 'کامل بودن داده قیمت', passed: hasCandles, detailFa: hasCandles ? `${candles.length} کندل با close معتبر` : 'کمتر از ۳۰ کندل معتبر یا close نامعتبر است.' },
+    { labelFa: 'حذف کندل تکراری', passed: !conflictingCandleTimestamp, detailFa: conflictingCandleTimestamp ? 'برای یک timestamp چند کندل با مقادیر متناقض دریافت شد؛ رأی مسدود است.' : `${candleDeduplication.duplicateCount} کندل تکراری حذف شد.` },
     { labelFa: 'RSI از کندل‌های همین snapshot', passed: hasRsi, detailFa: hasRsi ? `RSI14: ${rsi!.toFixed(2)}؛ مستقیماً از closeهای همین snapshot محاسبه شد.` : 'RSI از کندل‌های همین snapshot قابل‌محاسبه نیست.' },
     { labelFa: 'تازگی تایم‌فریم ۱h/۴h', passed: higherTimeframeEvidenceIsTimestamped, detailFa: higherTimeframeEvidenceIsTimestamped ? `۱h ${Math.round(mtf1hFreshness!.ageMs / 1000)}s؛ ۴h ${Math.round(mtf4hFreshness!.ageMs / 1000)}s` : 'timestamp مستقل و تازه برای هر دو تایم‌فریم موجود نیست؛ تأیید آن‌ها در رأی استفاده نمی‌شود.' },
   ];
@@ -505,11 +573,21 @@ function evaluateTradeFlow(
     flow.status === 'LIVE' &&
     feed !== null &&
     sourceFreshness !== null &&
+    (flow.uniqueTradeCount === undefined ||
+      (Number.isSafeInteger(flow.uniqueTradeCount) && flow.uniqueTradeCount > 0)) &&
     isFiniteNumber(delta);
   const checks = [
     { labelFa: 'جریان معاملات واقعی', passed: flow?.isRealTradeFlow === true && flow.status === 'LIVE', detailFa: flow?.isRealTradeFlow === true && flow.status === 'LIVE' ? 'فید معاملات اجراشده زنده است.' : 'فید زنده معاملات واقعی تأیید نشد.' },
     { labelFa: 'تازگی CVD', passed: sourceFreshness !== null && feed !== null, detailFa: sourceFreshness ? `${Math.round(sourceFreshness.ageMs)}ms` : 'داده فاقد زمان معتبر یا کهنه است.' },
     { labelFa: 'وجود دلتا', passed: isFiniteNumber(delta), detailFa: isFiniteNumber(delta) ? `دلتا: ${delta}` : 'دلتا در دسترس نیست.' },
+    {
+      labelFa: 'معاملات یکتای عضو',
+      passed: flow?.uniqueTradeCount === undefined ||
+        (Number.isSafeInteger(flow.uniqueTradeCount) && flow.uniqueTradeCount > 0),
+      detailFa: flow?.uniqueTradeCount === undefined
+        ? 'منبع ورودی فقط CVD تجمیعی ارائه می‌کند؛ شمار شناسه‌دار معاملات در دسترس نیست.'
+        : `${flow.uniqueTradeCount} معامله یکتا؛ ${flow.duplicateTradeCount ?? 0} رویداد تکراری حذف شد.`,
+    },
   ];
   if (!valid || !flow || !sourceFreshness || !feed) {
     return abstain(member, 'بدون CVD/دلتا از فید زنده معاملات اجراشده، رأی جریان معاملات صادر نمی‌شود.', checks, sourceFreshness?.timestampMs, sourceFreshness?.ageMs);
@@ -552,6 +630,7 @@ function evaluateOrderBook(
   const checks = [
     { labelFa: 'دفتر سفارش واقعی و زنده', passed: !!book && isLiveStatus(book.status), detailFa: book ? `وضعیت فید: ${book.status}` : 'دفتر سفارش واقعی موجود نیست.' },
     { labelFa: 'تازگی snapshot', passed: sourceFreshness !== null && feed !== null, detailFa: sourceFreshness ? `${Math.round(sourceFreshness.ageMs)}ms` : 'snapshot تازه تأیید نشد.' },
+    { labelFa: 'حذف snapshot تکراری', passed: true, detailFa: `${book?.duplicateSnapshotCount ?? 0} snapshot تکراری با sequence/timestamp یکسان حذف شد.` },
     { labelFa: 'عمق معتبر', passed: !!book && isFiniteNumber(book.obi) && isFiniteNumber(book.bidDepthUsd) && isFiniteNumber(book.askDepthUsd) && book.bidDepthUsd + book.askDepthUsd > 0 && book.levelsCount > 0, detailFa: valid ? `${book!.levelsCount} سطح` : 'عمق/عدم‌تعادل دفتر سفارش ناقص است.' },
   ];
   if (!valid || !book || !sourceFreshness || !feed || !isFiniteNumber(book.obi)) {
@@ -581,6 +660,24 @@ function evaluateDerivatives(
   const feed = getFreshFeed(analysis?.dataQualityReport, 'derivatives', nowMs, 60_000);
   const fundingRate = analysis?.fundingRate ?? analysis?.funding;
   const hasOpenInterest = isFiniteNumber(analysis?.oi) && analysis.oi > 0;
+  const derivativeObservations = deduplicateDerivativeObservations([
+    ...(isFiniteNumber(analysis?.signalDataTimestamps?.fundingRateMs)
+      ? [{
+        venue: analysis?.dataQualityReport?.feeds.derivatives.source ?? 'unknown',
+        symbol: analysis?.canonicalSnapshot?.symbol ?? 'BTCUSDT',
+        timestampMs: analysis!.signalDataTimestamps!.fundingRateMs!,
+        dataType: 'funding' as const,
+      }]
+      : []),
+    ...(isFiniteNumber(analysis?.signalDataTimestamps?.openInterestMs)
+      ? [{
+        venue: analysis?.dataQualityReport?.feeds.derivatives.source ?? 'unknown',
+        symbol: analysis?.canonicalSnapshot?.symbol ?? 'BTCUSDT',
+        timestampMs: analysis!.signalDataTimestamps!.openInterestMs!,
+        dataType: 'open-interest' as const,
+      }]
+      : []),
+  ]);
   const fundingFreshness = freshTimestamp(
     analysis?.signalDataTimestamps?.fundingRateMs,
     analysis?.signalDataTimestamps?.fundingRateMs === undefined ||
@@ -608,8 +705,16 @@ function evaluateDerivatives(
     { labelFa: 'فید مشتقات زنده و تازه', passed: feed !== null, detailFa: feed ? `${Math.round(feed.ageMs)}ms` : 'فید مشتقات زنده/تازه تأیید نشد.' },
     { labelFa: 'Funding معتبر و تازه', passed: isFiniteNumber(fundingRate) && fundingFreshness !== null, detailFa: fundingFreshness && isFiniteNumber(fundingRate) ? `Funding: ${fundingRate}؛ سن ${Math.round(fundingFreshness.ageMs)}ms` : 'Funding فاقد timestamp مستقل و تازه است.' },
     { labelFa: 'Open Interest معتبر و تازه', passed: hasOpenInterest && openInterestFreshness !== null, detailFa: openInterestFreshness && hasOpenInterest ? `OI: ${analysis!.oi}؛ سن ${Math.round(openInterestFreshness.ageMs)}ms` : 'OI فاقد timestamp مستقل و تازه است.' },
+    { labelFa: 'مشاهدات مشتقات یکتا', passed: !derivativeObservations.conflictingIdentity, detailFa: `${derivativeObservations.values.length} مشاهدهٔ یکتا؛ ${derivativeObservations.duplicateCount} تکراری حذف شد.` },
   ];
-  if (!valid || !feed || !fundingFreshness || !openInterestFreshness || !isFiniteNumber(fundingRate)) {
+  if (
+    !valid ||
+    derivativeObservations.conflictingIdentity ||
+    !feed ||
+    !fundingFreshness ||
+    !openInterestFreshness ||
+    !isFiniteNumber(fundingRate)
+  ) {
     return abstain(member, 'بدون Funding، OI و فید تازه مشتقات، رأی صادر نمی‌شود.', checks, feed?.feed.timestamp, feed?.ageMs);
   }
 
@@ -704,7 +809,7 @@ function evaluateOnChain(
       nowMs,
       MAX_PUBLIC_ONCHAIN_AGE_MS,
     );
-    const confirmedTransfers = directWhaleFlow.largeTransfers.filter((transfer) =>
+    const eligibleTransfers = directWhaleFlow.largeTransfers.filter((transfer) =>
       transfer.confirmationStatus === 'CONFIRMED' &&
       transfer.blockchain.length > 0 &&
       transfer.transactionHash.length > 0 &&
@@ -712,6 +817,13 @@ function evaluateOnChain(
       Number.isFinite(transfer.timestampMs) &&
       transfer.timestampMs <= nowMs &&
       nowMs - transfer.timestampMs <= MAX_PUBLIC_ONCHAIN_AGE_MS
+    );
+    const identifiedTransfers = deduplicateOnChainTransfers(eligibleTransfers);
+    const confirmedTransfers = identifiedTransfers.values.filter((transfer) =>
+      Boolean(transfer.transferId?.trim())
+    );
+    const missingTransferIdentity = eligibleTransfers.some((transfer) =>
+      !transfer.transferId?.trim()
     );
     const usable = directWhaleFlow.status === 'LIVE' &&
       freshness !== null &&
@@ -738,8 +850,17 @@ function evaluateOnChain(
         passed: false,
         detailFa: 'آدرس‌ها ناشناس‌اند؛ ورود، خروج، خرید یا فروش استنباط نمی‌شود.',
       },
+      {
+        labelFa: 'شناسهٔ یکتای انتقال',
+        passed: !identifiedTransfers.conflictingIdentity && !missingTransferIdentity,
+        detailFa: identifiedTransfers.conflictingIdentity
+          ? 'برای یک blockchain/txid/logIndex یا vout مقادیر متناقض دریافت شد.'
+          : missingTransferIdentity
+            ? 'حداقل یک انتقال فاقد logIndex/vout پایدار است و برای رأی قابل‌شمارش نیست.'
+            : `${identifiedTransfers.duplicateCount} انتقال تکراری از چند provider حذف شد.`,
+      },
     ];
-    if (!usable || !freshness) {
+    if (!usable || !freshness || identifiedTransfers.conflictingIdentity || missingTransferIdentity) {
       return abstain(member, directWhaleFlow.unavailableReason ?? 'شواهد آن‌چین تازه و تأییدشده برای رأی معتبر کافی نیست.', checks, freshness?.timestampMs, freshness?.ageMs);
     }
     if (confirmedTransfers.length === 0) {
@@ -850,11 +971,19 @@ function evaluateMacro(
   nowMs: number,
   directMacroData?: FreeMacroDataResult,
 ): CouncilMemberVote {
-  const directSignals: Array<{ label: string; direction: -1 | 0 | 1; timestampMs: number }> = [];
+  const directSignals: Array<{
+    label: string;
+    provider: string;
+    metric: string;
+    direction: -1 | 0 | 1;
+    timestampMs: number;
+  }> = [];
   const sp500 = directMacroData?.sp500;
   if (isFreshDirectMacroMetric(sp500, nowMs) && isFiniteNumber(sp500.changePct)) {
     directSignals.push({
       label: 'S&P 500',
+      provider: sp500.provider,
+      metric: sp500.metric,
       direction: sp500.changePct >= 0.1 ? 1 : sp500.changePct <= -0.1 ? -1 : 0,
       timestampMs: sp500.observedAtMs,
     });
@@ -866,6 +995,8 @@ function evaluateMacro(
   if (freshDxy) {
     directSignals.push({
       label: 'شاخص واقعی DXY',
+      provider: dxy.provider,
+      metric: dxy.metric,
       direction: dxy.changePct >= 0.05 ? -1 : dxy.changePct <= -0.05 ? 1 : 0,
       timestampMs: dxy.observedAtMs,
     });
@@ -881,6 +1012,8 @@ function evaluateMacro(
     if (freshTradingViewProxy) {
       directSignals.push({
         label: 'TradingView TVC:DXY (CFD proxy؛ زمان دریافت، نه timestamp منبع)',
+        provider: dxyProxy.provider,
+        metric: dxyProxy.metric,
         direction: dxyProxy.changePct >= 0.05 ? -1 : dxyProxy.changePct <= -0.05 ? 1 : 0,
         timestampMs: dxyProxy.observedAtMs,
       });
@@ -889,6 +1022,8 @@ function evaluateMacro(
       if (isFreshDirectMacroMetric(broadDollar, nowMs) && isFiniteNumber(broadDollar.changePct)) {
         directSignals.push({
           label: 'دلار گستردهٔ فدرال رزرو (proxy، نه DXY)',
+          provider: broadDollar.provider,
+          metric: broadDollar.metric,
           direction: broadDollar.changePct >= 0.05 ? -1 : broadDollar.changePct <= -0.05 ? 1 : 0,
           timestampMs: broadDollar.observedAtMs,
         });
@@ -908,34 +1043,64 @@ function evaluateMacro(
     ) / freshFedRates.length;
     directSignals.push({
       label: 'نرخ‌های منتشرشدهٔ فدرال رزرو',
+      provider: [...new Set(freshFedRates.map(({ provider }) => provider))].sort().join('+'),
+      metric: [...new Set(freshFedRates.map(({ metric }) => metric))].sort().join('+'),
       direction: averageRateChange >= 0.01 ? -1 : averageRateChange <= -0.01 ? 1 : 0,
       timestampMs: Math.max(...freshFedRates.map((metric) => metric.observedAtMs)),
     });
   }
 
-  if (directSignals.length >= 2) {
-    const score = directSignals.reduce((sum, signal) => sum + signal.direction, 0);
+  const macroDeduplication = deduplicateMacroObservations(directSignals.map((signal) => ({
+    ...signal,
+  })));
+  const uniqueDirectSignals = macroDeduplication.values;
+  const conflictingDirectSignalIdentity = macroDeduplication.conflictingIdentity;
+
+  if (conflictingDirectSignalIdentity) {
+    return abstain(
+      member,
+      'یک منبع برای همان شاخص و timestamp مقادیر متناقض فرستاده است؛ عضو کلان ممتنع می‌شود.',
+      [{
+        labelFa: 'تعارض شناسهٔ شاخص کلان',
+        passed: false,
+        detailFa: 'یک شناسهٔ منبع/زمان جهت‌های متناقض ارائه کرده است.',
+      }],
+      Math.max(...directSignals.map(({ timestampMs }) => timestampMs)),
+      null,
+    );
+  }
+
+  if (uniqueDirectSignals.length >= 2) {
+    const score = uniqueDirectSignals.reduce((sum, signal) => sum + signal.direction, 0);
     const vote: CouncilVote = score >= 2 ? 'LONG' : score <= -2 ? 'SHORT' : 'NEUTRAL';
-    const sourceTimestampMs = Math.max(...directSignals.map((signal) => signal.timestampMs));
+    const sourceTimestampMs = Math.max(...uniqueDirectSignals.map((signal) => signal.timestampMs));
     return createVote(
       member,
       vote,
-      `رأی از ${directSignals.length} شاخص مستقیم و تازه گرفته شد: ${directSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ شاخص یا proxy با نام و نوع واقعی خودش گزارش شده است.`,
+      `رأی از ${uniqueDirectSignals.length} شاخص مستقیم و تازه گرفته شد: ${uniqueDirectSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ شاخص یا proxy با نام و نوع واقعی خودش گزارش شده است.`,
       [
         {
           labelFa: 'تازگی منابع کلان مستقیم',
           passed: true,
-          detailFa: directSignals.map(({ label, timestampMs }) => `${label}: ${Math.round((nowMs - timestampMs) / 60_000)} دقیقه`).join('؛ '),
+          detailFa: uniqueDirectSignals.map(({ label, timestampMs }) => `${label}: ${Math.round((nowMs - timestampMs) / 60_000)} دقیقه`).join('؛ '),
         },
         {
           labelFa: 'تعداد شاخص‌های مستقیم معتبر',
           passed: true,
-          detailFa: `${directSignals.length} شاخص مستقیم: ${directSignals.map(({ label }) => label).join('، ')}`,
+          detailFa: `${uniqueDirectSignals.length} شاخص مستقیم یکتا: ${uniqueDirectSignals.map(({ label }) => label).join('، ')}`,
+        },
+        {
+          labelFa: 'تعارض شناسهٔ شاخص کلان',
+          passed: !conflictingDirectSignalIdentity,
+          detailFa: conflictingDirectSignalIdentity
+            ? 'یک منبع/زمان برای شاخص کلان جهت‌های متناقض ارائه کرده است.'
+            : 'برای یک شاخص و timestamp، مشاهدهٔ متناقضی وجود ندارد.',
         },
       ],
       {
         sourceTimestampMs,
         sourceAgeMs: nowMs - sourceTimestampMs,
+        dataQualityPct: Math.round(Math.min(uniqueDirectSignals.length, 3) / 3 * 100),
         confidencePct: confidenceForStrength(Math.min(30, Math.abs(score) * 10)),
       },
     );
@@ -1010,6 +1175,7 @@ function evaluateMacro(
       {
         sourceTimestampMs,
         sourceAgeMs: nowMs - sourceTimestampMs,
+        dataQualityPct: Math.round(Math.min(contextSignals.length, 3) / 3 * 100),
         confidencePct: confidenceForStrength(Math.min(30, Math.abs(score) * 10)),
       },
     );
@@ -1032,7 +1198,17 @@ function evaluateMacro(
     { labelFa: 'نتیجه ارزیابی کلان', passed: hasBias, detailFa: hasBias ? `سوگیری: ${macro!.fundamentalBias}` : 'سوگیری کلان معتبر و پوشش کافی وجود ندارد.' },
   ];
   if (!macro || !freshness || !hasBias) {
-    return abstain(member, 'برای رأی کلان، داده تازه، نتیجه معتبر و دست‌کم دو شاخص زنده لازم است.', checks, freshness?.timestampMs, freshness?.ageMs);
+    return createVote(
+      member,
+      'ABSTAIN',
+      'برای رأی کلان، داده تازه، نتیجه معتبر و دست‌کم دو شاخص زنده لازم است.',
+      checks,
+      {
+        sourceTimestampMs: freshness?.timestampMs,
+        sourceAgeMs: freshness?.ageMs,
+        dataQualityPct: Math.round(liveIndicatorCount / 3 * 100),
+      },
+    );
   }
 
   const vote: CouncilVote = macro.fundamentalBias === 'BULLISH'
@@ -1045,7 +1221,11 @@ function evaluateMacro(
     vote,
     `سوگیری کلان ${macro.fundamentalBias} با پوشش ${liveIndicatorCount} شاخص زنده دریافت شد.`,
     checks,
-    { sourceTimestampMs: freshness.timestampMs, sourceAgeMs: freshness.ageMs }
+    {
+      sourceTimestampMs: freshness.timestampMs,
+      sourceAgeMs: freshness.ageMs,
+      dataQualityPct: Math.round(liveIndicatorCount / 3 * 100),
+    }
   );
 }
 
@@ -1055,30 +1235,51 @@ function evaluateNews(
   nowMs: number
 ): CouncilMemberVote {
   const freshness = getMacroAge(macro, nowMs, MAX_NEWS_AGE_MS);
+  const newsDeduplication = deduplicateNews(macro?.recentHeadlines ?? []);
+  const uniqueHeadlines = newsDeduplication.values;
+  const freshHeadlines = uniqueHeadlines.filter((headline) => {
+    const publishedAt = Date.parse(headline.publishedAt);
+    const ageMs = nowMs - publishedAt;
+    return Number.isFinite(publishedAt) && ageMs >= 0 && ageMs <= MAX_NEWS_AGE_MS;
+  });
   const hasLiveSentiment = macro?.newsSentimentStatus === 'LIVE' &&
     isFiniteNumber(macro.newsSentimentScore) &&
     macro.newsHeadlinesStatus === 'LIVE' &&
-    macro.recentHeadlines.length > 0;
+    freshHeadlines.length > 0;
   const independentPublisherCount = new Set(
-    macro?.recentHeadlines.map((headline) => headline.source.trim().toLowerCase()).filter(Boolean) ?? [],
+    freshHeadlines.map((headline) => headline.source.trim().toLowerCase()).filter(Boolean),
   ).size;
-  const hasSufficientCoverage = (macro?.recentHeadlines.length ?? 0) >= 3 &&
+  const hasSufficientCoverage = freshHeadlines.length >= 3 &&
     independentPublisherCount >= 2;
-  const latestFreshHeadline = macro?.recentHeadlines.reduce<number | null>((latest, headline) => {
-    const publishedAt = Date.parse(headline.publishedAt);
-    const ageMs = nowMs - publishedAt;
-    return Number.isFinite(publishedAt) && ageMs >= 0 && ageMs <= MAX_NEWS_AGE_MS
-      ? Math.max(latest ?? 0, publishedAt)
-      : latest;
-  }, null) ?? null;
+  const latestFreshHeadline = freshHeadlines.reduce<number | null>((latest, headline) => {
+    const publishedAtMs = Date.parse(headline.publishedAt);
+    return Math.max(latest ?? 0, publishedAtMs);
+  }, null);
   const headlinesAreFresh = latestFreshHeadline !== null;
+  const dataQualityPct = hasLiveSentiment
+    ? Math.round(
+        Math.min(freshHeadlines.length, 10) / 10 * 60 +
+        Math.min(independentPublisherCount, 4) / 4 * 40,
+      )
+    : 0;
   const checks = [
-    { labelFa: 'پوشش ناشران مستقل', passed: hasSufficientCoverage, detailFa: hasSufficientCoverage ? `${macro!.recentHeadlines.length} خبر از ${independentPublisherCount} ناشر` : `حداقل ۳ خبر از ۲ ناشر لازم است؛ اکنون ${macro?.recentHeadlines.length ?? 0} خبر از ${independentPublisherCount} ناشر موجود است.` },
-    { labelFa: 'ناشر و خبر معتبر', passed: hasLiveSentiment, detailFa: hasLiveSentiment ? `${macro!.recentHeadlines.length} خبر و امتیاز سنتیمنت زنده` : 'خبر معتبر یا امتیاز سنتیمنت زنده در دسترس نیست.' },
+    { labelFa: 'پوشش ناشران مستقل', passed: hasSufficientCoverage, detailFa: hasSufficientCoverage ? `${freshHeadlines.length} خبر یکتای تازه از ${independentPublisherCount} ناشر` : `حداقل ۳ خبر یکتای تازه از ۲ ناشر لازم است؛ اکنون ${freshHeadlines.length} خبر از ${independentPublisherCount} ناشر موجود است.` },
+    { labelFa: 'حذف خبرهای تکراری و هم‌معنی', passed: true, detailFa: `${newsDeduplication.duplicateCount} خبر تکراری/هم‌معنی از URLهای متفاوت ادغام شد.` },
+    { labelFa: 'ناشر و خبر معتبر', passed: hasLiveSentiment, detailFa: hasLiveSentiment ? `${freshHeadlines.length} خبر یکتای تازه و امتیاز سنتیمنت زنده` : 'خبر معتبر یا امتیاز سنتیمنت زنده در دسترس نیست.' },
     { labelFa: 'تازگی خبر و داده', passed: freshness !== null && headlinesAreFresh, detailFa: freshness && latestFreshHeadline !== null ? `${Math.round((nowMs - latestFreshHeadline) / 60_000)} دقیقه از انتشار آخرین خبر` : 'زمان خبر/داده کهنه یا نامعتبر است.' },
   ];
   if (!macro || !hasLiveSentiment || !hasSufficientCoverage || !freshness || !headlinesAreFresh || !isFiniteNumber(macro.newsSentimentScore)) {
-    return abstain(member, 'خبر تازه از چند ناشر مستقل همراه با سنتیمنت تأییدشده موجود نیست؛ شایعه یا شمار پست‌ها رأی محسوب نمی‌شود.', checks, freshness?.timestampMs, freshness?.ageMs);
+    return createVote(
+      member,
+      'ABSTAIN',
+      'خبر تازه از چند ناشر مستقل همراه با سنتیمنت تأییدشده موجود نیست؛ شایعه یا شمار پست‌ها رأی محسوب نمی‌شود.',
+      checks,
+      {
+        sourceTimestampMs: freshness?.timestampMs,
+        sourceAgeMs: freshness?.ageMs,
+        dataQualityPct,
+      },
+    );
   }
 
   const score = macro.newsSentimentScore;
@@ -1091,6 +1292,7 @@ function evaluateNews(
     {
       sourceTimestampMs: latestFreshHeadline,
       sourceAgeMs: nowMs - latestFreshHeadline,
+      dataQualityPct,
       confidencePct: confidenceForStrength(Math.min(30, Math.abs(score) / 2)),
     }
   );
@@ -1169,20 +1371,30 @@ export function evaluateEightMemberCouncil(input: {
   optionsData?: CouncilOptionsData | null;
   whaleFlowData?: CouncilWhaleFlowData | null;
   supportingModules?: Readonly<Record<string, CouncilModuleEvidence>>;
+  evidenceFingerprints?: Readonly<Record<number, string>>;
+  previousMemberEvidence?: Readonly<Record<number, CouncilMemberEvidenceCacheEntry>>;
   nowMs?: number;
 }): EightMemberCouncilReport {
   const nowMs = input.nowMs ?? Date.now();
   const members = EIGHT_MEMBER_COUNCIL;
-  const votes = [
-    evaluateTechnical(members[0], input.analysis, nowMs),
-    evaluateTradeFlow(members[1], input.analysis, nowMs),
-    evaluateOrderBook(members[2], input.analysis, nowMs),
-    evaluateDerivatives(members[3], input.analysis, nowMs),
-    evaluateOptions(members[4], input.optionsData, nowMs),
-    evaluateOnChain(members[5], input.macroContext, nowMs, input.whaleFlowData ?? undefined),
-    evaluateMacro(members[6], input.macroContext, nowMs, input.directMacroData),
-    evaluateNews(members[7], input.macroContext, nowMs),
-  ].map((vote) => ({
+  const evaluators = [
+    () => evaluateTechnical(members[0], input.analysis, nowMs),
+    () => evaluateTradeFlow(members[1], input.analysis, nowMs),
+    () => evaluateOrderBook(members[2], input.analysis, nowMs),
+    () => evaluateDerivatives(members[3], input.analysis, nowMs),
+    () => evaluateOptions(members[4], input.optionsData, nowMs),
+    () => evaluateOnChain(members[5], input.macroContext, nowMs, input.whaleFlowData ?? undefined),
+    () => evaluateMacro(members[6], input.macroContext, nowMs, input.directMacroData),
+    () => evaluateNews(members[7], input.macroContext, nowMs),
+  ];
+  const votes = evaluators.map((evaluate, index) => {
+    const memberId = index + 1;
+    return reuseCachedMemberVote(
+      input.previousMemberEvidence?.[memberId],
+      input.evidenceFingerprints?.[memberId],
+      nowMs,
+    ) ?? evaluate();
+  }).map((vote) => ({
     ...vote,
     supportingEvidence: vote.moduleIds.map((moduleId) => input.supportingModules?.[moduleId] ?? {
       moduleId,
