@@ -26,6 +26,8 @@ import {
   deriveSbkExitSignalId,
   deriveSbkSignalIds,
   freqtradeSignalAdapter,
+  SBK_EXECUTION_TIMEFRAME,
+  SBK_MAX_OPEN_TRADES,
   SBK_SIGNAL_CONTRACT_VERSION,
   validateSbkFreqtradeSignal,
   type SbkFreqtradeExitSignal,
@@ -1071,7 +1073,7 @@ async function analyzeSnapshot(
   availableBalance: number = balance,
   openRiskUsd = 0,
   dailyLossUsd = 0,
-  maxOpenTrades = 1,
+  maxOpenTrades = SBK_MAX_OPEN_TRADES,
 ): Promise<{
   candidate: DirectionalSignalCandidate | null;
   reason: string;
@@ -1331,6 +1333,9 @@ function runtimeExpectation(status: FreqtradeBotState): FreqtradeMarketSnapshotE
   if (!exchange || !pair || !timeframe || !status.market) {
     throw new Error('Freqtrade exchange, pair, market, or timeframe configuration is incomplete.');
   }
+  if (timeframe !== SBK_EXECUTION_TIMEFRAME) {
+    throw new Error(`SBK1 entry timeframe must be ${SBK_EXECUTION_TIMEFRAME}.`);
+  }
   if (
     status.exchange?.toLowerCase() !== exchange.toLowerCase() ||
     status.timeframe !== timeframe
@@ -1527,12 +1532,13 @@ export class ServerSignalRunner {
       if (
         !Number.isSafeInteger(status.openTradesCount) ||
         !Number.isSafeInteger(status.maxOpenTrades) ||
-        status.maxOpenTrades <= 0
+        status.maxOpenTrades <= 0 ||
+        status.maxOpenTrades > SBK_MAX_OPEN_TRADES
       ) {
         await this.record({
           candleTimestampMs,
           decision: 'NO TRADE',
-          reason: 'Freqtrade must provide a positive finite max_open_trades limit for portfolio-risk control.',
+          reason: `Freqtrade max_open_trades must be a positive integer no greater than ${SBK_MAX_OPEN_TRADES} for portfolio-risk control.`,
         });
         return;
       }

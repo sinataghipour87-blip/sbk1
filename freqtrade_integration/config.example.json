@@ -1,5 +1,5 @@
 {
-  "max_open_trades": 1,
+  "max_open_trades": 3,
   "stake_currency": "USDT",
   "stake_amount": "unlimited",
   "tradable_balance_ratio": 0.9,
@@ -10,6 +10,10 @@
   "trading_mode": "futures",
   "margin_mode": "isolated",
   "timeframe": "15m",
+  "trailing_stop": true,
+  "trailing_stop_positive": 0.01,
+  "trailing_stop_positive_offset": 0.02,
+  "trailing_only_offset_is_reached": true,
   "unfilledtimeout": {
     "entry": 15,
     "exit": 15,

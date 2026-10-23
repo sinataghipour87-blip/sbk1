@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { isValidSbk1HealthResponse, validateRuntimeSettings } from './run_sbk1';
+import { SBK_EXECUTION_TIMEFRAME, SBK_MAX_OPEN_TRADES } from '../src/services/freqtradeSignalAdapter';
 
 assert.equal(isValidSbk1HealthResponse({ status: 'ok', service: 'sbk1' }), true);
 assert.equal(isValidSbk1HealthResponse({ status: 'ok', service: 'other' }), false);
@@ -26,7 +27,7 @@ const config = {
   dry_run: true,
   dry_run_wallet: 1000,
   stake_amount: 'unlimited',
-  max_open_trades: 1,
+  max_open_trades: SBK_MAX_OPEN_TRADES,
   tradable_balance_ratio: 0.9,
   margin_mode: 'isolated',
   unfilledtimeout: { entry: 15, exit: 15, unit: 'seconds' },
@@ -56,6 +57,7 @@ const config = {
 
 const settings = validateRuntimeSettings(config, environment);
 assert.equal(settings.market, 'futures');
+assert.equal(settings.timeframe, SBK_EXECUTION_TIMEFRAME);
 assert.equal(settings.apiBaseUrl, 'http://127.0.0.1:8080/api/v1');
 assert.equal(settings.bridgeBaseUrl, 'http://127.0.0.1:3000');
 assert.throws(
@@ -119,8 +121,23 @@ assert.throws(
   /stake_amount must be unlimited/,
 );
 assert.throws(
-  () => validateRuntimeSettings({ ...config, max_open_trades: 2 }, environment),
-  /max_open_trades must be exactly 1/,
+  () => validateRuntimeSettings({ ...config, max_open_trades: 4 }, environment),
+  /max_open_trades must be exactly 3/,
+);
+assert.throws(
+  () => validateRuntimeSettings({ ...config, max_open_trades: 1 }, environment),
+  /max_open_trades must be exactly 3/,
+);
+assert.throws(
+  () => validateRuntimeSettings({ ...config, timeframe: '1h' }, environment),
+  /timeframe and SBK1_FREQTRADE_TIMEFRAME must match/,
+);
+assert.throws(
+  () => validateRuntimeSettings(config, {
+    ...environment,
+    SBK1_FREQTRADE_TIMEFRAME: '1h',
+  }),
+  /SBK1_FREQTRADE_TIMEFRAME must be 15m/,
 );
 assert.throws(
   () => validateRuntimeSettings({ ...config, tradable_balance_ratio: 0.91 }, environment),

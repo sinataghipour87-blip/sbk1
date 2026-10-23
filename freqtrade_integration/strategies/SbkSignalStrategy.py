@@ -16,6 +16,11 @@ from sbk_signal_contract import (
     unresolved_inflight_signal_ids,
     validate_bridge_url,
 )
+from yash_adapter import (
+    build_request_from_freqtrade,
+    evaluate_observation_only,
+    format_audit_log,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -25,14 +30,17 @@ MARKET_SNAPSHOT_PUBLISH_INTERVAL_MS = 1_000
 
 class SbkSignalStrategy(IStrategy):
     INTERFACE_VERSION = 3
-    timeframe = os.getenv("SBK1_FREQTRADE_TIMEFRAME", "15m")
+    timeframe = "15m"
     startup_candle_count = 300
     can_short = True
     process_only_new_candles = False
 
     minimal_roi = {}
     stoploss = -0.05
-    trailing_stop = False
+    trailing_stop = True
+    trailing_stop_positive = 0.01
+    trailing_stop_positive_offset = 0.02
+    trailing_only_offset_is_reached = True
     use_custom_stoploss = True
     use_exit_signal = True
     exit_profit_only = False
@@ -959,6 +967,35 @@ class SbkSignalStrategy(IStrategy):
         after_fill: bool,
         **kwargs: Any,
     ) -> float | None:
+        try:
+            data_provider = getattr(self, "dp", None)
+            primary = data_provider.get_pair_dataframe(pair, self.timeframe) if data_provider else None
+            context_1h = data_provider.get_pair_dataframe(pair, "1h") if data_provider else None
+            context_4h = data_provider.get_pair_dataframe(pair, "4h") if data_provider else None
+            fee_open = getattr(trade, "fee_open", None)
+            fee_close = getattr(trade, "fee_close", None)
+            fees = (
+                {"entry_fee_rate": float(fee_open), "exit_fee_rate": float(fee_close)}
+                if isinstance(fee_open, (int, float)) and isinstance(fee_close, (int, float))
+                else None
+            )
+            request = build_request_from_freqtrade(
+                trade,
+                current_rate,
+                current_time,
+                primary,
+                context_1h,
+                context_4h,
+                fees,
+            )
+            if request is not None:
+                logger.info("%s", format_audit_log(evaluate_observation_only(request)))
+        except Exception:
+            logger.exception(
+                "YASH_OBSERVATION_SKIPPED reason_code=DATA_INCOMPLETE "
+                "callback=custom_stoploss; existing stop behavior is unchanged."
+            )
+
         signal = trade.get_custom_data("sbk_signal")
         if not isinstance(signal, dict):
             signal = self._signals.get(getattr(trade, "enter_tag", "") or "")
@@ -989,6 +1026,35 @@ class SbkSignalStrategy(IStrategy):
         current_profit: float,
         **kwargs: Any,
     ) -> str | None:
+        try:
+            data_provider = getattr(self, "dp", None)
+            primary = data_provider.get_pair_dataframe(pair, self.timeframe) if data_provider else None
+            context_1h = data_provider.get_pair_dataframe(pair, "1h") if data_provider else None
+            context_4h = data_provider.get_pair_dataframe(pair, "4h") if data_provider else None
+            fee_open = getattr(trade, "fee_open", None)
+            fee_close = getattr(trade, "fee_close", None)
+            fees = (
+                {"entry_fee_rate": float(fee_open), "exit_fee_rate": float(fee_close)}
+                if isinstance(fee_open, (int, float)) and isinstance(fee_close, (int, float))
+                else None
+            )
+            request = build_request_from_freqtrade(
+                trade,
+                current_rate,
+                current_time,
+                primary,
+                context_1h,
+                context_4h,
+                fees,
+            )
+            if request is not None:
+                logger.info("%s", format_audit_log(evaluate_observation_only(request)))
+        except Exception:
+            logger.exception(
+                "YASH_OBSERVATION_SKIPPED reason_code=DATA_INCOMPLETE "
+                "callback=custom_exit; existing exit behavior is unchanged."
+            )
+
         entry_tag = getattr(trade, "enter_tag", None)
         trade_id = getattr(trade, "id", None)
         direction = "SHORT" if getattr(trade, "is_short", False) else "LONG"

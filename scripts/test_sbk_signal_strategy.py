@@ -92,6 +92,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "trading_mode": "futures",
             "stake_amount": 100,
         }
+
         self.now_ms = int(datetime.now(UTC).timestamp() * 1000)
         self.signal_id = "sbk1_" + "a" * 32
         self.signal = {
@@ -139,6 +140,15 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "contractVersion": "sbk1.freqtrade.signal.v3",
             "signals": [{"signal": self.signal, "status": "STRATEGY_ACCEPTED"}],
         }
+
+    def test_entry_timeframe_is_fixed_to_fifteen_minutes(self):
+        self.assertEqual(self.strategy.timeframe, "15m")
+
+    def test_trailing_stop_waits_for_offset_then_locks_one_percent(self):
+        self.assertTrue(self.strategy.trailing_stop)
+        self.assertEqual(self.strategy.trailing_stop_positive, 0.01)
+        self.assertEqual(self.strategy.trailing_stop_positive_offset, 0.02)
+        self.assertTrue(self.strategy.trailing_only_offset_is_reached)
 
     def test_empty_bridge_environment_uses_default_loopback_url(self):
         with patch.dict("os.environ", {

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
+import { SBK_EXECUTION_TIMEFRAME, SBK_MAX_OPEN_TRADES } from '../src/services/freqtradeSignalAdapter';
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_NODE_PORT = 3000;
@@ -130,6 +131,9 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   const sbkPair = requireEnv(env, 'SBK1_FREQTRADE_PAIR');
   const exchange = requireEnv(env, 'SBK1_SIGNAL_EXCHANGE').toLowerCase();
   const timeframe = requireEnv(env, 'SBK1_FREQTRADE_TIMEFRAME');
+  if (timeframe !== SBK_EXECUTION_TIMEFRAME) {
+    throw new Error(`SBK1_FREQTRADE_TIMEFRAME must be ${SBK_EXECUTION_TIMEFRAME}.`);
+  }
   const bridgeToken = requireEnv(env, 'SBK1_FREQTRADE_BRIDGE_TOKEN');
   const adminToken = requireEnv(env, 'ADMIN_TOKEN');
   requireEnv(env, 'FREQTRADE_USERNAME');
@@ -186,8 +190,8 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   if (config.stake_amount !== 'unlimited') {
     throw new Error('Freqtrade stake_amount must be unlimited so the signal strategy can apply its per-trade margin cap.');
   }
-  if (config.max_open_trades !== 1) {
-    throw new Error('Freqtrade max_open_trades must be exactly 1 for the reviewed DEMO risk profile.');
+  if (config.max_open_trades !== SBK_MAX_OPEN_TRADES) {
+    throw new Error(`Freqtrade max_open_trades must be exactly ${SBK_MAX_OPEN_TRADES} for the reviewed DEMO risk profile.`);
   }
   if (!Number.isFinite(config.dry_run_wallet) || (config.dry_run_wallet ?? 0) <= 0) {
     throw new Error('Freqtrade dry_run_wallet must be a finite positive virtual balance.');

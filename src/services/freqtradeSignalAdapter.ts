@@ -6,6 +6,8 @@ import { isDeepStrictEqual } from 'node:util';
 export const SBK_SIGNAL_CONTRACT_VERSION = 'sbk1.freqtrade.signal.v3';
 export const SBK_ENTRY_AUTHORIZATION_VERSION = 'sbk1.entry.authorization.v2';
 export const DRY_RUN_FIXTURE_SETUP_PREFIX = 'DRY_RUN_E2E_FIXTURE_';
+export const SBK_EXECUTION_TIMEFRAME = '15m';
+export const SBK_MAX_OPEN_TRADES = 3;
 
 export type SbkSignalDirection = 'LONG' | 'SHORT';
 export type SbkExitSignalStatus = 'PENDING' | 'CONFIRMED' | 'CLOSED' | 'EXPIRED';
@@ -319,6 +321,9 @@ export function validateSbkFreqtradeSignal(
   }
   if (typeof signal.timeframe !== 'string' || !/^\d+[mhdw]$/.test(signal.timeframe)) {
     throw new SbkSignalValidationError('Signal timeframe is invalid.', 'INVALID_TIMEFRAME');
+  }
+  if (signal.timeframe !== SBK_EXECUTION_TIMEFRAME) {
+    throw new SbkSignalValidationError('SBK1 entry signals must use the 15m execution timeframe.', 'TIMEFRAME_MISMATCH');
   }
   if (options.expectedTimeframe && signal.timeframe !== options.expectedTimeframe) {
     throw new SbkSignalValidationError('Signal timeframe does not match the configured strategy timeframe.', 'TIMEFRAME_MISMATCH');

@@ -1,0 +1,48 @@
+Metadata-Version: 2.4
+Name: yash-posttrade
+Version: 0.1.0
+Summary: Deterministic, observation-only post-trade policy engine for SBK1.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic<3,>=2.7
+Provides-Extra: test
+Requires-Dist: pytest<9,>=8; extra == "test"
+
+# Yash Post-Trade Policy Engine
+
+Yash is a deterministic, in-process post-trade decision package. It does not
+place orders, authorize entries, or make network requests. Phase 1 supports
+breakeven, time-stop, and confirmed invalidation decisions. Every decision is
+observation-only; a Freqtrade adapter must not execute its plans.
+
+## Safety boundaries
+
+- Primary evidence is the latest closed `15m` candle. `1h` and `4h` candles
+  are optional context only.
+- Primary evidence freshness defaults to 15 seconds and can be set to the
+  host's existing freshness limit. The caller must not use a more permissive
+  value than its own gate.
+- Invalid, incomplete, stale, unsupported, or future-dated evidence cannot
+  produce an executable decision.
+- `new_stoploss` is an absolute price in quote units. It is not a percentage
+  or Freqtrade stoploss ratio.
+- Stop proposals pass a direction-aware ratchet guard. LONG stops can only
+  move up; SHORT stops can only move down.
+- Yash does not alter entry gates, timeframe policy, position limits, or
+  Freqtrade's existing trailing settings (2% activation offset / 1% trail).
+- An invalidation object is treated as an affirmative, externally verified
+  invalidation fact and must reference the same fresh, closed 15m candle.
+
+## Local install and tests
+
+From this directory:
+
+```sh
+python -m pip install -e ".[test]"
+python -m pytest
+```
+
+The unit tests use deterministic values and do not contact exchanges. A
+passing unit suite does not authorize live execution. Integration tests with
+Freqtrade and an out-of-sample backtest are required before a future adapter
+may act on a Yash plan.

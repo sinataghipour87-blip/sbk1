@@ -81,7 +81,7 @@ const snapshot: FreqtradeMarketSnapshot = {
   pair: 'BTC/USDT:USDT',
   timeframe: '15m',
   generatedAtMs: currentNowMs,
-  candles: [candle],
+  candles: [candle, { ...candle, timestampMs: currentNowMs }],
   additionalCandles: {},
   ticker: null,
   orderBook: null,
@@ -122,6 +122,7 @@ try {
     getOpenTrades: async (): Promise<FreqtradeTrade[]> => [...rpcOpenTrades],
   };
   let analysisCalls = 0;
+  let analyzedCandleCount = 0;
   let exitEvaluationCalls = 0;
   async function namedArchiveSignalMock(
     record: SbkFreqtradeSignalRecord,
@@ -149,8 +150,9 @@ try {
       exitEvaluationCalls += 1;
       return { shouldExit: true, reason: 'CONTRACT_TEST_ONLY thesis invalidation' };
     },
-    analyze: async () => {
+    analyze: async (_snapshot, analyzedCandles) => {
       analysisCalls += 1;
+      analyzedCandleCount = analyzedCandles.length;
       return {
         candidate: {
           direction: 'SHORT' as const,
@@ -202,16 +204,33 @@ try {
     minimumCandles: 1,
   };
 
+  const higherTimeframeRunner = new ServerSignalRunner({
+    ...dependencies,
+    getSnapshot: () => ({ ...snapshot, timeframe: '1h' }),
+  });
+  await higherTimeframeRunner.runOnce();
+  assert.equal(analysisCalls, 0, 'higher-timeframe snapshots must not independently reach entry analysis');
+
   const firstRunner = new ServerSignalRunner(dependencies);
   await firstRunner.runOnce();
   await firstRunner.runOnce();
   assert.equal(analysisCalls, 1, 'the same closed candle must only be analyzed once per runner instance');
+  assert.equal(analyzedCandleCount, 1, 'only completed 15m candles may reach entry analysis');
+  assert.equal(snapshot.candles.length, 2, 'the snapshot fixture includes one still-forming candle');
 
   const restartedRunner = new ServerSignalRunner(dependencies);
   await restartedRunner.runOnce();
   const stored = await adapter.getForStrategy(snapshot.pair, snapshot.timeframe);
   assert.equal(stored.length, 1, 'a restarted runner must not queue a second signal for the same candle');
   assert.equal(stored[0]?.signal.direction, 'SHORT');
+  assert.equal(stored[0]?.signal.timeframe, '15m');
+  const overLimitRunner = new ServerSignalRunner({
+    ...dependencies,
+    getFreqtradeStatus: async () => ({ ...status, maxOpenTrades: 4 }),
+  });
+  const analysisCallsBeforeOverLimit = analysisCalls;
+  await overLimitRunner.runOnce();
+  assert.equal(analysisCalls, analysisCallsBeforeOverLimit, 'runner must reject an execution config above the three-trade cap');
   assert.equal(stored[0]?.signal.referencePrice, candle.close);
   assert.equal(stored[0]?.signal.entryConditions.stopLoss, candle.high);
   assert.equal(stored[0]?.signal.entryConditions.takeProfit, candle.low);

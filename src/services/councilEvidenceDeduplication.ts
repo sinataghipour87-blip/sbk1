@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { CouncilWhaleTransfer } from './eightMemberCouncil';
 
 export interface IdentifiedTrade {
@@ -125,10 +124,6 @@ export function normalizeNewsTitle(value: string): string {
     .replace(/\s+/g, ' ');
 }
 
-function headlineHash(value: string): string {
-  return createHash('sha256').update(normalizeNewsTitle(value)).digest('hex');
-}
-
 const NEWS_TITLE_STOP_WORDS = new Set([
   'a', 'an', 'and', 'after', 'as', 'at', 'by', 'for', 'from', 'in',
   'is', 'of', 'on', 'the', 'to', 'with', 'following', 'amid', 'report',
@@ -209,11 +204,11 @@ export function deduplicateNews<T extends {
       Number.isFinite(candidateTimeMs) &&
       Math.abs(publishedAtMs - candidateTimeMs) <= 12 * 60 * 60_000;
     if (url && candidateUrl && url === candidateUrl) return true;
-    if (content && candidateContent && headlineHash(content) === headlineHash(candidateContent)) return true;
+    if (content && candidateContent && content === candidateContent) return true;
     if (
       title &&
       candidateTitle &&
-      headlineHash(title) === headlineHash(candidateTitle) &&
+      title === candidateTitle &&
       samePublicationWindow
     ) return true;
     const tokens = new Set(normalizedNewsTokens(item.headline));

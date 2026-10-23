@@ -1,5 +1,6 @@
 import type { AnalysisResult } from '../types/trading';
 import type { EightMemberCouncilReport } from './eightMemberCouncil';
+import { SBK_EXECUTION_TIMEFRAME, SBK_MAX_OPEN_TRADES } from './freqtradeSignalAdapter';
 import { calculateCentralRiskAllocation } from './centralRiskAllocation';
 import type {
   WalkForwardCandleResearchReport,
@@ -324,6 +325,15 @@ export function runPostCouncilTradeControl(
   addGate('COUNCIL_REPORT', councilError === null, councilError ?? 'گزارش و حدنصاب شورا معتبر است.');
   if (councilError) return reject(councilError);
   const direction = input.council.selectedDirection!;
+  const entryTimeframeValid = input.analysis.timeframe === SBK_EXECUTION_TIMEFRAME;
+  addGate(
+    'ENTRY_TIMEFRAME',
+    entryTimeframeValid,
+    entryTimeframeValid
+      ? `تایم‌فریم ورود ${SBK_EXECUTION_TIMEFRAME} است؛ افق نگهداری مستقل ارزیابی می‌شود.`
+      : `سیگنال ورود فقط روی کندل بسته‌شدهٔ ${SBK_EXECUTION_TIMEFRAME} مجاز است.`,
+  );
+  if (!entryTimeframeValid) return reject('ENTRY_TIMEFRAME_MISMATCH: تایم‌فریم ورود باید 15m باشد.');
   holdingHorizon = selectHoldingHorizon(
     input.candleResearch,
     input.analysis,
@@ -476,6 +486,20 @@ export function runPostCouncilTradeControl(
     return reject('کنترل مرکزی سطوح ورود/حدضرر/هدف را برای جهت شورا معتبر ندانست.');
   }
 
+  const entryPriceDeviationBps =
+    Math.abs(entryPrice - input.referencePrice) / input.referencePrice * 10_000;
+  const entryPriceDeviationValid = entryPriceDeviationBps <= input.maxDeviationBps;
+  addGate(
+    'ENTRY_PRICE_DEVIATION',
+    entryPriceDeviationValid,
+    entryPriceDeviationValid
+      ? 'قیمت نهایی ورود با قیمت مرجع در محدودهٔ انحراف مجاز است.'
+      : `انحراف قیمت نهایی ورود ${entryPriceDeviationBps.toFixed(2)}bps از سقف ${input.maxDeviationBps}bps بیشتر است.`,
+  );
+  if (!entryPriceDeviationValid) {
+    return reject('ENTRY_PRICE_DEVIATION_EXCEEDED: قیمت نهایی ورود از حد انحراف مجاز نسبت به قیمت مرجع فراتر رفت.');
+  }
+
   const stopFraction = Math.abs(entryPrice - stopLoss) / entryPrice;
   const riskRewardRatio = Math.abs(takeProfit - entryPrice) / Math.abs(entryPrice - stopLoss);
   const stopDistancePct = stopFraction * 100;
@@ -495,6 +519,7 @@ export function runPostCouncilTradeControl(
   const riskContextIsValid =
     Number.isSafeInteger(input.maxOpenTrades) &&
     input.maxOpenTrades > 0 &&
+    input.maxOpenTrades <= SBK_MAX_OPEN_TRADES &&
     Number.isFinite(input.openRiskUsd) &&
     input.openRiskUsd >= 0 &&
     Number.isFinite(input.dailyLossUsd) &&
