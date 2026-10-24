@@ -8,13 +8,11 @@ import { newsShockFirewallService } from '../services/newsShockFirewall';
 import type { WalkForwardCandleResearchReport } from '../services/walkForwardCandleResearch';
 import type { HoldingHorizonDecision } from '../services/postCouncilTradeController';
 import { CollapsibleCard } from './CollapsibleCard';
-import { macroContextBrainService } from '../services/macroContextBrain';
 import {
   COUNCIL_COORDINATOR_MODULES,
-  evaluateEightMemberCouncil,
   type CouncilModuleEvidence,
-  type CouncilMacroContext,
   type CouncilVote,
+  type EightMemberCouncilReport,
 } from '../services/eightMemberCouncil';
 
 interface Props {
@@ -23,6 +21,7 @@ interface Props {
   currentPrice?: number;
   activePositions?: TradePosition[];
   tradeHistory?: TradeHistory[];
+  councilReport?: EightMemberCouncilReport | null;
 }
 
 interface OpenSourceModuleResult {
@@ -478,20 +477,13 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
   currentPrice = 0,
   activePositions = [],
   tradeHistory = [],
+  councilReport = null,
 }) => {
-  const [macroContext, setMacroContext] = useState<CouncilMacroContext | null>(null);
   const [advisory, setAdvisory] = useState<OpenSourceAdvisoryReport | null>(null);
   const [advisoryError, setAdvisoryError] = useState<string | null>(null);
   const [brainReport, setBrainReport] = useState<MultiBrainConsensusReport | null>(null);
   const [latestExecutionAudit, setLatestExecutionAudit] = useState<ExecutionAuditView | null>(null);
   const [executionAuditError, setExecutionAuditError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const refresh = () => setMacroContext(macroContextBrainService.getMacroContext());
-    refresh();
-    const timer = window.setInterval(refresh, 15_000);
-    return () => window.clearInterval(timer);
-  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -612,10 +604,23 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
     activePositions,
   }), [analysis, currentPrice, aiPrediction, activePositions, tradeHistory, advisory, brainReport, pillarBreakdown, pentagon]);
 
-  const report = useMemo(
-    () => evaluateEightMemberCouncil({ analysis, macroContext, supportingModules }),
-    [analysis, macroContext, supportingModules]
-  );
+  const report = councilReport;
+  if (!report) {
+    return (
+      <CollapsibleCard
+        title="شورای ۸ عضو تحلیل بازار"
+        badge="در انتظار گزارش سرور"
+        badgeColor="text-slate-300 bg-slate-900 border-slate-700"
+        defaultOpen={true}
+        icon={<Users className="w-5 h-5 text-cyan-300" />}
+      >
+        <p className="rounded-xl border border-slate-800 bg-[#041124] p-3 text-xs leading-6 text-slate-300">
+          رأی شورا فقط پس از ارزیابی سرور و از جریان رویداد تصمیم نمایش داده می‌شود؛ محاسبهٔ مستقل در رابط انجام نمی‌شود.
+        </p>
+      </CollapsibleCard>
+    );
+  }
+
   return (
     <CollapsibleCard
       title="شورای ۸ عضو تحلیل بازار"

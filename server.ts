@@ -24,13 +24,21 @@ import {
     FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS,
     FreqtradeMarketSnapshotValidationError,
     freqtradeMarketDataBridge,
+    type FreqtradeMarketSnapshot,
 } from './src/services/freqtradeMarketDataBridge';
-import { createServerSignalRunner, type ServerSignalRunner } from './src/services/serverSignalRunner';
+import {
+    createServerSignalRunner,
+    type ServerSignalRunner,
+    type ServerSignalRunnerUpdate,
+} from './src/services/serverSignalRunner';
 import { operationalTradeArchive } from './src/services/operationalTradeArchive';
 import { fetchDirectNewsHeadlines } from './src/services/directNewsFeeds';
 import { fetchFreeMacroData } from './src/services/freeMacroData';
 import { openSourceAdvisoryService } from './src/services/openSourceAdvisoryService';
 import { binancePublicMarketDataStream } from './src/services/publicMarketDataStream';
+import { bybitPublicMarketDataStream } from './src/services/bybitPublicMarketDataStream';
+import { fetchPublicMarketCandles } from './src/services/publicMarketDataFallback';
+import { selectChartPrice } from './src/services/chartMarketFeed';
 
 dotenv.config();
 
@@ -131,12 +139,78 @@ app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok', service: 'sbk1' });
 });
 
+let chartBinanceCandlesCache: {
+    key: string;
+    fetchedAtMs: number;
+    candles: Awaited<ReturnType<typeof fetchPublicMarketCandles>>;
+} | null = null;
+let chartBinanceCandlesRequest: Promise<Awaited<ReturnType<typeof fetchPublicMarketCandles>>> | null = null;
+const chartCandlesLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false },
+});
+
+app.get('/api/market/chart-candles', chartCandlesLimiter, async (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() ||
+        process.env.FREQTRADE_EXCHANGE?.trim().toLowerCase() || '';
+    const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() ||
+        process.env.FREQTRADE_PAIR?.trim() || '';
+    const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
+        process.env.FREQTRADE_TIMEFRAME?.trim() || '';
+    const market = process.env.SBK1_MARKET?.trim() === 'spot' ||
+        process.env.FREQTRADE_MARKET?.trim() === 'spot'
+        ? 'spot'
+        : 'futures';
+    if (exchange !== 'bybit' || market !== 'futures' || !pair || !timeframe) {
+        return res.status(409).json({
+            error: 'Binance chart fallback is only configured for the Bybit Futures chart market.',
+            code: 'CHART_FALLBACK_NOT_CONFIGURED',
+        });
+    }
+
+    const key = `${pair}|${timeframe}|${market}`;
+    const nowMs = Date.now();
+    if (chartBinanceCandlesCache?.key === key &&
+        nowMs - chartBinanceCandlesCache.fetchedAtMs < 30_000) {
+        return res.json({
+            source: 'binance',
+            pair,
+            timeframe,
+            candles: chartBinanceCandlesCache.candles,
+        });
+    }
+    try {
+        if (!chartBinanceCandlesRequest) {
+            chartBinanceCandlesRequest = fetchPublicMarketCandles({ pair, timeframe, market });
+        }
+        const candles = await chartBinanceCandlesRequest;
+        chartBinanceCandlesCache = { key, fetchedAtMs: Date.now(), candles };
+        return res.json({ source: 'binance', pair, timeframe, candles });
+    } catch (error) {
+        return res.status(503).json({
+            error: error instanceof Error ? error.message : 'Binance chart candles are unavailable.',
+            code: 'CHART_FALLBACK_CANDLES_UNAVAILABLE',
+        });
+    } finally {
+        chartBinanceCandlesRequest = null;
+    }
+});
+
 // Configure Rate Limiter for API paths
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 1000, // Keep general API traffic separate from sensitive LIVE operations.
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) =>
+        (req.method === 'POST' &&
+            req.originalUrl.split('?')[0] === '/api/freqtrade/market-snapshot') ||
+        (req.method === 'GET' &&
+            req.originalUrl.split('?')[0] === '/api/market/freqtrade-snapshot'),
     validate: {
         xForwardedForHeader: false,
     },
@@ -145,6 +219,20 @@ const apiLimiter = rateLimit({
     }
 });
 app.use('/api/', apiLimiter);
+
+const freqtradeSnapshotLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 2000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    passOnStoreError: false,
+    validate: {
+        xForwardedForHeader: false,
+    },
+    message: {
+        error: 'سهمیهٔ ارسال snapshot از حد مجاز گذشت؛ انتشار طبق cadence فعلی ادامه یابد.'
+    }
+});
 
 const liveOperationLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -629,7 +717,11 @@ function requireFreqtradeBridgeAuth(req: express.Request, res: express.Response,
     next();
 }
 
-app.post('/api/freqtrade/market-snapshot', requireFreqtradeBridgeAuth, async (req, res) => {
+app.post(
+    '/api/freqtrade/market-snapshot',
+    requireFreqtradeBridgeAuth,
+    freqtradeSnapshotLimiter,
+    async (req, res) => {
     try {
         const [botState, whitelist] = await Promise.all([
             freqtradeBridge.getStatus(),
@@ -643,7 +735,8 @@ app.post('/api/freqtrade/market-snapshot', requireFreqtradeBridgeAuth, async (re
                 accepted: false,
                 code: 'MARKET_SNAPSHOT_NOT_CONFIGURED',
                 error: 'SBK1 Freqtrade exchange, pair, and timeframe are required before accepting market snapshots.',
-            });
+                },
+            );
         }
         if (
             botState.status !== 'running' ||
@@ -689,6 +782,210 @@ app.get('/api/open-source-advisories', requireAdminAuth, (_req, res) => {
         status: report?.status ?? 'NOT_RUN',
         decisionInfluence: 'ADVISORY_ONLY',
         report,
+    });
+});
+
+app.get('/api/market/freqtrade-snapshot/stream', (_req, res) => {
+    const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+    const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+    const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+    if (!exchange || !pair || !timeframe) {
+        return res.status(503).json({
+            error: 'Freqtrade market snapshot is not configured; start the managed Freqtrade integration.',
+            code: 'MARKET_SNAPSHOT_NOT_CONFIGURED',
+        });
+    }
+
+    let initialSnapshot: FreqtradeMarketSnapshot;
+    try {
+        initialSnapshot = freqtradeMarketDataBridge.getLatestConfigured({ exchange, pair, timeframe });
+    } catch (error) {
+        return res.status(503).json({
+            error: error instanceof Error ? error.message : 'No fresh Freqtrade market snapshot is available.',
+            code: error instanceof FreqtradeMarketSnapshotValidationError
+                ? error.code
+                : 'MARKET_SNAPSHOT_UNAVAILABLE',
+        });
+    }
+
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    let canWrite = true;
+    let pendingSnapshot: FreqtradeMarketSnapshot | null = null;
+    const writeSnapshot = (snapshot: typeof initialSnapshot) => {
+        if (
+            res.destroyed ||
+            snapshot.exchange.toLowerCase() !== exchange ||
+            snapshot.market !== initialSnapshot.market ||
+            snapshot.pair !== pair ||
+            snapshot.timeframe !== timeframe
+        ) return;
+        if (!canWrite) {
+            pendingSnapshot = snapshot;
+            return;
+        }
+        canWrite = res.write(`id: ${snapshot.generatedAtMs}\ndata: ${JSON.stringify({
+            serverTimeMs: Date.now(),
+            snapshot,
+        })}\n\n`);
+    };
+
+    const unsubscribe = freqtradeMarketDataBridge.subscribe(writeSnapshot);
+    res.on('drain', () => {
+        canWrite = true;
+        if (pendingSnapshot) {
+            const latestSnapshot = pendingSnapshot;
+            pendingSnapshot = null;
+            writeSnapshot(latestSnapshot);
+        }
+    });
+    const heartbeat = setInterval(() => {
+        if (!res.destroyed && canWrite) canWrite = res.write(': keepalive\n\n');
+    }, 15_000);
+    res.on('close', () => {
+        clearInterval(heartbeat);
+        unsubscribe();
+    });
+    writeSnapshot(initialSnapshot);
+});
+
+app.get('/api/market/chart-stream', (req, res) => {
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    let canWrite = true;
+    let pendingFrame: string | null = null;
+    let cachedFreqtradeTicker: FreqtradeMarketSnapshot['ticker'] = null;
+    let lastFreqtradeFallbackCheckAtMs = 0;
+    let lastFreqtradeFallbackError: string | null = null;
+    const send = () => {
+        if (res.destroyed || res.writableEnded) return;
+        const nowMs = Date.now();
+        const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() ||
+            process.env.FREQTRADE_EXCHANGE?.trim().toLowerCase() || '';
+        const bybitPrice = exchange === 'bybit'
+            ? bybitPublicMarketDataStream.getLatestPrice(nowMs)
+            : null;
+        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() ||
+            process.env.FREQTRADE_PAIR?.trim() || '';
+        const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
+            process.env.FREQTRADE_TIMEFRAME?.trim() || '';
+        if (
+            !bybitPrice &&
+            exchange === 'bybit' &&
+            pair &&
+            timeframe &&
+            nowMs - lastFreqtradeFallbackCheckAtMs >= 1_000
+        ) {
+            lastFreqtradeFallbackCheckAtMs = nowMs;
+            try {
+                cachedFreqtradeTicker = freqtradeMarketDataBridge.getLatestConfigured(
+                    { exchange, pair, timeframe },
+                    nowMs,
+                ).ticker;
+                lastFreqtradeFallbackError = null;
+            } catch (error) {
+                cachedFreqtradeTicker = null;
+                const message = error instanceof Error ? error.message : String(error);
+                if (message !== lastFreqtradeFallbackError) {
+                    console.warn('[ChartMarketFeed] Bybit Freqtrade ticker fallback is unavailable:', message);
+                    lastFreqtradeFallbackError = message;
+                }
+            }
+        }
+        const freqtradeTicker = bybitPrice ? null : cachedFreqtradeTicker;
+        const freshFreqtradeTicker = freqtradeTicker &&
+            nowMs - freqtradeTicker.retrievedAtMs >= -1_000 &&
+            nowMs - freqtradeTicker.retrievedAtMs <= 5_000
+            ? freqtradeTicker
+            : null;
+        const binancePrice = binancePublicMarketDataStream.getLatestPrice(nowMs);
+        const bybitCandidate = bybitPrice
+            ? { ...bybitPrice, source: 'bybit' as const }
+            : freshFreqtradeTicker
+              ? {
+                price: freshFreqtradeTicker.last,
+                sourceTimestampMs: freshFreqtradeTicker.exchangeTimestampMs ?? freshFreqtradeTicker.retrievedAtMs,
+                receivedAtMs: freshFreqtradeTicker.retrievedAtMs,
+                source: 'bybit' as const,
+            }
+              : null;
+        const selectedPrice = selectChartPrice(bybitCandidate, binancePrice, nowMs);
+        const update = selectedPrice
+            ? {
+                state: 'LIVE' as const,
+                source: selectedPrice.source,
+                price: selectedPrice.price,
+                sourceTimestampMs: selectedPrice.sourceTimestampMs,
+                receivedAtMs: nowMs,
+            }
+            : bybitPublicMarketDataStream.getLastReceivedAtMs() > 0 ||
+              binancePublicMarketDataStream.getLastReceivedAtMs() > 0
+              ? {
+                  state: 'STALE' as const,
+                  source: null,
+                  price: null,
+                  sourceTimestampMs: null,
+                  receivedAtMs: nowMs,
+              }
+              : bybitPublicMarketDataStream.isConnected() ||
+                binancePublicMarketDataStream.isConnected()
+              ? {
+                  state: 'DEGRADED' as const,
+                  source: null,
+                  price: null,
+                  sourceTimestampMs: null,
+                  receivedAtMs: nowMs,
+              }
+            : {
+                state: 'DISCONNECTED' as const,
+                source: null,
+                price: null,
+                sourceTimestampMs: null,
+                receivedAtMs: nowMs,
+            };
+        const identity = `${update.state}:${update.source ?? ''}:${update.sourceTimestampMs ?? ''}:${update.price ?? ''}`;
+        if (identity === lastSentIdentity && nowMs - lastSentAtMs < 2_000) return;
+        const frame = `data: ${JSON.stringify(update)}\n\n`;
+        if (!canWrite) {
+            pendingFrame = frame;
+            lastSentIdentity = identity;
+            lastSentAtMs = nowMs;
+            return;
+        }
+        canWrite = res.write(frame);
+        lastSentIdentity = identity;
+        lastSentAtMs = nowMs;
+    };
+    let lastSentIdentity = '';
+    let lastSentAtMs = 0;
+    send();
+    const publisher = setInterval(send, 250);
+    const heartbeat = setInterval(() => {
+        if (!res.destroyed && !res.writableEnded && canWrite) {
+            canWrite = res.write(': keepalive\n\n');
+        }
+    }, 15_000);
+    res.on('drain', () => {
+        canWrite = true;
+        if (pendingFrame) {
+            const frame = pendingFrame;
+            pendingFrame = null;
+            canWrite = res.write(frame);
+        }
+    });
+    req.on('close', () => {
+        clearInterval(publisher);
+        clearInterval(heartbeat);
     });
 });
 
@@ -1376,6 +1673,126 @@ let liveTradingState = {
     } as Record<string, { status: string; message: string }>,
     liveAutoTradeEnabled: false
 };
+let serverAutoPilotEnabled = false;
+let serverSignalRunner: ServerSignalRunner | null = null;
+
+function serializeRunnerUpdate(update: ServerSignalRunnerUpdate): ServerSignalRunnerUpdate {
+    const councilReport = update.councilReport;
+    return {
+        ...update,
+        councilReport: councilReport
+            ? {
+                ...councilReport,
+                members: councilReport.members.map((member) => ({
+                    ...member,
+                    supportingEvidence: member.supportingEvidence.map((evidence) => ({
+                        moduleId: evidence.moduleId,
+                        nameFa: evidence.nameFa,
+                        status: evidence.status,
+                        sourceTimestampMs: evidence.sourceTimestampMs,
+                        summaryFa: evidence.summaryFa,
+                    })),
+                })),
+            }
+            : null,
+    };
+}
+
+app.get('/api/decision/stream', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    const send = (update: ServerSignalRunnerUpdate) => {
+        if (!res.destroyed && !res.writableEnded) res.write(`data: ${JSON.stringify(serializeRunnerUpdate(update))}\n\n`);
+    };
+    const unsubscribe = serverSignalRunner?.subscribe(send);
+    if (!serverSignalRunner) {
+        send({
+            updatedAtMs: Date.now(),
+            autoPilotEnabled: serverAutoPilotEnabled,
+            candleTimestampMs: null,
+            decision: 'NO TRADE',
+            reason: 'Server decision runner is not ready.',
+            councilReport: null,
+        });
+    }
+    const heartbeat = setInterval(() => {
+        if (!res.writableEnded) res.write(': heartbeat\n\n');
+    }, 15_000);
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        unsubscribe?.();
+    });
+});
+
+app.post('/api/decision/auto-pilot', requireAdminAuth, liveOperationLimiter, async (req, res) => {
+    const { enabled } = req.body;
+    if (typeof enabled !== 'boolean') {
+        return res.status(400).json({ success: false, error: '`enabled` must be a boolean.' });
+    }
+    if (enabled) {
+        if (liveTradingState.killSwitchActive) {
+            return res.status(409).json({ success: false, autoPilotEnabled: false, error: 'Kill switch is active; disarm it before enabling demo Auto-Pilot.' });
+        }
+        try {
+            const status = await freqtradeBridge.getStatus();
+            if (status.status !== 'running' || !status.dryRun || status.forceEntryEnabled !== false) {
+                return res.status(409).json({
+                    success: false,
+                    autoPilotEnabled: false,
+                    error: 'Auto-Pilot requires a running Freqtrade dry-run instance with force_entry_enable=false.',
+                });
+            }
+        } catch (error) {
+            return res.status(503).json({
+                success: false,
+                autoPilotEnabled: false,
+                error: error instanceof Error ? error.message : 'Freqtrade status is unavailable.',
+            });
+        }
+    }
+    serverAutoPilotEnabled = enabled;
+    serverSignalRunner?.refreshAutoPilotState();
+    return res.json({ success: true, autoPilotEnabled: serverAutoPilotEnabled, executionMode: 'DRY_RUN' });
+});
+
+app.post('/api/decision/manual-entry', requireAdminAuth, liveOperationLimiter, async (req, res) => {
+    const { direction } = req.body;
+    if (direction !== 'LONG' && direction !== 'SHORT') {
+        return res.status(400).json({ success: false, error: '`direction` must be LONG or SHORT.' });
+    }
+    if (liveTradingState.killSwitchActive) {
+        return res.status(409).json({ success: false, error: 'Kill switch is active; manual entry is blocked.' });
+    }
+    try {
+        const status = await freqtradeBridge.getStatus();
+        if (status.status !== 'running' || !status.dryRun || status.forceEntryEnabled !== false) {
+            return res.status(409).json({
+                success: false,
+                error: 'Manual intents require a running Freqtrade dry-run instance with force_entry_enable=false.',
+            });
+        }
+    } catch (error) {
+        return res.status(503).json({
+            success: false,
+            error: error instanceof Error ? error.message : 'Freqtrade status is unavailable.',
+        });
+    }
+    if (!serverSignalRunner) {
+        return res.status(503).json({ success: false, error: 'Server decision runner is not ready.' });
+    }
+    if (!serverSignalRunner.requestManualEntry(direction)) {
+        return res.status(409).json({ success: false, error: 'A manual intent is already awaiting server evaluation.' });
+    }
+    return res.status(202).json({
+        success: true,
+        status: 'PENDING_SERVER_COUNCIL_AND_RISK_CHECKS',
+        direction,
+        message: 'Intent queued; no order is authorized until the server council and risk pipeline approve it.',
+    });
+});
 
 app.get('/api/live/status', async (req, res) => {
     try {
@@ -2012,7 +2429,6 @@ app.use('/api', (req, res) => {
 // Vite middleware
 let viteServer: Awaited<ReturnType<typeof createViteServer>> | null = null;
 let httpServer: ReturnType<typeof app.listen> | null = null;
-let serverSignalRunner: ServerSignalRunner | null = null;
 
 function listenOnAvailablePort(port: number, allowFallback: boolean): Promise<ReturnType<typeof app.listen>> {
     return new Promise((resolve, reject) => {
@@ -2043,7 +2459,7 @@ async function startServer() {
 
   app.use(viteServer.middlewares);
 
-  // Initialize persistent state; market and execution feeds belong to Freqtrade.
+  // Initialize persistent state; execution snapshots and chart pricing use the configured Freqtrade market.
   await startServerSideMarketFeed();
   if (shutdownRequested) {
     await viteServer.close();
@@ -2061,8 +2477,13 @@ async function startServer() {
     } catch (error) {
       console.error('[SBK1] Binance live market stream could not be configured; REST fallback remains enabled:', error);
     }
+    try {
+      bybitPublicMarketDataStream.start(streamPair, streamMarket);
+    } catch (error) {
+      console.error('[SBK1] Bybit live chart stream could not be configured; the chart will report it as unavailable:', error);
+    }
   } else {
-    console.warn('[SBK1] Binance live market stream was not started; no Freqtrade pair is configured.');
+    console.warn('[SBK1] Public market streams were not started; no Freqtrade pair is configured.');
   }
 
     const configuredPort = Number(process.env.SBK1_PORT || 3000);
@@ -2075,6 +2496,7 @@ async function startServer() {
     console.log(`Server running on port ${listeningPort}`);
     serverSignalRunner = createServerSignalRunner({
       isKillSwitchActive: () => liveTradingState.killSwitchActive,
+      isAutoPilotEnabled: () => serverAutoPilotEnabled,
     });
     serverSignalRunner.start();
 }
@@ -2095,6 +2517,7 @@ async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
       serverSignalRunner?.stop(),
       openSourceAdvisoryService.stop(),
       Promise.resolve(binancePublicMarketDataStream.stop()),
+      Promise.resolve(bybitPublicMarketDataStream.stop()),
       new Promise<void>((resolve, reject) => {
         if (!httpServer?.listening) {
           resolve();

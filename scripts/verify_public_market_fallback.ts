@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { AnalysisResult, DataQualityReport } from '../src/types/trading';
 import {
+  fetchPublicMarketCandles,
   fetchPublicMarketFallback,
 } from '../src/services/publicMarketDataFallback';
 import { applyPublicMarketFallbackToCouncilAnalysis } from '../src/services/serverSignalRunner';
@@ -118,6 +119,23 @@ assert.equal(fallback.provider, 'Binance public REST API');
 assert.equal(fallback.candles.status, 'LIVE');
 assert.equal(fallback.candles.value?.length, 40);
 assert.equal(fallback.fastCandles.status, 'LIVE');
+const chartFallbackCandles = await fetchPublicMarketCandles({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: fixtureFetcher,
+  timeoutMs: 100,
+});
+assert.equal(chartFallbackCandles.length, 40);
+assert.deepEqual(chartFallbackCandles[0], {
+  timestampMs: latestCloseMs - 40 * 60_000,
+  open: 100,
+  high: 102,
+  low: 99,
+  close: 101,
+  volume: 10,
+});
 assert.equal(fallback.fastCandles.sourceTimestampMs, fallback.candles.sourceTimestampMs);
 assert.equal(fallback.higherTimeframeCandles['1h'].status, 'LIVE');
 assert.equal(fallback.higherTimeframeCandles['4h'].status, 'LIVE');

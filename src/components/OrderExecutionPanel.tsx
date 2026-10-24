@@ -26,6 +26,7 @@ import { evaluateSignalToExecution } from '../services/signalToExecution';
 import { getTradeHistory } from '../services/history';
 import { calculateKellyRisk, calculateDrawdown } from '../services/kellyRisk';
 import { calculateHedgeBreakEvenPrice } from '../App';
+import type { EightMemberCouncilReport } from '../services/eightMemberCouncil';
 
 interface OrderExecutionPanelProps {
   balance: number;
@@ -47,6 +48,9 @@ interface OrderExecutionPanelProps {
   autoTradeActive: boolean;
   onToggleAutoTrade: () => void;
   mode?: 'manual' | 'auto';
+  demoTradingMode?: boolean;
+  councilReport?: EightMemberCouncilReport | null;
+  serverDecisionReason?: string;
 }
 
 const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
@@ -69,6 +73,9 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
   autoTradeActive,
   onToggleAutoTrade,
   mode,
+  demoTradingMode = false,
+  councilReport = null,
+  serverDecisionReason = 'در انتظار گزارش تصمیم سرور.',
 }) => {
   const [isEditingBalance, setIsEditingBalance] = useState<boolean>(false);
   const [balanceInput, setBalanceInput] = useState<string>(balance.toString());
@@ -177,13 +184,12 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
   const currentLev = userLeverage ?? analysis.leverage;
 
   const evalResultLong = useMemo(() => {
-    return evaluateSignalToExecution(analysis, 'LONG', prediction, history);
-  }, [analysis, prediction, history]);
+    return evaluateSignalToExecution(analysis, 'LONG', prediction, history, undefined, undefined, demoTradingMode);
+  }, [analysis, demoTradingMode, prediction, history]);
 
   const evalResultShort = useMemo(() => {
-    return evaluateSignalToExecution(analysis, 'SHORT', prediction, history);
-  }, [analysis, prediction, history]);
-
+    return evaluateSignalToExecution(analysis, 'SHORT', prediction, history, undefined, undefined, demoTradingMode);
+  }, [analysis, demoTradingMode, prediction, history]);
   const probLong =
     analysis.scoreLong + analysis.scoreShort > 0
       ? Math.round((analysis.scoreLong / (analysis.scoreLong + analysis.scoreShort)) * 100)
@@ -204,6 +210,9 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
       {/* 1. Leverage Configuration Bar */}
       {mode === 'manual' ? (
         <div className="bg-gradient-to-br from-[#04101e] to-[#030712] border border-cyan-500/40 rounded-xl p-3 space-y-2.5 shadow-[0_0_18px_rgba(6,182,212,0.15)] relative hud-corner">
+          <p className="text-[10px] text-cyan-200">
+            دکمه‌های LONG/SHORT درخواست را به سرور می‌فرستند؛ شورا و گیت‌های ریسک سمت سرور تصمیم می‌گیرند.
+          </p>
           <div className="flex items-center justify-between text-xs font-mono">
             <span className="flex items-center gap-1.5 text-slate-200 font-bold">
               <Sliders className="w-3.5 h-3.5 text-cyan-400" />
@@ -291,7 +300,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
             </span>
             <span className="text-slate-300 font-bold flex items-center gap-1">
               <Cpu className="w-3 h-3 text-slate-400" />
-              همگرایی: {analysis.confScore}/5
+              امتیاز تحلیل: {analysis.confScore}/5
             </span>
             <span className="text-rose-400 font-bold flex items-center gap-1">
               احتمال فروش: {probShort}%
@@ -333,8 +342,14 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                 <div className="text-xs font-bold font-mono text-white">معامله خودکار SB (Auto-Pilot)</div>
                 <div className="text-[10px] text-slate-400">
                   {autoTradeActive
-                    ? 'ورود هوشمند با تایید ارکان (معامله بعدی ۲ دقیقه بعد در صورت تداوم تایید ارکان با اهرم ۱.۵x)'
-                    : 'ورود دستی یا فعال‌سازی ربات خودکار'}
+                    ? 'پایش شورا؛ ورود دمو فقط با حدنصاب شورا و عبور از گیت اجرا، حداکثر یک‌بار در هر کندل ۱۵ دقیقه‌ای'
+                    : 'فعال‌سازی اتوپایلوت سرور؛ اجرا فقط در Freqtrade dry-run و پس از گیت‌های شورا و ریسک'}
+                </div>
+                <div className="text-[9px] text-slate-500">
+                  رابط فقط وضعیت را نمایش می‌دهد؛ تصمیم و ثبت سیگنال را سرور انجام می‌دهد.
+                </div>
+                <div className="text-[9px] text-slate-400" aria-live="polite">
+                  وضعیت سرور: {serverDecisionReason}
                 </div>
               </div>
             </div>
@@ -346,7 +361,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                   : 'bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-700/50'
               }`}
             >
-              {autoTradeActive ? '🟢 ربات خودکار فعال است' : '⚪ روشن کردن ربات خودکار'}
+              {autoTradeActive ? '🟢 اتوپایلوت سرور فعال است' : '⚪ فعال‌سازی اتوپایلوت سرور'}
             </button>
           </div>
 
@@ -363,16 +378,36 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
             </div>
           )}
 
-          {/* Live Dual-Radar State (LONG & SHORT Parallel Tracking) */}
+          {/* Current eight-member council report */}
           <div className="pt-2 border-t border-cyan-950/60 space-y-2">
             <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pb-0.5">
               <span className="flex items-center gap-1 font-bold">
                 <span className={`w-1.5 h-1.5 rounded-full ${autoTradeActive ? 'bg-cyan-400 animate-pulse' : 'bg-slate-500'}`} />
-                <span>پایش دوطرفه ارکان به صورت همزمان (Dual-Radar):</span>
+                <span>رأی فعلی شورای ۸ عضو:</span>
               </span>
               <span className="text-cyan-400 font-bold">ظرفیت: {filteredPositions.length}/{mode === 'auto' ? 3 : 6}</span>
             </div>
 
+            {councilReport ? (
+              <>
+                <div className="grid grid-cols-4 gap-1 text-[10px] font-mono">
+                  <span className="rounded border border-emerald-800/60 bg-emerald-950/30 p-1 text-center text-emerald-200">LONG {councilReport.longVotes}</span>
+                  <span className="rounded border border-rose-800/60 bg-rose-950/30 p-1 text-center text-rose-200">SHORT {councilReport.shortVotes}</span>
+                  <span className="rounded border border-slate-700 bg-slate-950/30 p-1 text-center text-slate-200">خنثی {councilReport.neutralVotes}</span>
+                  <span className="rounded border border-amber-800/60 bg-amber-950/30 p-1 text-center text-amber-200">ممتنع {councilReport.abstentions}</span>
+                </div>
+                <p className="text-[10px] leading-5 text-slate-300">
+                  {councilReport.summaryFa}
+                  {' '}· {new Date(councilReport.evaluatedAtMs).toLocaleTimeString('fa-IR')}
+                </p>
+              </>
+            ) : (
+              <p className="text-[10px] text-amber-200">گزارش رأی شورا هنوز آماده نیست؛ رأی فرضی نمایش داده نمی‌شود.</p>
+            )}
+
+            <p className="pt-1 text-[9px] font-bold text-slate-400">
+              ارزیابی گیت اجرای خرید/فروش (جدا از شمارش رأی شورا)
+            </p>
             <div className="grid grid-cols-2 gap-2">
               {/* 1. LONG Radar */}
               <div className={`p-2 rounded-lg border text-xs font-mono transition-all ${
@@ -393,14 +428,14 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                     }`}>
                       <span className="w-1.5 h-1.5 rounded-full bg-white" />
                     </span>
-                    <span>رادار لانگ / خرید</span>
+                    <span>گیت خرید / LONG</span>
                   </span>
                   <span className="text-[10px] px-1 py-0.5 rounded bg-[#010912] border border-cyan-950 text-slate-400 font-bold">
-                    {evalResultLong.totalPillarsPassed}/8 رکن
+                    {evalResultLong.canExecute ? 'مجاز' : 'در انتظار'}
                   </span>
                 </div>
                 <div className="mt-1.5 flex items-center justify-between text-[10px]">
-                  <span className="text-slate-400">امتیاز همگرایی:</span>
+                  <span className="text-slate-400">امتیاز گیت اجرا:</span>
                   <span className={`font-bold ${evalResultLong.canExecute ? 'text-emerald-400 text-xs' : 'text-amber-300'}`}>
                     {evalResultLong.totalScorePct}%
                   </span>
@@ -409,7 +444,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                   {autoTradeActive
                     ? evalResultLong.canExecute
                       ? '🎯 سیگنال خرید آماده شلیک!'
-                      : '⏳ در حال همسوسازی ارکان...'
+                      : '⏳ گیت اجرا تأیید نکرده است'
                     : 'ربات خاموش است'}
                 </div>
               </div>
@@ -433,14 +468,14 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                     }`}>
                       <span className="w-1.5 h-1.5 rounded-full bg-white" />
                     </span>
-                    <span>رادار شورت / فروش</span>
+                    <span>گیت فروش / SHORT</span>
                   </span>
                   <span className="text-[10px] px-1 py-0.5 rounded bg-[#010912] border border-cyan-950 text-slate-400 font-bold">
-                    {evalResultShort.totalPillarsPassed}/8 رکن
+                    {evalResultShort.canExecute ? 'مجاز' : 'در انتظار'}
                   </span>
                 </div>
                 <div className="mt-1.5 flex items-center justify-between text-[10px]">
-                  <span className="text-slate-400">امتیاز همگرایی:</span>
+                  <span className="text-slate-400">امتیاز گیت اجرا:</span>
                   <span className={`font-bold ${evalResultShort.canExecute ? 'text-rose-400 text-xs' : 'text-amber-300'}`}>
                     {evalResultShort.totalScorePct}%
                   </span>
@@ -449,7 +484,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                   {autoTradeActive
                     ? evalResultShort.canExecute
                       ? '🎯 سیگنال فروش آماده شلیک!'
-                      : '⏳ در حال همسوسازی ارکان...'
+                      : '⏳ گیت اجرا تأیید نکرده است'
                     : 'ربات خاموش است'}
                 </div>
               </div>
@@ -504,10 +539,10 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                     <div className="flex flex-col">
                       <span className="font-bold text-xs text-cyan-300 flex items-center gap-1.5">
                         <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
-                        <span>🛡️ پوزیشن {targetSignalDir === 'LONG' ? 'خرید' : 'فروش'} فعال است (امتیاز ارکان: {targetSignalDir === 'LONG' ? evalResultLong.totalScorePct : evalResultShort.totalScorePct}٪)</span>
+                        <span>🛡️ پوزیشن {targetSignalDir === 'LONG' ? 'خرید' : 'فروش'} فعال است (امتیاز گیت اجرا: {targetSignalDir === 'LONG' ? evalResultLong.totalScorePct : evalResultShort.totalScorePct}٪)</span>
                       </span>
                       <span className="text-[9.5px] text-slate-400 mt-0.5">
-                        ارکان با روند معامله همسو هستند؛ ورود مجدد تا تثبیت سود معامله باز قفل است.
+                        گیت اجرا با جهت موقعیت همسو است؛ ورود مجدد تا تثبیت سود معامله باز قفل است.
                       </span>
                     </div>
                   );
@@ -534,7 +569,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                   ? `امتیاز: ${evalResultLong.totalScorePct}%` 
                   : evalResultShort.canExecute 
                   ? `امتیاز: ${evalResultShort.totalScorePct}%` 
-                  : 'در انتظار همگرایی ارکان'}
+                  : 'در انتظار تأیید گیت اجرا'}
               </span>
             </div>
           </div>
@@ -1229,30 +1264,24 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
           {(!mode || mode === 'auto') && (
             <div className="grid grid-cols-2 gap-2">
               <button
-                disabled={isDrawdownLocked}
                 onClick={() => onAutoTrade('LONG')}
                 className={`py-2.5 rounded-xl bg-emerald-950/40 border border-emerald-500/50 font-mono text-xs flex items-center justify-center gap-1.5 transition-all shadow-[0_0_15px_rgba(16,185,129,0.15)] ${
-                  isDrawdownLocked
-                    ? 'opacity-40 cursor-not-allowed filter grayscale text-slate-500'
-                    : 'hover:bg-emerald-900/60 text-emerald-300 cursor-pointer'
+                  'hover:bg-emerald-900/60 text-emerald-300 cursor-pointer'
                 }`}
-                title={isDrawdownLocked ? 'به دلیل پوزیشن در ضرر، ورود خودکار مسدود است' : 'بررسی فوری کَش آخرین تحلیل و ورود خودکار بدون تاخیر شبکه'}
+                title="درخواست LONG به سرور؛ جهت، شورا و ریسک در سرور بررسی می‌شوند."
               >
                 <Bot className="w-4 h-4 animate-pulse text-emerald-400" />
-                <span>ورود خودکار لانگ (Auto LONG)</span>
+                <span>درخواست LONG به سرور</span>
               </button>
               <button
-                disabled={isDrawdownLocked}
                 onClick={() => onAutoTrade('SHORT')}
                 className={`py-2.5 rounded-xl bg-rose-950/40 border border-rose-500/50 font-mono text-xs flex items-center justify-center gap-1.5 transition-all shadow-[0_0_15px_rgba(244,63,94,0.15)] ${
-                  isDrawdownLocked
-                    ? 'opacity-40 cursor-not-allowed filter grayscale text-slate-500'
-                    : 'hover:bg-rose-900/60 text-rose-300 cursor-pointer'
+                  'hover:bg-rose-900/60 text-rose-300 cursor-pointer'
                 }`}
-                title={isDrawdownLocked ? 'به دلیل پوزیشن در ضرر، ورود خودکار مسدود است' : 'بررسی فوری کَش آخرین تحلیل و ورود خودکار بدون تاخیر شبکه'}
+                title="درخواست SHORT به سرور؛ جهت، شورا و ریسک در سرور بررسی می‌شوند."
               >
                 <Bot className="w-4 h-4 animate-pulse text-rose-400" />
-                <span>ورود خودکار شورت (Auto SHORT)</span>
+                <span>درخواست SHORT به سرور</span>
               </button>
             </div>
           )}

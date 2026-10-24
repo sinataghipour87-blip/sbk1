@@ -716,13 +716,6 @@ async function runStack(): Promise<void> {
       return;
     }
 
-    nodeProcess = spawnManaged(
-      process.execPath,
-      ['--import', 'tsx', 'server.ts'],
-      'SBK1 server',
-    );
-    await waitFor('SBK1 API', checkSbk1Ready, nodeProcess);
-
     freqtradeProcess = spawnManaged(
       freqtradeExecutable(),
       [
@@ -740,6 +733,13 @@ async function runStack(): Promise<void> {
       { ...process.env, SBK1_BRIDGE_URL: settings.bridgeBaseUrl },
     );
     await waitFor('Freqtrade RPC and strategy', checkFreqtradeReady, freqtradeProcess);
+
+    nodeProcess = spawnManaged(
+      process.execPath,
+      ['--import', 'tsx', 'server.ts'],
+      'SBK1 server',
+    );
+    await waitFor('SBK1 API and UI', checkSbk1Ready, nodeProcess);
     console.log('[sbk1] Both services are healthy. Press Ctrl+C to stop the managed stack.');
   } catch (error) {
     await requestShutdown(1);

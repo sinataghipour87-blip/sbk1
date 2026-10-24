@@ -325,6 +325,25 @@ class SbkSignalStrategy(IStrategy):
             response.raise_for_status()
             self._market_snapshot_last_publish_ms = generated_at_ms
             return True
+        except requests.HTTPError as exc:
+            response = exc.response
+            code = "unknown"
+            detail = str(exc)
+            if response is not None:
+                try:
+                    error_payload = response.json()
+                except ValueError:
+                    error_payload = None
+                if isinstance(error_payload, dict):
+                    code = str(error_payload.get("code", code))
+                    detail = str(error_payload.get("error", detail))
+            logger.error(
+                "Freqtrade market snapshot was rejected (HTTP %s, code=%s): %s",
+                response.status_code if response is not None else "unknown",
+                code,
+                detail,
+            )
+            return False
         except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
             logger.error("Freqtrade market snapshot push failed; no market data was cached by this strategy: %s", exc)
             return False

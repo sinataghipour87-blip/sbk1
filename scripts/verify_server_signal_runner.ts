@@ -18,6 +18,7 @@ import { OperationalTradeArchive } from '../src/services/operationalTradeArchive
 import type { OperationalTradeArchiveMetadata } from '../src/services/operationalTradeArchive';
 import { centralTradeDatasetService } from '../src/services/centralTradeDataset';
 import type { SbkFreqtradeSignalRecord } from '../src/services/freqtradeSignalAdapter';
+import type { EightMemberCouncilReport } from '../src/services/eightMemberCouncil';
 
 const fixturePath = path.resolve('scripts/fixtures/CONTRACT_TEST_ONLY.json');
 const parsedFixture: unknown = JSON.parse(await readFile(fixturePath, 'utf8'));
@@ -224,6 +225,48 @@ try {
   assert.equal(stored.length, 1, 'a restarted runner must not queue a second signal for the same candle');
   assert.equal(stored[0]?.signal.direction, 'SHORT');
   assert.equal(stored[0]?.signal.timeframe, '15m');
+  const autoPilotOffRunner = new ServerSignalRunner({
+    ...dependencies,
+    isAutoPilotEnabled: () => false,
+  });
+  await autoPilotOffRunner.runOnce();
+  assert.equal(
+    autoPilotOffRunner.getLatestUpdate().reason.includes('Auto-Pilot is disabled'),
+    true,
+    'the server council may evaluate while Auto-Pilot is off, but must not submit an automatic entry',
+  );
+  assert.equal((await adapter.getForStrategy(snapshot.pair, snapshot.timeframe)).length, 1);
+
+  const conflictingCouncilReport: EightMemberCouncilReport = {
+    evaluatedAtMs: currentNowMs,
+    quorumRequired: 5,
+    members: [],
+    longVotes: 5,
+    shortVotes: 3,
+    neutralVotes: 0,
+    abstentions: 0,
+    selectedDirection: 'LONG',
+    quorumMet: true,
+    summaryFa: 'CONTRACT_TEST_ONLY council report.',
+  };
+  const manualIntentRunner = new ServerSignalRunner({
+    ...dependencies,
+    isAutoPilotEnabled: () => false,
+    submitSignal: async () => {
+      throw new Error('A manual intent conflicting with the council must not submit a signal.');
+    },
+    analyze: async (...args) => ({
+      ...await dependencies.analyze!(...args),
+      councilReport: conflictingCouncilReport,
+    }),
+  });
+  assert.equal(manualIntentRunner.requestManualEntry('SHORT'), true);
+  await manualIntentRunner.runOnce();
+  assert.match(
+    manualIntentRunner.getLatestUpdate().reason,
+    /does not match the server council direction/,
+    'manual direction is an intent only and must match the authoritative server council',
+  );
   const overLimitRunner = new ServerSignalRunner({
     ...dependencies,
     getFreqtradeStatus: async () => ({ ...status, maxOpenTrades: 4 }),

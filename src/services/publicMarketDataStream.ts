@@ -188,6 +188,34 @@ export class BinancePublicMarketDataStream {
     };
   }
 
+  getLatestPrice(nowMs = Date.now()): {
+    price: number;
+    sourceTimestampMs: number;
+    receivedAtMs: number;
+    source: 'binance';
+  } | null {
+    const latest = this.latestPrice;
+    if (
+      !latest ||
+      nowMs - latest.sourceTimestampMs < -1_000 ||
+      nowMs - latest.sourceTimestampMs > MAX_STREAM_AGE_MS
+    ) return null;
+    return {
+      price: latest.price,
+      sourceTimestampMs: latest.sourceTimestampMs,
+      receivedAtMs: latest.retrievedAtMs,
+      source: 'binance',
+    };
+  }
+
+  isConnected(): boolean {
+    return [...this.sockets.values()].some((socket) => socket.readyState === WebSocket.OPEN);
+  }
+
+  getLastReceivedAtMs(): number {
+    return this.latestPrice?.retrievedAtMs ?? 0;
+  }
+
   private connect(channel: StreamChannel): void {
     if (this.stopped || !this.urls) return;
     let socket: PublicMarketSocket;

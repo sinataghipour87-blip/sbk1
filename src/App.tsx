@@ -82,15 +82,16 @@ import {
   getCanonicalMarketSnapshot 
 } from './services/marketData';
 import { analyzePro } from './services/analysisEngine';
-import { AnalysisResult, TradePosition, TradeHistory, UserSettings, SentimentData, ExecutionMode } from './types/trading';
-import { loadSettings, saveSettings } from './services/settings';
+import { AnalysisResult, TradePosition, TradeHistory, UserSettings, SentimentData, ExecutionMode, Candle } from './types/trading';
+import { loadSettings } from './services/settings';
 import { saveTradeToHistory, getTradeHistory } from './services/history';
 import { calculateKellyRisk, getAntiTiltStatus, calculateDynamicKellyMargin, evaluateCognitiveConviction } from './services/kellyRisk';
 import { requestNotificationPermission, sendNotification } from './services/notifications';
-import { setupFreqtradeMarketFeed, type WebSocketConnectionState } from './services/websocket';
+import { setupFreqtradeMarketFeed, type MarketFeedConnectionState } from './services/freqtradeMarketFeed';
+import { fetchBinanceChartCandles, setupChartMarketFeed, type ChartMarketFeedUpdate } from './services/chartMarketFeed';
 import { validatePrecisionEntry, generateClientSidePredictionFallback, updatePredictiveModelFeedbackLoop, evaluate15mTimingAndLifecycle, runDistributedMultiTimeframeBrains, calculateAiMtfConsensusCorrelation, evaluateFuturePredictability } from './services/predictiveEngine';
-import { evaluateSignalToExecution, buildExecutionPosition, calculateLogicTargets } from './services/signalToExecution';
-import { verifyAutoTradePrerequisites } from './services/autoTradeGuard';
+import type { CouncilMemberVote } from './services/eightMemberCouncil';
+import type { EightMemberCouncilReport } from './services/eightMemberCouncil';
 import { getExecutionMode, getSelectedExecutionMode } from './services/executionMode';
 import type { FreqtradeTrade } from './services/freqtradeBridge';
 import { brainEvolutionHub } from './services/brainSelfEvolutionHub';
@@ -104,6 +105,62 @@ const TfjsReinforcementLearningWidget = lazy(() =>
     default: TfjsReinforcementLearningWidget,
   }))
 );
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCouncilReport(value: unknown): value is EightMemberCouncilReport {
+  if (
+    !isRecord(value) ||
+    !Number.isSafeInteger(value.evaluatedAtMs) ||
+    value.quorumRequired !== 5 ||
+    !Array.isArray(value.members) ||
+    !Number.isSafeInteger(value.longVotes) ||
+    !Number.isSafeInteger(value.shortVotes) ||
+    !Number.isSafeInteger(value.neutralVotes) ||
+    !Number.isSafeInteger(value.abstentions) ||
+    !(value.selectedDirection === 'LONG' || value.selectedDirection === 'SHORT' || value.selectedDirection === null) ||
+    typeof value.quorumMet !== 'boolean' ||
+    typeof value.summaryFa !== 'string'
+  ) return false;
+
+  const validVotes = new Set(['LONG', 'SHORT', 'NEUTRAL', 'ABSTAIN']);
+  return value.members.every((member): member is CouncilMemberVote =>
+    isRecord(member) &&
+    Number.isSafeInteger(member.id) &&
+    typeof member.nameFa === 'string' &&
+    typeof member.nameEn === 'string' &&
+    typeof member.questionFa === 'string' &&
+    Array.isArray(member.inputIds) &&
+    member.inputIds.every((id) => typeof id === 'string') &&
+    Array.isArray(member.moduleIds) &&
+    member.moduleIds.every((id) => typeof id === 'string') &&
+    typeof member.vote === 'string' &&
+    validVotes.has(member.vote) &&
+    typeof member.rationaleFa === 'string' &&
+    (member.sourceTimestampMs === null || Number.isSafeInteger(member.sourceTimestampMs)) &&
+    (member.sourceAgeMs === null || Number.isFinite(member.sourceAgeMs)) &&
+    (member.dataQualityPct === null || Number.isFinite(member.dataQualityPct)) &&
+    (member.confidencePct === null || Number.isFinite(member.confidencePct)) &&
+    Array.isArray(member.qualityChecks) &&
+    member.qualityChecks.every((check) =>
+      isRecord(check) &&
+      typeof check.labelFa === 'string' &&
+      typeof check.passed === 'boolean' &&
+      typeof check.detailFa === 'string'
+    ) &&
+    Array.isArray(member.supportingEvidence) &&
+    member.supportingEvidence.every((evidence) =>
+      isRecord(evidence) &&
+      typeof evidence.moduleId === 'string' &&
+      typeof evidence.nameFa === 'string' &&
+      ['AVAILABLE', 'UNAVAILABLE', 'STALE'].includes(String(evidence.status)) &&
+      (evidence.sourceTimestampMs === null || Number.isSafeInteger(evidence.sourceTimestampMs)) &&
+      typeof evidence.summaryFa === 'string'
+    )
+  );
+}
 
 export interface DerivFeeData {
   fundingRate?: number;
@@ -203,7 +260,7 @@ function isLatestMarketDataVerified(
 ): boolean {
   if (
     !analysis ||
-    analysis.dataStatus !== 'LIVE' ||
+    (analysis.dataStatus !== 'LIVE' && analysis.dataStatus !== 'VERIFIED_REALTIME') ||
     lastAnalysisAtMs === null ||
     nowMs - lastAnalysisAtMs < 0 ||
     nowMs - lastAnalysisAtMs > 15_000 ||
@@ -276,12 +333,20 @@ export default function App() {
   const [activePositions, setActivePositions] = useState<TradePosition[]>([]);
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [councilReport, setCouncilReport] = useState<EightMemberCouncilReport | null>(null);
+  const [serverAutoPilotEnabled, setServerAutoPilotEnabled] = useState(false);
+  const [serverDecisionReason, setServerDecisionReason] = useState('در انتظار گزارش تصمیم سرور.');
   const [lastAnalysisAtMs, setLastAnalysisAtMs] = useState<number | null>(null);
   const [aiPrediction, setAiPrediction] = useState<any | null>(null);
   const [source, setSource] = useState<string>('Bybit 15m');
   const [isFetching, setIsFetching] = useState<boolean>(false);
   const [marketDataError, setMarketDataError] = useState<string | null>(null);
-  const [marketStreamState, setMarketStreamState] = useState<WebSocketConnectionState>('DISCONNECTED');
+  const [marketStreamState, setMarketStreamState] = useState<MarketFeedConnectionState>('DISCONNECTED');
+  const [chartFeedState, setChartFeedState] = useState<MarketFeedConnectionState>('DISCONNECTED');
+  const [chartLivePrice, setChartLivePrice] = useState<number | null>(null);
+  const [chartFeedSource, setChartFeedSource] = useState<'binance' | 'bybit' | null>(null);
+  const [chartCandles, setChartCandles] = useState<Candle[] | null>(null);
+  const chartFeedSourceRef = useRef<'binance' | 'bybit' | null>(null);
   const [walletAdjustmentAmount, setWalletAdjustmentAmount] = useState('100');
   const [notification, setNotification] = useState<string | null>(null);
   const [isCalibratingEngines, setIsCalibratingEngines] = useState<boolean>(false);
@@ -343,7 +408,6 @@ export default function App() {
 
   const lastCloseTimeRef = useRef<number>(0);
   const fastReloadReadyRef = useRef<boolean>(false);
-  const lastAutoTradeSignalRef = useRef<string | null>(null);
   const lastClosedTradePnlRef = useRef<number>(0);
   const wsRef = useRef<any>(null);
   const isFetchingRef = useRef<boolean>(false);
@@ -363,6 +427,39 @@ export default function App() {
   useEffect(() => { balanceRef.current = balance; }, [balance]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { userLeverageRef.current = userLeverage; }, [userLeverage]);
+
+  useEffect(() => {
+    const stream = new EventSource('/api/decision/stream');
+    stream.onmessage = (event) => {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (error) {
+        console.error('[SBK1] Server decision stream returned invalid JSON:', error);
+        return;
+      }
+      if (!isRecord(payload)) {
+        console.error('[SBK1] Server decision stream returned an invalid event.');
+        return;
+      }
+      if (typeof payload.autoPilotEnabled === 'boolean') {
+        setServerAutoPilotEnabled(payload.autoPilotEnabled);
+      }
+      if (typeof payload.reason === 'string') setServerDecisionReason(payload.reason);
+      if (payload.councilReport === null) {
+        setCouncilReport(null);
+      } else if (isCouncilReport(payload.councilReport)) {
+        setCouncilReport(payload.councilReport);
+      } else {
+        setCouncilReport(null);
+        console.error('[SBK1] Server decision stream contained an invalid council report.');
+      }
+    };
+    stream.onerror = () => {
+      setServerDecisionReason('جریان تصمیم سرور قطع است؛ گزارش شورا ممکن است قدیمی باشد.');
+    };
+    return () => stream.close();
+  }, []);
 
   const lastNotifRef = useRef(0);
   const showNotification = useCallback((msg: string) => {
@@ -1296,7 +1393,7 @@ export default function App() {
     }
   }, [showNotification, commitTradeClosureAndContinuousLearning]);
 
-  // Realtime WebSocket price tick handling with instant execution
+  // Prepare the UI once; market snapshots arrive from the server event stream.
   useEffect(() => {
     // 🎓 آموزش اولیه و تسلیح شبکه عصبی TensorFlow.js بر روی سوابق معاملات واقعی
     const hist = getTradeHistory();
@@ -1309,29 +1406,7 @@ export default function App() {
     }
 
     requestNotificationPermission();
-    wsRef.current = setupFreqtradeMarketFeed((rawPrice) => {
-      if (!rawPrice || rawPrice <= 0) return;
-      const price = rawPrice;
-      smoothedPriceRef.current = rawPrice;
-
-      // Update the in-memory fast snapshot price immediately
-      if (latestAnalysisSnapshotRef.current) {
-        latestAnalysisSnapshotRef.current = {
-          ...latestAnalysisSnapshotRef.current,
-          price,
-        };
-      }
-
-
-      const now = Date.now();
-      // Throttle rapid WS ticks to max 1 update per 100ms for ultra-responsive DOM rendering
-      if (now - lastPriceUpdateRef.current > 100) {
-        lastPriceUpdateRef.current = now;
-        setAnalysis((prev) => (prev ? { ...prev, price } : null));
-      }
-    }, setMarketStreamState);
-    return () => wsRef.current?.close();
-  }, [runRealtimePositionTicks]);
+  }, []);
 
   // Click outside handler for wallet dropdown (without full-screen backdrop to prevent blurring other places)
   useEffect(() => {
@@ -1355,6 +1430,8 @@ export default function App() {
   // Fetch Market Data & Run Analysis with 3-Tier TP Engine
   const loadMarketData = useCallback(async () => {
     if (isFetchingRef.current) return;
+    const selectedMode = executionModeRef.current ?? getSelectedExecutionMode();
+    const allowDemoData = selectedMode === 'PAPER' || selectedMode === 'DRY_RUN';
     isFetchingRef.current = true;
     setIsFetching(true);
     try {
@@ -1507,8 +1584,11 @@ export default function App() {
         fetchFuturesPrices(),
         getCanonicalMarketSnapshot().catch(() => undefined),
       ]);
-      if (candleData.status !== 'LIVE' || candleData.candles.length < 300) {
-        throw new Error(candleData.error || 'کمتر از ۳۰۰ کندل واقعی و تازه برای تحلیل معتبر دریافت شد.');
+      if (
+        (!allowDemoData && (candleData.status !== 'LIVE' || candleData.candles.length < 300)) ||
+        (allowDemoData && (candleData.status === 'DATA_UNAVAILABLE' || candleData.candles.length < 30))
+      ) {
+        throw new Error(candleData.error || `برای ${allowDemoData ? 'تحلیل دمو' : 'تحلیل کامل'} حداقل ${allowDemoData ? 30 : 300} کندل لازم است.`);
       }
 
       const dataQualityReport = evaluateMarketDataQuality(
@@ -1535,12 +1615,13 @@ export default function App() {
         currentBalance,
         dynamicRiskPct,
         candleData.rawCandles,
-        dataQualityReport.status,
+        allowDemoData ? candleData.status : dataQualityReport.status,
         dataQualityReport,
         realObiData,
         canonicalSnapshot,
         futuresPrices,
-        orderFlowFeatures
+        orderFlowFeatures,
+        { allowDemoData },
       );
 
       const effectiveUserLev = userLeverageRef.current;
@@ -1653,11 +1734,125 @@ export default function App() {
     }
   }, [showNotification]);
 
-  // Ultra-high-performance 3-sec auto refresh for instant real-time sync
   useEffect(() => {
-    loadMarketData();
-    const interval = setInterval(loadMarketData, 3000);
-    return () => clearInterval(interval);
+    let activeSource: ChartMarketFeedUpdate['source'] = null;
+    let latestUpdate: ChartMarketFeedUpdate | null = null;
+    let fallbackCandlesLoaded = false;
+    let fallbackCandlesRequestActive = false;
+    let fallbackRetryAfterMs = 0;
+    let retryTimer: number | null = null;
+    let closed = false;
+
+    const clearRetryTimer = () => {
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
+
+    const loadFallbackCandles = async () => {
+      if (
+        closed ||
+        fallbackCandlesRequestActive ||
+        activeSource !== 'binance' ||
+        Date.now() < fallbackRetryAfterMs
+      ) return;
+      fallbackCandlesRequestActive = true;
+      try {
+        const candles = await fetchBinanceChartCandles();
+        if (closed || activeSource !== 'binance') return;
+        fallbackRetryAfterMs = 0;
+        fallbackCandlesLoaded = true;
+        setChartCandles(candles);
+        setChartFeedState(latestUpdate?.state ?? 'DEGRADED');
+        setChartFeedSource('binance');
+        setChartLivePrice(latestUpdate?.state === 'LIVE' ? latestUpdate.price : null);
+        clearRetryTimer();
+        retryTimer = window.setTimeout(() => {
+          retryTimer = null;
+          void loadFallbackCandles();
+        }, 60_000);
+      } catch (error) {
+        if (closed || activeSource !== 'binance') return;
+        fallbackCandlesLoaded = false;
+        console.error('[ChartMarketFeed] Binance fallback candles are unavailable:', error);
+        setChartFeedState('DEGRADED');
+        setChartLivePrice(null);
+        fallbackRetryAfterMs = Date.now() + 5_000;
+        retryTimer = window.setTimeout(() => {
+          retryTimer = null;
+          void loadFallbackCandles();
+        }, 5_000);
+      } finally {
+        fallbackCandlesRequestActive = false;
+      }
+    };
+
+    const feed = setupChartMarketFeed((update) => {
+      latestUpdate = update;
+      if (update.state !== 'LIVE' || update.source === null) {
+        activeSource = null;
+        chartFeedSourceRef.current = null;
+        fallbackCandlesLoaded = false;
+        fallbackRetryAfterMs = 0;
+        clearRetryTimer();
+        setChartFeedState(update.state);
+        setChartFeedSource(null);
+        setChartLivePrice(null);
+        setChartCandles(null);
+        return;
+      }
+      if (activeSource !== update.source) {
+        activeSource = update.source;
+        chartFeedSourceRef.current = update.source;
+        fallbackCandlesLoaded = false;
+        fallbackRetryAfterMs = 0;
+        clearRetryTimer();
+        setChartCandles(null);
+      }
+      if (update.source === 'binance' && !fallbackCandlesLoaded) {
+        setChartFeedState('DEGRADED');
+        setChartFeedSource('binance');
+        setChartLivePrice(null);
+        void loadFallbackCandles();
+        return;
+      }
+      setChartFeedState(update.state);
+      setChartFeedSource(update.source);
+      setChartLivePrice(update.price);
+    });
+    return () => {
+      closed = true;
+      clearRetryTimer();
+      feed.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    wsRef.current = setupFreqtradeMarketFeed((rawPrice) => {
+      if (!rawPrice || rawPrice <= 0) return;
+      smoothedPriceRef.current = rawPrice;
+      if (latestAnalysisSnapshotRef.current) {
+        latestAnalysisSnapshotRef.current = {
+          ...latestAnalysisSnapshotRef.current,
+          price: rawPrice,
+        };
+      }
+
+      const now = Date.now();
+      if (now - lastPriceUpdateRef.current > 100) {
+        lastPriceUpdateRef.current = now;
+        setAnalysis((prev) => (prev ? { ...prev, price: rawPrice } : null));
+      }
+    }, setMarketStreamState, (snapshot) => {
+      if (chartFeedSourceRef.current === 'bybit' && snapshot.candles.length >= 30) {
+        setChartCandles(snapshot.candles.map(({ open, high, low, close, volume }) =>
+          [open, high, low, close, volume],
+        ));
+      }
+      void loadMarketData();
+    });
+    return () => wsRef.current?.close();
   }, [loadMarketData]);
 
   // Handle Leverage Slider Change
@@ -1678,49 +1873,37 @@ export default function App() {
     localStorage.setItem('quantum_balance', String(newBalance));
   };
 
-  const handlePaperTrade = useCallback((direction: 'LONG' | 'SHORT', isAuto: boolean) => {
+  const handleManualTrade = useCallback(async (direction: 'LONG' | 'SHORT') => {
     const mode = executionModeRef.current ?? getSelectedExecutionMode();
-    if (mode !== 'PAPER' && mode !== 'BACKTEST') {
-      showNotification('ثبت سفارش مستقیم غیرفعال است؛ Freqtrade تنها مالک اجرای سفارش است.');
+    if (mode !== 'PAPER' && mode !== 'DRY_RUN') {
+      showNotification('درخواست دستی فقط در حالت PAPER/DRY_RUN مجاز است؛ مسیر LIVE پشتیبانی نمی‌شود.');
       return;
     }
-
-    const snapshot = latestAnalysisSnapshotRef.current ?? analysis;
-    const currentBalance = balanceRef.current;
-    if (!snapshot || currentBalance < 5) {
-      showNotification('برای شبیه‌سازی، ابتدا دادهٔ بازار و موجودی آزمایشی معتبر وارد کنید.');
+    const adminToken = localStorage.getItem('admin_token')?.trim();
+    if (!adminToken) {
+      showNotification('برای ارسال درخواست دستی به سرور، ابتدا توکن مدیر را وارد کنید.');
       return;
     }
-
-    const positions = activePositionsRef.current;
-    if (positions.length >= (isAuto ? 3 : 6)) {
-      showNotification('ظرفیت پوزیشن‌های شبیه‌سازی‌شده پر است.');
-      return;
+    try {
+      const response = await fetch('/api/decision/manual-entry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-token': adminToken },
+        body: JSON.stringify({ direction }),
+      });
+      const payload: unknown = await response.json();
+      if (!response.ok || !isRecord(payload) || payload.success !== true) {
+        const error = isRecord(payload) && typeof payload.error === 'string'
+          ? payload.error
+          : `درخواست دستی رد شد (HTTP ${response.status}).`;
+        showNotification(error);
+        return;
+      }
+      showNotification(`درخواست ${direction} به سرور رسید؛ شورا و گیت‌های ریسک باید آن را تأیید کنند.`);
+    } catch (error) {
+      console.error('[SBK1] Could not submit manual server intent:', error);
+      showNotification(error instanceof Error ? error.message : 'ارسال درخواست دستی به سرور ناموفق بود.');
     }
-
-    const position = buildExecutionPosition(
-      snapshot,
-      direction,
-      currentBalance,
-      getTradeHistory(),
-      userLeverageRef.current ?? snapshot.leverage,
-      false,
-      aiPredictionRef.current
-    );
-    if (!position) {
-      showNotification('گیت داده یا ریسک معامله را تأیید نکرد؛ شبیه‌سازی ثبت نشد.');
-      return;
-    }
-
-    position.name = isAuto ? 'AUTO PAPER' : 'MANUAL PAPER';
-    position.isAuto = isAuto;
-    position.isExchangeConfirmed = false;
-    const updatedPositions = [...positions, position];
-    activePositionsRef.current = updatedPositions;
-    setActivePositions(updatedPositions);
-    localStorage.setItem('quantum_positions', JSON.stringify(updatedPositions));
-    showNotification(`${isAuto ? 'ورود خودکار' : 'ورود دستی'} ${direction} فقط در ${mode} ثبت شد؛ سفارشی به صرافی ارسال نشد.`);
-  }, [analysis, showNotification]);
+  }, [showNotification]);
 
   const handleClosePaperTrade = useCallback((positionId: string) => {
     const mode = executionModeRef.current ?? getSelectedExecutionMode();
@@ -1758,66 +1941,43 @@ export default function App() {
   }, [analysis, commitTradeClosureAndContinuousLearning, showNotification]);
 
   const handleToggleAutoTrade = useCallback(async () => {
-    const enabled = settingsRef.current.autoTradeEnabled;
-    if (enabled) {
-      const updated = { ...settingsRef.current, autoTradeEnabled: false };
-      settingsRef.current = updated;
-      setSettings(updated);
-      saveSettings(updated);
-      showNotification('Auto-Pilot شبیه‌سازی متوقف شد.');
-      return;
-    }
-
+    const enabled = !serverAutoPilotEnabled;
     const mode = executionModeRef.current ?? getSelectedExecutionMode();
-    if (mode !== 'PAPER') {
-      showNotification('Auto-Pilot فقط در حالت PAPER قابل فعال‌سازی است.');
+    if (enabled && mode !== 'PAPER' && mode !== 'DRY_RUN') {
+      showNotification('Auto-Pilot فقط در حالت PAPER/DRY_RUN قابل فعال‌سازی است؛ LIVE پشتیبانی نمی‌شود.');
       return;
     }
-    const snapshot = latestAnalysisSnapshotRef.current ?? analysis;
-    const prerequisites = await verifyAutoTradePrerequisites(snapshot, activePositionsRef.current, getTradeHistory(), mode);
-    if (!prerequisites.isEligible) {
-      const blocker = prerequisites.detailsFa.find((detail) => detail.startsWith('❌'));
-      showNotification(`Auto-Pilot فعال نشد: ${blocker || 'پیش‌نیازهای ایمنی تأیید نشد.'}`);
+    const adminToken = localStorage.getItem('admin_token')?.trim();
+    if (!adminToken) {
+      showNotification('برای کنترل اتوپایلوت سرور، ابتدا توکن مدیر را وارد کنید.');
       return;
     }
+    try {
+      const response = await fetch('/api/decision/auto-pilot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-token': adminToken },
+        body: JSON.stringify({ enabled }),
+      });
+      const payload: unknown = await response.json();
+      if (!response.ok || !isRecord(payload) || payload.success !== true) {
+        const error = isRecord(payload) && typeof payload.error === 'string'
+          ? payload.error
+          : `تغییر وضعیت اتوپایلوت رد شد (HTTP ${response.status}).`;
+        showNotification(error);
+        return;
+      }
+      showNotification(enabled ? 'اتوپایلوت سرور فعال شد؛ اجرا همچنان فقط dry-run و تحت کنترل شورا و ریسک است.' : 'اتوپایلوت سرور غیرفعال شد؛ مدیریت خروج پوزیشن‌های باز ادامه دارد.');
+    } catch (error) {
+      console.error('[SBK1] Could not change server Auto-Pilot state:', error);
+      showNotification(error instanceof Error ? error.message : 'تغییر وضعیت اتوپایلوت سرور ناموفق بود.');
+    }
+  }, [serverAutoPilotEnabled, showNotification]);
 
-    const updated = { ...settingsRef.current, autoTradeEnabled: true };
-    settingsRef.current = updated;
-    setSettings(updated);
-    saveSettings(updated);
-    showNotification('Auto-Pilot در حالت PAPER فعال شد؛ اجرای زنده در دسترس نیست.');
-  }, [analysis, showNotification]);
-
-  const fullSystemEval = useMemo(() => {
-    if (!analysis) return null;
-    const historyData = getTradeHistory();
-    return evaluateSignalToExecution(analysis, undefined, aiPrediction, historyData, winRateConfig.minWinProbability);
-  }, [analysis, aiPrediction, winRateConfig.minWinProbability]);
-
-  const fullSystemEvalLong = useMemo(() => {
-    if (!analysis) return null;
-    const historyData = getTradeHistory();
-    return evaluateSignalToExecution(analysis, 'LONG', aiPrediction, historyData, winRateConfig.minWinProbability);
-  }, [analysis, aiPrediction, winRateConfig.minWinProbability]);
-
-  const fullSystemEvalShort = useMemo(() => {
-    if (!analysis) return null;
-    const historyData = getTradeHistory();
-    return evaluateSignalToExecution(analysis, 'SHORT', aiPrediction, historyData, winRateConfig.minWinProbability);
-  }, [analysis, aiPrediction, winRateConfig.minWinProbability]);
+  const isDemoTradingMode = ['PAPER', 'DRY_RUN'].includes(
+    executionModeRef.current ?? getSelectedExecutionMode(),
+  );
 
   const liveEffectivePrice = analysis?.price || (analysis?.candles && analysis.candles.length > 0 ? ((analysis.candles[analysis.candles.length - 1] as any).close ?? (Array.isArray(analysis.candles[analysis.candles.length - 1]) ? analysis.candles[analysis.candles.length - 1][3] : 0)) : 0);
-
-  useEffect(() => {
-    const mode = executionModeRef.current ?? getSelectedExecutionMode();
-    if (mode !== 'PAPER' || !settings.autoTradeEnabled || !fullSystemEval?.canExecute) return;
-    if (fullSystemEval.direction !== 'LONG' && fullSystemEval.direction !== 'SHORT') return;
-    if (activePositionsRef.current.length > 0) return;
-    const signalKey = `${Math.floor(Date.now() / 900_000)}:${fullSystemEval.direction}`;
-    if (lastAutoTradeSignalRef.current === signalKey) return;
-    lastAutoTradeSignalRef.current = signalKey;
-    handlePaperTrade(fullSystemEval.direction, true);
-  }, [analysis, fullSystemEval, handlePaperTrade, settings.autoTradeEnabled]);
 
   const selectedExecutionMode = executionModeRef.current ?? getSelectedExecutionMode();
   const adjustSandboxWallet = (direction: 'add' | 'subtract') => {
@@ -1936,11 +2096,11 @@ export default function App() {
             </p>
           )}
           <p role="status" aria-live="polite" className="px-2 text-[11px] text-slate-400">
-            WebSocket بازار: {
-              marketStreamState === 'LIVE' ? 'زنده' :
-              marketStreamState === 'DEGRADED' ? 'در حال اتصال مجدد؛ تحلیل دوره‌ای ادامه دارد' :
-              marketStreamState === 'STALE' ? 'دادهٔ WebSocket کهنه است؛ تحلیل دوره‌ای ادامه دارد' :
-              'قطع؛ تحلیل دوره‌ای از API ادامه دارد'
+            فید بازار Freqtrade: {
+              marketStreamState === 'LIVE' ? 'snapshot تازه' :
+              marketStreamState === 'DEGRADED' ? 'ناقص؛ تلاش مجدد' :
+              marketStreamState === 'STALE' ? 'snapshot کهنه؛ تلاش مجدد' :
+              'قطع؛ تلاش مجدد'
             }
             {' · '}
             تحلیل: {lastAnalysisAtMs ? `آخرین اجرا ${new Date(lastAnalysisAtMs).toLocaleTimeString('fa-IR')}` : 'در انتظار دادهٔ معتبر'}
@@ -2020,7 +2180,16 @@ export default function App() {
                 contentClassName="overflow-hidden"
               >
                 {analysis ? (
-                  <QuantumChart analysis={analysis} prediction={aiPrediction} activePositions={activePositions} />
+                  <QuantumChart
+                    analysis={analysis}
+                    prediction={aiPrediction}
+                    activePositions={activePositions}
+                    marketStreamState={chartFeedState}
+                    livePrice={chartLivePrice}
+                    livePriceSource={chartFeedSource}
+                    chartCandles={chartCandles}
+                    councilReport={councilReport}
+                  />
                 ) : (
                   <div className="h-[480px] bg-[#040e1b] rounded-xl border border-cyan-900/40 flex items-center justify-center text-cyan-400 font-mono text-sm animate-pulse">
                     در حال بارگذاری و همگام‌سازی نمودار کوانتومی BTC/USDT...
@@ -2040,12 +2209,14 @@ export default function App() {
                     userLeverage={userLeverage ?? analysis.leverage}
                     analysis={analysis}
                     activePositions={activePositions}
-                    onOpenTrade={(direction) => handlePaperTrade(direction, false)}
+                    onOpenTrade={handleManualTrade}
                     onClosePosition={handleClosePaperTrade}
-                    onAutoTrade={(direction) => handlePaperTrade(direction, true)}
+                    onAutoTrade={handleManualTrade}
                     prediction={aiPrediction}
-                    autoTradeActive={settings.autoTradeEnabled}
+                    autoTradeActive={serverAutoPilotEnabled}
                     onToggleAutoTrade={handleToggleAutoTrade}
+                    serverDecisionReason={serverDecisionReason}
+                    demoTradingMode={isDemoTradingMode}
                     mode="manual"
                   />
                 </CollapsibleCard>
@@ -2062,13 +2233,16 @@ export default function App() {
                     userLeverage={userLeverage ?? analysis.leverage}
                     analysis={analysis}
                     activePositions={activePositions}
-                    onOpenTrade={(direction) => handlePaperTrade(direction, false)}
+                    onOpenTrade={handleManualTrade}
                     onClosePosition={handleClosePaperTrade}
-                    onAutoTrade={(direction) => handlePaperTrade(direction, true)}
+                    onAutoTrade={handleManualTrade}
                     prediction={aiPrediction}
-                    autoTradeActive={settings.autoTradeEnabled}
+                    autoTradeActive={serverAutoPilotEnabled}
                     onToggleAutoTrade={handleToggleAutoTrade}
+                    serverDecisionReason={serverDecisionReason}
+                    demoTradingMode={isDemoTradingMode}
                     mode="auto"
+                    councilReport={councilReport}
                   />
                 </CollapsibleCard>
               )}
@@ -2238,6 +2412,7 @@ export default function App() {
                     currentPrice={liveEffectivePrice}
                     activePositions={activePositions}
                     tradeHistory={getTradeHistory()}
+                    councilReport={councilReport}
                   />
                   <CentralDatasetPerformanceMatrixWidget />
                   <WavePredictionEngineWidget
@@ -2292,7 +2467,7 @@ export default function App() {
                     analysis={analysis}
                     aiPrediction={aiPrediction}
                     currentPrice={liveEffectivePrice}
-                    autoTradeActive={settings.autoTradeEnabled}
+                    autoTradeActive={serverAutoPilotEnabled}
                     activePositions={activePositions}
                     recentHistory={getTradeHistory()}
                   />
@@ -2362,7 +2537,7 @@ export default function App() {
                     analysis={analysis}
                     currentPrice={liveEffectivePrice}
                     activePositions={activePositions}
-                    autoPilotActive={settings.autoTradeEnabled}
+                    autoPilotActive={serverAutoPilotEnabled}
                   />
                   <VolatilitySpikePredictorWidget
                     analysis={analysis}

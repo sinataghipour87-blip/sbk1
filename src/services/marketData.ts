@@ -48,7 +48,7 @@ export interface BybitCandlesResult {
   source: string;
 }
 
-let cachedFreqtradeSnapshot: { data: FreqtradeMarketSnapshot; fetchedAtMs: number } | null = null;
+let cachedFreqtradeSnapshot: { data: FreqtradeMarketSnapshot } | null = null;
 let freqtradeSnapshotRequest: Promise<FreqtradeMarketSnapshot> | null = null;
 const freqtradeSnapshotLatencyMs = new WeakMap<FreqtradeMarketSnapshot, number>();
 
@@ -56,12 +56,48 @@ function getSnapshotNetworkLatencyMs(snapshot: FreqtradeMarketSnapshot): number 
   return freqtradeSnapshotLatencyMs.get(snapshot) ?? null;
 }
 
+export function cacheFreqtradeMarketSnapshot(
+  payload: unknown,
+  validationNowMs = Date.now(),
+): FreqtradeMarketSnapshot {
+  if (
+    typeof payload !== 'object' ||
+    payload === null ||
+    Array.isArray(payload) ||
+    !('exchange' in payload) ||
+    !('market' in payload) ||
+    !('pair' in payload) ||
+    !('timeframe' in payload)
+  ) {
+    throw new Error('Freqtrade market snapshot event is malformed.');
+  }
+  const value = payload as Record<string, unknown>;
+  const snapshot = validateFreqtradeMarketSnapshot(value, {
+    exchange: String(value.exchange),
+    market: value.market === 'futures' ? 'futures' : 'spot',
+    pair: String(value.pair),
+    timeframe: String(value.timeframe),
+  }, validationNowMs);
+  if (snapshot.contractVersion !== FREQTRADE_MARKET_SNAPSHOT_VERSION) {
+    throw new Error('Freqtrade market snapshot event contract version is not supported.');
+  }
+  if (cachedFreqtradeSnapshot && snapshot.generatedAtMs <= cachedFreqtradeSnapshot.data.generatedAtMs) {
+    return cachedFreqtradeSnapshot.data;
+  }
+  cachedFreqtradeSnapshot = { data: snapshot };
+  return snapshot;
+}
+
 export async function getFreqtradeMarketSnapshot(forceRefresh = false): Promise<FreqtradeMarketSnapshot> {
   if (typeof window === 'undefined') {
     throw new Error('Freqtrade market snapshots are available only through the SBK1 browser API.');
   }
   const nowMs = Date.now();
-  if (!forceRefresh && cachedFreqtradeSnapshot && nowMs - cachedFreqtradeSnapshot.fetchedAtMs <= 1_000) {
+  if (
+    !forceRefresh &&
+    cachedFreqtradeSnapshot &&
+    nowMs - cachedFreqtradeSnapshot.data.generatedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
+  ) {
     return cachedFreqtradeSnapshot.data;
   }
   if (freqtradeSnapshotRequest) return freqtradeSnapshotRequest;
@@ -84,17 +120,6 @@ export async function getFreqtradeMarketSnapshot(forceRefresh = false): Promise<
         throw new Error(`Freqtrade market snapshot is unavailable (non-JSON response).`);
       }
       const payload: unknown = JSON.parse(text);
-      if (
-        typeof payload !== 'object' ||
-        payload === null ||
-        Array.isArray(payload) ||
-        !('exchange' in payload) ||
-        !('market' in payload) ||
-        !('pair' in payload) ||
-        !('timeframe' in payload)
-      ) {
-        throw new Error('Freqtrade market snapshot response is malformed.');
-      }
       const serverNowHeader = response.headers.get('X-SBK1-Server-Time');
       const serverNowMs = serverNowHeader === null
         ? Date.parse(response.headers.get('Date') ?? '')
@@ -102,18 +127,8 @@ export async function getFreqtradeMarketSnapshot(forceRefresh = false): Promise<
       const validationNowMs = Number.isSafeInteger(serverNowMs) && serverNowMs > 0
         ? serverNowMs
         : Date.now();
-      const value = payload as Record<string, unknown>;
-      const snapshot = validateFreqtradeMarketSnapshot(value, {
-        exchange: String(value.exchange),
-        market: value.market === 'futures' ? 'futures' : 'spot',
-        pair: String(value.pair),
-        timeframe: String(value.timeframe),
-      }, validationNowMs);
-      if (snapshot.contractVersion !== FREQTRADE_MARKET_SNAPSHOT_VERSION) {
-        throw new Error('Freqtrade market snapshot contract version is not supported.');
-      }
+      const snapshot = cacheFreqtradeMarketSnapshot(payload, validationNowMs);
       freqtradeSnapshotLatencyMs.set(snapshot, Math.round(performance.now() - startedAt));
-      cachedFreqtradeSnapshot = { data: snapshot, fetchedAtMs: Date.now() };
       return snapshot;
     } finally {
       clearTimeout(timeout);
@@ -298,7 +313,7 @@ export interface FetchCandlesResult {
   candles: Candle[];
   rawCandles: Candle[];
   source: string;
-  status: 'LIVE' | 'STALE' | 'DATA_UNAVAILABLE' | 'SIMULATED';
+  status: 'LIVE' | 'STALE' | 'DATA_UNAVAILABLE' | 'SIMULATED' | 'VERIFIED_REALTIME';
   error?: string;
   timestamp?: number;
   candleStartTimeMs?: number;
@@ -531,7 +546,7 @@ export async function fetchOrderBookImbalance(): Promise<number | null> {
 }
 
 export async function fetchRealTradeFlowCvd(): Promise<OrderFlowFeatures> {
-  return {
+  const unavailable = (error: string): OrderFlowFeatures => ({
     cvdDelta: null,
     cvdDeltaUsd: null,
     cvdDivergence: 'UNAVAILABLE',
@@ -549,7 +564,72 @@ export async function fetchRealTradeFlowCvd(): Promise<OrderFlowFeatures> {
     ageMs: Number.POSITIVE_INFINITY,
     latencyMs: 0,
     source: 'freqtrade.dataprovider',
-    error: 'Freqtrade market snapshots do not contain trade-level flow data.',
+    error,
+  });
+
+  let snapshot: FreqtradeMarketSnapshot;
+  try {
+    snapshot = await getFreqtradeMarketSnapshot();
+  } catch (error) {
+    return unavailable(error instanceof Error ? error.message : String(error));
+  }
+
+  const nowMs = Date.now();
+  const tradeFlow = snapshot.tradeFlow;
+  const tradeFlowAgeMs = tradeFlow ? nowMs - tradeFlow.retrievedAtMs : Number.POSITIVE_INFINITY;
+  const trades = tradeFlow?.trades;
+  if (
+    !tradeFlow ||
+    !trades?.length ||
+    tradeFlowAgeMs < 0 ||
+    tradeFlowAgeMs > 5_000 ||
+    trades.some((trade) => {
+      const ageMs = nowMs - trade.timestampMs;
+      return ageMs < 0 || ageMs > 5_000;
+    })
+  ) {
+    return unavailable('Fresh trade-level flow is missing from the Freqtrade snapshot.');
+  }
+
+  const buyTrades = trades.filter((trade) => trade.side === 'buy');
+  const sellTrades = trades.filter((trade) => trade.side === 'sell');
+  const takerBuyVol = buyTrades.reduce((total, trade) => total + trade.amount, 0);
+  const takerSellVol = sellTrades.reduce((total, trade) => total + trade.amount, 0);
+  const totalTakerVolume = takerBuyVol + takerSellVol;
+  const cvdDelta = takerBuyVol - takerSellVol;
+  const cvdDeltaUsd = buyTrades.reduce((total, trade) => total + trade.amount * trade.price, 0) -
+    sellTrades.reduce((total, trade) => total + trade.amount * trade.price, 0);
+  const firstTrade = trades[0];
+  const lastTrade = trades[trades.length - 1];
+  if (
+    !Number.isFinite(totalTakerVolume) ||
+    totalTakerVolume <= 0 ||
+    !Number.isFinite(cvdDelta) ||
+    !Number.isFinite(cvdDeltaUsd)
+  ) {
+    return unavailable('Trade-level flow totals are invalid.');
+  }
+
+  return {
+    cvdDelta,
+    cvdDeltaUsd,
+    cvdDivergence: 'RECENT_TRADE_FLOW_WINDOW',
+    takerBuyVol,
+    takerSellVol,
+    takerRatio: takerBuyVol / totalTakerVolume,
+    takerDelta: cvdDelta,
+    tradePriceChangePct: ((lastTrade.price - firstTrade.price) / firstTrade.price) * 100,
+    delta: cvdDelta,
+    cumulativeDelta: cvdDelta,
+    deltaVelocity: cvdDelta / Math.max(1, (tradeFlow.retrievedAtMs - firstTrade.timestampMs) / 1_000),
+    isRealTradeFlow: true,
+    uniqueTradeCount: trades.length,
+    duplicateTradeCount: tradeFlow.duplicateCount ?? 0,
+    status: 'LIVE',
+    timestampUtc: lastTrade.timestampMs,
+    ageMs: nowMs - lastTrade.timestampMs,
+    latencyMs: getSnapshotNetworkLatencyMs(snapshot) ?? 0,
+    source: `${snapshot.source}.tradeFlow`,
   };
 }
 

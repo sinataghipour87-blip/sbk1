@@ -1,11 +1,19 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { AnalysisResult, TradePosition } from '../types/trading';
+import type { MarketFeedConnectionState } from '../services/freqtradeMarketFeed';
+import type { EightMemberCouncilReport } from '../services/eightMemberCouncil';
+import type { Candle } from '../types/trading';
 import { ZoomIn, ZoomOut, RotateCcw, Layers, Zap, Activity, Maximize2, Camera, BarChart2, Radio, Sparkles, TrendingUp, TrendingDown } from 'lucide-react';
 
 interface QuantumChartProps {
   analysis: AnalysisResult;
   prediction?: any;
   activePositions?: TradePosition[];
+  marketStreamState: MarketFeedConnectionState;
+  livePrice?: number | null;
+  livePriceSource?: string | null;
+  chartCandles?: Candle[] | null;
+  councilReport?: EightMemberCouncilReport | null;
 }
 
 interface PriceBadgeItem {
@@ -23,7 +31,16 @@ interface PriceBadgeItem {
   lineColor: string;
 }
 
-export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction, activePositions = [] }) => {
+export const QuantumChart: React.FC<QuantumChartProps> = ({
+  analysis,
+  prediction,
+  activePositions = [],
+  marketStreamState,
+  livePrice = null,
+  livePriceSource = null,
+  chartCandles = null,
+  councilReport = null,
+}) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -112,7 +129,18 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     ctx.fillStyle = bgGrad;
     ctx.fillRect(0, 0, width, height);
 
-    if (!analysis || !analysis.candles || analysis.candles.length === 0) {
+    const useBinanceCandles = livePriceSource === 'binance' && !!chartCandles?.length;
+    if (livePriceSource === 'binance' && !chartCandles?.length) {
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('در حال همگام‌سازی کندل‌های Binance...', width / 2, height / 2);
+      ctx.restore();
+      return;
+    }
+    const useSourceCandles = !!chartCandles?.length && livePriceSource !== null;
+    const sourceCandles = useSourceCandles ? chartCandles : analysis?.candles;
+    if (!analysis || !sourceCandles || sourceCandles.length === 0) {
       ctx.fillStyle = '#10b981';
       ctx.font = 'bold 12px monospace';
       ctx.textAlign = 'center';
@@ -120,13 +148,14 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
       ctx.restore();
       return;
     }
+    const currentMarketPrice = livePrice ?? analysis.price;
 
     // Dynamic Height Partitions: Main chart (74%), MACD Sub-chart (26%)
     const mainHeight = height * 0.74;
     const macdTop = mainHeight + 10;
     const macdHeight = Math.max(22, height - macdTop - 8);
 
-    const totalCandlesCount = analysis.candles.length;
+    const totalCandlesCount = sourceCandles.length;
     const count = Math.min(visibleCandles, totalCandlesCount);
     
     // Handle pan offset bounds
@@ -136,13 +165,13 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     const startIdx = Math.max(0, totalCandlesCount - count - clampedPan);
     const endIdx = startIdx + count;
 
-    const candles = analysis.candles.slice(startIdx, endIdx);
-    const ema20 = (analysis.ema20 || []).slice(startIdx, endIdx);
-    const ema50 = (analysis.ema50 || []).slice(startIdx, endIdx);
-    const ema200 = (analysis.ema200 || []).slice(startIdx, endIdx);
-    const bbUp = (analysis.bbUp || []).slice(startIdx, endIdx);
-    const bbLow = (analysis.bbLow || []).slice(startIdx, endIdx);
-    const macdH = (analysis.macdH || []).slice(startIdx, endIdx);
+    const candles = sourceCandles.slice(startIdx, endIdx);
+    const ema20 = useBinanceCandles ? [] : (analysis.ema20 || []).slice(startIdx, endIdx);
+    const ema50 = useBinanceCandles ? [] : (analysis.ema50 || []).slice(startIdx, endIdx);
+    const ema200 = useBinanceCandles ? [] : (analysis.ema200 || []).slice(startIdx, endIdx);
+    const bbUp = useBinanceCandles ? [] : (analysis.bbUp || []).slice(startIdx, endIdx);
+    const bbLow = useBinanceCandles ? [] : (analysis.bbLow || []).slice(startIdx, endIdx);
+    const macdH = useBinanceCandles ? [] : (analysis.macdH || []).slice(startIdx, endIdx);
 
     if (candles.length === 0) {
       ctx.restore();
@@ -150,11 +179,11 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     }
 
     // Determine Price Bounds with boundary damping
-    let rawMin = Math.min(...candles.map(c => c[2]));
-    let rawMax = Math.max(...candles.map(c => c[1]));
+    let rawMin = Math.min(...candles.map(c => c[2]), currentMarketPrice);
+    let rawMax = Math.max(...candles.map(c => c[1]), currentMarketPrice);
 
-    const forecastList = prediction?.forecast15m || [];
-    if (clampedPan === 0) {
+    const forecastList = useBinanceCandles ? [] : prediction?.forecast15m || [];
+    if (!useBinanceCandles && clampedPan === 0) {
       forecastList.forEach((fc: any) => {
         if (fc.high) rawMax = Math.max(rawMax, fc.high);
         if (fc.low) rawMin = Math.min(rawMin, fc.low);
@@ -165,16 +194,16 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
       });
     }
 
-    if (analysis.tp3) rawMax = Math.max(rawMax, analysis.tp3);
-    if (analysis.sl) rawMin = Math.min(rawMin, analysis.sl);
+    if (!useBinanceCandles && analysis.tp3) rawMax = Math.max(rawMax, analysis.tp3);
+    if (!useBinanceCandles && analysis.sl) rawMin = Math.min(rawMin, analysis.sl);
 
     // Pad bounds
     const rawPadding = Math.max(10, (rawMax - rawMin) * 0.08);
     rawMin -= rawPadding;
     rawMax += rawPadding;
 
-    // Smooth dampening
-    if (smoothBoundsRef.current.min === 0 || Math.abs(smoothBoundsRef.current.min - rawMin) > 800) {
+    // Smoothly adapt bounds even after large price moves instead of snapping the chart scale.
+    if (smoothBoundsRef.current.min === 0) {
       smoothBoundsRef.current = { min: rawMin, max: rawMax };
     } else {
       smoothBoundsRef.current.min = smoothBoundsRef.current.min * 0.85 + rawMin * 0.15;
@@ -280,7 +309,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     ctx.setLineDash([]);
 
     // 4. SMC Order Block Zone
-    if (showSmc && analysis.smcOrderBlock) {
+    if (!useBinanceCandles && showSmc && analysis.smcOrderBlock) {
       const ob = analysis.smcOrderBlock;
       const yTop = getY(ob.top);
       const yBottom = getY(ob.bottom);
@@ -403,7 +432,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     if (clampedPan === 0 && forecastList.length > 0) {
       const lastCandleIdx = count - 1;
       const lastX = chartXStart + lastCandleIdx * stepX + stepX / 2;
-      const lastY = getY(analysis.price);
+      const lastY = getY(currentMarketPrice);
 
       const isLongTrend = (prediction?.trend === 'BULLISH') || (analysis.direction === 'LONG');
       const forecastColor = isLongTrend ? '#34d399' : '#fb7185';
@@ -424,7 +453,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
       // Draw 5 Forecast Candlesticks
       forecastList.forEach((fc: any, fIdx: number) => {
         const fx = chartXStart + (count + fIdx) * stepX + stepX / 2;
-        const cOpen = fc.open || (fIdx === 0 ? analysis.price : (forecastList[fIdx - 1]?.close || analysis.price));
+        const cOpen = fc.open || (fIdx === 0 ? currentMarketPrice : (forecastList[fIdx - 1]?.close || currentMarketPrice));
         const cClose = fc.close || fc.price;
         const cHigh = fc.high || Math.max(cOpen, cClose) + (Math.abs(cClose - cOpen) * 0.3);
         const cLow = fc.low || Math.min(cOpen, cClose) - (Math.abs(cClose - cOpen) * 0.3);
@@ -489,7 +518,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     // Zero Collisions & 100% Full-Width Chart Layout
     const levelItems: PriceBadgeItem[] = [];
 
-    if (analysis.tp1) {
+    if (!useBinanceCandles && analysis.tp1) {
       levelItems.push({
         id: 'tp1',
         label: 'TP1',
@@ -506,7 +535,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
       });
     }
 
-    if (analysis.tp2) {
+    if (!useBinanceCandles && analysis.tp2) {
       levelItems.push({
         id: 'tp2',
         label: 'TP2',
@@ -523,7 +552,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
       });
     }
 
-    if (analysis.tp3) {
+    if (!useBinanceCandles && analysis.tp3) {
       levelItems.push({
         id: 'tp3',
         label: 'FINAL TP',
@@ -540,7 +569,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
       });
     }
 
-    if (analysis.sl) {
+    if (!useBinanceCandles && analysis.sl) {
       levelItems.push({
         id: 'sl',
         label: 'STOP LOSS',
@@ -642,10 +671,10 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     });
 
     // 9.5. REAL-TIME ACTIVE OPEN POSITIONS OVERLAY (Drawn directly on chart canvas)
-    if (activePositions && activePositions.length > 0) {
+    if (!useBinanceCandles && activePositions && activePositions.length > 0) {
       activePositions.forEach((pos, pIdx) => {
         const entryY = Math.max(2, Math.min(mainHeight - 2, getY(pos.entry)));
-        const curP = analysis.price;
+        const curP = currentMarketPrice;
         const curY = Math.max(2, Math.min(mainHeight - 2, getY(curP)));
 
         // Calculate Real-Time PnL
@@ -709,7 +738,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     }
 
     // 10. Current Price Line & Right Axis Tag
-    const curY = getY(analysis.price);
+    const curY = getY(currentMarketPrice);
     ctx.strokeStyle = '#10b981';
     ctx.lineWidth = 1.2;
     ctx.setLineDash([3, 3]);
@@ -726,7 +755,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     ctx.fillStyle = '#ffffff';
     ctx.font = 'bold 9.5px monospace';
     ctx.textAlign = 'left';
-    ctx.fillText(`$${analysis.price.toFixed(1)}`, curPriceX + 4, curY + 3);
+    ctx.fillText(`$${currentMarketPrice.toFixed(1)}`, curPriceX + 4, curY + 3);
 
     // 11. MACD Sub-chart (Clean without text)
     ctx.strokeStyle = 'rgba(16, 185, 129, 0.2)';
@@ -808,7 +837,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
     }
 
     ctx.restore();
-  }, [analysis, prediction, activePositions, visibleCandles, priceScaleFactor, panOffset, showIndicators, showSmc, showVrvp]);
+  }, [analysis, prediction, activePositions, livePrice, livePriceSource, chartCandles, visibleCandles, priceScaleFactor, panOffset, showIndicators, showSmc, showVrvp]);
 
   // Interactive Dragging and Mouse Event Handlers
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -912,8 +941,28 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
           </div>
 
           <div className="flex items-center gap-1 bg-emerald-950/80 px-2 py-0.5 rounded-lg border border-emerald-500/40 text-[11px] text-emerald-300 shadow-sm">
-            <Radio className="w-3 h-3 text-emerald-400 animate-pulse" />
             <span>SB 2126 QUANTUM</span>
+          </div>
+
+          <div
+            role="status"
+            aria-live="polite"
+            className={`flex items-center gap-1 px-2 py-0.5 rounded-lg border text-[11px] shadow-sm ${
+              marketStreamState === 'LIVE'
+                ? 'bg-emerald-950/80 border-emerald-500/40 text-emerald-300'
+                : 'bg-amber-950/70 border-amber-500/40 text-amber-300'
+            }`}
+          >
+            <Radio className={`w-3 h-3 ${marketStreamState === 'LIVE' ? 'text-emerald-400 animate-pulse' : 'text-amber-400'}`} />
+            <span>
+              {marketStreamState === 'LIVE'
+                ? `زنده · ${livePriceSource === 'binance' ? 'Binance' : 'Bybit'}`
+                : marketStreamState === 'DEGRADED'
+                  ? 'فید ناقص؛ تلاش مجدد'
+                  : marketStreamState === 'STALE'
+                    ? 'داده کهنه؛ تلاش مجدد'
+                    : 'فید قطع؛ تلاش مجدد'}
+            </span>
           </div>
 
           {activePositions.length > 0 && (
@@ -1021,6 +1070,42 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({ analysis, prediction
           className="w-full h-full block relative z-10"
         />
       </div>
+
+      <details className="mt-2 rounded-lg border border-cyan-900/50 bg-[#041124] p-2 text-[10px]">
+        <summary className="cursor-pointer font-bold text-cyan-200">
+          تحلیل شورا روی چارت · {councilReport
+            ? `LONG ${councilReport.longVotes} / SHORT ${councilReport.shortVotes} / خنثی ${councilReport.neutralVotes} / ممتنع ${councilReport.abstentions}`
+            : 'گزارش هنوز آماده نیست'}
+        </summary>
+        {councilReport ? (
+          <div className="mt-2 space-y-2">
+            <p className="text-slate-300">{councilReport.summaryFa}</p>
+            <div className="grid gap-1 sm:grid-cols-2">
+              {councilReport.members.map((member) => (
+                <div key={member.id} className="rounded border border-slate-800 bg-black/20 p-2">
+                  <p className="font-bold text-slate-200">
+                    عضو {member.id} · {member.nameFa} · {member.vote}
+                  </p>
+                  <p className="mt-1 leading-4 text-slate-400">{member.rationaleFa}</p>
+                  {member.supportingEvidence
+                    .filter((evidence) => evidence.status === 'AVAILABLE')
+                    .slice(0, 2)
+                    .map((evidence) => (
+                      <p key={evidence.moduleId} className="mt-1 leading-4 text-cyan-100/80">
+                        {evidence.nameFa}: {evidence.summaryFa}
+                      </p>
+                    ))}
+                </div>
+              ))}
+            </div>
+            <p className="text-slate-500">
+              خطوط EMA، بولینگر و MACD از تحلیل تکنیکال سیستم رسم می‌شوند؛ رأی شورا به‌تنهایی سطح قیمت یا مجوز معامله نیست.
+            </p>
+          </div>
+        ) : (
+          <p className="mt-1 text-amber-200">تا آماده‌شدن گزارش واقعی، رأی یا تحلیل اعضا جعل نمی‌شود.</p>
+        )}
+      </details>
 
       {/* Footer Legend Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 mt-2 pt-1.5 border-t border-emerald-950/80 text-[10px] text-slate-400 relative z-20">

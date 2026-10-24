@@ -47,6 +47,7 @@ import {
 import {
   runEightMemberCouncilRuntime,
 } from './eightMemberCouncilRuntime';
+import type { EightMemberCouncilReport } from './eightMemberCouncil';
 import { runPostCouncilTradeControl } from './postCouncilTradeController';
 import type { HoldingHorizonDecision } from './postCouncilTradeController';
 import { macroContextBrainService } from './macroContextBrain';
@@ -114,6 +115,7 @@ export interface ServerSignalRunnerDependencies {
   getDailyRealizedLossUsd(dayStartMs: number, nowMs: number): Promise<number>;
   getSnapshot(expected: FreqtradeMarketSnapshotExpectation, nowMs: number): FreqtradeMarketSnapshot;
   isKillSwitchActive(): boolean;
+  isAutoPilotEnabled?: () => boolean;
   submitSignal(
     signal: SbkFreqtradeSignal,
     expected: { expectedPair: string; expectedExchange: string; expectedTimeframe: string },
@@ -152,11 +154,22 @@ export interface ServerSignalRunnerDependencies {
     featureVersion?: string;
     modelVersion?: string;
     openSourceAdvisories?: OpenSourceAdvisoryReport;
+    councilReport?: EightMemberCouncilReport;
   }>;
   appendAudit?: (record: ServerSignalAuditRecord) => Promise<void>;
   now?: () => number;
   pollIntervalMs?: number;
   minimumCandles?: number;
+}
+
+export interface ServerSignalRunnerUpdate {
+  updatedAtMs: number;
+  autoPilotEnabled: boolean;
+  candleTimestampMs: number | null;
+  decision: 'NO TRADE' | 'LONG' | 'SHORT';
+  reason: string;
+  councilReport: EightMemberCouncilReport | null;
+  signalId?: string;
 }
 
 function timeframeToMs(timeframe: string): number {
@@ -1084,6 +1097,7 @@ async function analyzeSnapshot(
   featureVersion: string;
   modelVersion: string;
   openSourceAdvisories?: OpenSourceAdvisoryReport;
+  councilReport?: EightMemberCouncilReport;
 }> {
   const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance, true);
   const [freeMacroData, optionsData, whaleFlowData, publicMarketFallback] = await Promise.all([
@@ -1159,6 +1173,7 @@ async function analyzeSnapshot(
     return {
       candidate: null,
       reason: `Council quorum not met; no directional pipeline, leverage, margin, or Freqtrade signal was produced. ${councilReport.summaryFa}`,
+      councilReport,
       openSourceAdvisories: analysis.openSourceAdvisories,
       featureSnapshot: makeServerFeatureSnapshot(analysis),
       featureVersion: 'server-signal-features-v1',
@@ -1204,6 +1219,7 @@ async function analyzeSnapshot(
       : null,
     ...(approved && control.executionRisk ? { executionRisk: control.executionRisk } : {}),
     reason: control.reason,
+    councilReport,
     holdingHorizon: control.holdingHorizon,
     openSourceAdvisories: analysis.openSourceAdvisories,
     ...(approved && executionPlan ? {
@@ -1354,6 +1370,9 @@ export class ServerSignalRunner {
   private timer: NodeJS.Timeout | null = null;
   private inFlight: Promise<void> | null = null;
   private lastProcessedCandleMs: number | null = null;
+  private pendingManualIntent: { direction: 'LONG' | 'SHORT'; requestedAtMs: number } | null = null;
+  private readonly listeners = new Set<(update: ServerSignalRunnerUpdate) => void>();
+  private latestUpdate: ServerSignalRunnerUpdate;
 
   constructor(private readonly dependencies: ServerSignalRunnerDependencies) {
     this.now = dependencies.now ?? Date.now;
@@ -1361,6 +1380,62 @@ export class ServerSignalRunner {
     this.minimumCandles = dependencies.minimumCandles ?? MINIMUM_CANDLES_FOR_ANALYSIS;
     this.analyze = dependencies.analyze ?? analyzeSnapshot;
     this.audit = dependencies.appendAudit ?? appendAudit;
+    this.latestUpdate = {
+      updatedAtMs: this.now(),
+      autoPilotEnabled: this.isAutoPilotEnabled(),
+      candleTimestampMs: null,
+      decision: 'NO TRADE',
+      reason: 'در انتظار اجرای تحلیل سرور.',
+      councilReport: null,
+    };
+  }
+
+  private isAutoPilotEnabled(): boolean {
+    return this.dependencies.isAutoPilotEnabled?.() ?? true;
+  }
+
+  getLatestUpdate(): ServerSignalRunnerUpdate {
+    return this.latestUpdate;
+  }
+
+  subscribe(listener: (update: ServerSignalRunnerUpdate) => void): () => void {
+    this.listeners.add(listener);
+    listener(this.latestUpdate);
+    return () => this.listeners.delete(listener);
+  }
+
+  requestManualEntry(direction: 'LONG' | 'SHORT'): boolean {
+    if (this.pendingManualIntent) return false;
+    this.pendingManualIntent = { direction, requestedAtMs: this.now() };
+    void this.runOnce();
+    return true;
+  }
+
+  refreshAutoPilotState(): void {
+    this.publishUpdate({
+      candleTimestampMs: this.latestUpdate.candleTimestampMs,
+      decision: this.latestUpdate.decision,
+      reason: this.latestUpdate.reason,
+      councilReport: this.latestUpdate.councilReport,
+      ...(this.latestUpdate.signalId ? { signalId: this.latestUpdate.signalId } : {}),
+    });
+  }
+
+  private publishUpdate(
+    update: Omit<ServerSignalRunnerUpdate, 'updatedAtMs' | 'autoPilotEnabled'>,
+  ): void {
+    this.latestUpdate = {
+      ...update,
+      updatedAtMs: this.now(),
+      autoPilotEnabled: this.isAutoPilotEnabled(),
+    };
+    for (const listener of this.listeners) {
+      try {
+        listener(this.latestUpdate);
+      } catch (error) {
+        console.error('[SBK1_SIGNAL_RUNNER] Could not publish decision status to an SSE subscriber:', error);
+      }
+    }
   }
 
   start(): void {
@@ -1400,6 +1475,16 @@ export class ServerSignalRunner {
     const nowMs = this.now();
     let candleTimestampMs: number | null = null;
     try {
+      if (
+        this.pendingManualIntent &&
+        nowMs - this.pendingManualIntent.requestedAtMs > timeframeToMs(SBK_EXECUTION_TIMEFRAME)
+      ) {
+        this.pendingManualIntent = null;
+        const reason = 'Manual intent expired before the server could evaluate it on a completed 15-minute candle.';
+        await this.record({ candleTimestampMs: null, decision: 'NO TRADE', reason });
+        this.publishUpdate({ candleTimestampMs: null, decision: 'NO TRADE', reason, councilReport: null });
+        return;
+      }
       const status = await this.dependencies.getFreqtradeStatus();
       try {
         await this.dependencies.syncClosedTrades?.(status);
@@ -1452,11 +1537,20 @@ export class ServerSignalRunner {
           decision: 'NO TRADE',
           reason: 'No completed candle is available in the current Freqtrade snapshot.',
         });
+        this.publishUpdate({
+          candleTimestampMs: null,
+          decision: 'NO TRADE',
+          reason: 'No completed candle is available in the current Freqtrade snapshot.',
+          councilReport: null,
+        });
         return;
       }
       candleTimestampMs = latestSnapshotCandle.timestampMs;
-      if (this.lastProcessedCandleMs !== null && candleTimestampMs <= this.lastProcessedCandleMs) return;
-      this.lastProcessedCandleMs = candleTimestampMs;
+      const isNewCandle = this.lastProcessedCandleMs === null || candleTimestampMs > this.lastProcessedCandleMs;
+      if (!isNewCandle && !this.pendingManualIntent) return;
+      if (isNewCandle) this.lastProcessedCandleMs = candleTimestampMs;
+      const manualDirection = this.pendingManualIntent?.direction ?? null;
+      this.pendingManualIntent = null;
 
       const openTrades = await this.dependencies.getOpenTrades();
       if (!Array.isArray(openTrades)) {
@@ -1467,11 +1561,13 @@ export class ServerSignalRunner {
         throw new Error('Freqtrade status and open-trade list disagree; portfolio risk cannot be verified.');
       }
       if (completedCandles.length < this.minimumCandles) {
+        const reason = `Only ${completedCandles.length} completed candles are available; ${this.minimumCandles} are required for analysis.`;
         await this.record({
           candleTimestampMs,
           decision: 'NO TRADE',
-          reason: `Only ${completedCandles.length} completed candles are available; ${this.minimumCandles} are required for analysis.`,
+          reason,
         });
+        this.publishUpdate({ candleTimestampMs, decision: 'NO TRADE', reason, councilReport: null });
         return;
       }
       const settings = readSignalSettings();
@@ -1602,6 +1698,37 @@ export class ServerSignalRunner {
           openSourceAdvisories: result.openSourceAdvisories,
           holdingHorizon: result.holdingHorizon,
         });
+        this.publishUpdate({
+          candleTimestampMs,
+          decision: 'NO TRADE',
+          reason: result.reason,
+          councilReport: result.councilReport ?? null,
+        });
+        return;
+      }
+      if (
+        manualDirection &&
+        (candidate.direction !== manualDirection || result.councilReport?.selectedDirection !== manualDirection)
+      ) {
+        const reason = `Manual ${manualDirection} request rejected: it does not match the server council direction.`;
+        await this.record({ candleTimestampMs, decision: 'NO TRADE', reason });
+        this.publishUpdate({
+          candleTimestampMs,
+          decision: 'NO TRADE',
+          reason,
+          councilReport: result.councilReport ?? null,
+        });
+        return;
+      }
+      if (!manualDirection && !this.isAutoPilotEnabled()) {
+        const reason = 'Server council produced an approved candidate, but Auto-Pilot is disabled and no manual intent is pending.';
+        await this.record({ candleTimestampMs, decision: 'NO TRADE', reason });
+        this.publishUpdate({
+          candleTimestampMs,
+          decision: 'NO TRADE',
+          reason,
+          councilReport: result.councilReport ?? null,
+        });
         return;
       }
       if (
@@ -1624,6 +1751,12 @@ export class ServerSignalRunner {
           reason: 'The complete decision pipeline did not provide an entry authorization.',
           openSourceAdvisories: result.openSourceAdvisories,
           holdingHorizon: result.holdingHorizon,
+        });
+        this.publishUpdate({
+          candleTimestampMs,
+          decision: 'NO TRADE',
+          reason: 'The complete decision pipeline did not provide an entry authorization.',
+          councilReport: result.councilReport ?? null,
         });
         return;
       }
@@ -1650,6 +1783,13 @@ export class ServerSignalRunner {
           signalId: ids.signalId,
           duplicate: true,
           openSourceAdvisories: result.openSourceAdvisories,
+        });
+        this.publishUpdate({
+          candleTimestampMs,
+          decision: candidate.direction,
+          reason: 'This completed candle already has a persisted Freqtrade signal.',
+          councilReport: result.councilReport ?? null,
+          signalId: ids.signalId,
         });
         return;
       }
@@ -1747,6 +1887,15 @@ export class ServerSignalRunner {
         openSourceAdvisories: result.openSourceAdvisories,
         holdingHorizon: result.holdingHorizon,
       });
+      this.publishUpdate({
+        candleTimestampMs,
+        decision: candidate.direction,
+        reason: submitted.duplicate
+          ? 'Freqtrade adapter recognized this signal as an idempotent duplicate.'
+          : 'Directional signal was accepted by the Freqtrade adapter.',
+        councilReport: result.councilReport ?? null,
+        signalId: signal.signalId,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error('[SBK1_SIGNAL_RUNNER] Candle analysis failed:', error);
@@ -1755,6 +1904,12 @@ export class ServerSignalRunner {
         decision: 'NO TRADE',
         reason: message,
       });
+      this.publishUpdate({
+        candleTimestampMs,
+        decision: 'NO TRADE',
+        reason: message,
+        councilReport: null,
+      });
       if (candleTimestampMs !== null) this.lastProcessedCandleMs = candleTimestampMs;
     }
   }
@@ -1762,6 +1917,7 @@ export class ServerSignalRunner {
 
 export function createServerSignalRunner(options: {
   isKillSwitchActive: () => boolean;
+  isAutoPilotEnabled?: () => boolean;
 }): ServerSignalRunner {
   return new ServerSignalRunner({
     getFreqtradeStatus: () => freqtradeBridge.getStatus(),
@@ -1771,6 +1927,7 @@ export function createServerSignalRunner(options: {
       freqtradeBridge.getDailyRealizedLossUsd(dayStartMs, nowMs),
     getSnapshot: (expected, nowMs) => freqtradeMarketDataBridge.getLatestConfigured(expected, nowMs),
     isKillSwitchActive: options.isKillSwitchActive,
+    isAutoPilotEnabled: options.isAutoPilotEnabled,
     submitSignal: (signal, expected) => freqtradeSignalAdapter.submit(signal, {
       nowMs: Date.now(),
       ...expected,

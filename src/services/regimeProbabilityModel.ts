@@ -221,6 +221,7 @@ function brierScore(samples: TrainingSample[], model: { weights: number[][] }, t
 export function classifyFutureRegime(
   candles: Candle[],
   currentFeatures: RegimeFeatures,
+  allowUnvalidatedPartialHistory = false,
 ): RegimeProbabilityModelResult {
   const samples: TrainingSample[] = [];
   for (let index = 50; index + HORIZON_CANDLES <= candles.length; index++) {
@@ -231,16 +232,46 @@ export function classifyFutureRegime(
     const label = targetScores.indexOf(Math.max(...targetScores));
     samples.push({ index, features: normalizeFeatures(historicalFeatures), label });
   }
-
-  if (candles.length < 300 || samples.length < 100) {
-    throw new Error('Regime model requires at least 300 valid real candles for time-separated training, calibration, and OOS evaluation.');
-  }
-
   const trainBoundary = Math.floor(candles.length * 0.6);
   const calibrationBoundary = Math.floor(candles.length * 0.8);
   const training = samples.filter(sample => sample.index < trainBoundary - HORIZON_CANDLES);
   const calibration = samples.filter(sample => sample.index >= trainBoundary + HORIZON_CANDLES && sample.index <= calibrationBoundary - HORIZON_CANDLES);
   const oos = samples.filter(sample => sample.index >= calibrationBoundary + HORIZON_CANDLES);
+
+  if (
+    allowUnvalidatedPartialHistory &&
+    (candles.length < 300 || samples.length < 100)
+  ) {
+    const probabilities = softmax(scoreRegime(currentFeatures));
+    const maxIndex = probabilities.indexOf(Math.max(...probabilities));
+    const output = Object.fromEntries(
+      REGIMES.map((regime, index) => [regime, probabilities[index] * 100]),
+    ) as Record<AdvancedRegimeType, number>;
+    const rounded = Object.fromEntries(
+      REGIMES.map((regime) => [regime, Math.round(output[regime] * 10) / 10]),
+    ) as Record<AdvancedRegimeType, number>;
+    const roundDiff = Math.round((100 - Object.values(rounded).reduce((sum, value) => sum + value, 0)) * 10) / 10;
+    rounded[REGIMES[maxIndex]] = Math.round((rounded[REGIMES[maxIndex]] + roundDiff) * 10) / 10;
+    return {
+      activeRegime: REGIMES[maxIndex],
+      probabilities: rounded,
+      validation: {
+        status: 'UNCALIBRATED',
+        modelVersion: MODEL_VERSION,
+        horizonCandles: HORIZON_CANDLES,
+        trainingSampleSize: training.length,
+        calibrationSampleSize: calibration.length,
+        oosSampleSize: oos.length,
+        oosBrierScore: null,
+        baselineBrierScore: null,
+      },
+    };
+  }
+
+  if (candles.length < 300 || samples.length < 100) {
+    throw new Error('Regime model requires at least 300 valid real candles for time-separated training, calibration, and OOS evaluation.');
+  }
+
   const model = fitModel(training);
   if (!model) {
     throw new Error('Regime model cannot fit: historical OOS labels contain fewer than two observed regime classes.');

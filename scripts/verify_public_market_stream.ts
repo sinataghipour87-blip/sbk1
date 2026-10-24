@@ -5,9 +5,16 @@ import {
   BinancePublicMarketDataStream,
   type PublicMarketSocket,
 } from '../src/services/publicMarketDataStream';
+import { BybitPublicMarketDataStream } from '../src/services/bybitPublicMarketDataStream';
+import { selectChartPrice } from '../src/services/chartMarketFeed';
 
 class FakeWebSocket extends EventEmitter implements PublicMarketSocket {
   readyState: number = WebSocket.OPEN;
+  sent: string[] = [];
+
+  send(data: string): void {
+    this.sent.push(data);
+  }
 
   close(code = 1000, reason = ''): void {
     this.readyState = WebSocket.CLOSED;
@@ -32,6 +39,30 @@ assert.match(connectedUrls[0], /^wss:\/\/fstream\.binance\.com\/ws\/btcusdt@trad
 assert.match(connectedUrls[1], /^wss:\/\/fstream\.binance\.com\/ws\/btcusdt@depth20@100ms$/);
 
 const nowMs = Date.now();
+const bybitCandidate = {
+  source: 'bybit' as const,
+  price: 100,
+  sourceTimestampMs: nowMs - 100,
+  receivedAtMs: nowMs - 50,
+};
+const binanceCandidate = {
+  source: 'binance' as const,
+  price: 101,
+  sourceTimestampMs: nowMs - 100,
+  receivedAtMs: nowMs - 50,
+};
+assert.equal(selectChartPrice(bybitCandidate, binanceCandidate, nowMs)?.source, 'bybit',
+  'fresh Bybit data remains preferred while available');
+assert.equal(selectChartPrice(
+  { ...bybitCandidate, sourceTimestampMs: nowMs - 6_000 },
+  binanceCandidate,
+  nowMs,
+)?.source, 'binance', 'fresh Binance data takes over when Bybit is stale');
+assert.equal(selectChartPrice(
+  { ...bybitCandidate, sourceTimestampMs: nowMs - 6_000 },
+  { ...binanceCandidate, sourceTimestampMs: nowMs - 6_000 },
+  nowMs,
+), null, 'the chart must report no live source when both feeds are stale');
 const send = (socket: FakeWebSocket, data: Record<string, unknown>) =>
   socket.emit('message', Buffer.from(JSON.stringify(data)));
 send(tradeSocket, {
@@ -106,4 +137,30 @@ assert.equal(stale.orderBook, null);
 assert.equal(stale.partialFastCandle, null);
 
 stream.stop();
-console.log('Binance WebSocket trade/depth subscriptions, live candle aggregation, and stale-feed rejection passed.');
+
+const bybitSockets: FakeWebSocket[] = [];
+const bybitUrls: string[] = [];
+const bybit = new BybitPublicMarketDataStream((url) => {
+  bybitUrls.push(url);
+  const socket = new FakeWebSocket();
+  bybitSockets.push(socket);
+  return socket;
+});
+bybit.start('BTC/USDT:USDT', 'futures');
+const [bybitSocket] = bybitSockets;
+assert.ok(bybitSocket);
+bybitSocket.emit('open');
+assert.deepEqual(bybitUrls, ['wss://stream.bybit.com/v5/public/linear']);
+assert.deepEqual(JSON.parse(bybitSocket.sent[0]!), {
+  op: 'subscribe',
+  args: ['publicTrade.BTCUSDT'],
+});
+bybitSocket.emit('message', Buffer.from(JSON.stringify({
+  topic: 'publicTrade.BTCUSDT',
+  data: [{ T: Date.now() - 10, p: '102', i: 'trade-1' }],
+})));
+assert.equal(bybit.getLatestPrice()?.price, 102);
+assert.equal(bybit.isConnected(), true);
+bybit.stop();
+
+console.log('Binance and Bybit Futures WebSocket feeds, live price validation, aggregation, and stale-feed rejection passed.');

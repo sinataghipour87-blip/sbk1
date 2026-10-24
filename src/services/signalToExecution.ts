@@ -49,6 +49,7 @@ export function evaluateSignalToExecution(
   tradeHistoryList?: TradeHistory[],
   minWinProbGate: number = 70,
   macroContextOverride?: MacroCorrelationData,
+  allowDemoData = false,
 ): SignalToExecutionResult {
   const requestedDirection = targetDirection ??
     (analysis.direction === 'LONG' || analysis.direction === 'SHORT' ? analysis.direction : undefined);
@@ -67,14 +68,15 @@ export function evaluateSignalToExecution(
     };
   }
   const dir = requestedDirection;
-  const feedAudit = missingDataIntegrityGuard.auditMarketDataIntegrity(analysis);
-  if (!feedAudit.isTradePermitted) {
+  const feedAudit = missingDataIntegrityGuard.auditMarketDataIntegrity(analysis, { allowDemoData });
+  const demoDataUsable = allowDemoData && feedAudit.isTradePermitted;
+  if (allowDemoData ? !demoDataUsable : !feedAudit.isTradePermitted) {
     return {
       canExecute: false,
       totalScorePct: 0,
       direction: 'NEUTRAL',
       breakdown: [],
-      reasonFa: feedAudit.blockReasonFa || 'داده بازار معتبر و کامل نیست؛ معامله مسدود شد.',
+      reasonFa: feedAudit.blockReasonFa || 'برای ارزیابی دمو حداقل ۳۰ کندل معتبر و قیمت و ATR لازم است.',
       executionQuality: 'NOISY_REJECTED',
       allSystemsPassed: false,
       totalPillarsPassed: 0,
@@ -613,9 +615,13 @@ export function evaluateSignalToExecution(
   const corePillarsPassed = aiPassed && htfPassed && obiPassed && trendPassed;
 
   // 🚀 هماهنگی ۱۰۰٪ ارکان شکارچی با موج‌سواری و صدور مجوز معامله:
-  const isDataQualityAllowed = analysis.dataQualityReport?.isTradeAllowed === true &&
-    analysis.dataQualityReport.status === 'LIVE';
-  const isDataAvailable =
+  const isDataQualityAllowed = allowDemoData
+    ? demoDataUsable
+    : analysis.dataQualityReport?.isTradeAllowed === true &&
+      analysis.dataQualityReport.status === 'LIVE';
+  const isDataAvailable = allowDemoData
+    ? demoDataUsable
+    :
     (analysis.dataStatus === 'LIVE' || analysis.dataStatus === 'VERIFIED_REALTIME') &&
     isDataQualityAllowed;
   const isPositiveEv = analysis.expectedValue !== undefined && analysis.expectedValue !== null && analysis.expectedValue > 0;
@@ -878,10 +884,11 @@ export function buildExecutionPosition(
   tradeHistory: TradeHistory[],
   userLeverage?: number,
   usePrecisionPullback = false,
-  aiPrediction?: any
+  aiPrediction?: any,
+  allowDemoData = false,
 ): TradePosition | null {
   // ۵۰. اعتبارسنجی یکپارچه سلامت داده‌ها و ممانعت از صفرسازی داده‌های مفقود (Missing Data Guard)
-  const feedAudit = missingDataIntegrityGuard.auditMarketDataIntegrity(analysis);
+  const feedAudit = missingDataIntegrityGuard.auditMarketDataIntegrity(analysis, { allowDemoData });
   if (!feedAudit.isTradePermitted) {
     return null;
   }

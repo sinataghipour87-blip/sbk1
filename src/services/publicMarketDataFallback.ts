@@ -234,6 +234,37 @@ function parseCandles(
   return { candles: parsed, latestCloseMs };
 }
 
+export async function fetchPublicMarketCandles(options: {
+  pair: string;
+  timeframe: string;
+  market: MarketKind;
+  nowMs?: number;
+  fetcher?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<FreqtradeMarketCandle[]> {
+  const nowMs = options.nowMs ?? Date.now();
+  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 3_000;
+  const symbol = normalizeSymbol(options.pair);
+  const interval = timeframeInterval(options.timeframe);
+  const baseUrl = options.market === 'futures'
+    ? 'https://fapi.binance.com'
+    : 'https://api.binance.com';
+  const pathname = options.market === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines';
+  const url = new URL(`${baseUrl}${pathname}`);
+  url.searchParams.set('symbol', symbol);
+  url.searchParams.set('interval', interval);
+  url.searchParams.set('limit', String(MAX_HISTORICAL_CANDLE_LIMIT[options.market]));
+  const { payload } = await fetchJsonEndpoint(url.toString(), fetcher, nowMs, timeoutMs);
+  const parsed = parseCandles(
+    payload,
+    Math.max(nowMs, Date.now()),
+    timeframeMs(interval),
+    candleMaxAgeMs(interval),
+  );
+  return parsed.candles;
+}
+
 function parseOrderBook(
   payload: unknown,
   retrievedAtMs: number,
