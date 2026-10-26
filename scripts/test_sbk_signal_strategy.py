@@ -53,7 +53,6 @@ def make_authorization(signal_id, timestamp_ms, timeframe, direction):
         "holdingHorizonMinutes": 30,
     }
 
-
 class InflightSignalReconciliationTests(unittest.TestCase):
     def test_unmatched_inflight_signal_states_are_quarantined(self):
         records = [
@@ -83,6 +82,7 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.strategy._exit_signals = {}
         self.strategy._consumed_exit_ids = set()
         self.strategy._pair = "BTC/USDT:USDT"
+        self.strategy._pairs = ["BTC/USDT:USDT"]
         self.strategy._bridge_url = "http://127.0.0.1:3000"
         self.strategy._bridge_token = "a" * 64
         self.strategy.config = {
@@ -141,6 +141,51 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "signals": [{"signal": self.signal, "status": "STRATEGY_ACCEPTED"}],
         }
 
+    def test_signal_validation_is_scoped_to_each_configured_pair(self):
+        self.strategy._pairs = [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
+            "XRP/USDT:USDT",
+            "BNB/USDT:USDT",
+        ]
+        for pair in self.strategy._pairs:
+            with self.subTest(pair=pair):
+                signal = {**self.signal, "pair": pair}
+                self.assertTrue(
+                    self.strategy._is_valid_signal(
+                        signal,
+                        self.now_ms,
+                        "bybit",
+                        "futures",
+                    )
+                )
+        self.assertFalse(
+            self.strategy._is_valid_signal(
+                {**self.signal, "pair": "DOGE/USDT:USDT"},
+                self.now_ms,
+                "bybit",
+                "futures",
+            )
+        )
+
+    def test_informative_pairs_cover_every_configured_market(self):
+        self.strategy._pairs = [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
+            "XRP/USDT:USDT",
+            "BNB/USDT:USDT",
+        ]
+
+        informative_pairs = self.strategy.informative_pairs()
+
+        self.assertEqual(len(informative_pairs), 20)
+        self.assertEqual(
+            {pair for pair, _ in informative_pairs},
+            set(self.strategy._pairs),
+        )
+
     def test_entry_timeframe_is_fixed_to_fifteen_minutes(self):
         self.assertEqual(self.strategy.timeframe, "15m")
 
@@ -163,7 +208,6 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
     def test_market_snapshot_refreshes_inside_ticker_window_with_completed_candles(self):
         now = datetime.now(UTC)
         now_ms = int(now.timestamp() * 1000)
-        self.strategy._market_snapshot_last_publish_ms = now_ms - 5_000
         timeframe_ms = 15 * 60 * 1000
         current_candle_start = now_ms // timeframe_ms * timeframe_ms
         timestamps = [
@@ -217,20 +261,33 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
             "contractVersion": "sbk1.freqtrade.signal.v3",
             "signals": [],
         }
+        configured_pairs = [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
+            "XRP/USDT:USDT",
+            "BNB/USDT:USDT",
+        ]
+        self.strategy._pairs = configured_pairs
 
         with (
             patch("SbkSignalStrategy.requests.post", return_value=response) as post,
             patch("SbkSignalStrategy.requests.get", return_value=poll_response) as get,
         ):
-            self.strategy.bot_loop_start(now)
+            for _ in configured_pairs:
+                self.strategy.bot_loop_start(now)
 
-        get.assert_called_once()
-        self.assertEqual(self.strategy.dp.get_pair_dataframe.call_count, 5)
+        self.assertEqual(get.call_count, len(configured_pairs))
+        self.assertEqual(self.strategy.dp.get_pair_dataframe.call_count, 5 * len(configured_pairs))
         self.strategy.dp.get_pair_dataframe.assert_any_call("BTC/USDT:USDT", "15m")
-        post.assert_called_once()
+        self.assertEqual(post.call_count, len(configured_pairs))
+        self.assertEqual(
+            {call.kwargs["json"]["pair"] for call in post.call_args_list},
+            set(configured_pairs),
+        )
         self.assertEqual(post.call_args.args[0], "http://127.0.0.1:3000/api/freqtrade/market-snapshot")
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], f"Bearer {'a' * 64}")
-        payload = post.call_args.kwargs["json"]
+        payload = post.call_args_list[0].kwargs["json"]
         self.assertEqual(payload["source"], "freqtrade.dataprovider")
         self.assertEqual(len(payload["candles"]), 2)
         self.assertEqual(payload["candles"][-1]["timestampMs"], timestamps[1])
@@ -249,6 +306,46 @@ class SbkSignalStrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["tradeFlow"]["trades"][0]["symbol"], "BTC/USDT:USDT")
         self.assertEqual(payload["tradeFlow"]["trades"][0]["side"], "buy")
         self.assertEqual(set(payload["additionalCandles"]), {"1m", "5m", "1h", "4h"})
+
+    def test_market_snapshot_scheduler_refreshes_all_pairs_within_freshness_window(self):
+        configured_pairs = [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
+            "XRP/USDT:USDT",
+            "BNB/USDT:USDT",
+        ]
+        self.strategy._pairs = configured_pairs
+        self.strategy._market_snapshot_last_publish_by_pair = {}
+        self.strategy.dp = object()
+        published_at = {}
+
+        def record_snapshot(pair, _current_time, now_ms):
+            published_at[pair] = now_ms
+            return True
+
+        with patch.object(
+            self.strategy,
+            "_publish_market_snapshot_for_pair",
+            side_effect=record_snapshot,
+        ) as publish_pair:
+            for loop_number in range(7):
+                now_ms = self.now_ms + loop_number * 5_000
+                self.strategy._publish_market_snapshot(
+                    datetime.fromtimestamp(now_ms / 1000, UTC),
+                )
+
+        self.assertEqual(set(published_at), set(configured_pairs))
+        self.assertLessEqual(
+            max(self.now_ms + 30_000 - timestamp for timestamp in published_at.values()),
+            10_000,
+            "all five pairs must remain inside the 15-second snapshot freshness limit",
+        )
+        self.assertEqual(
+            publish_pair.call_count,
+            21,
+            "three snapshots per five-second Freqtrade loop must cover all configured pairs",
+        )
 
     def test_market_snapshot_is_not_published_in_backtest(self):
         self.strategy.config["runmode"] = SimpleNamespace(value="backtest")

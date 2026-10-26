@@ -36,6 +36,10 @@ class PrivateConfigInitializationTests(unittest.TestCase):
         config = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertEqual(env_values["FREQTRADE_PAIR"], env_values["SBK1_FREQTRADE_PAIR"])
+        self.assertEqual(
+            env_values["SBK1_FREQTRADE_PAIRS"].split(","),
+            config["exchange"]["pair_whitelist"],
+        )
         self.assertEqual(env_values["FREQTRADE_USERNAME"], config["api_server"]["username"])
         self.assertEqual(env_values["FREQTRADE_PASSWORD"], config["api_server"]["password"])
         self.assertEqual(env_values["FREQTRADE_USERNAME"], env_values["FREQTRADE__API_SERVER__USERNAME"])

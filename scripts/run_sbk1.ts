@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import dotenv from 'dotenv';
 import { SBK_EXECUTION_TIMEFRAME, SBK_MAX_OPEN_TRADES } from '../src/services/freqtradeSignalAdapter';
+import { parseFreqtradePairs, PRIMARY_FREQTRADE_PAIR } from '../src/services/freqtradePairs';
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_NODE_PORT = 3000;
@@ -70,6 +71,7 @@ interface RuntimeSettings {
   bridgeBaseUrl: string;
   exchange: string;
   pair: string;
+  pairs: string[];
   timeframe: string;
   market: 'spot' | 'futures';
   apiPort: number;
@@ -129,6 +131,7 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   }
   const pair = requireEnv(env, 'FREQTRADE_PAIR');
   const sbkPair = requireEnv(env, 'SBK1_FREQTRADE_PAIR');
+  const pairs = parseFreqtradePairs(requireEnv(env, 'SBK1_FREQTRADE_PAIRS'));
   const exchange = requireEnv(env, 'SBK1_SIGNAL_EXCHANGE').toLowerCase();
   const timeframe = requireEnv(env, 'SBK1_FREQTRADE_TIMEFRAME');
   if (timeframe !== SBK_EXECUTION_TIMEFRAME) {
@@ -147,6 +150,9 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   }
   if (pair !== sbkPair) {
     throw new Error('FREQTRADE_PAIR and SBK1_FREQTRADE_PAIR must match exactly.');
+  }
+  if (pair !== PRIMARY_FREQTRADE_PAIR) {
+    throw new Error(`FREQTRADE_PAIR must remain the primary pair ${PRIMARY_FREQTRADE_PAIR}.`);
   }
   if (config.strategy !== STRATEGY_NAME) {
     throw new Error(`Freqtrade config must select ${STRATEGY_NAME}.`);
@@ -169,7 +175,7 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
   if (
     config.exchange?.name?.toLowerCase() !== exchange ||
     !Array.isArray(config.exchange.pair_whitelist) ||
-    !config.exchange.pair_whitelist.includes(pair)
+    pairs.some((configuredPair) => !config.exchange?.pair_whitelist?.includes(configuredPair))
   ) {
     throw new Error('Freqtrade exchange and pair whitelist must match the SBK1 signal settings.');
   }
@@ -277,6 +283,7 @@ export function validateRuntimeSettings(config: FreqtradeConfig, env: NodeJS.Pro
     bridgeBaseUrl: bridgeUrl.toString().replace(/\/$/, ''),
     exchange,
     pair,
+    pairs,
     timeframe,
     market: config.trading_mode,
     apiPort: api.listen_port,
@@ -320,6 +327,17 @@ function freqtradeExecutable(): string {
   return process.platform === 'win32'
     ? path.join(ROOT_DIR, '.venv', 'Scripts', 'freqtrade.exe')
     : path.join(ROOT_DIR, '.venv', 'bin', 'freqtrade');
+}
+
+function withYashPythonPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const yashSourcePath = path.join(ROOT_DIR, 'yash-posttrade', 'src');
+  const existingPythonPath = env.PYTHONPATH?.trim();
+  return {
+    ...env,
+    PYTHONPATH: existingPythonPath
+      ? `${yashSourcePath}${path.delimiter}${existingPythonPath}`
+      : yashSourcePath,
+  };
 }
 
 async function validatePrerequisites(): Promise<void> {
@@ -508,17 +526,19 @@ async function checkFreqtradeReady(): Promise<void> {
   const config = await requestJson(apiUrl('/show_config'), { headers });
   const whitelist = await requestJson(apiUrl('/whitelist'), { headers });
   const status = await requestJson(apiUrl('/status'), { headers });
+  const whitelistPairs = isRecord(whitelist) && Array.isArray(whitelist.whitelist)
+    ? whitelist.whitelist.filter((pair): pair is string => typeof pair === 'string')
+    : null;
   if (
     !isRecord(config) ||
-    !isRecord(whitelist) ||
     config.strategy !== STRATEGY_NAME ||
     config.dry_run !== true ||
     config.state !== 'running' ||
     String(config.exchange).toLowerCase() !== settings!.exchange ||
     config.trading_mode !== settings!.market ||
     config.timeframe !== settings!.timeframe ||
-    !Array.isArray(whitelist.whitelist) ||
-    !whitelist.whitelist.includes(settings!.pair) ||
+    !whitelistPairs ||
+    settings!.pairs.some((pair) => !whitelistPairs.includes(pair)) ||
     !Array.isArray(status)
   ) {
     throw new Error('Authenticated RPC state does not match the validated SBK1 execution configuration.');
@@ -559,7 +579,7 @@ function verifyStrategyDiscovery(): void {
       '--strategy-path',
       'freqtrade_integration/strategies',
     ],
-    { cwd: ROOT_DIR, env: process.env, encoding: 'utf8', timeout: 45_000 },
+    { cwd: ROOT_DIR, env: withYashPythonPath(process.env), encoding: 'utf8', timeout: 45_000 },
   );
   if (result.error || result.status !== 0) {
     throw new Error('Freqtrade strategy discovery failed; check the Python environment and configuration.');
@@ -730,7 +750,7 @@ async function runStack(): Promise<void> {
         STRATEGY_NAME,
       ],
       'Freqtrade',
-      { ...process.env, SBK1_BRIDGE_URL: settings.bridgeBaseUrl },
+      withYashPythonPath({ ...process.env, SBK1_BRIDGE_URL: settings.bridgeBaseUrl }),
     );
     await waitFor('Freqtrade RPC and strategy', checkFreqtradeReady, freqtradeProcess);
 

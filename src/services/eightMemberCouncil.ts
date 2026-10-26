@@ -1,6 +1,7 @@
 import type { AnalysisResult, DataQualityReport, MarketFeedQuality } from '../types/trading';
 import type { MacroCorrelationData } from './macroContextBrain';
 import type { FreeMacroDataResult } from './freeMacroData';
+import { getFreqtradePairBaseAsset, SUPPORTED_FREQTRADE_PAIRS } from './freqtradePairs';
 import {
   deduplicateCandles,
   deduplicateDerivativeObservations,
@@ -13,6 +14,8 @@ export type CouncilVote = 'LONG' | 'SHORT' | 'NEUTRAL' | 'ABSTAIN';
 export type CouncilDirection = 'LONG' | 'SHORT' | null;
 
 export interface CouncilOptionsData {
+  pair?: string;
+  asset?: string;
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   timestampMs: number | null;
   retrievedAtMs?: number | null;
@@ -28,9 +31,12 @@ export interface CouncilOptionsData {
   callOpenInterest?: number;
   putOpenInterest?: number;
   underlyingPrice?: number;
+  unavailableReason?: string;
 }
 
 export interface CouncilWhaleFlowData {
+  pair?: string;
+  asset?: string;
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   provider: string;
   timestampMs: number | null;
@@ -280,6 +286,65 @@ const MEMBER_EVIDENCE_MAX_AGE_MS: Readonly<Record<number, number>> = {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+const DEFAULT_MACRO_BETA_BY_PAIR: Readonly<Record<string, number>> = {
+  'BTC/USDT:USDT': 1,
+  'ETH/USDT:USDT': 1.05,
+  'SOL/USDT:USDT': 1.3,
+  'XRP/USDT:USDT': 1.2,
+  'BNB/USDT:USDT': 1.15,
+};
+
+function readMacroBeta(pair: string): number | null {
+  if (!getFreqtradePairBaseAsset(pair)) return null;
+  const raw = process.env.SBK1_MACRO_BETA_BY_PAIR?.trim();
+  if (!raw) return DEFAULT_MACRO_BETA_BY_PAIR[pair] ?? null;
+  let values: Record<string, unknown>;
+  if (raw.startsWith('{')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('SBK1_MACRO_BETA_BY_PAIR must be a valid JSON object or pair=number list.');
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('SBK1_MACRO_BETA_BY_PAIR must be a JSON object keyed by full Freqtrade pair.');
+    }
+    values = parsed as Record<string, unknown>;
+  } else {
+    values = {};
+    for (const entry of raw.split(',')) {
+      const separator = entry.lastIndexOf('=');
+      if (separator < 1) {
+        throw new Error('SBK1_MACRO_BETA_BY_PAIR must contain comma-separated full-pair=number entries.');
+      }
+      const configuredPair = entry.slice(0, separator).trim();
+      const beta = Number(entry.slice(separator + 1).trim());
+      if (!configuredPair || Object.hasOwn(values, configuredPair)) {
+        throw new Error('SBK1_MACRO_BETA_BY_PAIR contains an empty or duplicate pair entry.');
+      }
+      values[configuredPair] = beta;
+    }
+  }
+  for (const [configuredPair, beta] of Object.entries(values)) {
+    if (
+      !SUPPORTED_FREQTRADE_PAIRS.includes(configuredPair as (typeof SUPPORTED_FREQTRADE_PAIRS)[number]) ||
+      !isFiniteNumber(beta) ||
+      beta <= 0 ||
+      beta > 5
+    ) {
+      throw new Error('SBK1_MACRO_BETA_BY_PAIR values must map supported full pairs to numbers in (0, 5].');
+    }
+  }
+  const beta = values[pair];
+  return isFiniteNumber(beta) && beta > 0 && beta <= 5
+    ? beta
+    : (raw ? null : DEFAULT_MACRO_BETA_BY_PAIR[pair] ?? null);
+}
+
+export function getCouncilMacroBeta(pair: string): number | null {
+  return readMacroBeta(pair);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -741,12 +806,17 @@ function evaluateDerivatives(
 function evaluateOptions(
   member: CouncilMemberDefinition,
   options: CouncilOptionsData | null | undefined,
-  nowMs: number
+  nowMs: number,
+  pair?: string,
 ): CouncilMemberVote {
+  const pairMatches = pair === undefined || (
+    options?.pair === pair &&
+    options.asset === getFreqtradePairBaseAsset(pair)
+  );
   const sourceFreshness = options
     ? freshTimestamp(options.timestampMs, options.ageMs, nowMs, MAX_OPTIONS_AGE_MS)
     : null;
-  const valid = !!options &&
+  const valid = pairMatches && !!options &&
     options.status === 'LIVE' &&
     sourceFreshness !== null &&
     isFiniteNumber(options.qualityPct) &&
@@ -767,6 +837,7 @@ function evaluateOptions(
     options.strikePrice > 0 &&
     isFiniteNumber(options.skewPct);
   const checks = [
+    { labelFa: 'تطبیق جفت‌ارز', passed: pairMatches, detailFa: pairMatches ? `دادهٔ اختیار برای ${pair ?? options?.pair ?? 'جفت نامشخص'} است.` : `دادهٔ جفت ${options?.pair ?? 'نامشخص'} برای ${pair} رد شد.` },
     { labelFa: 'فید اختیار معامله', passed: !!options && options.status === 'LIVE', detailFa: options ? `${options.provider ?? 'منبع نامشخص'}؛ وضعیت: ${options.status}` : 'فید اختیار معامله به سیستم متصل نیست.' },
     { labelFa: 'تازگی و کیفیت منبع', passed: sourceFreshness !== null && !!options && isFiniteNumber(options.qualityPct) && options.qualityPct >= 80 && isFiniteNumber(options.contractsCount) && options.contractsCount >= 20, detailFa: sourceFreshness && options ? `${Math.round(sourceFreshness.ageMs)}ms؛ کیفیت ${options.qualityPct}/100؛ قرارداد معتبر ${options.contractsCount ?? 0}` : 'زمان/کیفیت معتبر برای منبع موجود نیست.' },
     { labelFa: 'نوسان ضمنی', passed: !!options && isFiniteNumber(options.impliedVolatilityPct) && options.impliedVolatilityPct >= 0, detailFa: options && isFiniteNumber(options.impliedVolatilityPct) ? `IV: ${options.impliedVolatilityPct}%` : 'IV معتبر موجود نیست.' },
@@ -801,14 +872,71 @@ function evaluateOnChain(
   macro: CouncilMacroContext | null | undefined,
   nowMs: number,
   directWhaleFlow?: CouncilWhaleFlowData,
+  pair?: string,
 ): CouncilMemberVote {
-  if (directWhaleFlow?.largeTransfers) {
+  if (pair !== undefined && directWhaleFlow && directWhaleFlow.pair !== pair) {
+    return abstain(
+      member,
+      `دادهٔ آن‌چین برای ${directWhaleFlow.pair ?? 'جفت نامشخص'} است و برای ${pair} قابل استفاده نیست.`,
+      [{
+        labelFa: 'تطبیق جفت‌ارز و شبکه',
+        passed: false,
+        detailFa: `انتظار ${pair}؛ دریافت ${directWhaleFlow.pair ?? 'دادهٔ بدون جفت'}.`,
+      }],
+      directWhaleFlow.timestampMs,
+      directWhaleFlow.ageMs,
+    );
+  }
+  if (
+    pair !== undefined &&
+    directWhaleFlow &&
+    directWhaleFlow.asset !== getFreqtradePairBaseAsset(pair)
+  ) {
+    return abstain(
+      member,
+      `شبکه/دارایی دادهٔ آن‌چین با دارایی ${pair} تطبیق ندارد.`,
+      [{
+        labelFa: 'تطبیق دارایی زنجیره',
+        passed: false,
+        detailFa: `انتظار ${getFreqtradePairBaseAsset(pair)}؛ دریافت ${directWhaleFlow.asset ?? 'دارایی نامشخص'}.`,
+      }],
+      directWhaleFlow.timestampMs,
+      directWhaleFlow.ageMs,
+    );
+  }
+  if (directWhaleFlow?.largeTransfers && (pair === undefined || directWhaleFlow.pair === pair)) {
     const freshness = freshTimestamp(
       directWhaleFlow.timestampMs,
       directWhaleFlow.ageMs,
       nowMs,
       MAX_PUBLIC_ONCHAIN_AGE_MS,
     );
+    const expectedAsset = pair ? getFreqtradePairBaseAsset(pair) : null;
+    const expectedBlockchain: Record<string, string> = {
+      BTC: 'bitcoin',
+      ETH: 'ethereum',
+      SOL: 'solana',
+      XRP: 'xrp',
+      BNB: 'binance_smart_chain',
+    };
+    const hasForeignTransfer = expectedAsset !== null &&
+      directWhaleFlow.largeTransfers.some((transfer) =>
+        transfer.asset.toUpperCase() !== expectedAsset ||
+        transfer.blockchain.toLowerCase() !== expectedBlockchain[expectedAsset],
+      );
+    if (hasForeignTransfer) {
+      return abstain(
+        member,
+        `provider برای ${pair} انتقالی از شبکه یا دارایی دیگری فرستاد؛ کل شواهد رد شد.`,
+        [{
+          labelFa: 'تطبیق شبکهٔ انتقال‌ها',
+          passed: false,
+          detailFa: `شبکه و دارایی مورد انتظار ${expectedBlockchain[expectedAsset!]}/${expectedAsset}.`,
+        }],
+        directWhaleFlow.timestampMs,
+        directWhaleFlow.ageMs,
+      );
+    }
     const eligibleTransfers = directWhaleFlow.largeTransfers.filter((transfer) =>
       transfer.confirmationStatus === 'CONFIRMED' &&
       transfer.blockchain.length > 0 &&
@@ -938,6 +1066,18 @@ function evaluateOnChain(
     );
   }
 
+  if (pair !== undefined) {
+    return abstain(
+      member,
+      `دادهٔ آن‌چین pair-scoped برای ${pair} موجود نیست؛ context قدیمی BTCمحور برای این عضو استفاده نشد.`,
+      [{
+        labelFa: 'دادهٔ اختصاصی دارایی',
+        passed: false,
+        detailFa: 'منبع آن‌چین فاقد جفت/شبکهٔ منطبق است.',
+      }],
+    );
+  }
+
   const freshness = getMacroAge(macro, nowMs, MAX_ONCHAIN_AGE_MS);
   const hasFlow = macro?.whaleFlowStatus === 'LIVE' &&
     isFiniteNumber(macro.whaleNetflowBtc) &&
@@ -970,7 +1110,20 @@ function evaluateMacro(
   macro: CouncilMacroContext | null | undefined,
   nowMs: number,
   directMacroData?: FreeMacroDataResult,
+  pair?: string,
 ): CouncilMemberVote {
+  const macroBeta = pair === undefined ? 1 : readMacroBeta(pair);
+  if (macroBeta === null) {
+    return abstain(
+      member,
+      `ضریب واکنش کلانِ کالیبره‌شده برای ${pair} تنظیم نشده است؛ رأی عمومی بازار روی این دارایی اعمال نشد.`,
+      [{
+        labelFa: 'ضریب واکنش اختصاصی دارایی',
+        passed: false,
+        detailFa: `SBK1_MACRO_BETA_BY_PAIR باید برای ${pair} مقدار کالیبره‌شده داشته باشد.`,
+      }],
+    );
+  }
   const directSignals: Array<{
     label: string;
     provider: string;
@@ -1071,13 +1224,13 @@ function evaluateMacro(
   }
 
   if (uniqueDirectSignals.length >= 2) {
-    const score = uniqueDirectSignals.reduce((sum, signal) => sum + signal.direction, 0);
+    const score = uniqueDirectSignals.reduce((sum, signal) => sum + signal.direction * macroBeta, 0);
     const vote: CouncilVote = score >= 2 ? 'LONG' : score <= -2 ? 'SHORT' : 'NEUTRAL';
     const sourceTimestampMs = Math.max(...uniqueDirectSignals.map((signal) => signal.timestampMs));
     return createVote(
       member,
       vote,
-      `رأی از ${uniqueDirectSignals.length} شاخص مستقیم و تازه گرفته شد: ${uniqueDirectSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ شاخص یا proxy با نام و نوع واقعی خودش گزارش شده است.`,
+      `رأی ${pair ?? 'بازار'} با ضریب واکنش ${macroBeta} از ${uniqueDirectSignals.length} شاخص مستقیم و تازه گرفته شد: ${uniqueDirectSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ شاخص یا proxy با نام و نوع واقعی خودش گزارش شده است.`,
       [
         {
           labelFa: 'تازگی منابع کلان مستقیم',
@@ -1153,13 +1306,13 @@ function evaluateMacro(
     });
   }
   if (contextSignals.length >= 2) {
-    const score = contextSignals.reduce((sum, signal) => sum + signal.direction, 0);
+    const score = contextSignals.reduce((sum, signal) => sum + signal.direction * macroBeta, 0);
     const vote: CouncilVote = score >= 2 ? 'LONG' : score <= -2 ? 'SHORT' : 'NEUTRAL';
     const sourceTimestampMs = Math.max(...contextSignals.map((signal) => signal.timestampMs));
     return createVote(
       member,
       vote,
-      `رأی از ${contextSignals.length} شاخص مستقیم و تازهٔ زمینهٔ کلان گرفته شد: ${contextSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ proxy دلار به‌جای DXY معرفی نشده است.`,
+      `رأی ${pair ?? 'بازار'} با ضریب واکنش ${macroBeta} از ${contextSignals.length} شاخص مستقیم و تازهٔ زمینهٔ کلان گرفته شد: ${contextSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ proxy دلار به‌جای DXY معرفی نشده است.`,
       [
         {
           labelFa: 'تازگی منابع کلان مستقیم',
@@ -1178,6 +1331,18 @@ function evaluateMacro(
         dataQualityPct: Math.round(Math.min(contextSignals.length, 3) / 3 * 100),
         confidencePct: confidenceForStrength(Math.min(30, Math.abs(score) * 10)),
       },
+    );
+  }
+
+  if (pair !== undefined) {
+    return abstain(
+      member,
+      `برای ${pair} دو شاخص مستقیم و تازه برای ارزیابی واکنش اختصاصی موجود نیست؛ سوگیری عمومی macroContext به ارث نمی‌رسد.`,
+      [{
+        labelFa: 'پوشش شاخص‌های واکنش‌پذیری',
+        passed: false,
+        detailFa: `${contextSignals.length} شاخص pair-context معتبر؛ حداقل دو شاخص مستقل لازم است.`,
+      }],
     );
   }
 
@@ -1212,14 +1377,14 @@ function evaluateMacro(
   }
 
   const vote: CouncilVote = macro.fundamentalBias === 'BULLISH'
-    ? 'LONG'
+    ? macroBeta >= 1 ? 'LONG' : 'NEUTRAL'
     : macro.fundamentalBias === 'BEARISH'
-      ? 'SHORT'
+      ? macroBeta >= 1 ? 'SHORT' : 'NEUTRAL'
       : 'NEUTRAL';
   return createVote(
     member,
     vote,
-    `سوگیری کلان ${macro.fundamentalBias} با پوشش ${liveIndicatorCount} شاخص زنده دریافت شد.`,
+    `سوگیری کلان ${macro.fundamentalBias} برای ${pair ?? 'بازار'} با ضریب واکنش ${macroBeta} و پوشش ${liveIndicatorCount} شاخص زنده ارزیابی شد.`,
     checks,
     {
       sourceTimestampMs: freshness.timestampMs,
@@ -1232,10 +1397,14 @@ function evaluateMacro(
 function evaluateNews(
   member: CouncilMemberDefinition,
   macro: CouncilMacroContext | null | undefined,
-  nowMs: number
+  nowMs: number,
+  pair?: string,
 ): CouncilMemberVote {
   const freshness = getMacroAge(macro, nowMs, MAX_NEWS_AGE_MS);
-  const newsDeduplication = deduplicateNews(macro?.recentHeadlines ?? []);
+  const pairHeadlines = pair === undefined
+    ? macro?.recentHeadlines ?? []
+    : (macro?.recentHeadlines ?? []).filter((headline) => headline.pair === pair);
+  const newsDeduplication = deduplicateNews(pairHeadlines);
   const uniqueHeadlines = newsDeduplication.values;
   const freshHeadlines = uniqueHeadlines.filter((headline) => {
     const publishedAt = Date.parse(headline.publishedAt);
@@ -1267,6 +1436,7 @@ function evaluateNews(
     { labelFa: 'حذف خبرهای تکراری و هم‌معنی', passed: true, detailFa: `${newsDeduplication.duplicateCount} خبر تکراری/هم‌معنی از URLهای متفاوت ادغام شد.` },
     { labelFa: 'ناشر و خبر معتبر', passed: hasLiveSentiment, detailFa: hasLiveSentiment ? `${freshHeadlines.length} خبر یکتای تازه و امتیاز سنتیمنت زنده` : 'خبر معتبر یا امتیاز سنتیمنت زنده در دسترس نیست.' },
     { labelFa: 'تازگی خبر و داده', passed: freshness !== null && headlinesAreFresh, detailFa: freshness && latestFreshHeadline !== null ? `${Math.round((nowMs - latestFreshHeadline) / 60_000)} دقیقه از انتشار آخرین خبر` : 'زمان خبر/داده کهنه یا نامعتبر است.' },
+    { labelFa: 'تطبیق جفت‌ارز خبر', passed: pair === undefined || freshHeadlines.every((headline) => headline.pair === pair), detailFa: pair === undefined ? 'اجرای بدون جفت؛ سازگاری قدیمی.' : `${freshHeadlines.length} خبر برای ${pair} فیلتر شد.` },
   ];
   if (!macro || !hasLiveSentiment || !hasSufficientCoverage || !freshness || !headlinesAreFresh || !isFiniteNumber(macro.newsSentimentScore)) {
     return createVote(
@@ -1370,6 +1540,7 @@ export function evaluateEightMemberCouncil(input: {
   directMacroData?: FreeMacroDataResult;
   optionsData?: CouncilOptionsData | null;
   whaleFlowData?: CouncilWhaleFlowData | null;
+  pair?: string;
   supportingModules?: Readonly<Record<string, CouncilModuleEvidence>>;
   evidenceFingerprints?: Readonly<Record<number, string>>;
   previousMemberEvidence?: Readonly<Record<number, CouncilMemberEvidenceCacheEntry>>;
@@ -1382,10 +1553,10 @@ export function evaluateEightMemberCouncil(input: {
     () => evaluateTradeFlow(members[1], input.analysis, nowMs),
     () => evaluateOrderBook(members[2], input.analysis, nowMs),
     () => evaluateDerivatives(members[3], input.analysis, nowMs),
-    () => evaluateOptions(members[4], input.optionsData, nowMs),
-    () => evaluateOnChain(members[5], input.macroContext, nowMs, input.whaleFlowData ?? undefined),
-    () => evaluateMacro(members[6], input.macroContext, nowMs, input.directMacroData),
-    () => evaluateNews(members[7], input.macroContext, nowMs),
+    () => evaluateOptions(members[4], input.optionsData, nowMs, input.pair),
+    () => evaluateOnChain(members[5], input.macroContext, nowMs, input.whaleFlowData ?? undefined, input.pair),
+    () => evaluateMacro(members[6], input.macroContext, nowMs, input.directMacroData, input.pair),
+    () => evaluateNews(members[7], input.macroContext, nowMs, input.pair),
   ];
   const votes = evaluators.map((evaluate, index) => {
     const memberId = index + 1;

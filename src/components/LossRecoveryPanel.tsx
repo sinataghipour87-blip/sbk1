@@ -423,7 +423,7 @@ export const LossRecoveryPanel: React.FC<LossRecoveryPanelProps> = ({
                     ? 'bg-slate-900 border-emerald-500/50 shadow-md text-white'
                     : 'bg-transparent border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/40'
                 }`}
-              >
+               type="button">
                 <div className="flex items-center gap-1.5 justify-between w-full">
                   <span className="text-[11px] font-bold truncate">{strat.nameFa}</span>
                   {strat.icon}
@@ -791,7 +791,7 @@ export const LossRecoveryPanel: React.FC<LossRecoveryPanelProps> = ({
                   onClick={runLiveSimulation}
                   disabled={isSimulating}
                   className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 disabled:from-slate-800 disabled:to-slate-800 disabled:text-slate-500 text-white font-black text-xs flex items-center gap-2 shadow-[0_0_18px_rgba(16,185,129,0.35)] transition-all cursor-pointer"
-                >
+                 type="button">
                   <Play className="w-4 h-4 fill-current text-white" />
                   <span>{isSimulating ? 'در حال اجرای فرمول‌های بازیابی...' : 'شروع شبیه‌سازی بحران و نجات پوزیشن'}</span>
                 </button>
@@ -882,7 +882,7 @@ export const LossRecoveryPanel: React.FC<LossRecoveryPanelProps> = ({
               onClick={onResetEngine}
               className="p-2 rounded-xl bg-[#030c1b] border border-slate-800 text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
               title="بازتنظیم وضعیت موتور بازیابی"
-            >
+             type="button">
               <RefreshCw className="w-4 h-4" />
             </button>
           </div>

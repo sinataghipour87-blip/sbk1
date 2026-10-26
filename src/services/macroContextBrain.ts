@@ -11,6 +11,7 @@ export type MetricDataStatus = 'LIVE' | 'PROXY' | 'UNKNOWN' | 'UNAVAILABLE';
 
 export interface BitcoinNewsItem {
   id: string;
+  pair?: string;
   headline: string;
   source: string;
   url: string;

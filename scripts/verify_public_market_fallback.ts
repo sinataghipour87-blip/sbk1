@@ -117,6 +117,7 @@ const fallback = await fetchPublicMarketFallback({
 });
 assert.equal(fallback.provider, 'Binance public REST API');
 assert.equal(fallback.candles.status, 'LIVE');
+assert.equal(fallback.candles.provider, 'Binance public REST API');
 assert.equal(fallback.candles.value?.length, 40);
 assert.equal(fallback.fastCandles.status, 'LIVE');
 const chartFallbackCandles = await fetchPublicMarketCandles({
@@ -136,6 +137,81 @@ assert.deepEqual(chartFallbackCandles[0], {
   close: 101,
   volume: 10,
 });
+const bybitFallbackCandles = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/klines') {
+      return new Response('unavailable', { status: 503 });
+    }
+    if (url.hostname === 'api.bybit.com' && url.pathname === '/v5/market/kline') {
+      return Response.json({
+        retCode: 0,
+        result: {
+          symbol: 'BTCUSDT',
+          list: candleRows.slice().reverse().map((row) => row.map(String)),
+        },
+      });
+    }
+    return new Response('unavailable', { status: 503 });
+  },
+  timeoutMs: 100,
+});
+assert.equal(bybitFallbackCandles.candles.status, 'LIVE');
+assert.equal(bybitFallbackCandles.candles.provider, 'Bybit V5 public REST API');
+assert.match(bybitFallbackCandles.candles.endpoint ?? '', /api\.bybit\.com\/v5\/market\/kline/);
+assert.equal(bybitFallbackCandles.candles.isPartial, true);
+assert.equal(bybitFallbackCandles.candles.value?.length, 40);
+assert.deepEqual(bybitFallbackCandles.candles.value?.[0], {
+  timestampMs: latestCloseMs - 40 * 60_000,
+  open: 100,
+  high: 102,
+  low: 99,
+  close: 101,
+  volume: 10,
+});
+const okxFallbackCandles = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/klines') {
+      return new Response('unavailable', { status: 503 });
+    }
+    if (url.hostname === 'api.bybit.com' && url.pathname === '/v5/market/kline') {
+      return Response.json({
+        retCode: 0,
+        result: { symbol: 'ETHUSDT', list: candleRows.slice().reverse().map((row) => row.map(String)) },
+      });
+    }
+    if (url.hostname === 'www.okx.com' && url.pathname === '/api/v5/market/candles') {
+      return Response.json({
+        code: '0',
+        data: candleRows.slice().reverse().map((row) => [
+          String(row[0]), String(row[1]), String(row[2]), String(row[3]), String(row[4]),
+          '1', '1', '1', '1',
+        ]),
+      });
+    }
+    return new Response('unavailable', { status: 503 });
+  },
+  timeoutMs: 100,
+});
+assert.equal(okxFallbackCandles.candles.status, 'LIVE');
+assert.equal(okxFallbackCandles.candles.provider, 'OKX V5 public REST API');
+assert.match(okxFallbackCandles.candles.endpoint ?? '', /www\.okx\.com\/api\/v5\/market\/candles/);
+assert.equal(okxFallbackCandles.candles.isPartial, true);
+assert.equal(okxFallbackCandles.candles.value?.length, 40);
+assert.equal(
+  okxFallbackCandles.candles.value?.[0].volume,
+  1,
+  'OKX futures volume is normalized from base-currency volume, not contract count',
+);
 assert.equal(fallback.fastCandles.sourceTimestampMs, fallback.candles.sourceTimestampMs);
 assert.equal(fallback.higherTimeframeCandles['1h'].status, 'LIVE');
 assert.equal(fallback.higherTimeframeCandles['4h'].status, 'LIVE');
@@ -156,6 +232,74 @@ assert.match(fallback.orderBook.endpoint ?? '', /fapi\.binance\.com\/fapi\/v1\/d
 assert.equal(fallback.orderBook.receivedAtMs, nowMs);
 assert.deepEqual(fallback.orderBook.value?.bids[0], { price: 100, amount: 5 });
 assert.equal(fallback.orderBook.value?.sequenceId, 77);
+const bybitDepthTimestamp = nowMs - 100;
+const bybitTradeTimestamp = nowMs - 200;
+const bybitBookAndTradeFallback = await fetchPublicMarketFallback({
+  pair: 'BTC/USDT:USDT',
+  timeframe: '1m',
+  market: 'futures',
+  nowMs,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (
+      url.hostname === 'fapi.binance.com' &&
+      ['/fapi/v1/depth', '/fapi/v1/aggTrades'].includes(url.pathname)
+    ) return new Response('unavailable', { status: 503 });
+    if (url.hostname === 'api.bybit.com' && url.pathname === '/v5/market/orderbook') {
+      return Response.json({
+        retCode: 0,
+        time: bybitDepthTimestamp,
+        result: {
+          s: 'BTCUSDT',
+          ts: bybitDepthTimestamp,
+          seq: 88,
+          b: [['100', '2'], ['99', '3']],
+          a: [['101', '4'], ['102', '5']],
+        },
+      });
+    }
+    if (url.hostname === 'api.bybit.com' && url.pathname === '/v5/market/recent-trade') {
+      return Response.json({
+        retCode: 0,
+        time: nowMs,
+        result: {
+          category: 'linear',
+          list: [
+            {
+              execId: 'bybit-exec-2',
+              symbol: 'BTCUSDT',
+              price: '101',
+              size: '0.5',
+              side: 'Sell',
+              time: String(bybitTradeTimestamp),
+            },
+            {
+              execId: 'bybit-exec-1',
+              symbol: 'BTCUSDT',
+              price: '100',
+              size: '0.25',
+              side: 'Buy',
+              time: String(bybitTradeTimestamp - 50),
+            },
+          ],
+        },
+      });
+    }
+    return fixtureFetcher(input, init);
+  },
+  timeoutMs: 100,
+});
+assert.equal(bybitBookAndTradeFallback.orderBook.status, 'LIVE');
+assert.equal(bybitBookAndTradeFallback.orderBook.provider, 'Bybit V5 public REST API');
+assert.match(bybitBookAndTradeFallback.orderBook.endpoint ?? '', /api\.bybit\.com\/v5\/market\/orderbook/);
+assert.equal(bybitBookAndTradeFallback.orderBook.value?.venue, 'bybit');
+assert.equal(bybitBookAndTradeFallback.orderBook.value?.sequenceId, 88);
+assert.equal(bybitBookAndTradeFallback.tradeFlow.status, 'LIVE');
+assert.equal(bybitBookAndTradeFallback.tradeFlow.provider, 'Bybit V5 public REST API');
+assert.match(bybitBookAndTradeFallback.tradeFlow.endpoint ?? '', /api\.bybit\.com\/v5\/market\/recent-trade/);
+assert.equal(bybitBookAndTradeFallback.tradeFlow.value?.trades.length, 2);
+assert.equal(bybitBookAndTradeFallback.tradeFlow.value?.trades[0].side, 'buy');
+assert.equal(bybitBookAndTradeFallback.tradeFlow.value?.trades[0].venue, 'bybit');
 assert.equal(fallback.fundingRate.status, 'LIVE');
 assert.match(fallback.fundingRate.endpoint ?? '', /fapi\.binance\.com\/fapi\/v1\/premiumIndex/);
 assert.equal(fallback.openInterest.status, 'LIVE');

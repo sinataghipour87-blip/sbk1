@@ -51,7 +51,9 @@ const child = spawn(
     cwd: process.cwd(),
     env: {
       ...process.env,
+      NODE_ENV: 'development',
       SBK1_PORT: String(port),
+      SBK1_LOCAL_DEMO_AUTH_BYPASS: 'true',
       ADMIN_TOKEN: adminToken,
       FREQTRADE_BASE_URL: 'http://127.0.0.1:1',
       FREQTRADE_USERNAME: 'legacy-route-test-user',
@@ -70,6 +72,48 @@ try {
   const healthResponse = await fetch(`${baseUrl}/api/health`);
   assert.match(healthResponse.headers.get('content-type') || '', /application\/json/);
   assert.equal((await healthResponse.json() as { status?: string }).status, 'ok');
+
+  const localAutoPilotOffResponse = await fetch(`${baseUrl}/api/decision/auto-pilot`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(localAutoPilotOffResponse.status, 200, 'local demo Auto-Pilot control should work without an admin token');
+  assert.equal((await localAutoPilotOffResponse.json() as { autoPilotEnabled?: boolean }).autoPilotEnabled, false);
+
+  const localAutoPilotOnResponse = await fetch(`${baseUrl}/api/decision/auto-pilot`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.ok(
+    [409, 503].includes(localAutoPilotOnResponse.status),
+    'Auto-Pilot enable must pass local auth but fail closed on kill switch or unavailable Freqtrade status',
+  );
+
+  const localManualIntentResponse = await fetch(`${baseUrl}/api/decision/manual-entry`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pair: 'BTC/USDT:USDT', direction: 'LONG' }),
+  });
+  assert.ok(
+    [409, 503].includes(localManualIntentResponse.status),
+    'manual intent must pass local auth but fail closed on kill switch or unavailable Freqtrade status',
+  );
+
+  const remoteHostAutoPilotResponse = await fetch(`${baseUrl}/api/decision/auto-pilot`, {
+    method: 'POST',
+    headers: { origin: 'http://dashboard.example.test', 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(remoteHostAutoPilotResponse.status, 403, 'non-local Origin must not use the development bypass');
+
+  const protectedModeResponse = await fetch(`${baseUrl}/api/execution/mode`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ mode: 'PAPER' }),
+  });
+  assert.equal(protectedModeResponse.status, 403, 'the local demo bypass must not affect other admin routes');
   const fundamentalResponse = await fetch(`${baseUrl}/api/btc-fundamental-grounding`);
   const fundamental = await fundamentalResponse.json() as {
     status?: string;

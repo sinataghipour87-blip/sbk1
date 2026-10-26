@@ -163,7 +163,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
                 ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30 font-black'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <Radio className="w-3.5 h-3.5" />
             <span>۷ حلقه شکارچی</span>
           </button>
@@ -174,7 +174,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
                 ? 'bg-rose-500 text-white shadow-md shadow-rose-500/30 font-black'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <Radar className="w-3.5 h-3.5" />
             <span>رادار زوال لبه (Decay)</span>
           </button>
@@ -185,7 +185,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
                 ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/30 font-black'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <Dna className="w-3.5 h-3.5" />
             <span>ژنوم موج (Wave DNA)</span>
           </button>
@@ -196,7 +196,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
                 ? 'bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-950 shadow-md shadow-emerald-500/30 font-black'
                 : 'text-emerald-400/80 hover:text-emerald-300'
             }`}
-          >
+           type="button">
             <BookOpen className="w-3.5 h-3.5" />
             <span>حافظه درسی و Counterfactual</span>
           </button>
@@ -361,7 +361,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
                   <button
                     onClick={() => onPartialClosePosition(currentPos.id, 50)}
                     className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black rounded-lg transition-all shadow-md"
-                  >
+                   type="button">
                     سیو سود و کاهش ۵۰٪ حجم
                   </button>
                 )}
@@ -369,7 +369,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
                   <button
                     onClick={() => onClosePosition(currentPos.id, `Edge Decay: ${edgeRadar.recommendedAction}`)}
                     className="flex items-center gap-1.5 px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-black rounded-lg transition-all shadow-md shadow-rose-900/50"
-                  >
+                   type="button">
                     <LogOut className="w-3.5 h-3.5" />
                     <span>خروج فوری از معامله</span>
                   </button>
@@ -511,7 +511,7 @@ export const HunterOsDashboardWidget: React.FC<HunterOsDashboardWidgetProps> = (
             <button
               onClick={handleSaveCurrentWave}
               className="flex items-center gap-1.5 px-3.5 py-2 bg-cyan-600 hover:bg-cyan-500 text-slate-950 text-xs font-black rounded-lg transition-all shadow-md shrink-0"
-            >
+             type="button">
               <Database className="w-3.5 h-3.5" />
               <span>ذخیرهٔ نمونهٔ غیرآماری</span>
             </button>

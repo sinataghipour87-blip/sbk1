@@ -15,6 +15,7 @@ const environment = {
   ADMIN_TOKEN: 'runtime-test-admin-token-that-is-long-enough',
   FREQTRADE_PAIR: 'BTC/USDT:USDT',
   SBK1_FREQTRADE_PAIR: 'BTC/USDT:USDT',
+  SBK1_FREQTRADE_PAIRS: 'BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,BNB/USDT:USDT',
   SBK1_SIGNAL_EXCHANGE: 'BYBIT',
   SBK1_FREQTRADE_TIMEFRAME: '15m',
   SBK1_FREQTRADE_BRIDGE_TOKEN: 'runtime-test-bridge-token-that-is-long-enough',
@@ -44,7 +45,7 @@ const config = {
   force_entry_enable: false,
   exchange: {
     name: 'bybit',
-    pair_whitelist: ['BTC/USDT:USDT'],
+    pair_whitelist: ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 'BNB/USDT:USDT'],
   },
   api_server: {
     enabled: true,

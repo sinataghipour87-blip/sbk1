@@ -53,7 +53,7 @@ export const TfjsReinforcementLearningWidget: React.FC<Props> = ({
           onClick={handleManualRlTraining}
           disabled={isTrainingAnim}
           className="px-2.5 py-1 rounded-lg bg-cyan-950 hover:bg-cyan-900 border border-cyan-500/50 text-cyan-200 text-[11px] font-mono font-bold flex items-center gap-1.5 cursor-pointer transition-all"
-        >
+         type="button">
           <RefreshCw className={`w-3.5 h-3.5 text-cyan-400 ${isTrainingAnim ? 'animate-spin' : ''}`} />
           <span>{isTrainingAnim ? 'در حال آموزش شبکه tfjs...' : 'آموزش آنلاین بر اساس آخرین معامله'}</span>
         </button>

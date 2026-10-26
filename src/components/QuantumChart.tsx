@@ -14,6 +14,8 @@ interface QuantumChartProps {
   livePriceSource?: string | null;
   chartCandles?: Candle[] | null;
   councilReport?: EightMemberCouncilReport | null;
+  onTimeframeChange: (timeframe: string) => Promise<void>;
+  timeframeNotice?: string | null;
 }
 
 interface PriceBadgeItem {
@@ -40,6 +42,8 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
   livePriceSource = null,
   chartCandles = null,
   councilReport = null,
+  onTimeframeChange,
+  timeframeNotice = null,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -49,6 +53,8 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
   const [priceScaleFactor, setPriceScaleFactor] = useState<number>(1.0);
   const [panOffset, setPanOffset] = useState<number>(0);
   const [timeframe, setTimeframe] = useState<string>('15M');
+  const [timeframeLoading, setTimeframeLoading] = useState(false);
+  const [timeframeError, setTimeframeError] = useState<string | null>(null);
   const [showIndicators, setShowIndicators] = useState<boolean>(true);
   const [showSmc, setShowSmc] = useState<boolean>(true);
   const [showVrvp, setShowVrvp] = useState<boolean>(true);
@@ -68,6 +74,20 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
     setVisibleCandles(85);
     setPriceScaleFactor(1.0);
     setPanOffset(0);
+  };
+  const selectTimeframe = async (nextTimeframe: string) => {
+    if (timeframeLoading || nextTimeframe === timeframe) return;
+    setTimeframeLoading(true);
+    setTimeframeError(null);
+    try {
+      await onTimeframeChange(nextTimeframe);
+      setTimeframe(nextTimeframe);
+      setPanOffset(0);
+    } catch (error) {
+      setTimeframeError(error instanceof Error ? error.message : 'دادهٔ این تایم‌فریم در دسترس نیست.');
+    } finally {
+      setTimeframeLoading(false);
+    }
   };
 
   // Export PNG Snapshot
@@ -130,6 +150,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
     ctx.fillRect(0, 0, width, height);
 
     const useBinanceCandles = livePriceSource === 'binance' && !!chartCandles?.length;
+    const hideAnalysisOverlays = useBinanceCandles || timeframe !== '15M';
     if (livePriceSource === 'binance' && !chartCandles?.length) {
       ctx.fillStyle = '#fbbf24';
       ctx.font = 'bold 12px monospace';
@@ -138,7 +159,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
       ctx.restore();
       return;
     }
-    const useSourceCandles = !!chartCandles?.length && livePriceSource !== null;
+    const useSourceCandles = !!chartCandles?.length && (livePriceSource !== null || timeframe !== '15M');
     const sourceCandles = useSourceCandles ? chartCandles : analysis?.candles;
     if (!analysis || !sourceCandles || sourceCandles.length === 0) {
       ctx.fillStyle = '#10b981';
@@ -166,12 +187,12 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
     const endIdx = startIdx + count;
 
     const candles = sourceCandles.slice(startIdx, endIdx);
-    const ema20 = useBinanceCandles ? [] : (analysis.ema20 || []).slice(startIdx, endIdx);
-    const ema50 = useBinanceCandles ? [] : (analysis.ema50 || []).slice(startIdx, endIdx);
-    const ema200 = useBinanceCandles ? [] : (analysis.ema200 || []).slice(startIdx, endIdx);
-    const bbUp = useBinanceCandles ? [] : (analysis.bbUp || []).slice(startIdx, endIdx);
-    const bbLow = useBinanceCandles ? [] : (analysis.bbLow || []).slice(startIdx, endIdx);
-    const macdH = useBinanceCandles ? [] : (analysis.macdH || []).slice(startIdx, endIdx);
+    const ema20 = hideAnalysisOverlays ? [] : (analysis.ema20 || []).slice(startIdx, endIdx);
+    const ema50 = hideAnalysisOverlays ? [] : (analysis.ema50 || []).slice(startIdx, endIdx);
+    const ema200 = hideAnalysisOverlays ? [] : (analysis.ema200 || []).slice(startIdx, endIdx);
+    const bbUp = hideAnalysisOverlays ? [] : (analysis.bbUp || []).slice(startIdx, endIdx);
+    const bbLow = hideAnalysisOverlays ? [] : (analysis.bbLow || []).slice(startIdx, endIdx);
+    const macdH = hideAnalysisOverlays ? [] : (analysis.macdH || []).slice(startIdx, endIdx);
 
     if (candles.length === 0) {
       ctx.restore();
@@ -182,8 +203,8 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
     let rawMin = Math.min(...candles.map(c => c[2]), currentMarketPrice);
     let rawMax = Math.max(...candles.map(c => c[1]), currentMarketPrice);
 
-    const forecastList = useBinanceCandles ? [] : prediction?.forecast15m || [];
-    if (!useBinanceCandles && clampedPan === 0) {
+    const forecastList = hideAnalysisOverlays ? [] : prediction?.forecast15m || [];
+    if (!hideAnalysisOverlays && clampedPan === 0) {
       forecastList.forEach((fc: any) => {
         if (fc.high) rawMax = Math.max(rawMax, fc.high);
         if (fc.low) rawMin = Math.min(rawMin, fc.low);
@@ -194,8 +215,8 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
       });
     }
 
-    if (!useBinanceCandles && analysis.tp3) rawMax = Math.max(rawMax, analysis.tp3);
-    if (!useBinanceCandles && analysis.sl) rawMin = Math.min(rawMin, analysis.sl);
+    if (!hideAnalysisOverlays && analysis.tp3) rawMax = Math.max(rawMax, analysis.tp3);
+    if (!hideAnalysisOverlays && analysis.sl) rawMin = Math.min(rawMin, analysis.sl);
 
     // Pad bounds
     const rawPadding = Math.max(10, (rawMax - rawMin) * 0.08);
@@ -309,7 +330,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
     ctx.setLineDash([]);
 
     // 4. SMC Order Block Zone
-    if (!useBinanceCandles && showSmc && analysis.smcOrderBlock) {
+    if (!hideAnalysisOverlays && showSmc && analysis.smcOrderBlock) {
       const ob = analysis.smcOrderBlock;
       const yTop = getY(ob.top);
       const yBottom = getY(ob.bottom);
@@ -518,7 +539,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
     // Zero Collisions & 100% Full-Width Chart Layout
     const levelItems: PriceBadgeItem[] = [];
 
-    if (!useBinanceCandles && analysis.tp1) {
+    if (!hideAnalysisOverlays && analysis.tp1) {
       levelItems.push({
         id: 'tp1',
         label: 'TP1',
@@ -535,7 +556,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
       });
     }
 
-    if (!useBinanceCandles && analysis.tp2) {
+    if (!hideAnalysisOverlays && analysis.tp2) {
       levelItems.push({
         id: 'tp2',
         label: 'TP2',
@@ -552,7 +573,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
       });
     }
 
-    if (!useBinanceCandles && analysis.tp3) {
+    if (!hideAnalysisOverlays && analysis.tp3) {
       levelItems.push({
         id: 'tp3',
         label: 'FINAL TP',
@@ -569,7 +590,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
       });
     }
 
-    if (!useBinanceCandles && analysis.sl) {
+    if (!hideAnalysisOverlays && analysis.sl) {
       levelItems.push({
         id: 'sl',
         label: 'STOP LOSS',
@@ -671,7 +692,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
     });
 
     // 9.5. REAL-TIME ACTIVE OPEN POSITIONS OVERLAY (Drawn directly on chart canvas)
-    if (!useBinanceCandles && activePositions && activePositions.length > 0) {
+    if (!hideAnalysisOverlays && activePositions && activePositions.length > 0) {
       activePositions.forEach((pos, pIdx) => {
         const entryY = Math.max(2, Math.min(mainHeight - 2, getY(pos.entry)));
         const curP = currentMarketPrice;
@@ -925,11 +946,15 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
         <div className="flex items-center gap-1.5 flex-wrap">
           {/* Timeframe Selector Pills */}
           <div className="flex items-center bg-[#020712] rounded-lg p-0.5 border border-emerald-900/60 text-[10px]">
-            {['1M', '5M', '15M', '1H', '4H', '1D'].map(tf => (
+            {['1M', '5M', '15M', '1H', '4H'].map(tf => (
               <button
                 key={tf}
-                onClick={() => setTimeframe(tf)}
-                className={`px-1.5 py-0.5 rounded transition cursor-pointer font-bold ${
+                type="button"
+                aria-label={`تایم‌فریم ${tf}`}
+                aria-pressed={timeframe === tf}
+                disabled={timeframeLoading}
+                onClick={() => void selectTimeframe(tf)}
+                className={`px-1.5 py-0.5 rounded transition cursor-pointer font-bold disabled:opacity-50 ${
                   timeframe === tf
                     ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/50 shadow-sm'
                     : 'text-slate-400 hover:text-slate-200'
@@ -939,6 +964,21 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
               </button>
             ))}
           </div>
+          {timeframeError && (
+            <span role="alert" className="text-rose-300 text-[10px]">
+              {timeframeError}
+            </span>
+          )}
+          {timeframeNotice && (
+            <span role="alert" className="text-amber-300 text-[10px]">
+              {timeframeNotice}
+            </span>
+          )}
+          {timeframe !== '15M' && (
+            <span className="text-slate-400 text-[10px]">
+              کندل‌ها از snapshot فریکترید هستند؛ اندیکاتورهای ۱۵ دقیقه‌ای برای این نما پنهان‌اند.
+            </span>
+          )}
 
           <div className="flex items-center gap-1 bg-emerald-950/80 px-2 py-0.5 rounded-lg border border-emerald-500/40 text-[11px] text-emerald-300 shadow-sm">
             <span>SB 2126 QUANTUM</span>
@@ -974,24 +1014,27 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
 
           <div className="flex items-center gap-0.5 bg-[#020712] rounded-lg p-0.5 border border-emerald-900/60 shadow-inner">
             <button
+              aria-label="بزرگ‌نمایی نمودار"
               onClick={zoomIn}
               className="p-1 hover:bg-emerald-950 rounded text-emerald-300 transition cursor-pointer"
               title="بزرگ‌نمایی (کندل کمتر)"
-            >
+             type="button">
               <ZoomIn className="w-3 h-3" />
             </button>
             <button
+              aria-label="کوچک‌نمایی نمودار"
               onClick={zoomOut}
               className="p-1 hover:bg-emerald-950 rounded text-emerald-300 transition cursor-pointer"
               title="کوچک‌نمایی (کندل بیشتر)"
-            >
+             type="button">
               <ZoomOut className="w-3 h-3" />
             </button>
             <button
+              aria-label="بازنشانی بزرگ‌نمایی نمودار"
               onClick={zoomReset}
               className="p-1 hover:bg-emerald-950 rounded text-emerald-300 transition cursor-pointer"
               title="ریست زوم"
-            >
+             type="button">
               <RotateCcw className="w-3 h-3" />
             </button>
           </div>
@@ -999,6 +1042,7 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
 
         <div className="flex items-center gap-1.5 flex-wrap">
           <button
+            aria-pressed={showVrvp}
             onClick={() => setShowVrvp(!showVrvp)}
             className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] transition-all cursor-pointer ${
               showVrvp
@@ -1006,50 +1050,54 @@ export const QuantumChart: React.FC<QuantumChartProps> = ({
                 : 'bg-slate-900/60 text-slate-400 border border-slate-800'
             }`}
             title="نمایش حجم پروفایل VRVP و نقطه کنترل POC"
-          >
+           type="button">
             <BarChart2 className="w-3 h-3" />
             <span>VRVP / POC</span>
           </button>
 
           <button
+            aria-pressed={showIndicators}
             onClick={() => setShowIndicators(!showIndicators)}
             className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] transition-all cursor-pointer ${
               showIndicators
                 ? 'bg-emerald-950/90 text-emerald-300 border border-emerald-500/50 shadow-sm'
                 : 'bg-slate-900/60 text-slate-400 border border-slate-800'
             }`}
-          >
+           type="button">
             <Layers className="w-3 h-3" />
             <span>اندیکاتورها</span>
           </button>
 
           <button
+            aria-pressed={showSmc}
             onClick={() => setShowSmc(!showSmc)}
             className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] transition-all cursor-pointer ${
               showSmc
                 ? 'bg-emerald-950/90 text-emerald-300 border border-emerald-500/50 shadow-sm'
                 : 'bg-slate-900/60 text-slate-400 border border-slate-800'
             }`}
-          >
+           type="button">
             <Zap className="w-3 h-3" />
             <span>SMC</span>
           </button>
 
           {/* Screenshot / Snapshot Export */}
           <button
+            aria-label="ذخیرهٔ تصویر نمودار"
             onClick={exportChartSnapshot}
             className="p-1 hover:bg-emerald-950 rounded-lg text-emerald-300 border border-emerald-900/60 transition cursor-pointer"
             title="ذخیره عکس با کیفیت از نمودار (PNG Snapshot)"
-          >
+           type="button">
             <Camera className="w-3.5 h-3.5" />
           </button>
 
           {/* Fullscreen Toggle */}
           <button
+            aria-label="نمایش تمام‌صفحهٔ نمودار"
             onClick={toggleFullscreen}
             className="p-1 hover:bg-emerald-950 rounded-lg text-emerald-300 border border-emerald-900/60 transition cursor-pointer"
             title="نمایش تمام‌صفحه چارت"
-          >
+           type="button">
             <Maximize2 className="w-3.5 h-3.5" />
           </button>
         </div>

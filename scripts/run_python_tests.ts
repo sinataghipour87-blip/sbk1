@@ -23,7 +23,16 @@ if (!existsSync(python)) {
       'scripts.test_realistic_backtester',
       'scripts.test_init_sbk1_config',
     ],
-    { stdio: 'inherit' },
+    {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        PYTHONPATH: [
+          path.resolve('yash-posttrade', 'src'),
+          process.env.PYTHONPATH?.trim(),
+        ].filter(Boolean).join(path.delimiter),
+      },
+    },
   );
   if (result.error) {
     console.error(`Could not run Python tests: ${result.error.message}`);

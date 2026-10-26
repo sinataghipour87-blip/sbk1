@@ -76,14 +76,14 @@ export const HunterOrderFlowDashboardWidget: React.FC<HunterOrderFlowDashboardWi
             disabled
             title="آرشیو تاریخی سیگنال‌های واقعی SBK1 موجود نیست"
             className="px-3 py-1.5 rounded-lg bg-indigo-600 disabled:opacity-50 text-white font-medium text-xs flex items-center gap-1.5"
-          >
+           type="button">
             <BarChart3 className="w-3.5 h-3.5" />
             <span>بک‌تست: آرشیو سیگنال در دسترس نیست</span>
           </button>
           <button
             onClick={updateOrderFlow}
             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition"
-          >
+           type="button">
             <RefreshCw className="w-3.5 h-3.5 text-amber-400" />
           </button>
         </div>

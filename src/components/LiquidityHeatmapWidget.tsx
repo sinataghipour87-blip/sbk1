@@ -330,7 +330,7 @@ export const LiquidityHeatmapWidget: React.FC<LiquidityHeatmapProps> = ({ curren
             className={`px-2.5 py-1 rounded-lg transition-all ${
               filterSide === 'ALL' ? 'bg-cyan-600 text-white font-bold' : 'text-slate-400 hover:text-white'
             }`}
-          >
+           type="button">
             همه استخرها ({liquidityMap.pools.length})
           </button>
           <button
@@ -338,7 +338,7 @@ export const LiquidityHeatmapWidget: React.FC<LiquidityHeatmapProps> = ({ curren
             className={`flex items-center gap-1 px-2.5 py-1 rounded-lg transition-all ${
               filterSide === 'BUY_SIDE' ? 'bg-emerald-600 text-white font-bold' : 'text-slate-400 hover:text-emerald-300'
             }`}
-          >
+           type="button">
             <ArrowUpRight className="w-3.5 h-3.5" />
             نقدینگی خرید (بالای قیمت)
           </button>
@@ -347,7 +347,7 @@ export const LiquidityHeatmapWidget: React.FC<LiquidityHeatmapProps> = ({ curren
             className={`flex items-center gap-1 px-2.5 py-1 rounded-lg transition-all ${
               filterSide === 'SELL_SIDE' ? 'bg-rose-600 text-white font-bold' : 'text-slate-400 hover:text-rose-300'
             }`}
-          >
+           type="button">
             <ArrowDownRight className="w-3.5 h-3.5" />
             نقدینگی فروش (پایین قیمت)
           </button>
@@ -360,7 +360,7 @@ export const LiquidityHeatmapWidget: React.FC<LiquidityHeatmapProps> = ({ curren
               ? 'bg-amber-950/80 border-amber-500/50 text-amber-300'
               : 'bg-slate-950/80 border-slate-800 text-slate-400 hover:text-white'
           }`}
-        >
+         type="button">
           <Filter className="w-3.5 h-3.5" />
           <span>فقط استخرهای دست‌نخورده (Unmitigated)</span>
         </button>

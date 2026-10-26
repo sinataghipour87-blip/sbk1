@@ -205,6 +205,73 @@ try {
     minimumCandles: 1,
   };
 
+  const originalConfiguredPairs = process.env.SBK1_FREQTRADE_PAIRS;
+  process.env.SBK1_FREQTRADE_PAIRS = [
+    'BTC/USDT:USDT',
+    'ETH/USDT:USDT',
+    'SOL/USDT:USDT',
+    'XRP/USDT:USDT',
+    'BNB/USDT:USDT',
+  ].join(',');
+  const analyzedPairs: string[] = [];
+  const multiPairSnapshots = new Map(
+    process.env.SBK1_FREQTRADE_PAIRS.split(',').map((pair) => [pair, { ...snapshot, pair }]),
+  );
+  const multiPairRunner = new ServerSignalRunner({
+    ...dependencies,
+    getSnapshot: (expected) => multiPairSnapshots.get(expected.pair)!,
+    isAutoPilotEnabled: () => false,
+    analyze: async (pairSnapshot) => {
+      analyzedPairs.push(pairSnapshot.pair);
+      return { candidate: null, reason: 'CONTRACT_TEST_ONLY no candidate.' };
+    },
+  });
+  try {
+    await multiPairRunner.runOnce();
+  } finally {
+    if (originalConfiguredPairs === undefined) delete process.env.SBK1_FREQTRADE_PAIRS;
+    else process.env.SBK1_FREQTRADE_PAIRS = originalConfiguredPairs;
+  }
+  assert.deepEqual(
+    analyzedPairs,
+    ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 'BNB/USDT:USDT'],
+    'the server runner must independently analyze each configured pair',
+  );
+  assert.equal(multiPairRunner.getPairUpdates().length, 5, 'each configured pair must publish its own decision state');
+
+  const timeBeforeDelayedRpc = currentNowMs;
+  let snapshotLookupAtMs: number | null = null;
+  const delayedRpcRunner = new ServerSignalRunner({
+    ...dependencies,
+    getFreqtradeStatus: async () => {
+      currentNowMs += 20_000;
+      return { ...status, lastChecked: currentNowMs };
+    },
+    getSnapshot: (_expected, nowMs) => {
+      snapshotLookupAtMs = nowMs;
+      return { ...snapshot, generatedAtMs: currentNowMs };
+    },
+    analyze: async () => ({
+      candidate: null,
+      reason: 'CONTRACT_TEST_ONLY delayed RPC preflight.',
+    }),
+  });
+  try {
+    await delayedRpcRunner.runOnce();
+    assert.equal(
+      snapshotLookupAtMs,
+      currentNowMs,
+      'snapshot freshness must use the current time after asynchronous RPC preflight',
+    );
+    assert.equal(
+      delayedRpcRunner.getLatestUpdate().reason,
+      'CONTRACT_TEST_ONLY delayed RPC preflight.',
+      'a fresh snapshot after delayed RPC preflight must reach analysis',
+    );
+  } finally {
+    currentNowMs = timeBeforeDelayedRpc;
+  }
+
   const higherTimeframeRunner = new ServerSignalRunner({
     ...dependencies,
     getSnapshot: () => ({ ...snapshot, timeframe: '1h' }),
@@ -260,7 +327,7 @@ try {
       councilReport: conflictingCouncilReport,
     }),
   });
-  assert.equal(manualIntentRunner.requestManualEntry('SHORT'), true);
+  assert.equal(manualIntentRunner.requestManualEntry('BTC/USDT:USDT', 'SHORT'), true);
   await manualIntentRunner.runOnce();
   assert.match(
     manualIntentRunner.getLatestUpdate().reason,
@@ -457,6 +524,11 @@ try {
   await closedRunner.runOnce();
   assert.equal(exitEvaluationCalls, 1, 'a closed trade must not be evaluated or receive another exit');
   assert.equal((await adapter.getPendingExitSignals(snapshot.pair)).length, 0);
+  assert.equal(
+    closedRunner.getLatestUpdate().reason,
+    'Manual SBK1 kill switch is active; open-position exits were still evaluated.',
+    'the UI must report the active kill switch instead of retaining a stale snapshot error',
+  );
   console.log('Named Freqtrade RPC mock verified entry, one-shot exit signal, and closed-trade idempotency.');
 } finally {
   if (originalSignalStore === undefined) delete process.env.SBK1_SIGNAL_STORE_PATH;

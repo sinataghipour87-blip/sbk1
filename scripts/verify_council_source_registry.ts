@@ -50,6 +50,11 @@ assert.equal(find('orderbook.binance-depth').url, 'https://fapi.binance.com/fapi
 assert.equal(find('orderbook.binance-depth').symbol, 'ETHUSDT');
 assert.equal(find('orderbook.binance-depth').responseTimestampMs, nowMs - 1_000);
 assert.equal(find('orderbook.binance-depth').receivedAtMs, nowMs - 500);
+assert.equal(find('orderbook.bybit-depth').enabled, true);
+assert.equal(find('orderbook.bybit-trades').fallbackGroup, 'market.trades');
+assert.equal(find('market.candles-bybit').enabled, true);
+assert.equal(find('market.candles-bybit').priority, 2);
+assert.equal(find('market.candles-bybit').fallbackGroup, 'market.closed-15m');
 assert.equal(find('macro.fred-broad-dollar').health, 'LIVE');
 assert.equal(find('macro.fred-broad-dollar').symbol, 'DTWEXBGS');
 assert.equal(find('macro.fred-broad-dollar').realtimeEligible, false);
@@ -62,9 +67,26 @@ assert.equal(find('derivatives.binance-funding').health, 'UNAVAILABLE');
 assert.equal(find('derivatives.binance-funding').reason, 'HTTP 503');
 assert.equal(find('onchain.blockstream-transactions').health, 'UNOBSERVED');
 assert.match(find('onchain.blockstream-transactions').reason ?? '', /does not expose endpoint-level telemetry/);
+assert.equal(find('onchain.ethereum-public-rpc').enabled, true);
+assert.match(find('onchain.ethereum-public-rpc').dataType, /no key/);
+assert.equal(find('onchain.solana-public-rpc').enabled, true);
+assert.match(find('onchain.solana-public-rpc').dataType, /public RPC limits apply/);
+assert.equal(find('onchain.bsc-public-rpc').enabled, true);
+assert.match(find('onchain.bsc-public-rpc').symbol, /chainid=56/);
+assert.equal(find('news.u-today').enabled, true);
+assert.equal(find('news.cryptonews').enabled, true);
 assert.equal(find('news.cryptopanic').health, 'DISABLED');
 assert.match(find('news.cryptopanic').reason ?? '', /HTTP 410/);
+assert.equal(find('news.ripple-insights').enabled, false);
+assert.equal(find('news.bnb-chain-blog').enabled, false);
+assert.equal(find('news.solana').enabled, true);
+assert.equal(find('news.solana-status').enabled, true);
 assert.equal(find('options.okx').health, 'DISABLED');
+assert.equal(find('options.binance-european').enabled, true);
+assert.match(find('options.binance-european').dataType, /fallback only/);
+assert.equal(find('options.bybit').enabled, true);
+assert.equal(find('options.bybit').priority, 3);
+assert.equal(find('options.bybit').fallbackGroup, 'options.btc-eth');
 assert.equal(find('derivatives.bybit-funding').enabled, false);
 assert.throws(
   () => buildCouncilSourceRegistry({ 'unknown.endpoint': {

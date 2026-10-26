@@ -76,7 +76,7 @@ export const DemoTestingSandbox: React.FC<Props> = ({
                 ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-[0_0_10px_rgba(16,185,129,0.3)]'
                 : 'bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-800'
             }`}
-          >
+           type="button">
             {autoTradeActive ? '🟢 اتوترید فعال و ناظر بازار' : '⚪ اتوترید غیرفعال (روشن کنید)'}
           </button>
         </div>

@@ -214,7 +214,7 @@ export const LiquidityRiskPanel: React.FC<LiquidityRiskPanelProps> = ({
                 ? 'bg-emerald-600 text-white shadow-[0_0_10px_rgba(16,185,129,0.3)]'
                 : 'text-slate-400 hover:text-white'
             }`}
-          >
+           type="button">
             <ArrowUpRight className="w-3 h-3" />
             لانگ
           </button>
@@ -225,7 +225,7 @@ export const LiquidityRiskPanel: React.FC<LiquidityRiskPanelProps> = ({
                 ? 'bg-rose-600 text-white shadow-[0_0_10px_rgba(244,63,94,0.3)]'
                 : 'text-slate-400 hover:text-white'
             }`}
-          >
+           type="button">
             <ArrowDownRight className="w-3 h-3" />
             شورت
           </button>
@@ -262,7 +262,7 @@ export const LiquidityRiskPanel: React.FC<LiquidityRiskPanelProps> = ({
                 }
               }}
               className="text-[9px] px-1.5 py-0.5 rounded bg-cyan-900/60 hover:bg-cyan-800 text-cyan-200 border border-cyan-500/40"
-            >
+             type="button">
               {riskData.optimalLeverage}x (اعمال)
             </button>
           </div>

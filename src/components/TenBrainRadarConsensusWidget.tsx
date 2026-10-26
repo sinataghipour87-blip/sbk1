@@ -65,7 +65,7 @@ export const TenBrainRadarConsensusWidget: React.FC<Props> = ({
           <button
             onClick={handleRefresh}
             className="px-2.5 py-1 rounded-lg bg-cyan-950 hover:bg-cyan-900 border border-cyan-500/50 text-cyan-200 font-mono text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition-all"
-          >
+           type="button">
             <RefreshCw className="w-3.5 h-3.5 text-cyan-400" />
             <span>به‌روزرسانی گزارش</span>
           </button>
@@ -82,7 +82,7 @@ export const TenBrainRadarConsensusWidget: React.FC<Props> = ({
                 ? 'bg-cyan-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.4)]'
                 : 'text-slate-400 hover:text-white bg-[#041124]'
             }`}
-          >
+           type="button">
             <Network className="w-3.5 h-3.5" />
             <span>اجماع تحلیلی</span>
           </button>
@@ -93,7 +93,7 @@ export const TenBrainRadarConsensusWidget: React.FC<Props> = ({
                 ? 'bg-cyan-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.4)]'
                 : 'text-slate-400 hover:text-white bg-[#041124]'
             }`}
-          >
+           type="button">
             <Cpu className="w-3.5 h-3.5" />
             <span>خروجی پردازشگرها</span>
           </button>
@@ -104,7 +104,7 @@ export const TenBrainRadarConsensusWidget: React.FC<Props> = ({
                 ? 'bg-cyan-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.4)]'
                 : 'text-slate-400 hover:text-white bg-[#041124]'
             }`}
-          >
+           type="button">
             <ShieldCheck className="w-3.5 h-3.5" />
             <span>پیشنهادها ({report.proposalsListFa.length})</span>
           </button>

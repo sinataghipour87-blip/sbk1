@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import crypto from 'crypto';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
@@ -36,9 +37,9 @@ import { fetchDirectNewsHeadlines } from './src/services/directNewsFeeds';
 import { fetchFreeMacroData } from './src/services/freeMacroData';
 import { openSourceAdvisoryService } from './src/services/openSourceAdvisoryService';
 import { binancePublicMarketDataStream } from './src/services/publicMarketDataStream';
-import { bybitPublicMarketDataStream } from './src/services/bybitPublicMarketDataStream';
 import { fetchPublicMarketCandles } from './src/services/publicMarketDataFallback';
 import { selectChartPrice } from './src/services/chartMarketFeed';
+import { getConfiguredFreqtradePairs, PRIMARY_FREQTRADE_PAIR } from './src/services/freqtradePairs';
 
 dotenv.config();
 
@@ -671,6 +672,57 @@ function requireAdminAuth(req: express.Request, res: express.Response, next: exp
     next();
 }
 
+function isLoopbackAddress(address: string | undefined): boolean {
+    const normalized = address?.toLowerCase().split('%')[0];
+    if (!normalized) return false;
+    if (normalized === '::1') return true;
+    if (normalized.startsWith('::ffff:')) return isLoopbackAddress(normalized.slice('::ffff:'.length));
+    return isIP(normalized) === 4 && Number(normalized.split('.')[0]) === 127;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+    const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (normalized === 'localhost' || normalized === '::1') return true;
+    return isIP(normalized) === 4 && Number(normalized.split('.')[0]) === 127;
+}
+
+function isLocalDemoAuthBypassRequest(req: express.Request): boolean {
+    if (
+        process.env.SBK1_LOCAL_DEMO_AUTH_BYPASS !== 'true' ||
+        process.env.NODE_ENV === 'production' ||
+        !isLoopbackHost(process.env.SBK1_HOST?.trim() || '127.0.0.1') ||
+        !isLoopbackAddress(req.socket.remoteAddress)
+    ) {
+        return false;
+    }
+
+    const requestHost = req.get('host');
+    if (!requestHost) return false;
+    let parsedRequestHost: URL;
+    try {
+        parsedRequestHost = new URL(`http://${requestHost}`);
+    } catch {
+        return false;
+    }
+    if (!isLoopbackHost(parsedRequestHost.hostname)) return false;
+
+    const origin = req.get('origin');
+    if (!origin) return true;
+    try {
+        const parsedOrigin = new URL(origin);
+        return ['http:', 'https:'].includes(parsedOrigin.protocol) &&
+            isLoopbackHost(parsedOrigin.hostname) &&
+            parsedOrigin.host.toLowerCase() === requestHost.toLowerCase();
+    } catch {
+        return false;
+    }
+}
+
+function requireLocalDemoOrAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    if (isLocalDemoAuthBypassRequest(req)) return next();
+    return requireAdminAuth(req, res, next);
+}
+
 // Apply Admin Auth to all /api/exchange and /api/live routes (Item 1)
 app.use('/api/exchange', liveOperationLimiter);
 app.use('/api/live', liveOperationLimiter);
@@ -727,10 +779,11 @@ app.post(
             freqtradeBridge.getStatus(),
             freqtradeBridge.getWhitelist(),
         ]);
-        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const configuredPairs = getConfiguredFreqtradePairs();
+        const pair = typeof req.body?.pair === 'string' ? req.body.pair : '';
         const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
         const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
-        if (!pair || !exchange || !timeframe) {
+        if (!configuredPairs.includes(pair) || !exchange || !timeframe) {
             return res.status(503).json({
                 accepted: false,
                 code: 'MARKET_SNAPSHOT_NOT_CONFIGURED',
@@ -745,13 +798,13 @@ app.post(
             botState.forceEntryEnabled ||
             botState.exchange?.toLowerCase() !== exchange ||
             botState.timeframe !== timeframe ||
-            freqtradeBridge.getConfiguredPair() !== pair ||
+            freqtradeBridge.getConfiguredPair() !== PRIMARY_FREQTRADE_PAIR ||
             !whitelist.includes(pair)
         ) {
             return res.status(409).json({
                 accepted: false,
                 code: 'FREQTRADE_MARKET_CONFIGURATION_MISMATCH',
-                error: 'Snapshot publisher must match a running, guarded Freqtrade dry-run configuration and whitelisted pair.',
+                error: 'Snapshot publisher must match a running, guarded Freqtrade dry-run configuration and one configured whitelisted pair.',
             });
         }
 
@@ -775,8 +828,12 @@ app.post(
     }
 });
 
-app.get('/api/open-source-advisories', requireAdminAuth, (_req, res) => {
-    const report = openSourceAdvisoryService.getLatest();
+app.get('/api/open-source-advisories', requireAdminAuth, (req, res) => {
+    const requestedPair = typeof req.query.pair === 'string' ? req.query.pair : PRIMARY_FREQTRADE_PAIR;
+    if (!getConfiguredFreqtradePairs().includes(requestedPair)) {
+        return res.status(400).json({ status: 'UNAVAILABLE', error: 'Unsupported pair.' });
+    }
+    const report = openSourceAdvisoryService.getLatest(requestedPair);
     res.setHeader('Cache-Control', 'no-store');
     res.json({
         status: report?.status ?? 'NOT_RUN',
@@ -785,9 +842,11 @@ app.get('/api/open-source-advisories', requireAdminAuth, (_req, res) => {
     });
 });
 
-app.get('/api/market/freqtrade-snapshot/stream', (_req, res) => {
+app.get('/api/market/freqtrade-snapshot/stream', (req, res) => {
     const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
-    const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+    const configuredPairs = getConfiguredFreqtradePairs();
+    const requestedPair = typeof req.query.pair === 'string' ? req.query.pair : PRIMARY_FREQTRADE_PAIR;
+    const pair = configuredPairs.includes(requestedPair) ? requestedPair : '';
     const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
     if (!exchange || !pair || !timeframe) {
         return res.status(503).json({
@@ -866,21 +925,18 @@ app.get('/api/market/chart-stream', (req, res) => {
     let pendingFrame: string | null = null;
     let cachedFreqtradeTicker: FreqtradeMarketSnapshot['ticker'] = null;
     let lastFreqtradeFallbackCheckAtMs = 0;
+    let lastFreqtradeTickerReceivedAtMs = 0;
     let lastFreqtradeFallbackError: string | null = null;
     const send = () => {
         if (res.destroyed || res.writableEnded) return;
         const nowMs = Date.now();
         const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() ||
             process.env.FREQTRADE_EXCHANGE?.trim().toLowerCase() || '';
-        const bybitPrice = exchange === 'bybit'
-            ? bybitPublicMarketDataStream.getLatestPrice(nowMs)
-            : null;
         const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() ||
             process.env.FREQTRADE_PAIR?.trim() || '';
         const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
             process.env.FREQTRADE_TIMEFRAME?.trim() || '';
         if (
-            !bybitPrice &&
             exchange === 'bybit' &&
             pair &&
             timeframe &&
@@ -892,6 +948,9 @@ app.get('/api/market/chart-stream', (req, res) => {
                     { exchange, pair, timeframe },
                     nowMs,
                 ).ticker;
+                if (cachedFreqtradeTicker) {
+                    lastFreqtradeTickerReceivedAtMs = cachedFreqtradeTicker.retrievedAtMs;
+                }
                 lastFreqtradeFallbackError = null;
             } catch (error) {
                 cachedFreqtradeTicker = null;
@@ -902,24 +961,22 @@ app.get('/api/market/chart-stream', (req, res) => {
                 }
             }
         }
-        const freqtradeTicker = bybitPrice ? null : cachedFreqtradeTicker;
+        const freqtradeTicker = cachedFreqtradeTicker;
         const freshFreqtradeTicker = freqtradeTicker &&
             nowMs - freqtradeTicker.retrievedAtMs >= -1_000 &&
             nowMs - freqtradeTicker.retrievedAtMs <= 5_000
             ? freqtradeTicker
             : null;
         const binancePrice = binancePublicMarketDataStream.getLatestPrice(nowMs);
-        const bybitCandidate = bybitPrice
-            ? { ...bybitPrice, source: 'bybit' as const }
-            : freshFreqtradeTicker
-              ? {
-                price: freshFreqtradeTicker.last,
-                sourceTimestampMs: freshFreqtradeTicker.exchangeTimestampMs ?? freshFreqtradeTicker.retrievedAtMs,
-                receivedAtMs: freshFreqtradeTicker.retrievedAtMs,
-                source: 'bybit' as const,
+        const freqtradeCandidate = freshFreqtradeTicker
+            ? {
+              price: freshFreqtradeTicker.last,
+              sourceTimestampMs: freshFreqtradeTicker.exchangeTimestampMs ?? freshFreqtradeTicker.retrievedAtMs,
+              receivedAtMs: freshFreqtradeTicker.retrievedAtMs,
+              source: 'bybit' as const,
             }
-              : null;
-        const selectedPrice = selectChartPrice(bybitCandidate, binancePrice, nowMs);
+            : null;
+        const selectedPrice = selectChartPrice(freqtradeCandidate, binancePrice, nowMs);
         const update = selectedPrice
             ? {
                 state: 'LIVE' as const,
@@ -928,7 +985,7 @@ app.get('/api/market/chart-stream', (req, res) => {
                 sourceTimestampMs: selectedPrice.sourceTimestampMs,
                 receivedAtMs: nowMs,
             }
-            : bybitPublicMarketDataStream.getLastReceivedAtMs() > 0 ||
+            : lastFreqtradeTickerReceivedAtMs > 0 ||
               binancePublicMarketDataStream.getLastReceivedAtMs() > 0
               ? {
                   state: 'STALE' as const,
@@ -937,8 +994,7 @@ app.get('/api/market/chart-stream', (req, res) => {
                   sourceTimestampMs: null,
                   receivedAtMs: nowMs,
               }
-              : bybitPublicMarketDataStream.isConnected() ||
-                binancePublicMarketDataStream.isConnected()
+              : binancePublicMarketDataStream.isConnected()
               ? {
                   state: 'DEGRADED' as const,
                   source: null,
@@ -992,7 +1048,9 @@ app.get('/api/market/chart-stream', (req, res) => {
 app.get('/api/market/freqtrade-snapshot', (req, res) => {
     try {
         const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
-        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || '';
+        const configuredPairs = getConfiguredFreqtradePairs();
+        const requestedPair = typeof req.query.pair === 'string' ? req.query.pair : PRIMARY_FREQTRADE_PAIR;
+        const pair = configuredPairs.includes(requestedPair) ? requestedPair : '';
         const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
         if (!exchange || !pair || !timeframe) {
             return res.status(503).json({
@@ -1011,6 +1069,48 @@ app.get('/api/market/freqtrade-snapshot', (req, res) => {
                 : 'MARKET_SNAPSHOT_UNAVAILABLE',
         });
     }
+});
+
+app.get('/api/market/pairs', (_req, res) => {
+    const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim().toLowerCase() || '';
+    const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() || '';
+    const pairs = getConfiguredFreqtradePairs();
+    if (!exchange || !timeframe) {
+        return res.status(503).json({
+            error: 'Multi-pair market monitoring is not configured.',
+            pairs: [],
+        });
+    }
+
+    const decisions = new Map(
+        (serverSignalRunner?.getPairUpdates() ?? []).map((update) => [update.pair, update]),
+    );
+    const markets = pairs.map((pair) => {
+        try {
+            const snapshot = freqtradeMarketDataBridge.getLatestConfigured(
+                { exchange, pair, timeframe },
+            );
+            return {
+                pair,
+                status: 'READY',
+                generatedAtMs: snapshot.generatedAtMs,
+                ticker: snapshot.ticker,
+                lastCandle: snapshot.candles.at(-1) ?? null,
+                decision: decisions.get(pair) ?? null,
+            };
+        } catch (error) {
+            return {
+                pair,
+                status: 'UNAVAILABLE',
+                generatedAtMs: null,
+                ticker: null,
+                lastCandle: null,
+                decision: decisions.get(pair) ?? null,
+                error: error instanceof Error ? error.message : 'Market data is unavailable.',
+            };
+        }
+    });
+    return res.json({ exchange, market: 'futures', timeframe, markets });
 });
 
 app.get('/api/freqtrade/connection-status', async (_req, res) => {
@@ -1418,8 +1518,12 @@ app.get('/api/whale-onchain-radar', async (_req, res) => {
 });
 
 app.get('/api/macro-context', async (_req, res) => {
+  const pair = typeof _req.query.pair === 'string' ? _req.query.pair : PRIMARY_FREQTRADE_PAIR;
+  if (!getConfiguredFreqtradePairs().includes(pair)) {
+    return res.status(400).json({ status: 'UNAVAILABLE', error: 'Unsupported pair.' });
+  }
   const [newsHeadlines, macroData] = await Promise.all([
-    fetchDirectNewsHeadlines(),
+    fetchDirectNewsHeadlines(fetch, Date.now(), 4_000, pair),
     fetchFreeMacroData(),
   ]);
   const endpoint = 'https://api.alternative.me/fng/?limit=1&format=json';
@@ -1518,13 +1622,24 @@ app.get('/api/macro-context', async (_req, res) => {
     latencyMs: metric.latencyMs,
     ...(metric.error ? { error: metric.error } : {}),
   });
+  const bitcoinActiveAddressesForPair = pair === 'BTC/USDT:USDT'
+    ? directMetric(macroData.bitcoinActiveAddresses)
+    : {
+      ...unavailable,
+      provider: 'NOT_APPLICABLE_TO_PAIR',
+      metric: 'Bitcoin active addresses',
+      reason: `BTC network metric is not assigned to ${pair}.`,
+    };
   const sourceRetrievedAtMs = [
     fearAndGreedRetrievedAtMs,
     newsHeadlines.retrievedAtMs,
-    ...Object.values(macroData).map((metric) => metric.retrievedAtMs),
+    ...Object.entries(macroData)
+      .filter(([key]) => key !== 'bitcoinActiveAddresses' || pair === 'BTC/USDT:USDT')
+      .map(([, metric]) => metric.retrievedAtMs),
   ].filter((timestamp): timestamp is number => typeof timestamp === 'number' && Number.isSafeInteger(timestamp));
   const lastUpdatedAtMs = sourceRetrievedAtMs.length > 0 ? Math.max(...sourceRetrievedAtMs) : null;
   res.json({
+    pair,
     fearAndGreedStatus, fearAndGreedIndex, fearAndGreedLabelFa,
     provenance: {
       fearAndGreedIndex: fearAndGreedProvenance,
@@ -1567,7 +1682,7 @@ app.get('/api/macro-context', async (_req, res) => {
       },
       whalePressureIndex: unavailable,
       whaleSentiment: unavailable,
-      bitcoinActiveAddresses: directMetric(macroData.bitcoinActiveAddresses),
+      bitcoinActiveAddresses: bitcoinActiveAddressesForPair,
     },
     etfFlowStatus: 'UNAVAILABLE', spotEtfNetInflowMillionUsd: null,
     dxyStatus: macroData.dxy.status, dxyIndex: macroData.dxy.value,
@@ -1586,7 +1701,7 @@ app.get('/api/macro-context', async (_req, res) => {
     newsHeadlinesStatus: newsHeadlines.status, recentHeadlines: newsHeadlines.headlines,
     whaleFlowStatus: 'UNAVAILABLE', whaleNetflowBtc: null, whalePressureIndex: null, whaleSentiment: null,
     bitcoinActiveAddressesStatus: macroData.bitcoinActiveAddresses.status,
-    bitcoinActiveAddresses: macroData.bitcoinActiveAddresses.value,
+    bitcoinActiveAddresses: pair === 'BTC/USDT:USDT' ? macroData.bitcoinActiveAddresses.value : null,
     lastUpdated: lastUpdatedAtMs,
     sourceGrounding: sourceRetrievedAtMs.length > 0 ? 'DIRECT_SOURCES' : 'UNAVAILABLE',
   });
@@ -1727,7 +1842,7 @@ app.get('/api/decision/stream', (req, res) => {
     });
 });
 
-app.post('/api/decision/auto-pilot', requireAdminAuth, liveOperationLimiter, async (req, res) => {
+app.post('/api/decision/auto-pilot', requireLocalDemoOrAdminAuth, liveOperationLimiter, async (req, res) => {
     const { enabled } = req.body;
     if (typeof enabled !== 'boolean') {
         return res.status(400).json({ success: false, error: '`enabled` must be a boolean.' });
@@ -1758,10 +1873,17 @@ app.post('/api/decision/auto-pilot', requireAdminAuth, liveOperationLimiter, asy
     return res.json({ success: true, autoPilotEnabled: serverAutoPilotEnabled, executionMode: 'DRY_RUN' });
 });
 
-app.post('/api/decision/manual-entry', requireAdminAuth, liveOperationLimiter, async (req, res) => {
-    const { direction } = req.body;
+app.post('/api/decision/manual-entry', requireLocalDemoOrAdminAuth, liveOperationLimiter, async (req, res) => {
+    const { direction, pair } = req.body;
+    const configuredPairs = getConfiguredFreqtradePairs();
     if (direction !== 'LONG' && direction !== 'SHORT') {
         return res.status(400).json({ success: false, error: '`direction` must be LONG or SHORT.' });
+    }
+    if (typeof pair !== 'string' || !configuredPairs.includes(pair)) {
+        return res.status(400).json({
+            success: false,
+            error: `\`pair\` must be one of the configured SBK1 pairs: ${configuredPairs.join(', ')}.`,
+        });
     }
     if (liveTradingState.killSwitchActive) {
         return res.status(409).json({ success: false, error: 'Kill switch is active; manual entry is blocked.' });
@@ -1783,12 +1905,13 @@ app.post('/api/decision/manual-entry', requireAdminAuth, liveOperationLimiter, a
     if (!serverSignalRunner) {
         return res.status(503).json({ success: false, error: 'Server decision runner is not ready.' });
     }
-    if (!serverSignalRunner.requestManualEntry(direction)) {
+    if (!serverSignalRunner.requestManualEntry(pair, direction)) {
         return res.status(409).json({ success: false, error: 'A manual intent is already awaiting server evaluation.' });
     }
     return res.status(202).json({
         success: true,
         status: 'PENDING_SERVER_COUNCIL_AND_RISK_CHECKS',
+        pair,
         direction,
         message: 'Intent queued; no order is authorized until the server council and risk pipeline approve it.',
     });
@@ -2105,8 +2228,8 @@ app.post('/api/freqtrade/dry-run-test-signal', liveOperationLimiter, requireAdmi
 
 app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) => {
     try {
+        const configuredPairs = getConfiguredFreqtradePairs();
         const configuredPair = freqtradeBridge.getConfiguredPair();
-        const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() || configuredPair;
         const botState = await freqtradeBridge.getStatus();
         const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim() ||
             process.env.FREQTRADE_EXCHANGE?.trim() ||
@@ -2125,8 +2248,8 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
             botState.market === undefined ||
             botState.exchange?.toLowerCase() !== exchange.toLowerCase() ||
             botState.timeframe !== timeframe ||
-            configuredPair !== pair ||
-            !whitelist.includes(pair)
+            configuredPair !== PRIMARY_FREQTRADE_PAIR ||
+            configuredPairs.some((pair) => !whitelist.includes(pair))
         ) {
             return res.status(409).json({
                 error: 'Freqtrade runtime configuration does not match the queued signal market.',
@@ -2134,16 +2257,20 @@ app.get('/api/freqtrade/signals', requireFreqtradeBridgeAuth, async (req, res) =
             });
         }
 
-        if (req.query.pair !== pair || req.query.timeframe !== timeframe) {
+        const requestedPair = typeof req.query.pair === 'string' ? req.query.pair : '';
+        const selectedPairs = requestedPair === '*'
+            ? configuredPairs
+            : configuredPairs.includes(requestedPair) ? [requestedPair] : [];
+        if (selectedPairs.length === 0 || req.query.timeframe !== timeframe) {
             return res.status(409).json({
-                error: 'Requested pair and timeframe must match the verified Freqtrade configuration.',
+                error: 'Requested pair(s) and timeframe must match the verified Freqtrade configuration.',
                 code: 'FREQTRADE_CONFIGURATION_MISMATCH',
             });
         }
 
-        const records = await freqtradeSignalAdapter.getForStrategy(pair, timeframe);
+        const records = (await Promise.all(selectedPairs.map((pair) => freqtradeSignalAdapter.getForStrategy(pair, timeframe)))).flat();
         const openTrades = await freqtradeBridge.getOpenTrades();
-        const pendingExitSignals = await freqtradeSignalAdapter.getPendingExitSignals(pair);
+        const pendingExitSignals = (await Promise.all(selectedPairs.map((pair) => freqtradeSignalAdapter.getPendingExitSignals(pair)))).flat();
         const exitSignals = pendingExitSignals.filter((signal) =>
             openTrades.some((trade) =>
                 trade.is_open &&
@@ -2477,11 +2604,6 @@ async function startServer() {
     } catch (error) {
       console.error('[SBK1] Binance live market stream could not be configured; REST fallback remains enabled:', error);
     }
-    try {
-      bybitPublicMarketDataStream.start(streamPair, streamMarket);
-    } catch (error) {
-      console.error('[SBK1] Bybit live chart stream could not be configured; the chart will report it as unavailable:', error);
-    }
   } else {
     console.warn('[SBK1] Public market streams were not started; no Freqtrade pair is configured.');
   }
@@ -2517,7 +2639,6 @@ async function shutdownServer(signal: NodeJS.Signals): Promise<void> {
       serverSignalRunner?.stop(),
       openSourceAdvisoryService.stop(),
       Promise.resolve(binancePublicMarketDataStream.stop()),
-      Promise.resolve(bybitPublicMarketDataStream.stop()),
       new Promise<void>((resolve, reject) => {
         if (!httpServer?.listening) {
           resolve();

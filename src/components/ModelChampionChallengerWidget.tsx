@@ -82,7 +82,7 @@ export const ModelChampionChallengerWidget: React.FC = () => {
             onClick={handleSyncDataset}
             className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-medium transition-all flex items-center gap-1.5"
             title="همگام‌سازی شاخص‌ها با دیتاست مرکزی"
-          >
+           type="button">
             <GitBranch className="w-3.5 h-3.5 text-cyan-400" />
             <span>همگام‌سازی با دیتاست</span>
           </button>
@@ -90,7 +90,7 @@ export const ModelChampionChallengerWidget: React.FC = () => {
             onClick={refreshState}
             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all"
             title="به‌روزرسانی وضعیت"
-          >
+           type="button">
             <RefreshCw className="w-4 h-4" />
           </button>
         </div>
@@ -516,7 +516,7 @@ export const ModelChampionChallengerWidget: React.FC = () => {
             onClick={handlePromoteChallenger}
             disabled={!audit.isPromotionApproved}
             className="px-4 py-2 rounded-xl bg-gradient-to-r from-amber-600 to-emerald-600 hover:from-amber-500 hover:to-emerald-500 text-white font-bold text-xs shadow-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
-          >
+           type="button">
             <Trophy className="w-4 h-4 text-amber-200" />
             <span>ارتقای مدل مدعی به مقام قهرمان پروداکشن (Promote to Champion)</span>
             <ArrowRight className="w-3.5 h-3.5 rotate-180" />

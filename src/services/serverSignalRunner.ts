@@ -53,13 +53,14 @@ import type { HoldingHorizonDecision } from './postCouncilTradeController';
 import { macroContextBrainService } from './macroContextBrain';
 import { sbFiveModelsEngine } from './sbFiveModelsEngine';
 import { fetchFreeMacroData } from './freeMacroData';
-import { fetchDeribitOptionsData } from './deribitOptionsData';
+import { fetchCouncilOptionsData } from './councilOptionsData';
 import {
   fetchOnChainWhaleData,
   startPublicBitcoinWhaleDataPrefetch,
   stopPublicBitcoinWhaleDataPrefetch,
 } from './publicBitcoinWhaleData';
 import { fetchPublicMarketFallback } from './publicMarketDataFallback';
+import { getConfiguredFreqtradePairs } from './freqtradePairs';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MINIMUM_CANDLES_FOR_ANALYSIS = 300;
@@ -97,6 +98,7 @@ function historicalPatternCostConfig(): {
 
 export interface ServerSignalAuditRecord {
   at: string;
+  pair?: string;
   candleTimestampMs: number | null;
   decision: 'NO TRADE' | 'LONG' | 'SHORT';
   reason: string;
@@ -126,6 +128,7 @@ export interface ServerSignalRunnerDependencies {
   ): Promise<void>;
   syncClosedTrades?(status: FreqtradeBotState): Promise<void>;
   getSignal(signalId: string): Promise<SbkFreqtradeSignalRecord | null>;
+  getEntrySignals?(): Promise<SbkFreqtradeSignalRecord[]>;
   submitExitSignal(signal: SbkFreqtradeExitSignal, nowMs: number): Promise<{ duplicate?: boolean }>;
   evaluateExit?(
     snapshot: FreqtradeMarketSnapshot,
@@ -164,6 +167,7 @@ export interface ServerSignalRunnerDependencies {
 
 export interface ServerSignalRunnerUpdate {
   updatedAtMs: number;
+  pair?: string | null;
   autoPilotEnabled: boolean;
   candleTimestampMs: number | null;
   decision: 'NO TRADE' | 'LONG' | 'SHORT';
@@ -610,10 +614,14 @@ async function analyzeOpenSourceAdvisories(
     if (advisoryCandles.length === 0) {
       throw new Error('No completed candles are available for open-source advisory analysis.');
     }
-    const newsResult = await fetchDirectNewsHeadlines();
+    const newsResult = await fetchDirectNewsHeadlines(fetch, Date.now(), 4_000, snapshot.pair);
     sourceHeadlines = newsResult.headlines;
     newsHeadlinesRetrievedAtMs = newsResult.retrievedAtMs;
-    const report = await openSourceAdvisoryService.analyze(advisoryCandles, newsResult.headlines);
+    const report = await openSourceAdvisoryService.analyze(
+      snapshot.pair,
+      advisoryCandles,
+      newsResult.headlines,
+    );
     if (report.sourceTimestampMs !== advisoryTimestampMs) {
       throw new Error('Open-source advisory output does not match the analyzed completed candle.');
     }
@@ -624,6 +632,7 @@ async function analyzeOpenSourceAdvisories(
     console.error('[SBK1_ADVISORIES] Local open-source analysis failed; council receives unavailable evidence:', error);
     const reason = error instanceof Error ? error.message : String(error);
     const report = openSourceAdvisoryService.publishUnavailable(
+      snapshot.pair,
       reason,
       advisoryTimestampMs,
       Date.now(),
@@ -868,9 +877,10 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
     sourceTimestampMs: number,
     maxAgeMs: number,
     detailsFa: string,
+    provider = fallback.provider,
   ) => createMarketFeedQuality({
     feedName,
-    source: fallback.provider,
+    source: provider,
     status: 'LIVE',
     timestamp: sourceTimestampMs,
     ageMs: Math.max(0, nowMs - sourceTimestampMs),
@@ -891,34 +901,38 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
   const fallbackOi = useFallbackDerivatives ? fallback.liveOpenInterest.value! : null;
   if (feeds && fallbackCandles) {
     feeds.candles = cloneFeed(
-      `${fallback.provider} completed candles`,
+      `${fallback.candles.provider ?? fallback.provider} completed candles`,
       fallback.candles.sourceTimestampMs!,
       candleFreshnessLimitMs,
       `${fallback.pair} تکمیل‌شده؛ ورودی جایگزین عضو ۱.`,
+      fallback.candles.provider,
     );
   }
   if (feeds && fallbackTrades) {
     feeds.orderFlow = cloneFeed(
-      `${fallback.provider} recent aggregate trades`,
+      `${fallback.tradeFlow.provider ?? fallback.provider} recent aggregate trades`,
       fallback.tradeFlow.sourceTimestampMs!,
       FREQTRADE_TRADE_FLOW_MAX_AGE_MS,
       `${fallbackTrades.trades.length} معاملهٔ یکتا از ${(fallback.tradeFlow.value?.duplicateCount ?? 0) + (fallbackTradeDeduplication?.duplicateCount ?? 0)} تکراری برای محاسبهٔ CVD عضو ۲.`,
+      fallback.tradeFlow.provider,
     );
   }
   if (feeds && fallbackBook) {
     feeds.orderBook = cloneFeed(
-      `${fallback.provider} order book`,
+      `${fallback.orderBook.provider ?? fallback.provider} order book`,
       fallback.orderBook.sourceTimestampMs!,
       5_000,
       'دفتر سفارش عمومی تازه برای عضو ۳.',
+      fallback.orderBook.provider,
     );
   }
   if (feeds && fallbackFunding && fallbackOi) {
     feeds.derivatives = cloneFeed(
-      `${fallback.provider} funding and current open interest`,
+      `${fallback.fundingRate.provider ?? fallback.provider} funding and current open interest`,
       Math.min(fallback.fundingRate.sourceTimestampMs!, fallback.liveOpenInterest.sourceTimestampMs!),
       60_000,
       'Funding تازه و OI لحظه‌ای از بازار آتی عمومی برای عضو ۴.',
+      fallback.fundingRate.provider,
     );
   }
 
@@ -1102,8 +1116,8 @@ async function analyzeSnapshot(
   const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance, true);
   const [freeMacroData, optionsData, whaleFlowData, publicMarketFallback] = await Promise.all([
     fetchFreeMacroData(),
-    fetchDeribitOptionsData({ nowMs }),
-    fetchOnChainWhaleData({ nowMs, btcPriceUsd: analysis.price }),
+    fetchCouncilOptionsData({ pair: snapshot.pair, nowMs }),
+    fetchOnChainWhaleData({ pair: snapshot.pair, nowMs, priceUsd: analysis.price }),
     fetchPublicMarketFallback({
       pair: snapshot.pair,
       timeframe: snapshot.timeframe,
@@ -1115,9 +1129,10 @@ async function analyzeSnapshot(
   const latestCompletedCandleTimestampMs = snapshot.candles
     .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= councilEvaluationNowMs)
     .at(-1)?.timestampMs;
-  const readyAdvisory = openSourceAdvisoryService.getLatest();
+  const readyAdvisory = openSourceAdvisoryService.getLatest(snapshot.pair);
   if (
     readyAdvisory &&
+    readyAdvisory.pair === snapshot.pair &&
     readyAdvisory.sourceTimestampMs === latestCompletedCandleTimestampMs &&
     readyAdvisory.generatedAtMs <= councilEvaluationNowMs &&
     councilEvaluationNowMs - readyAdvisory.generatedAtMs <= MAX_READY_ADVISORY_AGE_MS
@@ -1157,6 +1172,7 @@ async function analyzeSnapshot(
     .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= nowMs)
     .at(-1)?.timestampMs;
   const councilReport = await runEightMemberCouncilRuntime({
+    pair: snapshot.pair,
     analysis: councilAnalysis,
     multiBrainReport,
     sbReport,
@@ -1335,11 +1351,12 @@ async function appendAdvisoryReport(report: OpenSourceAdvisoryReport): Promise<v
   }
 }
 
-function runtimeExpectation(status: FreqtradeBotState): FreqtradeMarketSnapshotExpectation {
+function runtimeExpectation(status: FreqtradeBotState, pairOverride?: string): FreqtradeMarketSnapshotExpectation {
   const exchange = process.env.SBK1_SIGNAL_EXCHANGE?.trim() ||
     process.env.FREQTRADE_EXCHANGE?.trim() ||
     status.exchange;
-  const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() ||
+  const pair = pairOverride ||
+    process.env.SBK1_FREQTRADE_PAIR?.trim() ||
     process.env.FREQTRADE_PAIR?.trim() ||
     '';
   const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
@@ -1369,8 +1386,10 @@ export class ServerSignalRunner {
   private readonly audit: NonNullable<ServerSignalRunnerDependencies['appendAudit']>;
   private timer: NodeJS.Timeout | null = null;
   private inFlight: Promise<void> | null = null;
-  private lastProcessedCandleMs: number | null = null;
-  private pendingManualIntent: { direction: 'LONG' | 'SHORT'; requestedAtMs: number } | null = null;
+  private readonly lastProcessedCandleMsByPair = new Map<string, number>();
+  private readonly pendingManualIntents = new Map<string, { direction: 'LONG' | 'SHORT'; requestedAtMs: number }>();
+  private readonly latestUpdateByPair = new Map<string, ServerSignalRunnerUpdate>();
+  private currentPair: string | null = null;
   private readonly listeners = new Set<(update: ServerSignalRunnerUpdate) => void>();
   private latestUpdate: ServerSignalRunnerUpdate;
 
@@ -1382,6 +1401,7 @@ export class ServerSignalRunner {
     this.audit = dependencies.appendAudit ?? appendAudit;
     this.latestUpdate = {
       updatedAtMs: this.now(),
+      pair: null,
       autoPilotEnabled: this.isAutoPilotEnabled(),
       candleTimestampMs: null,
       decision: 'NO TRADE',
@@ -1398,15 +1418,19 @@ export class ServerSignalRunner {
     return this.latestUpdate;
   }
 
+  getPairUpdates(): ServerSignalRunnerUpdate[] {
+    return [...this.latestUpdateByPair.values()];
+  }
+
   subscribe(listener: (update: ServerSignalRunnerUpdate) => void): () => void {
     this.listeners.add(listener);
     listener(this.latestUpdate);
     return () => this.listeners.delete(listener);
   }
 
-  requestManualEntry(direction: 'LONG' | 'SHORT'): boolean {
-    if (this.pendingManualIntent) return false;
-    this.pendingManualIntent = { direction, requestedAtMs: this.now() };
+  requestManualEntry(pair: string, direction: 'LONG' | 'SHORT'): boolean {
+    if (this.pendingManualIntents.has(pair)) return false;
+    this.pendingManualIntents.set(pair, { direction, requestedAtMs: this.now() });
     void this.runOnce();
     return true;
   }
@@ -1427,8 +1451,10 @@ export class ServerSignalRunner {
     this.latestUpdate = {
       ...update,
       updatedAtMs: this.now(),
+      pair: this.currentPair,
       autoPilotEnabled: this.isAutoPilotEnabled(),
     };
+    if (this.currentPair) this.latestUpdateByPair.set(this.currentPair, this.latestUpdate);
     for (const listener of this.listeners) {
       try {
         listener(this.latestUpdate);
@@ -1454,7 +1480,7 @@ export class ServerSignalRunner {
 
   async runOnce(): Promise<void> {
     if (this.inFlight) return this.inFlight;
-    const operation = this.processSnapshot();
+    const operation = this.processAllSnapshots();
     this.inFlight = operation;
     try {
       await operation;
@@ -1465,21 +1491,33 @@ export class ServerSignalRunner {
 
   private async record(record: Omit<ServerSignalAuditRecord, 'at'>): Promise<void> {
     try {
-      await this.audit({ at: new Date(this.now()).toISOString(), ...record });
+      await this.audit({
+        at: new Date(this.now()).toISOString(),
+        ...(this.currentPair ? { pair: this.currentPair } : {}),
+        ...record,
+      });
     } catch (error) {
       console.error('[SBK1_SIGNAL_RUNNER] Could not append execution audit record:', error);
     }
   }
 
-  private async processSnapshot(): Promise<void> {
-    const nowMs = this.now();
+  private async processAllSnapshots(): Promise<void> {
+    for (const pair of getConfiguredFreqtradePairs()) {
+      await this.processSnapshot(pair);
+    }
+  }
+
+  private async processSnapshot(pair: string): Promise<void> {
+    this.currentPair = pair;
+    let nowMs = this.now();
     let candleTimestampMs: number | null = null;
+    const pendingManualIntent = this.pendingManualIntents.get(pair) ?? null;
     try {
       if (
-        this.pendingManualIntent &&
-        nowMs - this.pendingManualIntent.requestedAtMs > timeframeToMs(SBK_EXECUTION_TIMEFRAME)
+        pendingManualIntent &&
+        nowMs - pendingManualIntent.requestedAtMs > timeframeToMs(SBK_EXECUTION_TIMEFRAME)
       ) {
-        this.pendingManualIntent = null;
+        this.pendingManualIntents.delete(pair);
         const reason = 'Manual intent expired before the server could evaluate it on a completed 15-minute candle.';
         await this.record({ candleTimestampMs: null, decision: 'NO TRADE', reason });
         this.publishUpdate({ candleTimestampMs: null, decision: 'NO TRADE', reason, councilReport: null });
@@ -1507,7 +1545,8 @@ export class ServerSignalRunner {
         });
         return;
       }
-      const expected = runtimeExpectation(status);
+      const expected = runtimeExpectation(status, pair);
+      nowMs = this.now();
       const snapshot = this.dependencies.getSnapshot(expected, nowMs);
       if (
         snapshot.exchange.toLowerCase() !== expected.exchange.toLowerCase() ||
@@ -1546,11 +1585,12 @@ export class ServerSignalRunner {
         return;
       }
       candleTimestampMs = latestSnapshotCandle.timestampMs;
-      const isNewCandle = this.lastProcessedCandleMs === null || candleTimestampMs > this.lastProcessedCandleMs;
-      if (!isNewCandle && !this.pendingManualIntent) return;
-      if (isNewCandle) this.lastProcessedCandleMs = candleTimestampMs;
-      const manualDirection = this.pendingManualIntent?.direction ?? null;
-      this.pendingManualIntent = null;
+      const lastProcessedCandleMs = this.lastProcessedCandleMsByPair.get(pair) ?? null;
+      const isNewCandle = lastProcessedCandleMs === null || candleTimestampMs > lastProcessedCandleMs;
+      if (!isNewCandle && !pendingManualIntent) return;
+      if (isNewCandle) this.lastProcessedCandleMsByPair.set(pair, candleTimestampMs);
+      const manualDirection = pendingManualIntent?.direction ?? null;
+      if (pendingManualIntent) this.pendingManualIntents.delete(pair);
 
       const openTrades = await this.dependencies.getOpenTrades();
       if (!Array.isArray(openTrades)) {
@@ -1560,6 +1600,14 @@ export class ServerSignalRunner {
       if (actualOpenTradesCount !== status.openTradesCount) {
         throw new Error('Freqtrade status and open-trade list disagree; portfolio risk cannot be verified.');
       }
+      const openEntryTags = new Set(
+        openTrades.filter((trade) => trade.is_open).map((trade) => trade.enter_tag),
+      );
+      const queuedEntrySignals = (await this.dependencies.getEntrySignals?.() ?? []).filter((record) =>
+        !openEntryTags.has(record.signal.signalId) &&
+        ['ACCEPTED', 'STRATEGY_ACCEPTED', 'ORDER_SUBMITTED', 'PARTIALLY_FILLED', 'UNKNOWN_IN_FLIGHT']
+          .includes(record.status),
+      );
       if (completedCandles.length < this.minimumCandles) {
         const reason = `Only ${completedCandles.length} completed candles are available; ${this.minimumCandles} are required for analysis.`;
         await this.record({
@@ -1618,11 +1666,13 @@ export class ServerSignalRunner {
         });
       }
       if (this.dependencies.isKillSwitchActive()) {
+        const reason = 'Manual SBK1 kill switch is active; open-position exits were still evaluated.';
         await this.record({
           candleTimestampMs,
           decision: 'NO TRADE',
-          reason: 'Manual SBK1 kill switch is active; open-position exits were still evaluated.',
+          reason,
         });
+        this.publishUpdate({ candleTimestampMs, decision: 'NO TRADE', reason, councilReport: null });
         return;
       }
       if (
@@ -1638,11 +1688,11 @@ export class ServerSignalRunner {
         });
         return;
       }
-      if (actualOpenTradesCount >= status.maxOpenTrades) {
+      if (actualOpenTradesCount + queuedEntrySignals.length >= status.maxOpenTrades) {
         await this.record({
           candleTimestampMs,
           decision: 'NO TRADE',
-          reason: `Freqtrade open-trade limit reached (${actualOpenTradesCount}/${status.maxOpenTrades}).`,
+          reason: `Freqtrade open-trade limit or queued-entry reservation reached (${actualOpenTradesCount}+${queuedEntrySignals.length}/${status.maxOpenTrades}).`,
         });
         return;
       }
@@ -1661,10 +1711,18 @@ export class ServerSignalRunner {
         });
         return;
       }
-      const openRiskUsd = await calculateOpenTradeRiskUsd(
+      const verifiedOpenRiskUsd = await calculateOpenTradeRiskUsd(
         openTrades,
         (signalId) => this.dependencies.getSignal(signalId),
       );
+      const queuedRiskUsd = queuedEntrySignals.reduce((total, record) => {
+        const allocatedRiskUsd = record.signal.authorization?.allocatedRiskUsd;
+        if (!Number.isFinite(allocatedRiskUsd) || Number(allocatedRiskUsd) <= 0) {
+          throw new Error(`Queued Freqtrade signal ${record.signal.signalId} has no verifiable allocated risk.`);
+        }
+        return total + Number(allocatedRiskUsd);
+      }, 0);
+      const openRiskUsd = verifiedOpenRiskUsd + queuedRiskUsd;
       const utcDayStartMs = Date.UTC(
         new Date(nowMs).getUTCFullYear(),
         new Date(nowMs).getUTCMonth(),
@@ -1910,7 +1968,7 @@ export class ServerSignalRunner {
         reason: message,
         councilReport: null,
       });
-      if (candleTimestampMs !== null) this.lastProcessedCandleMs = candleTimestampMs;
+      if (candleTimestampMs !== null) this.lastProcessedCandleMsByPair.set(pair, candleTimestampMs);
     }
   }
 }
@@ -1946,6 +2004,11 @@ export function createServerSignalRunner(options: {
       }
     },
     getSignal: (signalId) => freqtradeSignalAdapter.get(signalId),
+    getEntrySignals: async () => (await Promise.all(
+        getConfiguredFreqtradePairs().map((pair) =>
+          freqtradeSignalAdapter.getForStrategy(pair, SBK_EXECUTION_TIMEFRAME),
+        ),
+      )).flat(),
     submitExitSignal: (signal, nowMs) => freqtradeSignalAdapter.submitExitSignal(signal, nowMs),
   });
 }

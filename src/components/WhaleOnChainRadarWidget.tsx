@@ -82,7 +82,7 @@ export const WhaleOnChainRadarWidget: React.FC = () => {
           onClick={fetchWhaleData}
           disabled={loading}
           className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all disabled:opacity-50"
-        >
+         type="button">
           <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-emerald-400' : ''}`} />
         </button>
       </div>

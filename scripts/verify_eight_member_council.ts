@@ -8,6 +8,7 @@ import {
   UNWIRED_OR_LEGACY_ANALYSIS_MODULES,
   UNWIRED_TRADE_MANAGEMENT_MODULES,
   evaluateEightMemberCouncil,
+  getCouncilMacroBeta,
   validateCouncilModuleOwnership,
   type CouncilMacroContext,
 } from '../src/services/eightMemberCouncil';
@@ -897,5 +898,201 @@ const staleFlow = evaluateEightMemberCouncil({
 });
 assert.equal(staleFlow.members[1].vote, 'ABSTAIN');
 assert.equal(staleFlow.selectedDirection, null);
+
+const configuredMacroBetas = process.env.SBK1_MACRO_BETA_BY_PAIR;
+delete process.env.SBK1_MACRO_BETA_BY_PAIR;
+assert.deepEqual(
+  [
+    getCouncilMacroBeta('BTC/USDT:USDT'),
+    getCouncilMacroBeta('ETH/USDT:USDT'),
+    getCouncilMacroBeta('SOL/USDT:USDT'),
+    getCouncilMacroBeta('XRP/USDT:USDT'),
+    getCouncilMacroBeta('BNB/USDT:USDT'),
+  ],
+  [1, 1.05, 1.3, 1.2, 1.15],
+);
+process.env.SBK1_MACRO_BETA_BY_PAIR =
+  'BTC/USDT:USDT=1.00,ETH/USDT:USDT=1.05,SOL/USDT:USDT=1.30,XRP/USDT:USDT=1.20,BNB/USDT:USDT=1.15';
+assert.equal(getCouncilMacroBeta('SOL/USDT:USDT'), 1.3);
+if (configuredMacroBetas === undefined) delete process.env.SBK1_MACRO_BETA_BY_PAIR;
+else process.env.SBK1_MACRO_BETA_BY_PAIR = configuredMacroBetas;
+
+const previousMacroBetas = process.env.SBK1_MACRO_BETA_BY_PAIR;
+process.env.SBK1_MACRO_BETA_BY_PAIR = JSON.stringify({
+  'BTC/USDT:USDT': 2,
+  'ETH/USDT:USDT': 0.5,
+});
+const betaMacroData = {
+  sp500: directMetricFixture('beta-provider', 'SP500', 0.2),
+  dxy: directMetricFixture('beta-provider', 'DXY', -0.2),
+  broadDollar: unavailableMetricFixture('broad-dollar'),
+  fedEffectiveRate: unavailableMetricFixture('EFFR'),
+  fedTargetUpperBound: unavailableMetricFixture('FEDFUNDS'),
+  bitcoinActiveAddresses: unavailableMetricFixture('AdrActCnt'),
+};
+const highBetaMacroVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  directMacroData: betaMacroData,
+  pair: 'BTC/USDT:USDT',
+  nowMs,
+}).members[6];
+const lowBetaMacroVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  directMacroData: betaMacroData,
+  pair: 'ETH/USDT:USDT',
+  nowMs,
+}).members[6];
+assert.equal(highBetaMacroVote.vote, 'LONG');
+assert.equal(lowBetaMacroVote.vote, 'NEUTRAL',
+  'macro sensitivity is applied using the target pair beta, not one shared vote');
+if (previousMacroBetas === undefined) delete process.env.SBK1_MACRO_BETA_BY_PAIR;
+else process.env.SBK1_MACRO_BETA_BY_PAIR = previousMacroBetas;
+
+const ethNewsContext: CouncilMacroContext = {
+  ...macroContext,
+  newsSentimentStatus: 'LIVE',
+  newsSentimentScore: 25,
+  newsHeadlinesStatus: 'LIVE',
+  recentHeadlines: ['Publisher A', 'Publisher B', 'Publisher C'].map((source, index) => ({
+    id: `eth-news-${index}`,
+    pair: 'ETH/USDT:USDT',
+    headline: `Ethereum ${index} network update`,
+    source,
+    url: `https://example.invalid/eth-news-${index}`,
+    publishedAt: new Date(nowMs - 1_000).toISOString(),
+  })),
+};
+assert.equal(evaluateEightMemberCouncil({
+  analysis,
+  macroContext: ethNewsContext,
+  pair: 'ETH/USDT:USDT',
+  nowMs,
+}).members[7].vote, 'LONG');
+assert.equal(evaluateEightMemberCouncil({
+  analysis,
+  macroContext: ethNewsContext,
+  pair: 'BTC/USDT:USDT',
+  nowMs,
+}).members[7].vote, 'ABSTAIN',
+  'ETH news cannot be reused in the BTC room');
+
+const mismatchedOptions = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  pair: 'ETH/USDT:USDT',
+  optionsData: {
+    pair: 'BTC/USDT:USDT',
+    asset: 'BTC',
+    status: 'LIVE',
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 95,
+    impliedVolatilityPct: 40,
+    putCallRatio: 0.7,
+    expiryTimestampMs: nowMs + 10 * 24 * 60 * 60_000,
+    strikePrice: 3_000,
+    skewPct: 2,
+    contractsCount: 24,
+    provider: 'fixture',
+  },
+  nowMs,
+});
+assert.equal(mismatchedOptions.members[4].vote, 'ABSTAIN');
+const mismatchedChain = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  pair: 'ETH/USDT:USDT',
+  whaleFlowData: {
+    pair: 'ETH/USDT:USDT',
+    asset: 'ETH',
+    status: 'LIVE',
+    provider: 'fixture',
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 90,
+    coverageStatus: 'SAMPLED',
+    largeTransfers: [{
+      transactionHash: 'a'.repeat(64),
+      blockchain: 'bitcoin',
+      blockHeight: 1,
+      timestampMs: nowMs - 1_000,
+      sourceProvider: 'fixture',
+      asset: 'BTC',
+      amount: 12,
+      estimatedUsd: 720_000,
+      confirmationStatus: 'CONFIRMED',
+      transferId: 'vout:0',
+    }],
+    exchangeInflowsBtc: null,
+    exchangeOutflowsBtc: null,
+    netExchangeFlowBtc: null,
+    transactionCount: 1,
+    windowStartHeight: 1,
+    windowEndHeight: 1,
+  },
+  nowMs,
+});
+assert.equal(mismatchedChain.members[5].vote, 'ABSTAIN',
+  'Bitcoin transfers cannot be counted in the Ethereum room even if mislabeled at the payload level');
+
+const pairRoomMatrix = [
+  'BTC/USDT:USDT',
+  'ETH/USDT:USDT',
+  'SOL/USDT:USDT',
+  'XRP/USDT:USDT',
+  'BNB/USDT:USDT',
+] as const;
+const previousMatrixBetas = process.env.SBK1_MACRO_BETA_BY_PAIR;
+process.env.SBK1_MACRO_BETA_BY_PAIR = '{}';
+for (const pair of pairRoomMatrix) {
+  const foreignOptionsData = pair === 'BTC/USDT:USDT' ? undefined : {
+    pair: 'BTC/USDT:USDT',
+    asset: 'BTC',
+    status: 'LIVE' as const,
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 95,
+    impliedVolatilityPct: 40,
+    putCallRatio: 0.7,
+    expiryTimestampMs: nowMs + 10 * 24 * 60 * 60_000,
+    strikePrice: 60_000,
+    skewPct: 2,
+    contractsCount: 24,
+    provider: 'matrix-fixture',
+  };
+  const foreignWhaleFlowData = pair === 'BTC/USDT:USDT' ? undefined : {
+    pair: 'BTC/USDT:USDT',
+    asset: 'BTC',
+    status: 'LIVE' as const,
+    provider: 'matrix-fixture',
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 90,
+    coverageStatus: 'SAMPLED' as const,
+    largeTransfers: [],
+    exchangeInflowsBtc: null,
+    exchangeOutflowsBtc: null,
+    netExchangeFlowBtc: null,
+    transactionCount: 0,
+    windowStartHeight: 1,
+    windowEndHeight: 1,
+  };
+  const roomReport = evaluateEightMemberCouncil({
+    analysis,
+    macroContext,
+    pair,
+    optionsData: foreignOptionsData,
+    whaleFlowData: foreignWhaleFlowData,
+    nowMs,
+  });
+  for (const memberId of [5, 6, 7, 8]) {
+    assert.equal(roomReport.members[memberId - 1].vote, 'ABSTAIN',
+      `member ${memberId} must abstain in ${pair} when its own validated evidence is absent`);
+  }
+}
+if (previousMatrixBetas === undefined) delete process.env.SBK1_MACRO_BETA_BY_PAIR;
+else process.env.SBK1_MACRO_BETA_BY_PAIR = previousMatrixBetas;
 
 console.log('Eight-member council verification passed.');

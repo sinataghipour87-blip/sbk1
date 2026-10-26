@@ -144,7 +144,7 @@ async function queryLatestBlock(fetcher: typeof fetch, apiKey: string): Promise<
   return latestBlock;
 }
 
-function getConfiguredAddresses(): string[] {
+export function getConfiguredAddresses(): string[] {
   const raw = process.env.SBK1_ETHERSCAN_WATCH_ADDRESSES ?? '';
   const addresses = raw.split(',').map((address) => address.trim().toLowerCase()).filter(Boolean);
   if (addresses.some((address) => !/^0x[a-f0-9]{40}$/.test(address))) {

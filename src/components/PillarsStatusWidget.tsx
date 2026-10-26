@@ -150,7 +150,7 @@ export const PillarsStatusWidget: React.FC<PillarsStatusWidgetProps> = ({
                 ? 'bg-slate-800 border-slate-600 text-white'
                 : 'bg-[#131722] border-slate-800 text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <span>🟢 ارکان خرید / LONG</span>
           </button>
         </div>
@@ -183,7 +183,7 @@ export const PillarsStatusWidget: React.FC<PillarsStatusWidgetProps> = ({
                 ? 'bg-slate-800 border-slate-600 text-white'
                 : 'bg-[#131722] border-slate-800 text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <span>🔴 ارکان فروش / SHORT</span>
           </button>
         </div>

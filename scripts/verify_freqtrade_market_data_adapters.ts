@@ -28,8 +28,8 @@ const marketSnapshot = {
   additionalCandles: {
     '1m': makeCandles(60_000, 30),
     '5m': makeCandles(5 * 60_000, 30),
-    '1h': makeCandles(60 * 60_000, 10),
-    '4h': makeCandles(4 * 60 * 60_000, 10),
+    '1h': makeCandles(60 * 60_000, 30),
+    '4h': makeCandles(4 * 60 * 60_000, 30),
   },
   ticker: {
     exchangeTimestampMs: null,
@@ -171,9 +171,19 @@ const candles = await marketData.fetchCandles();
   assert.equal(marketData.validateMarketDataLiveSafety(candles.candles, candles.status).isLiveSafe, true);
   assert.equal(marketData.validateMarketDataLiveSafety(candles.candles.slice(-299), candles.status).isLiveSafe, false);
 
-  const htf = await marketData.fetchHtf();
-  assert.equal(htf['Freqtrade 1h']?.length, 10);
-  assert.equal(htf['Freqtrade 4h']?.length, 10);
+for (const interval of ['1', '5', '60', '240']) {
+  const result = await marketData.fetchBybit(interval, 20);
+  assert.equal(result.candles.length, 20, `${interval}m chart timeframe should use validated Freqtrade snapshot candles`);
+}
+await assert.rejects(
+  marketData.fetchBybit('1440', 20),
+  /Unsupported Bybit candle request/,
+  'unsupported daily chart timeframe must not be advertised or silently mapped',
+);
+
+const htf = await marketData.fetchHtf();
+  assert.equal(htf['Freqtrade 1h']?.length, 30);
+  assert.equal(htf['Freqtrade 4h']?.length, 30);
   assert.equal(requestCount, 1, 'snapshot consumers should share the in-memory snapshot');
 
   const originalDateNow = Date.now;

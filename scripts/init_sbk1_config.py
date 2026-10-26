@@ -44,6 +44,16 @@ def initialize(root: Path) -> tuple[Path, Path]:
         raise ValueError("The environment template is missing the SBK1 market settings.")
 
     pair = pair_match.group(1).strip()
+    pairs_match = re.search(r"(?m)^SBK1_FREQTRADE_PAIRS=(.+)$", env_template)
+    if not pairs_match:
+        raise ValueError("The environment template is missing SBK1_FREQTRADE_PAIRS.")
+    pairs = [item.strip() for item in pairs_match.group(1).split(",") if item.strip()]
+    if (
+        len(pairs) != 5
+        or len(set(pairs)) != len(pairs)
+        or pairs[0] != pair
+    ):
+        raise ValueError("SBK1_FREQTRADE_PAIRS must contain five unique pairs and start with SBK1_FREQTRADE_PAIR.")
     exchange = exchange_match.group(1).strip().lower()
     timeframe = timeframe_match.group(1).strip()
     api = config_template.get("api_server", {})
@@ -54,7 +64,7 @@ def initialize(root: Path) -> tuple[Path, Path]:
         or config_template.get("trading_mode") not in ("spot", "futures")
         or config_template.get("timeframe") != timeframe
         or str(config_template.get("exchange", {}).get("name", "")).lower() != exchange
-        or pair not in config_pair
+        or any(configured_pair not in config_pair for configured_pair in pairs)
         or api.get("enabled") is not True
         or api.get("listen_ip_address") not in ("127.0.0.1", "::1", "localhost")
     ):
@@ -75,6 +85,7 @@ def initialize(root: Path) -> tuple[Path, Path]:
         ("FREQTRADE__API_SERVER__USERNAME", rpc_username),
         ("FREQTRADE__API_SERVER__PASSWORD", rpc_password),
         ("FREQTRADE_PAIR", pair),
+        ("SBK1_FREQTRADE_PAIRS", ",".join(pairs)),
         ("SBK1_FREQTRADE_BRIDGE_TOKEN", bridge_token),
     ):
         env_template = _set_env_value(env_template, name, value)

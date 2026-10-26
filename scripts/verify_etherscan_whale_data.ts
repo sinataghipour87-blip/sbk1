@@ -89,9 +89,9 @@ assert.equal(requestedActions.length, 3, 'fresh watchlist results are cached for
 
 resetPublicBitcoinWhaleDataCacheForTests();
 const combined = await fetchOnChainWhaleData({
+  pair: 'BTC/USDT:USDT',
   nowMs: nowMs + 2_000,
-  btcPriceUsd: 60_000,
-  ethPriceUsd: 2_500,
+  priceUsd: 60_000,
   fetcher: async (input) => {
     const url = new URL(String(input));
     if (url.hostname === 'mempool.space' && url.pathname.endsWith('/v1/blocks')) {
@@ -124,9 +124,45 @@ const combined = await fetchOnChainWhaleData({
 });
 assert.equal(combined.status, 'LIVE');
 assert.equal(combined.largeTransfers?.some((transfer) => transfer.blockchain === 'bitcoin'), true);
-assert.equal(combined.largeTransfers?.some((transfer) =>
-  transfer.blockchain === 'ethereum' && transfer.estimatedUsd === 252_500
-), true);
+assert.equal(combined.largeTransfers?.some((transfer) => transfer.blockchain === 'ethereum'), false,
+  'Bitcoin room must not receive Ethereum watchlist transfers');
+
+const ethereumRoom = await fetchOnChainWhaleData({
+  pair: 'ETH/USDT:USDT',
+  nowMs: nowMs + 2_000,
+  priceUsd: 2_500,
+  fetcher,
+});
+assert.equal(ethereumRoom.pair, 'ETH/USDT:USDT');
+assert.equal(ethereumRoom.asset, 'ETH');
+assert.equal(ethereumRoom.status, 'LIVE');
+assert.equal(ethereumRoom.largeTransfers?.length, 1);
+assert.equal(ethereumRoom.largeTransfers?.[0].estimatedUsd, 252_500);
+assert.equal(ethereumRoom.largeTransfers?.every((transfer) =>
+  transfer.blockchain === 'ethereum' && transfer.asset === 'ETH'
+), true, 'Ethereum room only receives native ETH chain evidence');
+
+let unsupportedChainRequested = false;
+for (const [pair, asset] of [
+  ['SOL/USDT:USDT', 'SOL'],
+  ['XRP/USDT:USDT', 'XRP'],
+  ['BNB/USDT:USDT', 'BNB'],
+] as const) {
+  const unsupportedRoom = await fetchOnChainWhaleData({
+    pair,
+    nowMs,
+    priceUsd: 150,
+    fetcher: async () => {
+      unsupportedChainRequested = true;
+      throw new Error(`No ${asset} provider is configured.`);
+    },
+  });
+  assert.equal(unsupportedRoom.status, 'UNAVAILABLE');
+  assert.equal(unsupportedRoom.pair, pair);
+  assert.equal(unsupportedRoom.asset, asset);
+}
+assert.equal(unsupportedChainRequested, false,
+  'unsupported chains must abstain rather than request BTC/ETH data');
 
 resetEtherscanWhaleDataCacheForTests();
 await assert.rejects(

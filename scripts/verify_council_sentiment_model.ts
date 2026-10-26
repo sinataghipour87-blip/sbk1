@@ -44,6 +44,7 @@ const sourceTimestampMs = candles.at(-1)!.timestampMs;
 const headlines: DirectNewsHeadline[] = [
   {
     id: 'local-inference-fixture-1',
+    pair: 'BTC/USDT:USDT',
     headline: 'Bitcoin market outlook improves as institutional demand strengthens',
     publisher: 'SBK1 deterministic inference fixture',
     url: 'https://example.invalid/sbk1-sentiment-fixture-1',
@@ -51,6 +52,7 @@ const headlines: DirectNewsHeadline[] = [
   },
   {
     id: 'local-inference-fixture-2',
+    pair: 'BTC/USDT:USDT',
     headline: 'Digital asset investment products report fresh inflows',
     publisher: 'Independent SBK1 inference fixture',
     url: 'https://example.invalid/sbk1-sentiment-fixture-2',
@@ -58,13 +60,14 @@ const headlines: DirectNewsHeadline[] = [
   },
   {
     id: 'local-inference-fixture-3',
+    pair: 'BTC/USDT:USDT',
     headline: 'Crypto market outlook remains constructive',
     publisher: 'SBK1 deterministic inference fixture',
     url: 'https://example.invalid/sbk1-sentiment-fixture-3',
     publishedAt: new Date(nowMs - 1_000).toISOString(),
   },
 ];
-const analysisReport = await openSourceAdvisoryService.analyze(candles, headlines);
+const analysisReport = await openSourceAdvisoryService.analyze('BTC/USDT:USDT', candles, headlines);
 const sentiment = analysisReport.modules.newsSentiment;
 if (sentiment.status !== 'AVAILABLE') {
   await openSourceAdvisoryService.stop();
@@ -84,8 +87,10 @@ assert.equal(sentiment.headlineCount, 3);
 assert.equal(Array.isArray(sentiment.headlines), true);
 
 const repositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-sentiment-model-council-'));
+const pairRepositoryDir = path.join(repositoryDir, 'BTC_USDT_USDT');
 try {
   const council = await runEightMemberCouncilRuntime({
+    pair: 'BTC/USDT:USDT',
     analysis: {
       candles: candles.map(({ open, high, low, close, volume }) =>
         [open, high, low, close, volume]),
@@ -125,7 +130,7 @@ try {
   assert.match(council.members[7].rationaleFa, /امتیاز سنتیمنت خبر معتبر/);
 
   const memberRecord = JSON.parse(
-    await readFile(path.join(repositoryDir, 'member-08.jsonl'), 'utf8').then((value) => value.trim()),
+    await readFile(path.join(pairRepositoryDir, 'member-08.jsonl'), 'utf8').then((value) => value.trim()),
   ) as {
     snapshotId: string;
     memberId: number;
@@ -135,14 +140,14 @@ try {
     moduleOutputs: Array<{ moduleId: string; status: string; sourceTimestampMs: number | null }>;
   };
   const voteRecord = JSON.parse(
-    await readFile(path.join(repositoryDir, 'council-votes.jsonl'), 'utf8').then((value) => value.trim()),
+    await readFile(path.join(pairRepositoryDir, 'council-votes.jsonl'), 'utf8').then((value) => value.trim()),
   ) as { snapshotId: string; report: { members: Array<{ id: number; vote: string }> } };
   const storedSentiment = memberRecord.moduleOutputs.find(
     ({ moduleId }) => moduleId === 'openSource.newsSentiment',
   );
 
   assert.equal(memberRecord.memberId, 8);
-  assert.equal(memberRecord.snapshotId, `SNP_${sourceTimestampMs}_${nowMs}`);
+  assert.equal(memberRecord.snapshotId, `SNP_BTC_USDT_USDT_${sourceTimestampMs}_${nowMs}`);
   assert.equal(voteRecord.snapshotId, memberRecord.snapshotId);
   assert.equal(storedSentiment?.status, 'AVAILABLE');
   assert.equal(storedSentiment?.sourceTimestampMs, sourceTimestampMs);

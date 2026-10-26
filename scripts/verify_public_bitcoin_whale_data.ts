@@ -5,6 +5,7 @@ import {
   resetPublicBitcoinWhaleDataCacheForTests,
 } from '../src/services/publicBitcoinWhaleData';
 import { evaluateEightMemberCouncil } from '../src/services/eightMemberCouncil';
+import { resetEtherscanWhaleDataCacheForTests } from '../src/services/etherscanWhaleData';
 import { resetWhaleAlertFlowCacheForTests } from '../src/services/whaleAlertFlow';
 
 const nowMs = Date.now();
@@ -62,6 +63,27 @@ assert.equal(data.largeTransfers?.[0].confirmationStatus, 'CONFIRMED');
 assert.equal(data.largeTransfers?.[0].blockHeight, 900_003);
 assert.equal(data.largeTransfers?.[0].transferId, 'vout:0');
 assert.equal(requests.length, 4);
+
+resetPublicBitcoinWhaleDataCacheForTests();
+const liveSourceNowMs = Date.now();
+const freshBlockTimestamp = Math.floor((liveSourceNowMs - 1_000) / 1_000);
+const requestStartClockMs = liveSourceNowMs - 10_000;
+const callerClockFetcher: typeof fetch = async (input) => {
+  const url = new URL(String(input));
+  if (url.pathname.endsWith('/v1/blocks')) {
+    return Response.json(blocks.map((block) => ({ ...block, timestamp: freshBlockTimestamp })));
+  }
+  return Response.json([]);
+};
+const clockSkewData = await fetchPublicBitcoinWhaleData({
+  nowMs: requestStartClockMs,
+  fetcher: callerClockFetcher,
+  sleep: async () => {},
+  forceRefresh: true,
+});
+assert.equal(clockSkewData.status, 'LIVE',
+  'a block timestamp newer than the caller start time but valid at response time must not be marked stale');
+assert.ok((clockSkewData.ageMs ?? Infinity) >= 0);
 
 const report = evaluateEightMemberCouncil({ whaleFlowData: data, nowMs });
 assert.equal(report.members.length, 8);
@@ -276,7 +298,7 @@ const nearFreshnessBoundary = await fetchPublicBitcoinWhaleData({
   fetcher: async (input) => new URL(String(input)).pathname.endsWith('/v1/blocks')
     ? Response.json(blocks.map((block) => ({
         ...block,
-        timestamp: Math.floor((nowMs - 299_000) / 1_000),
+        timestamp: Math.floor((Date.now() - 299_000) / 1_000),
       })))
     : Response.json([]),
   sleep: async () => {},
@@ -346,6 +368,7 @@ const previousWhaleAlertKey = process.env.WHALE_ALERT_API_KEY;
 process.env.WHALE_ALERT_API_KEY = '';
 const fallbackCalls: string[] = [];
 const failedFallback = await fetchOnChainWhaleData({
+  pair: 'BTC/USDT:USDT',
   nowMs,
   sleep: async () => {},
   forceRefresh: true,
@@ -363,5 +386,57 @@ assert.deepEqual(
 if (previousWhaleAlertKey === undefined) delete process.env.WHALE_ALERT_API_KEY;
 else process.env.WHALE_ALERT_API_KEY = previousWhaleAlertKey;
 
+resetEtherscanWhaleDataCacheForTests();
+const originalEthEnv = {
+  apiKey: process.env.ETHERSCAN_API_KEY,
+  addresses: process.env.SBK1_ETHERSCAN_WATCH_ADDRESSES,
+  minimum: process.env.SBK1_WHALE_MIN_ETH,
+  tokenThresholds: process.env.SBK1_WHALE_ERC20_THRESHOLDS,
+};
+process.env.ETHERSCAN_API_KEY = 'test-key';
+process.env.SBK1_ETHERSCAN_WATCH_ADDRESSES = `0x${'a'.repeat(40)}`;
+process.env.SBK1_WHALE_MIN_ETH = '100';
+process.env.SBK1_WHALE_ERC20_THRESHOLDS = '{}';
+const staleEth = await fetchOnChainWhaleData({
+  pair: 'ETH/USDT:USDT',
+  nowMs,
+  fetcher: async (input) => {
+    const url = new URL(String(input));
+    if (url.searchParams.get('action') === 'eth_blockNumber') {
+      return Response.json({ status: '1', message: 'OK', result: '0x1388' });
+    }
+    if (url.searchParams.get('action') === 'txlist') {
+      return Response.json({
+        status: '1',
+        message: 'OK',
+        result: [{
+          hash: `0x${'c'.repeat(64)}`,
+          timeStamp: String(Math.floor((nowMs - 6 * 60_000) / 1_000)),
+          blockNumber: '4000',
+          value: String(100n * 10n ** 18n),
+          isError: '0',
+        }],
+      });
+    }
+    assert.equal(url.searchParams.get('action'), 'tokentx');
+    return Response.json({ status: '1', message: 'OK', result: [] });
+  },
+});
+assert.equal(staleEth.status, 'STALE');
+assert.equal(
+  evaluateEightMemberCouncil({ pair: 'ETH/USDT:USDT', whaleFlowData: staleEth, nowMs }).members[5].vote,
+  'ABSTAIN',
+  'Etherscan evidence older than the five-minute vote freshness limit must abstain',
+);
+if (originalEthEnv.apiKey === undefined) delete process.env.ETHERSCAN_API_KEY;
+else process.env.ETHERSCAN_API_KEY = originalEthEnv.apiKey;
+if (originalEthEnv.addresses === undefined) delete process.env.SBK1_ETHERSCAN_WATCH_ADDRESSES;
+else process.env.SBK1_ETHERSCAN_WATCH_ADDRESSES = originalEthEnv.addresses;
+if (originalEthEnv.minimum === undefined) delete process.env.SBK1_WHALE_MIN_ETH;
+else process.env.SBK1_WHALE_MIN_ETH = originalEthEnv.minimum;
+if (originalEthEnv.tokenThresholds === undefined) delete process.env.SBK1_WHALE_ERC20_THRESHOLDS;
+else process.env.SBK1_WHALE_ERC20_THRESHOLDS = originalEthEnv.tokenThresholds;
+resetEtherscanWhaleDataCacheForTests();
+
 resetPublicBitcoinWhaleDataCacheForTests();
-console.log('Public Bitcoin sampled-output validation, threshold, deduplication, freshness, retry, and council tests passed.');
+console.log('Public Bitcoin/Ethereum on-chain validation, threshold, deduplication, freshness, retry, and council tests passed.');

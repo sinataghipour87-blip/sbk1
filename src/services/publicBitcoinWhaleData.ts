@@ -1,7 +1,12 @@
 import type { CouncilWhaleFlowData, CouncilWhaleTransfer } from './eightMemberCouncil';
-import { fetchEtherscanWhaleTransfers } from './etherscanWhaleData';
+import { fetchEtherscanWhaleTransfers, getConfiguredAddresses } from './etherscanWhaleData';
 import { deduplicateOnChainTransfers } from './councilEvidenceDeduplication';
 import { fetchWhaleAlertFlow } from './whaleAlertFlow';
+import { getFreqtradePairBaseAsset } from './freqtradePairs';
+import { fetchSolanaOnChainData } from './solanaOnChain';
+import { fetchXrpOnChainData } from './xrpOnChain';
+import { fetchBscOnChainData } from './bscOnChain';
+import { fetchPublicEvmOnChainData } from './publicEvmOnChain';
 
 const MEMPOOL_API = 'https://mempool.space/api';
 const BLOCKSTREAM_API = 'https://blockstream.info/api';
@@ -165,10 +170,12 @@ async function refreshPublicBitcoinWhaleData(options: {
   forceRefresh?: boolean;
 } = {}): Promise<CouncilWhaleFlowData> {
   const nowMs = options.nowMs ?? Date.now();
-  if (!options.forceRefresh && cachedResult && nowMs >= cachedAtMs && nowMs - cachedAtMs < CACHE_TTL_MS) {
+  const cacheEvaluationNowMs = Math.max(nowMs, Date.now());
+  if (!options.forceRefresh && cachedResult && cacheEvaluationNowMs >= cachedAtMs &&
+      cacheEvaluationNowMs - cachedAtMs < CACHE_TTL_MS) {
     const ageMs = cachedResult.timestampMs === null
       ? null
-      : nowMs - cachedResult.timestampMs;
+      : cacheEvaluationNowMs - cachedResult.timestampMs;
     return {
       ...cachedResult,
       status: ageMs !== null && ageMs <= MAX_ONCHAIN_VOTE_AGE_MS ? 'LIVE' : 'STALE',
@@ -240,13 +247,14 @@ async function refreshPublicBitcoinWhaleData(options: {
     if (!sourceName) {
       throw new Error(`All public Bitcoin block sources failed: ${sourceErrors.join('; ')}`);
     }
+    const verificationNowMs = Math.max(nowMs, Date.now());
     const transfers: CouncilWhaleTransfer[] = [];
     const seen = new Set<string>();
     for (const { block, transactions } of transactionsByBlock) {
       for (const transaction of transactions) {
         if (!transaction.status.confirmed) continue;
         const timestampMs = (transaction.status.block_time ?? block.timestamp) * 1_000;
-        if (timestampMs > nowMs || nowMs - timestampMs > maxAgeMs) continue;
+        if (timestampMs > verificationNowMs || verificationNowMs - timestampMs > maxAgeMs) continue;
         transaction.vout.forEach((output, index) => {
           const amount = output.value / 100_000_000;
           if (amount < thresholdBtc) return;
@@ -273,7 +281,7 @@ async function refreshPublicBitcoinWhaleData(options: {
 
     const latestBlock = blocks[0];
     const timestampMs = latestBlock.timestamp * 1_000;
-    const ageMs = nowMs - timestampMs;
+    const ageMs = verificationNowMs - timestampMs;
     if (ageMs < 0 || ageMs > maxAgeMs) {
       return unavailable(`${sourceName} latest sampled block is stale or has a future timestamp.`, 'STALE');
     }
@@ -281,7 +289,7 @@ async function refreshPublicBitcoinWhaleData(options: {
       status: ageMs <= MAX_ONCHAIN_VOTE_AGE_MS ? 'LIVE' : 'STALE',
       provider: `${sourceName} public REST API (sampled confirmed BTC outputs)`,
       timestampMs,
-      retrievedAtMs: Date.now(),
+      retrievedAtMs: verificationNowMs,
       ageMs,
       qualityPct: 85,
       coverageStatus: 'SAMPLED',
@@ -378,67 +386,164 @@ export async function stopPublicBitcoinWhaleDataPrefetch(): Promise<void> {
 }
 
 export async function fetchOnChainWhaleData(options: {
+  pair: string;
   nowMs?: number;
-  btcPriceUsd?: number | null;
-  ethPriceUsd?: number | null;
+  priceUsd?: number | null;
   fetcher?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   forceRefresh?: boolean;
-} = {}): Promise<CouncilWhaleFlowData> {
-  const primary = await fetchPublicBitcoinWhaleData(options);
-  let ethTransfers: CouncilWhaleTransfer[] = [];
-  try {
-    ethTransfers = await fetchEtherscanWhaleTransfers({
-      nowMs: options.nowMs ?? Date.now(),
-      ethPriceUsd: options.ethPriceUsd,
+}): Promise<CouncilWhaleFlowData> {
+  const asset = getFreqtradePairBaseAsset(options.pair);
+  if (!asset) throw new Error(`Unsupported pair for on-chain analysis: ${options.pair}`);
+  if (asset === 'BTC') {
+    const bitcoin = await fetchPublicBitcoinWhaleData({
+      nowMs: options.nowMs,
+      btcPriceUsd: options.priceUsd,
+      fetcher: options.fetcher,
+      sleep: options.sleep,
+      forceRefresh: options.forceRefresh,
+    });
+    if (bitcoin.status !== 'LIVE') {
+      const alert = await fetchWhaleAlertFlow({
+        apiKey: process.env.WHALE_ALERT_API_KEY,
+        nowMs: options.nowMs,
+        fetcher: options.fetcher,
+      });
+      if (alert.status === 'LIVE') {
+        return {
+          ...alert,
+          pair: options.pair,
+          asset,
+          provider: `Optional fallback: ${alert.provider}`,
+          unavailableReason: bitcoin.unavailableReason,
+        };
+      }
+    }
+    return {
+      ...bitcoin,
+      pair: options.pair,
+      asset,
+      largeTransfers: (bitcoin.largeTransfers ?? []).map((transfer) => ({
+        ...transfer,
+        estimatedUsd: finiteNumber(options.priceUsd) && options.priceUsd > 0
+          ? transfer.amount * options.priceUsd
+          : null,
+      })),
+    };
+  }
+  if (asset === 'ETH') {
+    try {
+      if (!process.env.ETHERSCAN_API_KEY?.trim()) {
+        const addresses = getConfiguredAddresses();
+        const threshold = Number(process.env.SBK1_WHALE_MIN_ETH ?? '100');
+        if (addresses.length === 0) {
+          return {
+            ...unavailable('Verified Ethereum CEX watchlist is not configured.'),
+            pair: options.pair,
+            asset,
+            provider: 'Ethereum mainnet public JSON-RPC (chainid=1)',
+          };
+        }
+        const publicRpcResult = await fetchPublicEvmOnChainData({
+          pair: options.pair,
+          asset: 'ETH',
+          blockchain: 'ethereum',
+          chainId: 1,
+          providers: [
+            { name: 'PublicNode Ethereum RPC', endpoint: 'https://ethereum-rpc.publicnode.com/' },
+            { name: '1RPC Ethereum', endpoint: 'https://1rpc.io/eth' },
+          ],
+          addresses,
+          threshold,
+          priceUsd: options.priceUsd,
+          nowMs: options.nowMs,
+          fetcher: options.fetcher,
+        });
+        return {
+          ...publicRpcResult,
+          pair: options.pair,
+          asset,
+        };
+      }
+      const transfers = (await fetchEtherscanWhaleTransfers({
+        nowMs: options.nowMs ?? Date.now(),
+        ethPriceUsd: options.priceUsd,
+        fetcher: options.fetcher,
+      })).filter((transfer) => transfer.asset === 'ETH');
+      if (transfers.length > 0) {
+        const timestampMs = Math.max(...transfers.map((transfer) => transfer.timestampMs));
+        const ageMs = Math.max(0, (options.nowMs ?? Date.now()) - timestampMs);
+        const isFresh = ageMs <= MAX_ONCHAIN_VOTE_AGE_MS;
+        return {
+          pair: options.pair,
+          asset,
+          status: isFresh ? 'LIVE' : 'STALE',
+          provider: 'Etherscan Ethereum native-asset configured address watchlist',
+          timestampMs,
+          retrievedAtMs: Date.now(),
+          ageMs,
+          qualityPct: isFresh ? 80 : 0,
+          coverageStatus: isFresh ? 'SAMPLED' : 'UNAVAILABLE',
+          unavailableReason: isFresh
+            ? undefined
+            : 'Latest observed Ethereum chain transaction is older than five minutes.',
+          largeTransfers: transfers,
+          exchangeInflowsBtc: null,
+          exchangeOutflowsBtc: null,
+          netExchangeFlowBtc: null,
+          transactionCount: transfers.length,
+          windowStartHeight: null,
+          windowEndHeight: null,
+        };
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error('[PublicBitcoinWhaleData] Ethereum on-chain source unavailable:', reason);
+      return {
+        ...unavailable(`Ethereum source unavailable: ${reason}`),
+        pair: options.pair,
+        asset,
+        provider: process.env.ETHERSCAN_API_KEY?.trim()
+          ? 'Etherscan Ethereum on-chain source'
+          : 'Ethereum mainnet public JSON-RPC (chainid=1)',
+      };
+    }
+    return {
+      ...unavailable('No qualifying, confirmed Ethereum native-asset transfers are available from the configured watchlist.'),
+      pair: options.pair,
+      asset,
+      provider: 'Etherscan Ethereum native-asset configured address watchlist',
+    };
+  }
+  if (asset === 'SOL') {
+    return fetchSolanaOnChainData({
+      pair: options.pair,
+      nowMs: options.nowMs,
+      priceUsd: options.priceUsd,
       fetcher: options.fetcher,
     });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : 'Unknown Etherscan provider error.';
-    console.error('[PublicBitcoinWhaleData] Optional Etherscan source unavailable:', reason);
   }
-  if (primary.status === 'LIVE' || ethTransfers.length > 0) {
-    const deduplicatedTransfers = deduplicateOnChainTransfers([
-      ...(primary.largeTransfers ?? []),
-      ...ethTransfers,
-    ]);
-    if (deduplicatedTransfers.conflictingIdentity) {
-      console.error('[PublicBitcoinWhaleData] Conflicting provider observations share an on-chain transfer identity.');
-    }
-    const transfers = deduplicatedTransfers.values;
-    const timestampMs = Math.max(
-      primary.status === 'LIVE' ? primary.timestampMs ?? 0 : 0,
-      ...ethTransfers.map((item) => item.timestampMs),
-    );
-    return {
-      ...primary,
-      status: 'LIVE',
-      provider: ethTransfers.length > 0
-        ? `${primary.status === 'LIVE' ? primary.provider : 'Etherscan configured address watchlist'} + Etherscan`
-        : primary.provider,
-      timestampMs,
-      retrievedAtMs: Math.max(primary.retrievedAtMs ?? 0, Date.now()),
-      ageMs: (options.nowMs ?? Date.now()) - timestampMs,
-      qualityPct: Math.min(primary.status === 'LIVE' ? primary.qualityPct : 80, 85),
-      coverageStatus: 'SAMPLED',
-      unavailableReason: primary.status === 'LIVE' ? undefined : primary.unavailableReason,
-      largeTransfers: transfers,
-      transactionCount: transfers.length,
-    };
+  if (asset === 'XRP') {
+    return fetchXrpOnChainData({
+      pair: options.pair,
+      nowMs: options.nowMs,
+      priceUsd: options.priceUsd,
+      fetcher: options.fetcher,
+    });
   }
-  const alert = await fetchWhaleAlertFlow({
-    apiKey: process.env.WHALE_ALERT_API_KEY,
-    nowMs: options.nowMs,
-    fetcher: options.fetcher,
-  });
-  if (alert.status === 'LIVE') {
-    return {
-      ...alert,
-      provider: `Optional fallback: ${alert.provider}`,
-      unavailableReason: primary.unavailableReason,
-    };
+  if (asset === 'BNB') {
+    return fetchBscOnChainData({
+      pair: options.pair,
+      nowMs: options.nowMs,
+      priceUsd: options.priceUsd,
+      fetcher: options.fetcher,
+    });
   }
-  return primary;
+  return {
+    ...unavailable(`No verified ${asset} chain provider is configured; Bitcoin or other-chain evidence is not substituted.`),
+    pair: options.pair,
+    asset,
+  };
 }
 
 export function resetPublicBitcoinWhaleDataCacheForTests(): void {

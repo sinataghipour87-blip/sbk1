@@ -15,12 +15,31 @@ const forbiddenStrings = [
   'nobitex',
 ];
 const publicMarketFeedPath = path.join('src', 'services', 'publicMarketDataFallback.ts');
+const okxOptionsFeedPath = path.join('src', 'services', 'okxOptionsData.ts');
+const binanceOptionsFeedPath = path.join('src', 'services', 'binanceEuropeanOptionsData.ts');
+const bybitOptionsFeedPath = path.join('src', 'services', 'bybitOptionsData.ts');
 const sourceRegistryPath = path.join('src', 'services', 'councilSourceRegistry.ts');
 const approvedPublicMarketEndpoints = [
   'fapi.binance.com',
   'api.binance.com',
   'api.bybit.com/v5/market/tickers',
   'www.okx.com/api/v5/market/ticker',
+];
+const approvedOkxOptionsRoutes = [
+  'public/instruments',
+  'public/opt-summary',
+  'public/open-interest',
+  'market/tickers',
+];
+const approvedBinanceOptionsRoutes = [
+  "'exchangeInfo'",
+  "'index'",
+  "'mark'",
+  "'openInterest'",
+];
+const approvedBybitOptionsRoutes = [
+  'instruments-info',
+  'tickers',
 ];
 
 function isExcluded(relativePath: string): boolean {
@@ -43,12 +62,27 @@ files.push(path.join(repositoryRoot, 'server.ts'));
 
 const findings: string[] = [];
 let publicMarketFeedContents: string | null = null;
+let okxOptionsFeedContents: string | null = null;
+let binanceOptionsFeedContents: string | null = null;
+let bybitOptionsFeedContents: string | null = null;
 let sourceRegistryContents: string | null = null;
 for (const file of files) {
   const relativePath = path.relative(repositoryRoot, file);
   const contents = readFileSync(file, 'utf8');
   if (relativePath === publicMarketFeedPath) {
     publicMarketFeedContents = contents;
+    continue;
+  }
+  if (relativePath === okxOptionsFeedPath) {
+    okxOptionsFeedContents = contents;
+    continue;
+  }
+  if (relativePath === binanceOptionsFeedPath) {
+    binanceOptionsFeedContents = contents;
+    continue;
+  }
+  if (relativePath === bybitOptionsFeedPath) {
+    bybitOptionsFeedContents = contents;
     continue;
   }
   if (relativePath === sourceRegistryPath) {
@@ -75,6 +109,45 @@ assert.doesNotMatch(
   publicMarketFeedContents,
   /(?:createOrder|cancelOrder|placeOrder|private\/|trade\/order)/i,
   'Direct exchange adapters must remain public-market-data-only.',
+);
+assert.ok(okxOptionsFeedContents, 'The read-only OKX options adapter must remain present.');
+assert.ok(
+  okxOptionsFeedContents.includes('www.okx.com/api/v5'),
+  'OKX options access must stay on the documented public V5 REST API host.',
+);
+for (const route of approvedOkxOptionsRoutes) {
+  assert.ok(okxOptionsFeedContents.includes(route), `OKX options adapter may use ${route}.`);
+}
+assert.doesNotMatch(
+  okxOptionsFeedContents,
+  /(?:new\s+WebSocket|method:\s*['"]POST|private\/|trade\/|account\/|order)/i,
+  'OKX options access must remain public, read-only market data.',
+);
+assert.ok(binanceOptionsFeedContents, 'The read-only Binance European Options adapter must remain present.');
+assert.ok(
+  binanceOptionsFeedContents.includes('https://eapi.binance.com/eapi/v1'),
+  'Binance options access must stay on the documented public European Options API.',
+);
+for (const route of approvedBinanceOptionsRoutes) {
+  assert.ok(binanceOptionsFeedContents.includes(route), `Binance options adapter may use ${route}.`);
+}
+assert.doesNotMatch(
+  binanceOptionsFeedContents,
+  /(?:method:\s*['"]POST|private\/|\/order(?:\/|\b)|listenKey)/i,
+  'Binance options access must remain public, read-only market data.',
+);
+assert.ok(bybitOptionsFeedContents, 'The read-only Bybit options adapter must remain present.');
+assert.ok(
+  bybitOptionsFeedContents.includes('https://api.bybit.com/v5/market'),
+  'Bybit options access must stay on the documented public V5 market API.',
+);
+for (const route of approvedBybitOptionsRoutes) {
+  assert.ok(bybitOptionsFeedContents.includes(route), `Bybit options adapter may use ${route}.`);
+}
+assert.doesNotMatch(
+  bybitOptionsFeedContents,
+  /(?:method:\s*['"]POST|private\/|createOrder|cancelOrder|placeOrder)/i,
+  'Bybit options access must remain public, read-only market data.',
 );
 assert.ok(sourceRegistryContents, 'The council source inventory must remain present.');
 assert.doesNotMatch(

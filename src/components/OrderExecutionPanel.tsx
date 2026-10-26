@@ -46,6 +46,7 @@ interface OrderExecutionPanelProps {
   onHedgeLiquidityDca?: (posId: string) => void;
   prediction: any;
   autoTradeActive: boolean;
+  autoTradePending?: boolean;
   onToggleAutoTrade: () => void;
   mode?: 'manual' | 'auto';
   demoTradingMode?: boolean;
@@ -71,6 +72,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
   onHedgeLiquidityDca,
   prediction,
   autoTradeActive,
+  autoTradePending = false,
   onToggleAutoTrade,
   mode,
   demoTradingMode = false,
@@ -213,23 +215,25 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
           <p className="text-[10px] text-cyan-200">
             دکمه‌های LONG/SHORT درخواست را به سرور می‌فرستند؛ شورا و گیت‌های ریسک سمت سرور تصمیم می‌گیرند.
           </p>
+          <p className="text-[10px] text-amber-200">
+            اهرم درخواست سروری از این پنل انتخاب نمی‌شود؛ کنترل ریسک سرور اهرم مجاز را تعیین می‌کند.
+          </p>
           <div className="flex items-center justify-between text-xs font-mono">
             <span className="flex items-center gap-1.5 text-slate-200 font-bold">
               <Sliders className="w-3.5 h-3.5 text-cyan-400" />
-              <span>انتخاب اهرم دستی (Manual Leverage):</span>
+              <span>اهرم تحلیل محلی (درخواست سرور را تغییر نمی‌دهد):</span>
             </span>
             <span className="text-xs px-2.5 py-0.5 rounded-lg bg-cyan-950 border border-cyan-500/60 text-cyan-300 font-black">
               {currentLev}x
             </span>
           </div>
-
-          {/* Quick Manual Leverage Buttons */}
           <div className="grid grid-cols-7 gap-1">
             {[5, 10, 15, 20, 25, 50, 100].map((lev) => (
               <button
                 key={lev}
                 type="button"
-                onClick={() => onSelectLeverage && onSelectLeverage(lev)}
+                aria-pressed={currentLev === lev}
+                onClick={() => onSelectLeverage?.(lev)}
                 className={`py-1.5 rounded-lg font-mono font-bold text-xs transition-all cursor-pointer ${
                   currentLev === lev
                     ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-white shadow-[0_0_10px_rgba(6,182,212,0.5)] border border-cyan-300 scale-105'
@@ -354,13 +358,15 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
               </div>
             </div>
             <button
+              disabled={autoTradePending}
+              aria-pressed={autoTradeActive}
               onClick={onToggleAutoTrade}
-              className={`px-3 py-1.5 rounded-xl font-mono font-bold text-xs transition-all cursor-pointer ${
+              className={`px-3 py-1.5 rounded-xl font-mono font-bold text-xs transition-all cursor-pointer disabled:opacity-50 ${
                 autoTradeActive
                   ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg'
                   : 'bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-700/50'
               }`}
-            >
+             type="button">
               {autoTradeActive ? '🟢 اتوپایلوت سرور فعال است' : '⚪ فعال‌سازی اتوپایلوت سرور'}
             </button>
           </div>
@@ -628,7 +634,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                 filteredPositions.forEach((p) => onClosePosition(p.id));
               }}
               className="py-1 px-3 rounded-lg bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white font-mono font-black text-xs flex items-center justify-center gap-1.5 transition-all shadow-[0_0_12px_rgba(16,185,129,0.3)] cursor-pointer"
-            >
+             type="button">
               <Zap className="w-3.5 h-3.5 text-amber-300 animate-bounce" />
               <span>⚡ تسویه آنی و خروج سربه‌سر (بدون ضرر تضمینی)</span>
             </button>
@@ -993,7 +999,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                               onClick={() => onActiveHedgeChip(pos.id)}
                               className="py-2 px-3 rounded-lg bg-gradient-to-r from-cyan-800 to-blue-800 hover:from-cyan-700 hover:to-blue-700 text-cyan-100 font-mono font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all border border-cyan-500/50 shadow-md cursor-pointer"
                               title="نقد کردن آنی سود لگ هج، شیفت نقطه ورود هج به قیمت زنده و کاهش فوری فاصله سربه‌سر"
-                            >
+                             type="button">
                               <RefreshCw className="w-3.5 h-3.5 text-cyan-300" />
                               <span>⚡ نوسان‌گیری و کاهش فاصله سربه‌سر</span>
                             </button>
@@ -1004,7 +1010,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                               onClick={() => onHedgeLiquidityDca(pos.id)}
                               className="py-2 px-3 rounded-lg bg-gradient-to-r from-purple-800 to-indigo-800 hover:from-purple-700 hover:to-indigo-700 text-purple-100 font-mono font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all border border-purple-500/50 shadow-md cursor-pointer"
                               title="تزریق پله نجات در کلاستر نقدینگی اردر بوک برای پرتاب نقطه سربه‌سر به نزدیک‌ترین فاصله"
-                            >
+                             type="button">
                               <Target className="w-3.5 h-3.5 text-amber-300" />
                               <span>🎯 پله نجات DCA در نقدینگی</span>
                             </button>
@@ -1023,7 +1029,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                               onClick={() => onUnhedgePosition(pos.id)}
                               className="w-full py-2 px-3 rounded-lg bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white font-mono font-black text-xs flex items-center justify-center gap-1.5 transition-all shadow-[0_0_15px_rgba(16,185,129,0.35)] cursor-pointer"
                               title="بستن فوری لگ هدج معکوس، قفل حد ضرر روی نقطه ورود و آزادسازی معامله اصلی جهت کسب سود کامل"
-                            >
+                             type="button">
                               <Zap className="w-4 h-4 text-amber-300 animate-pulse" />
                               <span>🔓 آزادسازی هوشمند معامله اصلی (حذف لگ هدج و فعال‌سازی سود TP)</span>
                             </button>
@@ -1079,7 +1085,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                                   }}
                                   className="py-1.5 px-1.5 rounded-lg bg-gradient-to-r from-indigo-700 to-blue-700 hover:from-indigo-600 hover:to-blue-600 text-white text-[10px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-all shadow-[0_0_8px_rgba(99,102,241,0.3)]"
                                   title="انجماد آنی ضرر و قفل کردن پوزیشن با هج معکوس"
-                                >
+                                 type="button">
                                   <ShieldCheck className="w-3.5 h-3.5" />
                                   قفل هج فوری 🛡️
                                 </button>
@@ -1093,7 +1099,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                                   }}
                                   className="py-1.5 px-1.5 rounded-lg bg-gradient-to-r from-emerald-700 to-teal-700 hover:from-emerald-600 hover:to-teal-600 text-white text-[10px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-all shadow-[0_0_8px_rgba(16,185,129,0.3)]"
                                   title="میانگین کم کردن اصولی با پله دوم"
-                                >
+                                 type="button">
                                   <Layers className="w-3.5 h-3.5" />
                                   خرید پله دوم 🚀
                                 </button>
@@ -1144,14 +1150,14 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                       <button
                         onClick={() => onPartialClosePosition(pos.id)}
                         className="py-1.5 rounded-lg bg-amber-600/90 hover:bg-amber-500 text-white font-mono font-bold text-[11px] flex items-center justify-center gap-1 transition-all cursor-pointer"
-                      >
+                       type="button">
                         <Layers className="w-3 h-3" />
                         تسویه ۱/۳
                       </button>
                       <button
                         onClick={() => onClosePosition(pos.id)}
                         className="py-1.5 rounded-lg bg-rose-900/80 hover:bg-rose-800 text-rose-200 border border-rose-700/60 font-mono font-bold text-[11px] flex items-center justify-center gap-1 transition-all cursor-pointer"
-                      >
+                       type="button">
                         <XCircle className="w-3.5 h-3.5" />
                         <span>خروج دستی #{index + 1}</span>
                       </button>
@@ -1160,7 +1166,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                     <button
                       onClick={() => onClosePosition(pos.id)}
                       className="w-full py-1.5 rounded-lg bg-rose-900/80 hover:bg-rose-800 text-rose-200 border border-rose-700/60 font-mono font-bold text-[11px] flex items-center justify-center gap-1 transition-all cursor-pointer"
-                    >
+                     type="button">
                       <XCircle className="w-3.5 h-3.5" />
                       <span>خروج دستی معامله #{index + 1}</span>
                     </button>
@@ -1269,7 +1275,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                   'hover:bg-emerald-900/60 text-emerald-300 cursor-pointer'
                 }`}
                 title="درخواست LONG به سرور؛ جهت، شورا و ریسک در سرور بررسی می‌شوند."
-              >
+               type="button">
                 <Bot className="w-4 h-4 animate-pulse text-emerald-400" />
                 <span>درخواست LONG به سرور</span>
               </button>
@@ -1279,7 +1285,7 @@ const OrderExecutionPanelComponent: React.FC<OrderExecutionPanelProps> = ({
                   'hover:bg-rose-900/60 text-rose-300 cursor-pointer'
                 }`}
                 title="درخواست SHORT به سرور؛ جهت، شورا و ریسک در سرور بررسی می‌شوند."
-              >
+               type="button">
                 <Bot className="w-4 h-4 animate-pulse text-rose-400" />
                 <span>درخواست SHORT به سرور</span>
               </button>

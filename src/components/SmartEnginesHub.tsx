@@ -133,7 +133,7 @@ export const SmartEnginesHub: React.FC<SmartEnginesHubProps> = ({
                   className={`w-11 h-6 rounded-full p-0.5 transition-colors cursor-pointer shrink-0 ${
                     eng.enabled ? 'bg-cyan-500' : 'bg-slate-800'
                   }`}
-                >
+                 type="button">
                   <div
                     className={`w-5 h-5 rounded-full bg-slate-950 shadow-md transform transition-transform ${
                       eng.enabled ? 'translate-x-0' : '-translate-x-5'

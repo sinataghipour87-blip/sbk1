@@ -68,7 +68,7 @@ export const AntiSelfDeceptionOnlineLearningWidget: React.FC = () => {
         <button
           onClick={runAudit}
           className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all flex items-center gap-1.5 text-xs"
-        >
+         type="button">
           <RefreshCw className="w-3.5 h-3.5 text-rose-400" />
           <span>ارزیابی مجدد</span>
         </button>

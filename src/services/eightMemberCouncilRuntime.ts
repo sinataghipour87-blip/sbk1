@@ -7,6 +7,7 @@ import type { FreeMacroDataResult, DirectMetricResult } from './freeMacroData';
 import {
   EIGHT_MEMBER_COUNCIL,
   evaluateEightMemberCouncil,
+  getCouncilMacroBeta,
   type CouncilMacroContext,
   type CouncilMemberVote,
   type CouncilMemberEvidenceCacheEntry,
@@ -19,6 +20,7 @@ import type { OpenSourceAdvisoryReport } from './openSourceAdvisoryService';
 import type { PublicMarketFallbackData } from './publicMarketDataFallback';
 import type { SbPentagonOutput } from './sbFiveModelsEngine';
 import type { SignalToExecutionResult } from './signalToExecution';
+import { getFreqtradePairBaseAsset } from './freqtradePairs';
 import {
   deduplicateCandles,
   deduplicateNews,
@@ -39,6 +41,7 @@ export interface CouncilMemberRepositoryEntry {
 }
 
 interface RuntimeInput {
+  pair?: string;
   analysis: AnalysisResult;
   councilReport?: EightMemberCouncilReport;
   multiBrainReport?: MultiBrainConsensusReport;
@@ -325,7 +328,10 @@ function brainEvidenceAvailability(
   }
 }
 
-function getNewsSentiment(report: OpenSourceAdvisoryReport | undefined): {
+function getNewsSentiment(
+  report: OpenSourceAdvisoryReport | undefined,
+  pair?: string,
+): {
   score: number;
   timestampMs: number;
   headlines: CouncilMacroContext['recentHeadlines'];
@@ -333,6 +339,7 @@ function getNewsSentiment(report: OpenSourceAdvisoryReport | undefined): {
   const result = report?.modules.newsSentiment;
   if (
     !report ||
+    (pair !== undefined && report.pair !== pair) ||
     report.status === 'UNAVAILABLE' ||
     result.status !== 'AVAILABLE' ||
     result.sourceTimestampMs !== report.sourceTimestampMs ||
@@ -353,6 +360,7 @@ function getNewsSentiment(report: OpenSourceAdvisoryReport | undefined): {
     if (!Number.isFinite(publishedAtMs)) return [];
     return [{
       id: `${item.publisher}:${publishedAtMs}:${item.headline}`,
+      pair: report.pair,
       headline: item.headline,
       source: item.publisher,
       url: '',
@@ -370,9 +378,11 @@ function getNewsSentiment(report: OpenSourceAdvisoryReport | undefined): {
 function makeMacroContext(
   base: CouncilMacroContext,
   report: OpenSourceAdvisoryReport | undefined,
+  pair?: string,
 ): CouncilMacroContext {
-  const sentiment = getNewsSentiment(report);
-  const directHeadlines = report?.sourceHeadlines?.flatMap((headline) => {
+  const scopedReport = pair === undefined || report?.pair === pair ? report : undefined;
+  const sentiment = getNewsSentiment(scopedReport, pair);
+  const directHeadlines = scopedReport?.sourceHeadlines?.flatMap((headline) => {
     const publishedAtMs = Date.parse(headline.publishedAt);
     if (
       !headline.headline.trim() ||
@@ -381,6 +391,7 @@ function makeMacroContext(
     ) return [];
     return [{
       id: headline.id,
+      pair: headline.pair,
       headline: headline.headline,
       source: headline.publisher,
       url: headline.url,
@@ -391,7 +402,7 @@ function makeMacroContext(
     ? directHeadlines
     : sentiment?.headlines ?? base.recentHeadlines;
   const advisorySentimentUnavailable = directHeadlines.length > 0 && !sentiment;
-  const headlineTimestampMs = report?.newsHeadlinesRetrievedAtMs ?? null;
+  const headlineTimestampMs = scopedReport?.newsHeadlinesRetrievedAtMs ?? null;
   return {
     ...base,
     lastUpdatedTime: Math.max(
@@ -440,6 +451,7 @@ function brainModules(report: MultiBrainConsensusReport): Record<string, unknown
 
 function sourceDataForMember(
   memberId: number,
+  pair: string | undefined,
   analysis: AnalysisResult,
   macro: CouncilMacroContext,
   freeMacroData?: FreeMacroDataResult,
@@ -590,22 +602,29 @@ function sourceDataForMember(
       };
     case 5:
       return {
-        optionsData: optionsData ?? null,
-        sourceStatus: optionsData?.status ?? 'UNAVAILABLE: no verified options feed is configured',
+        pair,
+        optionsData: optionsData && optionsData.pair === pair ? optionsData : null,
+        sourceStatus: optionsData && optionsData.pair === pair
+          ? optionsData.status
+          : 'UNAVAILABLE: options evidence is not scoped to this pair',
       };
     case 6: {
-      const onchainEvidence = whaleFlowData?.largeTransfers
-        ? deduplicateOnChainTransfers(whaleFlowData.largeTransfers)
+      const scopedWhaleData = whaleFlowData?.pair === pair ? whaleFlowData : null;
+      const isBitcoinPair = getFreqtradePairBaseAsset(pair ?? '') === 'BTC';
+      const onchainEvidence = scopedWhaleData?.largeTransfers
+        ? deduplicateOnChainTransfers(scopedWhaleData.largeTransfers)
         : null;
       return {
-        whaleFlowStatus: macro.whaleFlowStatus,
-        whaleSentiment: macro.whaleSentiment,
-        whaleNetflowBtc: macro.whaleNetflowBtc,
-        provenance: 'macroContext',
-        bitcoinActiveAddresses: freeMacroData?.bitcoinActiveAddresses ?? null,
-        publicOnChainData: whaleFlowData
+        pair,
+        asset: getFreqtradePairBaseAsset(pair ?? '') ?? null,
+        whaleFlowStatus: scopedWhaleData?.status ?? 'UNAVAILABLE',
+        whaleSentiment: isBitcoinPair ? macro.whaleSentiment : null,
+        whaleNetflowBtc: isBitcoinPair ? macro.whaleNetflowBtc : null,
+        provenance: scopedWhaleData?.provider ?? null,
+        bitcoinActiveAddresses: isBitcoinPair ? freeMacroData?.bitcoinActiveAddresses ?? null : null,
+        publicOnChainData: scopedWhaleData
           ? {
-            ...whaleFlowData,
+            ...scopedWhaleData,
             ...(onchainEvidence ? {
               largeTransfers: onchainEvidence.values,
               duplicateCount: onchainEvidence.duplicateCount,
@@ -617,6 +636,8 @@ function sourceDataForMember(
     }
     case 7:
       return {
+        pair,
+        macroBeta: pair ? getCouncilMacroBeta(pair) : null,
         overallDataStatus: macro.overallDataStatus,
         fundamentalBias: macro.fundamentalBias,
         sp500: { status: macro.sp500Status, dailyChangePct: macro.sp500DailyChangePct },
@@ -626,8 +647,12 @@ function sourceDataForMember(
         directSources: freeMacroData ?? null,
       };
     case 8: {
-      const newsEvidence = deduplicateNews(macro.recentHeadlines ?? []);
+      const scopedHeadlines = pair === undefined
+        ? macro.recentHeadlines ?? []
+        : (macro.recentHeadlines ?? []).filter((headline) => headline.pair === pair);
+      const newsEvidence = deduplicateNews(scopedHeadlines);
       return {
+        pair,
         recentHeadlines: newsEvidence.values,
         duplicateCount: newsEvidence.duplicateCount,
         newsSentimentStatus: macro.newsSentimentStatus,
@@ -800,7 +825,10 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
     summaryFa: input.analysis.liquidationCascadePrediction ? 'برآورد آبشار لیکوییدیشن تحلیل همین اسنپ‌شات.' : 'برآورد آبشار لیکوییدیشن در دسترس نیست.',
   };
 
-  const advisory = input.analysis.openSourceAdvisories;
+  const advisory = input.pair === undefined ||
+    input.analysis.openSourceAdvisories?.pair === input.pair
+    ? input.analysis.openSourceAdvisories
+    : undefined;
   const advisoryKeys = [
     'candlestickPatterns',
     'marketRegime',
@@ -877,15 +905,18 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
   };
   const macroData = input.freeMacroData;
   values['onchain.bitcoinActiveAddresses'] = directMetricEvidence(
-    macroData?.bitcoinActiveAddresses,
+    input.pair === undefined || getFreqtradePairBaseAsset(input.pair) === 'BTC'
+      ? macroData?.bitcoinActiveAddresses
+      : undefined,
     3 * 24 * 60 * 60_000,
     'شاخص تعداد آدرس‌های فعال شبکه بیت‌کوین؛ این داده جریان صرافی/نهنگ نیست و رأی جهت‌دار نمی‌سازد.',
   );
   const optionsData = input.optionsData;
+  const optionsPairMatches = input.pair === undefined || optionsData?.pair === input.pair;
   const optionsAgeMs = optionsData?.timestampMs === null || optionsData?.timestampMs === undefined
     ? null
     : (input.nowMs ?? Date.now()) - optionsData.timestampMs;
-  const optionsAvailable = optionsData?.status === 'LIVE' &&
+  const optionsAvailable = optionsPairMatches && optionsData?.status === 'LIVE' &&
     optionsAgeMs !== null &&
     optionsAgeMs >= 0 &&
     optionsAgeMs <= 5 * 60_000 &&
@@ -897,10 +928,12 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
     available: optionsAvailable,
     resolvedStatus: optionsAvailable ? 'AVAILABLE' : optionsData?.status === 'STALE' ? 'STALE' : 'UNAVAILABLE',
     summaryFa: optionsAvailable
-      ? `دادهٔ عمومی اختیار BTC از ${optionsData.provider ?? 'منبع نامشخص'}؛ ${optionsData.contractsCount} قرارداد معتبر، کیفیت ${optionsData.qualityPct}٪.`
-      : 'دادهٔ زنده و کافی اختیار معامله برای این اسنپ‌شات موجود نیست.',
+      ? `دادهٔ اختیار ${optionsData.pair} از ${optionsData.provider ?? 'منبع نامشخص'}؛ ${optionsData.contractsCount} قرارداد معتبر، کیفیت ${optionsData.qualityPct}٪.`
+      : 'دادهٔ زنده، کافی و منطبق با جفت اختیار معامله موجود نیست.',
   };
-  const whaleFlow = input.whaleFlowData;
+  const whaleFlow = input.pair === undefined || input.whaleFlowData?.pair === input.pair
+    ? input.whaleFlowData
+    : undefined;
   const whaleFlowAgeMs = whaleFlow?.timestampMs === null || whaleFlow?.timestampMs === undefined
     ? null
     : (input.nowMs ?? Date.now()) - whaleFlow.timestampMs;
@@ -1006,13 +1039,15 @@ async function persistMemberRecords(
 }
 
 export function evaluateEightMemberCouncilForSnapshot(input: {
+  pair?: string;
   analysis: AnalysisResult;
   macroContext: CouncilMacroContext;
   nowMs?: number;
 }): EightMemberCouncilReport {
   return evaluateEightMemberCouncil({
     analysis: input.analysis,
-    macroContext: makeMacroContext(input.macroContext, input.analysis.openSourceAdvisories),
+    pair: input.pair,
+    macroContext: makeMacroContext(input.macroContext, input.analysis.openSourceAdvisories, input.pair),
     nowMs: input.nowMs,
   });
 }
@@ -1021,12 +1056,17 @@ export async function runEightMemberCouncilRuntime(
   input: RuntimeInput,
 ): Promise<EightMemberCouncilReport> {
   const nowMs = input.nowMs ?? Date.now();
+  const pairScope = input.pair?.replace(/[^A-Z0-9]+/gi, '_');
+  const scopedAdvisory = input.pair === undefined ||
+    input.analysis.openSourceAdvisories?.pair === input.pair
+    ? input.analysis.openSourceAdvisories
+    : undefined;
   const sourceTimestampMs = input.decisionSnapshotTimestampMs ??
-    input.analysis.openSourceAdvisories?.sourceTimestampMs ??
+    scopedAdvisory?.sourceTimestampMs ??
     input.multiBrainReport?.sourceTimestampMs ??
     input.analysis.candles.at(-1)?.[0] ??
     null;
-  const snapshotId = `SNP_${sourceTimestampMs ?? 'unknown'}_${nowMs}`;
+  const snapshotId = `SNP_${pairScope ?? 'legacy'}_${sourceTimestampMs ?? 'unknown'}_${nowMs}`;
   const moduleValues = collectModuleValues(input, nowMs);
   const supportingModules: Record<string, CouncilModuleEvidence> = {};
 
@@ -1055,15 +1095,19 @@ export async function runEightMemberCouncilRuntime(
     }
   }
 
-  const macroContext = makeMacroContext(input.macroContext, input.analysis.openSourceAdvisories);
-  const repositoryDir = input.repositoryDir ??
+  const macroContext = makeMacroContext(input.macroContext, input.analysis.openSourceAdvisories, input.pair);
+  const baseRepositoryDir = input.repositoryDir ??
     process.env.SBK1_COUNCIL_REPOSITORY_DIR ??
     path.resolve(process.cwd(), 'data', 'council-members');
+  const repositoryDir = input.pair
+    ? path.join(baseRepositoryDir, pairScope ?? 'legacy')
+    : baseRepositoryDir;
   const memberSourceData = new Map(EIGHT_MEMBER_COUNCIL.map((member) => [
     member.id,
     sourceDataForMember(
       member.id,
-      input.analysis,
+        input.pair,
+        input.analysis,
       macroContext,
       input.freeMacroData,
       input.optionsData,
@@ -1087,6 +1131,7 @@ export async function runEightMemberCouncilRuntime(
     ));
   const baseReport = input.councilReport ?? evaluateEightMemberCouncil({
     analysis: input.analysis,
+    pair: input.pair,
     macroContext,
     directMacroData: input.freeMacroData,
     optionsData: input.optionsData,
@@ -1136,7 +1181,7 @@ export async function runEightMemberCouncilRuntime(
   await persistMemberRecords(entries, report, snapshotId, coordinatorOutput, repositoryDir);
   const operationalRepositoryDir = process.env.SBK1_COUNCIL_REPOSITORY_DIR ??
     path.resolve(process.cwd(), 'data', 'council-members');
-  if (path.resolve(repositoryDir) === path.resolve(operationalRepositoryDir)) {
+  if (path.resolve(baseRepositoryDir) === path.resolve(operationalRepositoryDir)) {
     scheduleCouncilRetentionSweep(repositoryDir);
   }
   return report;

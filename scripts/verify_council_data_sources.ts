@@ -3,9 +3,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { evaluateEightMemberCouncil } from '../src/services/eightMemberCouncil';
+import { getFreqtradePairBaseAsset, SUPPORTED_FREQTRADE_PAIRS } from '../src/services/freqtradePairs';
 import { fetchDirectNewsHeadlines } from '../src/services/directNewsFeeds';
 import { buildCouncilSourceRegistry, type CouncilSourceObservation } from '../src/services/councilSourceRegistry';
-import { fetchDeribitOptionsData } from '../src/services/deribitOptionsData';
+import { fetchCouncilOptionsData } from '../src/services/councilOptionsData';
 import { fetchFreeMacroData } from '../src/services/freeMacroData';
 import { fetchOnChainWhaleData } from '../src/services/publicBitcoinWhaleData';
 import { fetchPublicMarketFallback } from '../src/services/publicMarketDataFallback';
@@ -21,17 +23,33 @@ const probeStartedAtMs = Date.now();
 const pair = process.env.SBK1_FREQTRADE_PAIR?.trim() ||
   process.env.FREQTRADE_PAIR?.trim() ||
   'BTC/USDT:USDT';
-const timeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
-  process.env.FREQTRADE_TIMEFRAME?.trim() ||
-  '1m';
+if (!SUPPORTED_FREQTRADE_PAIRS.includes(pair as (typeof SUPPORTED_FREQTRADE_PAIRS)[number])) {
+  throw new Error(`SBK1_FREQTRADE_PAIR must be one of: ${SUPPORTED_FREQTRADE_PAIRS.join(', ')}.`);
+}
+const configuredTimeframe = process.env.SBK1_FREQTRADE_TIMEFRAME?.trim() ||
+  process.env.FREQTRADE_TIMEFRAME?.trim();
+if (configuredTimeframe && configuredTimeframe !== '15m') {
+  throw new Error('Council source verification is restricted to the closed 15m timeframe.');
+}
+const timeframe = '15m';
 const market = process.env.SBK1_MARKET?.trim() === 'spot' ? 'spot' : 'futures';
-const [macro, options, onChainData, news, publicMarketFallback] = await Promise.all([
+const [macro, pairProviderEvidence, publicMarketFallback] = await Promise.all([
   fetchFreeMacroData(),
-  fetchDeribitOptionsData(),
-  fetchOnChainWhaleData(),
-  fetchDirectNewsHeadlines(),
+  Promise.all(SUPPORTED_FREQTRADE_PAIRS.map(async (roomPair) => {
+    const asset = getFreqtradePairBaseAsset(roomPair);
+    if (!asset) throw new Error(`Unsupported council pair ${roomPair}.`);
+    const [options, onChainData, news] = await Promise.all([
+      fetchCouncilOptionsData({ pair: roomPair, nowMs: probeStartedAtMs }),
+      fetchOnChainWhaleData({ pair: roomPair, nowMs: probeStartedAtMs }),
+      fetchDirectNewsHeadlines(fetch, probeStartedAtMs, 4_000, roomPair),
+    ]);
+    return { pair: roomPair, options, onChainData, news };
+  })),
   fetchPublicMarketFallback({ pair, timeframe, market, nowMs: probeStartedAtMs }),
 ]);
+const selectedPairEvidence = pairProviderEvidence.find(({ pair: roomPair }) => roomPair === pair);
+if (!selectedPairEvidence) throw new Error(`No provider evidence was collected for ${pair}.`);
+const { options, onChainData, news } = selectedPairEvidence;
 const checkedAtMs = Date.now();
 const sourceObservations: Record<string, CouncilSourceObservation> = {};
 const recordObservation = (
@@ -107,15 +125,38 @@ for (const source of news.sources) {
     error: source.error,
   });
 }
-recordObservation('options.deribit-summary', {
+const optionsRegistryIds = options.provider.includes('OKX V5 + Binance European')
+  ? ['options.okx-v5', 'options.binance-european']
+  : [options.provider.includes('Binance European')
+    ? 'options.binance-european'
+    : options.provider.includes('OKX')
+      ? 'options.okx-v5'
+      : 'options.deribit-summary'];
+for (const optionsRegistryId of optionsRegistryIds) recordObservation(optionsRegistryId, {
   responseTimestampMs: options.timestampMs,
   receivedAtMs: options.retrievedAtMs ?? null,
   status: options.status,
-  error: options.status === 'UNAVAILABLE' ? 'No valid, fresh Deribit option contracts were returned.' : undefined,
+  error: options.status === 'UNAVAILABLE'
+    ? options.unavailableReason ?? 'No valid, fresh options contracts were returned.'
+    : undefined,
 });
-const onChainProviderId = onChainData.provider.includes('Blockstream')
-  ? 'onchain.blockstream-blocks'
-  : 'onchain.mempool-blocks';
+const onChainProviderId = onChainData.asset === 'ETH'
+  ? process.env.ETHERSCAN_API_KEY?.trim() && !onChainData.provider.includes('public JSON-RPC')
+    ? 'onchain.etherscan-transfers'
+    : 'onchain.ethereum-public-rpc'
+  : onChainData.asset === 'SOL'
+    ? process.env.HELIUS_API_KEY?.trim() && onChainData.provider.includes('Helius')
+      ? 'onchain.helius-solana'
+      : 'onchain.solana-public-rpc'
+    : onChainData.asset === 'XRP'
+      ? 'onchain.xrpscan-xrp'
+      : onChainData.asset === 'BNB'
+        ? process.env.BSCSCAN_API_KEY?.trim() && !onChainData.provider.includes('public JSON-RPC')
+          ? 'onchain.bscscan-bnb'
+          : 'onchain.bsc-public-rpc'
+        : onChainData.provider.includes('Blockstream')
+          ? 'onchain.blockstream-blocks'
+          : 'onchain.mempool-blocks';
 recordObservation(onChainProviderId, {
   responseTimestampMs: onChainData.timestampMs,
   receivedAtMs: onChainData.retrievedAtMs ?? null,
@@ -143,11 +184,30 @@ const recordMarketFeed = (
     error: feed.status === 'UNAVAILABLE' ? feed.error : undefined,
   });
 };
-recordMarketFeed('orderbook.binance-depth', publicMarketFallback.orderBook);
-recordMarketFeed('orderbook.binance-trades', publicMarketFallback.tradeFlow);
+recordMarketFeed(
+  publicMarketFallback.orderBook.endpoint?.includes('api.bybit.com')
+    ? 'orderbook.bybit-depth'
+    : 'orderbook.binance-depth',
+  publicMarketFallback.orderBook,
+);
+recordMarketFeed(
+  publicMarketFallback.tradeFlow.endpoint?.includes('api.bybit.com')
+    ? 'orderbook.bybit-trades'
+    : 'orderbook.binance-trades',
+  publicMarketFallback.tradeFlow,
+);
 recordMarketFeed('derivatives.binance-funding', publicMarketFallback.fundingRate);
 recordMarketFeed('derivatives.binance-open-interest-history', publicMarketFallback.openInterest);
 recordMarketFeed('derivatives.binance-open-interest-live', publicMarketFallback.liveOpenInterest);
+const candleEndpointHost = publicMarketFallback.candles.endpoint
+  ? new URL(publicMarketFallback.candles.endpoint).hostname
+  : '';
+const candleRegistryId = candleEndpointHost === 'api.bybit.com'
+  ? 'market.candles-bybit'
+  : candleEndpointHost === 'www.okx.com'
+    ? 'market.candles-okx'
+    : 'market.candles-binance';
+recordMarketFeed(candleRegistryId, publicMarketFallback.candles);
 for (const source of publicMarketFallback.exchangeQuoteSources) {
   const sourceId = `orderbook.exchange-${source.exchange}-price`;
   recordObservation(sourceId, {
@@ -165,7 +225,7 @@ if (!process.env.ETHERSCAN_API_KEY?.trim() ||
     responseTimestampMs: null,
     receivedAtMs: null,
     status: 'UNAVAILABLE',
-    error: 'Optional source is inactive: ETHERSCAN_API_KEY and SBK1_ETHERSCAN_WATCH_ADDRESSES are both required.',
+    error: 'Optional Etherscan supplement inactive; keyless Ethereum public RPC is the default path, but a verified watchlist is still required.',
   });
 }
 if (!process.env.WHALE_ALERT_API_KEY?.trim()) {
@@ -182,6 +242,7 @@ let newsAdvisoryError: string | null = null;
 if (news.headlines.length > 0 && publicMarketFallback.candles.value) {
   try {
     newsAdvisoryReport = await openSourceAdvisoryService.analyze(
+      pair,
       publicMarketFallback.candles.value.slice(-500),
       news.headlines,
     );
@@ -235,6 +296,108 @@ marketAnalysis.signalDataTimestamps = {
   mtf1hMs: publicMarketFallback.higherTimeframeCandles['1h'].sourceTimestampMs,
   mtf4hMs: publicMarketFallback.higherTimeframeCandles['4h'].sourceTimestampMs,
 };
+const pairMatrixMacroFeeds = Object.entries(macro)
+  .filter(([name]) => name !== 'dxy' && name !== 'dxyProxy')
+  .map(([, result]) => result);
+const pairMemberMatrix = pairProviderEvidence.flatMap((room) => {
+  const asset = getFreqtradePairBaseAsset(room.pair);
+  if (
+    room.options.pair !== room.pair ||
+    room.onChainData.pair !== room.pair ||
+    room.news.pair !== room.pair ||
+    room.news.headlines.some((headline) => headline.pair !== room.pair) ||
+    room.onChainData.largeTransfers?.some((transfer) => transfer.asset !== asset)
+  ) {
+    throw new Error(`Pair-scoped provider evidence leaked across rooms for ${room.pair}.`);
+  }
+  const roomMacroContext: CouncilMacroContext = {
+    overallDataStatus: 'UNAVAILABLE',
+    lastUpdatedTime: room.news.retrievedAtMs ?? checkedAtMs,
+    sp500Status: macro.sp500.status,
+    sp500DailyChangePct: macro.sp500.changePct,
+    dxyStatus: macro.dxy.status,
+    dxyDailyChangePct: macro.dxy.changePct,
+    etfFlowStatus: 'UNAVAILABLE',
+    spotEtfNetInflowMillionUsd: null,
+    newsSentimentStatus: 'UNAVAILABLE',
+    newsSentimentScore: null,
+    newsHeadlinesStatus: room.news.status,
+    recentHeadlines: room.news.headlines.map((headline) => ({
+      id: headline.id,
+      pair: headline.pair,
+      headline: headline.headline,
+      source: headline.publisher,
+      url: headline.url,
+      publishedAt: headline.publishedAt,
+    })),
+    whaleFlowStatus: room.onChainData.status === 'LIVE' ? 'LIVE' : 'UNKNOWN',
+    whaleNetflowBtc: null,
+    whalePressureIndex: null,
+    whaleSentiment: 'UNKNOWN',
+    fundamentalBias: 'UNAVAILABLE',
+  };
+  const report = evaluateEightMemberCouncil({
+    analysis: marketAnalysis,
+    macroContext: roomMacroContext,
+    directMacroData: macro,
+    optionsData: room.options,
+    whaleFlowData: room.onChainData,
+    pair: room.pair,
+    nowMs: checkedAtMs,
+  });
+  const roomVotes = report.members.filter(({ id }) => id >= 5 && id <= 8);
+  return roomVotes.map((member) => ({
+    pair: room.pair,
+    asset,
+    memberId: member.id,
+    member: member.nameEn,
+    provider: member.id === 5
+      ? room.options.provider
+      : member.id === 6
+        ? room.onChainData.provider
+        : member.id === 7
+          ? 'Shared public macro observations + pair-specific beta gate'
+          : room.news.sources.map(({ publisher }) => publisher).join(', '),
+    metricRequired: member.id === 5
+      ? 'active liquid option contracts, IV, put/call OI, expiry and strike'
+      : member.id === 6
+        ? `confirmed native ${asset} transfer above configured threshold to a verified CEX destination`
+        : member.id === 7
+          ? 'fresh shared macro metrics and independently calibrated pair beta'
+          : 'asset-scoped current headlines plus sentiment model and source coverage',
+    sourceStatus: member.id === 5
+      ? room.options.status
+      : member.id === 6
+        ? room.onChainData.status
+        : member.id === 7
+          ? pairMatrixMacroFeeds.every((metric) => metric.status === 'LIVE') ? 'LIVE' : 'UNAVAILABLE'
+          : room.news.status,
+    observedAtMs: member.id === 5
+      ? room.options.timestampMs
+      : member.id === 6
+        ? room.onChainData.timestampMs
+        : member.id === 7
+          ? macro.sp500.observedAtMs
+          : room.news.sources.reduce<number | null>(
+            (latest, source) => source.responseTimestampMs === null
+              ? latest
+              : Math.max(latest ?? 0, source.responseTimestampMs),
+            null,
+          ),
+    receivedAtMs: member.id === 5
+      ? room.options.retrievedAtMs ?? null
+      : member.id === 6
+        ? room.onChainData.retrievedAtMs ?? null
+        : member.id === 7
+          ? macro.sp500.retrievedAtMs
+          : room.news.retrievedAtMs,
+    vote: member.vote,
+    abstentionReason: member.vote === 'ABSTAIN' ? member.rationaleFa : null,
+  }));
+});
+if (pairMemberMatrix.length !== SUPPORTED_FREQTRADE_PAIRS.length * 4) {
+  throw new Error(`Expected 20 member/pair checks; observed ${pairMemberMatrix.length}.`);
+}
 const repositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-live-council-source-'));
 let whaleMemberVote: CouncilMemberVote;
 let memberVotes: Array<{
@@ -248,6 +411,7 @@ let memberVotes: Array<{
 }> = [];
 try {
   const runtimeReport = await runEightMemberCouncilRuntime({
+    pair,
     analysis: marketAnalysis,
     macroContext: {
       overallDataStatus: 'UNAVAILABLE',
@@ -316,10 +480,30 @@ const onChainMemberVerified = onChainRecordsValid &&
 
 const report = {
   checkedAt: new Date(checkedAtMs).toISOString(),
+  memberPairMatrix: {
+    expectedChecks: SUPPORTED_FREQTRADE_PAIRS.length * 4,
+    completedChecks: pairMemberMatrix.length,
+    sourceConnectionsLive: pairMemberMatrix.filter(({ sourceStatus }) => sourceStatus === 'LIVE').length,
+    votes: pairMemberMatrix,
+  },
   credentials: {
     fredApiKeyRequired: false,
     massiveApiKeyConfigured: Boolean(process.env.MASSIVE_API_KEY?.trim()),
     whaleAlertApiKeyConfigured: Boolean(process.env.WHALE_ALERT_API_KEY?.trim()),
+    heliusApiKeyConfigured: Boolean(process.env.HELIUS_API_KEY?.trim()),
+    xrpscanApiKeyConfigured: Boolean(process.env.XRPSCAN_API_KEY?.trim()),
+    xrpscanApiKeyUsed: false,
+    bscscanApiKeyConfigured: Boolean(process.env.BSCSCAN_API_KEY?.trim()),
+    cexWatchlistsConfigured: {
+      solana: Boolean(process.env.SBK1_SOL_WATCH_ADDRESSES?.trim()),
+      xrpl: Boolean(process.env.SBK1_XRP_WATCH_ADDRESSES?.trim()),
+      bnbSmartChain: Boolean(process.env.SBK1_BNB_WATCH_ADDRESSES?.trim()),
+    },
+    whaleThresholdsConfigured: {
+      sol: Boolean(process.env.SBK1_WHALE_MIN_SOL?.trim()),
+      xrp: Boolean(process.env.SBK1_WHALE_MIN_XRP?.trim()),
+      bnb: Boolean(process.env.SBK1_WHALE_MIN_BNB?.trim()),
+    },
   },
   macro: Object.fromEntries(
     Object.entries(macro).map(([name, result]) => [name, {
@@ -360,6 +544,7 @@ const report = {
     ageMs: options.ageMs,
     contractsCount: options.contractsCount,
     qualityPct: options.qualityPct,
+    unavailableReason: options.status === 'UNAVAILABLE' ? options.unavailableReason : undefined,
   },
   onChainEvidence: {
     status: onChainData.status,
@@ -454,7 +639,7 @@ const freshCrossExchangePriceCount = publicMarketFallback.exchangeQuoteSources.f
 const requiredFreshRegistryIds = [
   'orderbook.binance-depth',
   'orderbook.binance-trades',
-  'options.deribit-summary',
+  ...optionsRegistryIds,
   selectedOnchainSourceId,
   selectedDxySourceId,
   ...(market === 'futures'

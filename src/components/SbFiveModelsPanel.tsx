@@ -75,7 +75,7 @@ export const SbFiveModelsPanel: React.FC<Props> = ({
                 ? 'bg-indigo-600/30 border-indigo-500/50 text-indigo-200'
                 : 'bg-slate-800 border-slate-700 text-slate-400'
             }`}
-          >
+           type="button">
             <RefreshCw className={`w-3.5 h-3.5 ${autoTeachMode ? 'animate-spin' : ''}`} style={{ animationDuration: '4s' }} />
             {autoTeachMode ? 'یادگیری و آموزش خودکار: فعال' : 'یادگیری خودکار: متوقف'}
           </button>
@@ -217,7 +217,7 @@ export const SbFiveModelsPanel: React.FC<Props> = ({
                 alert(res.messageFa);
               }}
               className="px-2.5 py-1.5 bg-indigo-950/70 hover:bg-indigo-900 border border-indigo-500/30 text-indigo-200 rounded-lg transition-all"
-            >
+             type="button">
               🎓 آموزش: خروج فوق‌سریع در پولبک و قفل سود
             </button>
             <button
@@ -226,7 +226,7 @@ export const SbFiveModelsPanel: React.FC<Props> = ({
                 alert(res.messageFa);
               }}
               className="px-2.5 py-1.5 bg-rose-950/70 hover:bg-rose-900 border border-rose-500/30 text-rose-200 rounded-lg transition-all"
-            >
+             type="button">
               🛡️ آموزش: منع ورود پله دوم در ضرر (تضمین تک معامله)
             </button>
             <button
@@ -235,7 +235,7 @@ export const SbFiveModelsPanel: React.FC<Props> = ({
                 alert(res.messageFa);
               }}
               className="px-2.5 py-1.5 bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-500/30 text-emerald-200 rounded-lg transition-all"
-            >
+             type="button">
               🚀 آموزش: دوشیدن روند تا قطره آخر با تریلینگ پارابولیک
             </button>
           </div>

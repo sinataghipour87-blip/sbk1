@@ -62,6 +62,7 @@ import { hunterOsEngine } from './services/hunterOsEngine';
 
 import { AIRiskGovernor, RiskGovernorState } from './components/AIRiskGovernor';
 import ExecutionGovernorDashboard from './components/ExecutionGovernorDashboard';
+import { MultiPairDecisionPanel } from './components/MultiPairDecisionPanel';
 import { WinRateOptimizerComponent, WinRateOptimizerConfig } from './components/WinRateOptimizer';
 import { runUnifiedDecisionPipeline } from './services/decisionPipeline';
 import { SbFiveModelsPanel } from './components/SbFiveModelsPanel';
@@ -71,6 +72,7 @@ import { rootCauseAnalysisEngineService } from './services/rootCauseAnalysisEngi
 import { macroContextBrainService } from './services/macroContextBrain';
 import { 
   fetchCandles, 
+  fetchBybit,
   fetchDerivatives, 
   fetchFearGreed, 
   fetchHtf, 
@@ -281,6 +283,18 @@ function isLatestMarketDataVerified(
 export default function App() {
   const [settings, setSettings] = useState<UserSettings>(() => loadSettings());
   const [showSidebar, setShowSidebar] = useState(false);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const sidebarOpenerRef = useRef<HTMLElement | null>(null);
+  const openSidebar = useCallback(() => {
+    sidebarOpenerRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setShowSidebar(true);
+  }, []);
+  const closeSidebar = useCallback(() => {
+    setShowSidebar(false);
+    window.requestAnimationFrame(() => sidebarOpenerRef.current?.focus());
+  }, []);
   const executionModeRef = useRef<ExecutionMode | null>(null);
   const [freqtradeDashboard, setFreqtradeDashboard] = useState<{
     status: 'CHECKING' | 'CONNECTED' | 'UNAVAILABLE';
@@ -328,13 +342,67 @@ export default function App() {
   const [walletPopupRect, setWalletPopupRect] = useState<{ top: number; right: number } | null>(null);
   const [isWalletPopupOpen, setIsWalletPopupOpen] = useState(false);
   const walletRef = useRef<HTMLDivElement>(null);
+  const closeWalletPopup = useCallback(() => {
+    setIsWalletPopupOpen(false);
+    window.requestAnimationFrame(() => document.getElementById('wallet-topbar-button')?.focus());
+  }, []);
   const [systemHubTab, setSystemHubTab] = useState<'hunter_os' | 'sb_models' | 'brains' | 'scenarios' | 'volatility_risk' | 'flow_whales'>('hunter_os');
+
+  useEffect(() => {
+    if (!showSidebar) return;
+    const dialog = sidebarRef.current;
+    const focusableSelector = 'button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    dialog?.querySelector<HTMLElement>(focusableSelector)?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeSidebar();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialog) return;
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        first.focus();
+        return;
+      }
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [showSidebar, closeSidebar]);
+
+  useEffect(() => {
+    if (!isWalletPopupOpen) return;
+    walletRef.current?.querySelector<HTMLElement>('button')?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      closeWalletPopup();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [closeWalletPopup, isWalletPopupOpen]);
 
   const [activePositions, setActivePositions] = useState<TradePosition[]>([]);
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [councilReport, setCouncilReport] = useState<EightMemberCouncilReport | null>(null);
   const [serverAutoPilotEnabled, setServerAutoPilotEnabled] = useState(false);
+  const [autoPilotRequestPending, setAutoPilotRequestPending] = useState(false);
+  const autoPilotRequestPendingRef = useRef(false);
   const [serverDecisionReason, setServerDecisionReason] = useState('در انتظار گزارش تصمیم سرور.');
   const [lastAnalysisAtMs, setLastAnalysisAtMs] = useState<number | null>(null);
   const [aiPrediction, setAiPrediction] = useState<any | null>(null);
@@ -346,6 +414,9 @@ export default function App() {
   const [chartLivePrice, setChartLivePrice] = useState<number | null>(null);
   const [chartFeedSource, setChartFeedSource] = useState<'binance' | 'bybit' | null>(null);
   const [chartCandles, setChartCandles] = useState<Candle[] | null>(null);
+  const [chartTimeframe, setChartTimeframe] = useState('15M');
+  const [chartTimeframeCandles, setChartTimeframeCandles] = useState<Candle[] | null>(null);
+  const [chartTimeframeNotice, setChartTimeframeNotice] = useState<string | null>(null);
   const chartFeedSourceRef = useRef<'binance' | 'bybit' | null>(null);
   const [walletAdjustmentAmount, setWalletAdjustmentAmount] = useState('100');
   const [notification, setNotification] = useState<string | null>(null);
@@ -1855,6 +1926,62 @@ export default function App() {
     return () => wsRef.current?.close();
   }, [loadMarketData]);
 
+  const loadChartTimeframe = useCallback(async (timeframe: string) => {
+    if (timeframe === '15M') {
+      setChartTimeframe('15M');
+      setChartTimeframeCandles(null);
+      setChartTimeframeNotice(null);
+      return;
+    }
+    const intervalByTimeframe: Record<string, string> = {
+      '1M': '1',
+      '5M': '5',
+      '1H': '60',
+      '4H': '240',
+    };
+    const interval = intervalByTimeframe[timeframe];
+    if (!interval) throw new Error(`تایم‌فریم ${timeframe} پشتیبانی نمی‌شود.`);
+    const result = await fetchBybit(interval, 500, true);
+    if (result.candles.length < 20) {
+      throw new Error(`کندل کافی برای تایم‌فریم ${timeframe} دریافت نشد.`);
+    }
+    setChartTimeframeCandles(result.candles);
+    setChartTimeframe(timeframe);
+    setChartTimeframeNotice(null);
+  }, []);
+
+  useEffect(() => {
+    if (chartTimeframe === '15M') return;
+    let cancelled = false;
+    const refreshCandles = async () => {
+      const intervalByTimeframe: Record<string, string> = {
+        '1M': '1',
+        '5M': '5',
+        '1H': '60',
+        '4H': '240',
+      };
+      const interval = intervalByTimeframe[chartTimeframe];
+      if (!interval) return;
+      try {
+        const result = await fetchBybit(interval, 500, true);
+        if (!cancelled && result.candles.length >= 20) {
+          setChartTimeframeCandles(result.candles);
+          setChartTimeframeNotice(null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error(`[Chart] ${chartTimeframe} candle refresh failed:`, error);
+          setChartTimeframeNotice('به‌روزرسانی کندل‌ها ناموفق بود؛ آخرین دادهٔ دریافت‌شده نمایش داده می‌شود.');
+        }
+      }
+    };
+    const intervalId = window.setInterval(() => void refreshCandles(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [chartTimeframe]);
+
   // Handle Leverage Slider Change
   const handleLeverageChange = (newLev: number) => {
     setUserLeverage(newLev);
@@ -1873,22 +2000,20 @@ export default function App() {
     localStorage.setItem('quantum_balance', String(newBalance));
   };
 
-  const handleManualTrade = useCallback(async (direction: 'LONG' | 'SHORT') => {
+  const handleManualTrade = useCallback(async (direction: 'LONG' | 'SHORT', pair = 'BTC/USDT:USDT') => {
     const mode = executionModeRef.current ?? getSelectedExecutionMode();
     if (mode !== 'PAPER' && mode !== 'DRY_RUN') {
       showNotification('درخواست دستی فقط در حالت PAPER/DRY_RUN مجاز است؛ مسیر LIVE پشتیبانی نمی‌شود.');
       return;
     }
-    const adminToken = localStorage.getItem('admin_token')?.trim();
-    if (!adminToken) {
-      showNotification('برای ارسال درخواست دستی به سرور، ابتدا توکن مدیر را وارد کنید.');
-      return;
-    }
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const adminToken = localStorage.getItem('admin_token')?.trim();
+      if (adminToken) headers['x-admin-token'] = adminToken;
       const response = await fetch('/api/decision/manual-entry', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-admin-token': adminToken },
-        body: JSON.stringify({ direction }),
+        headers,
+        body: JSON.stringify({ direction, pair }),
       });
       const payload: unknown = await response.json();
       if (!response.ok || !isRecord(payload) || payload.success !== true) {
@@ -1898,7 +2023,7 @@ export default function App() {
         showNotification(error);
         return;
       }
-      showNotification(`درخواست ${direction} به سرور رسید؛ شورا و گیت‌های ریسک باید آن را تأیید کنند.`);
+      showNotification(`درخواست ${direction} برای ${pair} به سرور رسید؛ شورا و گیت‌های ریسک باید آن را تأیید کنند.`);
     } catch (error) {
       console.error('[SBK1] Could not submit manual server intent:', error);
       showNotification(error instanceof Error ? error.message : 'ارسال درخواست دستی به سرور ناموفق بود.');
@@ -1941,21 +2066,22 @@ export default function App() {
   }, [analysis, commitTradeClosureAndContinuousLearning, showNotification]);
 
   const handleToggleAutoTrade = useCallback(async () => {
+    if (autoPilotRequestPendingRef.current) return;
     const enabled = !serverAutoPilotEnabled;
     const mode = executionModeRef.current ?? getSelectedExecutionMode();
     if (enabled && mode !== 'PAPER' && mode !== 'DRY_RUN') {
       showNotification('Auto-Pilot فقط در حالت PAPER/DRY_RUN قابل فعال‌سازی است؛ LIVE پشتیبانی نمی‌شود.');
       return;
     }
-    const adminToken = localStorage.getItem('admin_token')?.trim();
-    if (!adminToken) {
-      showNotification('برای کنترل اتوپایلوت سرور، ابتدا توکن مدیر را وارد کنید.');
-      return;
-    }
+    autoPilotRequestPendingRef.current = true;
+    setAutoPilotRequestPending(true);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const adminToken = localStorage.getItem('admin_token')?.trim();
+      if (adminToken) headers['x-admin-token'] = adminToken;
       const response = await fetch('/api/decision/auto-pilot', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-admin-token': adminToken },
+        headers,
         body: JSON.stringify({ enabled }),
       });
       const payload: unknown = await response.json();
@@ -1970,6 +2096,9 @@ export default function App() {
     } catch (error) {
       console.error('[SBK1] Could not change server Auto-Pilot state:', error);
       showNotification(error instanceof Error ? error.message : 'تغییر وضعیت اتوپایلوت سرور ناموفق بود.');
+    } finally {
+      autoPilotRequestPendingRef.current = false;
+      setAutoPilotRequestPending(false);
     }
   }, [serverAutoPilotEnabled, showNotification]);
 
@@ -2015,44 +2144,45 @@ export default function App() {
 
       {showSidebar && (
         <div className="fixed inset-0 z-[80]">
-          <button
-            type="button"
-            aria-label="بستن منوی سیستم"
-            onClick={() => setShowSidebar(false)}
+          <div
+            aria-hidden="true"
+            onMouseDown={closeSidebar}
             className="fixed inset-0 bg-black/70 backdrop-blur-sm"
           />
           <aside
+            ref={sidebarRef}
             dir="rtl"
             role="dialog"
             aria-modal="true"
-            aria-label="منوی سیستم"
+            aria-labelledby="system-menu-title"
+            tabIndex={-1}
             className="fixed right-0 top-0 z-10 flex h-full w-80 max-w-[85vw] flex-col border-l border-indigo-500/30 bg-slate-950/95 p-5 shadow-2xl shadow-indigo-950/60"
           >
             <div className="mb-6 flex items-center justify-between border-b border-slate-800 pb-4">
               <div className="flex items-center gap-2 text-indigo-200">
                 <Settings className="h-5 w-5" />
-                <h2 className="font-bold">منوی سیستم</h2>
+                <h2 id="system-menu-title" className="font-bold">منوی سیستم</h2>
               </div>
               <button
                 type="button"
                 aria-label="بستن منوی سیستم"
-                onClick={() => setShowSidebar(false)}
+                onClick={closeSidebar}
                 className="rounded-lg px-2 py-1 text-slate-400 hover:bg-slate-800 hover:text-white"
               >
                 ×
               </button>
             </div>
             <nav className="flex flex-col gap-2">
-              <button type="button" onClick={() => { setSystemHubTab('hunter_os'); setShowSidebar(false); }} className="rounded-lg bg-gradient-to-r from-amber-950 to-orange-950 border border-amber-500/40 px-3 py-2 text-right text-sm text-amber-200 hover:bg-amber-900 font-bold">🏹 سیستم عامل شکارچی (HUNTER OS & Wave DNA)</button>
-              <button type="button" onClick={() => { setSystemHubTab('sb_models'); setShowSidebar(false); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">مدل‌های تخصصی هوش مصنوعی</button>
-              <button type="button" onClick={() => { setSystemHubTab('brains'); setShowSidebar(false); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">مغزها و شبکه اجماع</button>
-              <button type="button" onClick={() => { setSystemHubTab('scenarios'); setShowSidebar(false); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">سناریوها و بازیابی</button>
-              <button type="button" onClick={() => { setSystemHubTab('volatility_risk'); setShowSidebar(false); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">نوسان و مدیریت ریسک</button>
-              <button type="button" onClick={() => { setSystemHubTab('flow_whales'); setShowSidebar(false); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">جریان سفارش و نقدینگی</button>
+              <button type="button" onClick={() => { setSystemHubTab('hunter_os'); closeSidebar(); }} className="rounded-lg bg-gradient-to-r from-amber-950 to-orange-950 border border-amber-500/40 px-3 py-2 text-right text-sm text-amber-200 hover:bg-amber-900 font-bold">🏹 سیستم عامل شکارچی (HUNTER OS & Wave DNA)</button>
+              <button type="button" onClick={() => { setSystemHubTab('sb_models'); closeSidebar(); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">مدل‌های تخصصی هوش مصنوعی</button>
+              <button type="button" onClick={() => { setSystemHubTab('brains'); closeSidebar(); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">مغزها و شبکه اجماع</button>
+              <button type="button" onClick={() => { setSystemHubTab('scenarios'); closeSidebar(); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">سناریوها و بازیابی</button>
+              <button type="button" onClick={() => { setSystemHubTab('volatility_risk'); closeSidebar(); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">نوسان و مدیریت ریسک</button>
+              <button type="button" onClick={() => { setSystemHubTab('flow_whales'); closeSidebar(); }} className="rounded-lg bg-slate-900 px-3 py-2 text-right text-sm text-slate-200 hover:bg-indigo-950">جریان سفارش و نقدینگی</button>
               <button
                 type="button"
                 onClick={() => {
-                  setShowSidebar(false);
+                  closeSidebar();
                   document.getElementById('execution-governor')?.scrollIntoView({ behavior: 'smooth' });
                 }}
                 className="mt-3 rounded-lg border border-emerald-700/50 bg-emerald-950/50 px-3 py-2 text-right text-sm text-emerald-200 hover:bg-emerald-900/70"
@@ -2074,6 +2204,7 @@ export default function App() {
             isFetching={isFetching}
             onRefresh={loadMarketData}
             isDeepBlack={isDeepBlack}
+            isWalletOpen={isWalletPopupOpen}
             onToggleTheme={() => {
               setIsDeepBlack(prev => {
                 const next = !prev;
@@ -2082,7 +2213,7 @@ export default function App() {
                 return next;
               });
             }}
-            onOpenSidebar={() => setShowSidebar(true)}
+            onOpenSidebar={openSidebar}
             balance={balance}
             onToggleWallet={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
@@ -2114,7 +2245,11 @@ export default function App() {
                 : ` معامله مسدود است: ${analysis.dataQualityReport?.reasonsFa.join('، ') || 'کیفیت داده برای معامله کافی نیست.'}`}
             </p>
           )}
-           <TickerBar btcPrice={liveEffectivePrice} />
+           <TickerBar
+             btcPrice={liveEffectivePrice}
+             analysis={analysis}
+             isLive={isLatestMarketDataVerified(analysis, lastAnalysisAtMs)}
+           />
           </div>
 
           <section
@@ -2187,7 +2322,9 @@ export default function App() {
                     marketStreamState={chartFeedState}
                     livePrice={chartLivePrice}
                     livePriceSource={chartFeedSource}
-                    chartCandles={chartCandles}
+                    chartCandles={chartTimeframeCandles ?? chartCandles}
+                    onTimeframeChange={loadChartTimeframe}
+                    timeframeNotice={chartTimeframeNotice}
                     councilReport={councilReport}
                   />
                 ) : (
@@ -2214,6 +2351,7 @@ export default function App() {
                     onAutoTrade={handleManualTrade}
                     prediction={aiPrediction}
                     autoTradeActive={serverAutoPilotEnabled}
+                    autoTradePending={autoPilotRequestPending}
                     onToggleAutoTrade={handleToggleAutoTrade}
                     serverDecisionReason={serverDecisionReason}
                     demoTradingMode={isDemoTradingMode}
@@ -2238,6 +2376,7 @@ export default function App() {
                     onAutoTrade={handleManualTrade}
                     prediction={aiPrediction}
                     autoTradeActive={serverAutoPilotEnabled}
+                    autoTradePending={autoPilotRequestPending}
                     onToggleAutoTrade={handleToggleAutoTrade}
                     serverDecisionReason={serverDecisionReason}
                     demoTradingMode={isDemoTradingMode}
@@ -2338,7 +2477,7 @@ export default function App() {
 
                 <button
                   type="button"
-                  onClick={() => setShowSidebar(true)}
+                  onClick={openSidebar}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-indigo-900 to-purple-900 hover:from-indigo-800 hover:to-purple-800 text-purple-200 border border-purple-500/40 rounded-lg text-xs font-bold transition-all shadow-sm"
                 >
                   <Menu className="w-3.5 h-3.5" />
@@ -2585,8 +2724,16 @@ export default function App() {
       </div>
 
       <div id="execution-governor">
+        <div className="mb-3">
+          <MultiPairDecisionPanel
+            autoPilotEnabled={serverAutoPilotEnabled}
+            onManualEntry={(pair, direction) => handleManualTrade(direction, pair)}
+          />
+        </div>
         <ExecutionGovernorDashboard
           onModeSelected={handleExecutionModeSelected}
+          onManualEntry={handleManualTrade}
+          serverAutoPilotEnabled={serverAutoPilotEnabled}
           analysisStatus={analysis?.dataStatus ?? 'DATA_UNAVAILABLE'}
           lastAnalysisAtMs={lastAnalysisAtMs}
         />
@@ -2597,6 +2744,10 @@ export default function App() {
       {isWalletPopupOpen && (
         <div 
           ref={walletRef}
+          id="wallet-popup"
+          role="dialog"
+          aria-modal="false"
+          aria-label="کیف پول شبیه‌سازی SBK1"
           className="fixed z-[100000] w-80 bg-[#030712]/95 border-2 border-emerald-500 rounded-2xl p-4 shadow-[0_0_40px_rgba(16,185,129,0.5)] backdrop-blur-2xl animate-in fade-in slide-in-from-top-3 duration-200"
           style={{
             top: walletPopupRect?.top || 80,
@@ -2606,7 +2757,9 @@ export default function App() {
           <div className="flex items-center justify-between pb-3 border-b border-emerald-950/80 mb-3">
             <span className="text-xs font-bold text-emerald-300 font-sans">کیف پول شبیه‌سازی SBK1</span>
             <button
-              onClick={() => setIsWalletPopupOpen(false)}
+              type="button"
+              aria-label="بستن کیف پول"
+              onClick={closeWalletPopup}
               className="text-slate-400 hover:text-white text-xs cursor-pointer"
             >
               ✕

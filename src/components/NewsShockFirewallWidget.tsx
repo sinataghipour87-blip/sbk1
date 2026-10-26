@@ -98,7 +98,7 @@ export const NewsShockFirewallWidget: React.FC<NewsShockFirewallWidgetProps> = (
             onClick={refreshReport}
             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all"
             title="به‌روزرسانی وضعیت فایروال"
-          >
+           type="button">
             <RefreshCw className="w-4 h-4" />
           </button>
         </div>

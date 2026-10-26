@@ -160,7 +160,7 @@ export const WinRateOptimizerComponent: React.FC<WinRateOptimizerProps> = ({
               onClick={runProbabilityModelEvaluation}
               disabled={isCalibrating}
               className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-200 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shrink-0 disabled:opacity-50"
-            >
+             type="button">
               <RefreshCw className={`w-3.5 h-3.5 ${isCalibrating ? 'animate-spin' : ''}`} />
               <span>{isCalibrating ? 'در حال کالیبراسیون پایتون...' : 'کالیبراسیون آنی پایتون'}</span>
             </button>
@@ -283,7 +283,7 @@ export const WinRateOptimizerComponent: React.FC<WinRateOptimizerProps> = ({
                         ? 'bg-slate-900 text-amber-300 border-amber-900/60 hover:border-amber-500'
                         : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-emerald-600'
                     }`}
-                  >
+                   type="button">
                     {prob}% {prob === 90 && '👑 (توصیه ۹۰٪+)'}
                   </button>
                 );

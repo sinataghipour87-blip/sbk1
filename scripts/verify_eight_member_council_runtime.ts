@@ -952,6 +952,57 @@ try {
   assert.equal(whaleMember.sourceData.publicOnChainData.provider, 'mempool.space public REST API (sampled confirmed BTC outputs)');
   assert.equal(whaleMember.vote, 'NEUTRAL');
 
+  const pairRoomsRoot = path.join(repositoryDir, 'pair-rooms');
+  const btcPair = 'BTC/USDT:USDT';
+  const ethPair = 'ETH/USDT:USDT';
+  await runEightMemberCouncilRuntime({
+    pair: btcPair,
+    analysis: { ...analysis, openSourceAdvisories: undefined },
+    multiBrainReport,
+    sbReport,
+    macroContext,
+    optionsData: { ...connectedOptionsData, pair: btcPair, asset: 'BTC' },
+    whaleFlowData: { ...connectedWhaleFlowData, pair: btcPair, asset: 'BTC' },
+    decisionSnapshotTimestampMs: sourceTimestampMs,
+    repositoryDir: pairRoomsRoot,
+    nowMs,
+  });
+  const ethRoomReport = await runEightMemberCouncilRuntime({
+    pair: ethPair,
+    analysis,
+    multiBrainReport,
+    sbReport,
+    macroContext,
+    optionsData: { ...connectedOptionsData, pair: btcPair, asset: 'BTC' },
+    whaleFlowData: { ...connectedWhaleFlowData, pair: btcPair, asset: 'BTC' },
+    decisionSnapshotTimestampMs: sourceTimestampMs,
+    repositoryDir: pairRoomsRoot,
+    nowMs,
+  });
+  assert.equal(ethRoomReport.members[4].vote, 'ABSTAIN');
+  assert.equal(ethRoomReport.members[5].vote, 'ABSTAIN');
+  const btcRoomMember = await readLatestJsonLine<{ sourceData: Record<string, unknown> }>(
+    path.join(pairRoomsRoot, 'BTC_USDT_USDT', 'member-05.jsonl'),
+  );
+  const ethRoomMember = await readLatestJsonLine<{ sourceData: Record<string, unknown> }>(
+    path.join(pairRoomsRoot, 'ETH_USDT_USDT', 'member-05.jsonl'),
+  );
+  const ethRoomNewsMember = await readLatestJsonLine<{
+    moduleOutputs: Array<{ moduleId: string; status: string }>;
+  }>(path.join(pairRoomsRoot, 'ETH_USDT_USDT', 'member-08.jsonl'));
+  assert.equal((btcRoomMember.sourceData.optionsData as { pair: string }).pair, btcPair);
+  assert.equal(ethRoomMember.sourceData.optionsData, null);
+  assert.equal(
+    ethRoomNewsMember.moduleOutputs.find(({ moduleId }) => moduleId === 'openSource.newsSentiment')?.status,
+    'UNAVAILABLE',
+    'a report without the target pair identity cannot enter that room',
+  );
+  assert.notEqual(
+    path.join(pairRoomsRoot, 'BTC_USDT_USDT', 'member-05.jsonl'),
+    path.join(pairRoomsRoot, 'ETH_USDT_USDT', 'member-05.jsonl'),
+    'each pair persists member evidence in its own room directory',
+  );
+
   const noSupportingModulesDir = path.join(repositoryDir, 'no-supporting-modules');
   await runEightMemberCouncilRuntime({
     analysis: { ...analysis, openSourceAdvisories: undefined },

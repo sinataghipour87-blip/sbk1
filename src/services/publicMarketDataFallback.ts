@@ -9,6 +9,7 @@ import { deduplicateQuotes, deduplicateTrades } from './councilEvidenceDeduplica
 
 export interface PublicMarketFallbackFeed<T> {
   status: 'LIVE' | 'UNAVAILABLE';
+  provider?: string;
   sourceTimestampMs: number | null;
   endpoint?: string;
   receivedAtMs?: number | null;
@@ -128,6 +129,14 @@ function unavailable<T>(error: unknown): PublicMarketFallbackFeed<T> {
   };
 }
 
+function providerForEndpoint(endpoint: string): string {
+  const host = new URL(endpoint).hostname;
+  if (host === 'api.bybit.com') return 'Bybit V5 public REST API';
+  if (host === 'www.okx.com') return 'OKX V5 public REST API';
+  if (host === 'fapi.binance.com' || host === 'api.binance.com') return 'Binance public REST API';
+  return 'Public market data provider';
+}
+
 function freshFeed<T>(
   value: T,
   sourceTimestampMs: number,
@@ -234,6 +243,206 @@ function parseCandles(
   return { candles: parsed, latestCloseMs };
 }
 
+function parseNormalizedCandles(
+  candles: FreqtradeMarketCandle[],
+  nowMs: number,
+  intervalMs: number,
+  candleMaxAge: number,
+  provider: string,
+): { candles: FreqtradeMarketCandle[]; latestCloseMs: number } {
+  const parsed = candles
+    .filter((candle) =>
+      Number.isSafeInteger(candle.timestampMs) &&
+      [candle.open, candle.high, candle.low, candle.close, candle.volume].every(Number.isFinite) &&
+      Math.min(candle.open, candle.high, candle.low, candle.close) > 0 &&
+      candle.volume >= 0 &&
+      candle.high >= Math.max(candle.open, candle.close, candle.low) &&
+      candle.low <= Math.min(candle.open, candle.close, candle.high) &&
+      candle.timestampMs + intervalMs <= nowMs
+    )
+    .sort((left, right) => left.timestampMs - right.timestampMs);
+  if (parsed.length < 30) {
+    throw new Error(`${provider} returned fewer than 30 valid completed candles.`);
+  }
+  for (let index = 1; index < parsed.length; index += 1) {
+    if (parsed[index].timestampMs - parsed[index - 1].timestampMs !== intervalMs) {
+      throw new Error(`${provider} candle timestamps are not contiguous.`);
+    }
+  }
+  const latestCloseMs = parsed.at(-1)!.timestampMs + intervalMs;
+  if (nowMs - latestCloseMs > candleMaxAge) {
+    throw new Error(`${provider} latest completed candle is stale.`);
+  }
+  return { candles: parsed, latestCloseMs };
+}
+
+function parseBybitCandles(
+  payload: unknown,
+  symbol: string,
+  nowMs: number,
+  interval: string,
+): { candles: FreqtradeMarketCandle[]; latestCloseMs: number } {
+  if (
+    !isRecord(payload) ||
+    Number(payload.retCode) !== 0 ||
+    !isRecord(payload.result) ||
+    payload.result.symbol !== symbol ||
+    !Array.isArray(payload.result.list)
+  ) {
+    throw new Error('Bybit kline response is malformed or does not match the requested symbol.');
+  }
+  const candles = payload.result.list.flatMap((row): FreqtradeMarketCandle[] => {
+    if (!Array.isArray(row) || row.length < 6) return [];
+    const [timestamp, open, high, low, close, volume] = row.map(Number);
+    return [{
+      timestampMs: timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    }];
+  });
+  return parseNormalizedCandles(
+    candles,
+    nowMs,
+    timeframeMs(interval),
+    candleMaxAgeMs(interval),
+    'Bybit',
+  );
+}
+
+function okxBar(timeframe: string): string {
+  if (timeframe === '1h') return '1Hutc';
+  if (timeframe === '4h') return '4Hutc';
+  return timeframe;
+}
+
+function parseOkxCandles(
+  payload: unknown,
+  instrument: string,
+  market: MarketKind,
+  timeframe: string,
+  nowMs: number,
+): { candles: FreqtradeMarketCandle[]; latestCloseMs: number } {
+  if (!isRecord(payload) || payload.code !== '0' || !Array.isArray(payload.data)) {
+    throw new Error('OKX candle response is malformed or unsuccessful.');
+  }
+  const candles = payload.data.flatMap((row): FreqtradeMarketCandle[] => {
+    if (!Array.isArray(row) || row.length < 9 || String(row[8]) !== '1') return [];
+    const [timestamp, open, high, low, close] = row.map(Number);
+    const volumeIndex = market === 'futures' ? 6 : 5;
+    const volume = Number(row[volumeIndex]);
+    return [{
+      timestampMs: timestamp,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    }];
+  });
+  return parseNormalizedCandles(
+    candles,
+    nowMs,
+    timeframeMs(timeframe),
+    candleMaxAgeMs(timeframe),
+    `OKX ${instrument}`,
+  );
+}
+
+function publicCandleRequests(
+  symbol: string,
+  timeframe: string,
+  limit: number,
+  market: MarketKind,
+): Array<{ provider: string; url: string; parse: (payload: unknown, nowMs: number) => FreqtradeMarketCandle[] }> {
+  const bybitCategory = market === 'futures' ? 'linear' : 'spot';
+  const bybitInterval = timeframe === '1h' ? '60' : timeframe === '4h' ? '240' : timeframe;
+  const bybitUrl = new URL('https://api.bybit.com/v5/market/kline');
+  bybitUrl.searchParams.set('category', bybitCategory);
+  bybitUrl.searchParams.set('symbol', symbol);
+  bybitUrl.searchParams.set('interval', bybitInterval);
+  bybitUrl.searchParams.set('limit', String(Math.min(limit, 1000)));
+
+  const baseAsset = symbol.slice(0, -4);
+  const instrument = market === 'futures' ? `${baseAsset}-USDT-SWAP` : `${baseAsset}-USDT`;
+  const okxUrl = new URL('https://www.okx.com/api/v5/market/candles');
+  okxUrl.searchParams.set('instId', instrument);
+  okxUrl.searchParams.set('bar', okxBar(timeframe));
+  okxUrl.searchParams.set('limit', String(Math.min(limit, 300)));
+
+  return [
+    {
+      provider: 'Binance',
+      url: `https://${market === 'futures' ? 'fapi.binance.com' : 'api.binance.com'}${market === 'futures' ? '/fapi/v1' : '/api/v3'}/klines?symbol=${symbol}&interval=${timeframe}&limit=${limit}`,
+      parse(payload, nowMs) {
+        return parseCandles(payload, nowMs, timeframeMs(timeframe), candleMaxAgeMs(timeframe)).candles;
+      },
+    },
+    {
+      provider: 'Bybit',
+      url: bybitUrl.toString(),
+      parse(payload, nowMs) {
+        return parseBybitCandles(payload, symbol, nowMs, timeframe).candles;
+      },
+    },
+    {
+      provider: 'OKX',
+      url: okxUrl.toString(),
+      parse(payload, nowMs) {
+        return parseOkxCandles(payload, instrument, market, timeframe, nowMs).candles;
+      },
+    },
+  ];
+}
+
+async function fetchPublicCandlesWithFallback(options: {
+  pair: string;
+  timeframe: string;
+  market: MarketKind;
+  limit: number;
+  nowMs: number;
+  fetcher: typeof fetch;
+  timeoutMs: number;
+}): Promise<PublicMarketFallbackFeed<FreqtradeMarketCandle[]>> {
+  const symbol = normalizeSymbol(options.pair);
+  const interval = timeframeInterval(options.timeframe);
+  const errors: string[] = [];
+  const providers = publicCandleRequests(symbol, interval, options.limit, options.market);
+  for (const source of providers) {
+    try {
+      const { payload, retrievedAtMs } = await fetchJsonEndpoint(
+        source.url,
+        options.fetcher,
+        options.nowMs,
+        options.timeoutMs,
+      );
+      const evaluatedAtMs = Math.max(options.nowMs, Date.now());
+      const candles = source.parse(payload, evaluatedAtMs);
+      const latestCloseMs = candles.at(-1)!.timestampMs + timeframeMs(interval);
+      const feed = freshFeed(candles, latestCloseMs, evaluatedAtMs, candleMaxAgeMs(interval));
+      return {
+        ...feed,
+        provider: `${source.provider} public REST API`,
+        endpoint: source.url,
+        receivedAtMs: retrievedAtMs,
+        ...(errors.length > 0
+          ? { isPartial: true, error: `${source.provider} fallback used after: ${errors.join('; ')}` }
+          : {}),
+      };
+    } catch (error) {
+      errors.push(`${source.provider}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return {
+    ...unavailable<FreqtradeMarketCandle[]>(`All public candle providers failed: ${errors.join('; ')}`),
+    provider: 'Multi-venue public REST APIs',
+    endpoint: providers[0]?.url,
+    receivedAtMs: null,
+  };
+}
+
 export async function fetchPublicMarketCandles(options: {
   pair: string;
   timeframe: string;
@@ -245,24 +454,19 @@ export async function fetchPublicMarketCandles(options: {
   const nowMs = options.nowMs ?? Date.now();
   const fetcher = options.fetcher ?? fetch;
   const timeoutMs = options.timeoutMs ?? 3_000;
-  const symbol = normalizeSymbol(options.pair);
-  const interval = timeframeInterval(options.timeframe);
-  const baseUrl = options.market === 'futures'
-    ? 'https://fapi.binance.com'
-    : 'https://api.binance.com';
-  const pathname = options.market === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines';
-  const url = new URL(`${baseUrl}${pathname}`);
-  url.searchParams.set('symbol', symbol);
-  url.searchParams.set('interval', interval);
-  url.searchParams.set('limit', String(MAX_HISTORICAL_CANDLE_LIMIT[options.market]));
-  const { payload } = await fetchJsonEndpoint(url.toString(), fetcher, nowMs, timeoutMs);
-  const parsed = parseCandles(
-    payload,
-    Math.max(nowMs, Date.now()),
-    timeframeMs(interval),
-    candleMaxAgeMs(interval),
-  );
-  return parsed.candles;
+  const result = await fetchPublicCandlesWithFallback({
+    pair: options.pair,
+    timeframe: options.timeframe,
+    market: options.market,
+    limit: MAX_HISTORICAL_CANDLE_LIMIT[options.market],
+    nowMs,
+    fetcher,
+    timeoutMs,
+  });
+  if (result.status !== 'LIVE' || !result.value) {
+    throw new Error(result.error ?? 'No fresh public candle provider was available.');
+  }
+  return result.value;
 }
 
 function parseOrderBook(
@@ -292,6 +496,57 @@ function parseOrderBook(
   return {
     timestampMs: retrievedAtMs,
     venue: 'binance',
+    symbol,
+    ...(Number.isSafeInteger(sequenceId) && sequenceId >= 0 ? { sequenceId } : {}),
+    bids,
+    asks,
+  };
+}
+
+function parseBybitOrderBook(
+  payload: unknown,
+  nowMs: number,
+  symbol: string,
+): FreqtradeMarketOrderBook {
+  if (
+    !isRecord(payload) ||
+    Number(payload.retCode) !== 0 ||
+    !isRecord(payload.result) ||
+    payload.result.s !== symbol ||
+    !Array.isArray(payload.result.b) ||
+    !Array.isArray(payload.result.a)
+  ) {
+    throw new Error('Bybit order-book response is malformed or has the wrong symbol.');
+  }
+  const timestampMs = Number(payload.result.ts);
+  if (
+    !Number.isSafeInteger(timestampMs) ||
+    timestampMs <= 0 ||
+    Math.abs(timestampMs - nowMs) > MAX_FEED_AGE_MS.orderBook
+  ) {
+    throw new Error('Bybit order-book timestamp is stale or future-dated.');
+  }
+  const parseLevels = (levels: unknown[]): Array<{ price: number; amount: number }> =>
+    levels.slice(0, 20).map((level) => {
+      if (!Array.isArray(level) || level.length < 2) {
+        throw new Error('Bybit order-book level is malformed.');
+      }
+      const price = Number(level[0]);
+      const amount = Number(level[1]);
+      if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Bybit order-book level has invalid price or base-asset size.');
+      }
+      return { price, amount };
+    });
+  const bids = parseLevels(payload.result.b);
+  const asks = parseLevels(payload.result.a);
+  if (bids.length === 0 || asks.length === 0 || bids[0].price >= asks[0].price) {
+    throw new Error('Bybit order book has empty or crossed bid/ask levels.');
+  }
+  const sequenceId = Number(payload.result.seq ?? payload.result.u);
+  return {
+    timestampMs,
+    venue: 'bybit',
     symbol,
     ...(Number.isSafeInteger(sequenceId) && sequenceId >= 0 ? { sequenceId } : {}),
     bids,
@@ -337,6 +592,64 @@ function parseTrades(
   const uniqueTrades = deduplicateTrades(trades);
   if (uniqueTrades.conflictingIdentity) {
     throw new Error('Binance returned conflicting aggregate trades for the same trade id.');
+  }
+  return {
+    retrievedAtMs,
+    duplicateCount: uniqueTrades.duplicateCount,
+    trades: uniqueTrades.values,
+  };
+}
+
+function parseBybitTrades(
+  payload: unknown,
+  retrievedAtMs: number,
+  nowMs: number,
+  symbol: string,
+): FreqtradeMarketTradeFlow {
+  if (
+    !isRecord(payload) ||
+    Number(payload.retCode) !== 0 ||
+    !isRecord(payload.result) ||
+    payload.result.category !== undefined && !['spot', 'linear'].includes(String(payload.result.category)) ||
+    !Array.isArray(payload.result.list)
+  ) {
+    throw new Error('Bybit recent-trades response is malformed or unsuccessful.');
+  }
+  const trades = payload.result.list.flatMap((trade: unknown) => {
+    if (
+      !isRecord(trade) ||
+      trade.symbol !== symbol ||
+      typeof trade.execId !== 'string' ||
+      !trade.execId ||
+      !['Buy', 'Sell'].includes(String(trade.side))
+    ) return [];
+    const timestampMs = Number(trade.time);
+    const price = Number(trade.price);
+    const amount = Number(trade.size);
+    if (
+      !Number.isSafeInteger(timestampMs) ||
+      timestampMs > nowMs ||
+      Math.max(nowMs, Date.now()) - timestampMs > MAX_FEED_AGE_MS.tradeFlow ||
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      !Number.isFinite(amount) ||
+      amount <= 0
+    ) return [];
+    return [{
+      timestampMs,
+      side: trade.side === 'Buy' ? 'buy' as const : 'sell' as const,
+      price,
+      amount,
+      venue: 'bybit',
+      symbol,
+      tradeId: trade.execId,
+      exchangeEventId: trade.execId,
+    }];
+  }).sort((left, right) => left.timestampMs - right.timestampMs);
+  if (trades.length === 0) throw new Error('Bybit has no fresh, valid recent trades for the requested symbol.');
+  const uniqueTrades = deduplicateTrades(trades);
+  if (uniqueTrades.conflictingIdentity) {
+    throw new Error('Bybit returned conflicting trades for the same execution id.');
   }
   return {
     retrievedAtMs,
@@ -598,12 +911,14 @@ export async function fetchPublicMarketFallback(options: {
       const { payload, retrievedAtMs } = await fetchJsonEndpoint(url, fetcher, nowMs, timeoutMs);
       return {
         ...parse(payload, retrievedAtMs),
+        provider: providerForEndpoint(url),
         endpoint: url,
         receivedAtMs: retrievedAtMs,
       };
     } catch (error) {
       return {
         ...unavailable<T>(error),
+        provider: providerForEndpoint(url),
         endpoint: url,
         receivedAtMs: null,
       };
@@ -685,19 +1000,16 @@ export async function fetchPublicMarketFallback(options: {
       'Open interest is unavailable for spot markets.',
     ));
 
-  const fetchCandleFeed = (timeframe: string, limit: number) => fetchFeed(
-    endpoint(options.market === 'futures' ? '/fapi/v1/klines' : '/api/v3/klines', {
-      symbol,
-      interval: timeframe,
-      limit: String(limit),
-    }),
-    (payload) => {
-      const intervalMs = timeframeMs(timeframe);
-      const maxAgeMs = candleMaxAgeMs(timeframe);
-      const result = parseCandles(payload, nowMs, intervalMs, maxAgeMs);
-      return freshFeed(result.candles, result.latestCloseMs, nowMs, maxAgeMs);
-    },
-  );
+  const fetchCandleFeed = (timeframe: string, limit: number) =>
+    fetchPublicCandlesWithFallback({
+      pair: options.pair,
+      timeframe,
+      market: options.market,
+      limit,
+      nowMs,
+      fetcher,
+      timeoutMs,
+    });
   const candlesRequest = fetchCandleFeed(interval, MAX_HISTORICAL_CANDLE_LIMIT[options.market]);
   const fastCandlesRequest = interval === '1m'
     ? candlesRequest
@@ -758,10 +1070,51 @@ export async function fetchPublicMarketFallback(options: {
     openInterestRequest,
     liveOpenInterestRequest,
   ]);
+  if (orderBook.status !== 'LIVE') {
+    const bybitUrl = new URL('https://api.bybit.com/v5/market/orderbook');
+    bybitUrl.searchParams.set('category', options.market === 'futures' ? 'linear' : 'spot');
+    bybitUrl.searchParams.set('symbol', symbol);
+    bybitUrl.searchParams.set('limit', '20');
+    const bybitOrderBook = await fetchFeed(bybitUrl.toString(), (payload, retrievedAtMs) => {
+      const book = parseBybitOrderBook(payload, Math.max(nowMs, Date.now()), symbol);
+      return freshFeed(book, book.timestampMs, retrievedAtMs, MAX_FEED_AGE_MS.orderBook);
+    });
+    if (bybitOrderBook.status === 'LIVE') {
+      orderBook = {
+        ...bybitOrderBook,
+        isPartial: true,
+        error: `Bybit fallback used after Binance failed: ${orderBook.error ?? 'unavailable.'}`,
+      };
+    }
+  }
+  if (tradeFlow.status !== 'LIVE') {
+    const bybitUrl = new URL('https://api.bybit.com/v5/market/recent-trade');
+    bybitUrl.searchParams.set('category', options.market === 'futures' ? 'linear' : 'spot');
+    bybitUrl.searchParams.set('symbol', symbol);
+    bybitUrl.searchParams.set('limit', '100');
+    const bybitTradeFlow = await fetchFeed(bybitUrl.toString(), (payload, retrievedAtMs) => {
+      const trades = parseBybitTrades(payload, retrievedAtMs, Math.max(nowMs, Date.now()), symbol);
+      const sourceTimestampMs = trades.trades.at(-1)!.timestampMs;
+      return freshFeed(
+        trades,
+        sourceTimestampMs,
+        retrievedAtMs,
+        MAX_FEED_AGE_MS.tradeFlow,
+      );
+    });
+    if (bybitTradeFlow.status === 'LIVE') {
+      tradeFlow = {
+        ...bybitTradeFlow,
+        isPartial: true,
+        error: `Bybit fallback used after Binance failed: ${tradeFlow.error ?? 'unavailable.'}`,
+      };
+    }
+  }
   const exchangeQuotes = exchangeQuoteResult.feed;
   if (liveStream.orderBook) {
     orderBook = {
       status: 'LIVE',
+      provider: 'Binance public WebSocket',
       sourceTimestampMs: liveStream.orderBook.timestampMs,
       endpoint: `wss://${options.market === 'futures' ? 'fstream.binance.com' : 'stream.binance.com:9443'}/ws/${symbol.toLowerCase()}@depth20@100ms`,
       receivedAtMs: liveStream.orderBook.timestampMs,
@@ -771,6 +1124,7 @@ export async function fetchPublicMarketFallback(options: {
   if (liveStream.tradeFlow) {
     tradeFlow = {
       status: 'LIVE',
+      provider: 'Binance public WebSocket',
       sourceTimestampMs: liveStream.tradeFlow.trades.at(-1)!.timestampMs,
       endpoint: `wss://${options.market === 'futures' ? 'fstream.binance.com' : 'stream.binance.com:9443'}/ws/${symbol.toLowerCase()}@trade`,
       receivedAtMs: liveStream.tradeFlow.retrievedAtMs,
@@ -787,6 +1141,7 @@ export async function fetchPublicMarketFallback(options: {
   ) {
     fastCandles = {
       status: 'LIVE',
+      provider: 'Binance public WebSocket',
       sourceTimestampMs: partialCandle.sourceTimestampMs,
       endpoint: `wss://${options.market === 'futures' ? 'fstream.binance.com' : 'stream.binance.com:9443'}/ws/${symbol.toLowerCase()}@kline_1m`,
       receivedAtMs: partialCandle.sourceTimestampMs,

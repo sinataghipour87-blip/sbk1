@@ -1,8 +1,9 @@
 import type { CouncilOptionsData } from './eightMemberCouncil';
 import { deduplicateOptionContracts } from './councilEvidenceDeduplication';
+import { getFreqtradePairBaseAsset } from './freqtradePairs';
 
 const DERIBIT_SUMMARY_ENDPOINT =
-  'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option';
+  'https://www.deribit.com/api/v2/public/get_book_summary_by_currency';
 const REQUEST_TIMEOUT_MS = 5_000;
 const CACHE_TTL_MS = 15_000;
 const MAX_SOURCE_AGE_MS = 60_000;
@@ -41,11 +42,15 @@ interface ParsedOption {
   underlyingPrice: number;
 }
 
-let cachedAtMs = 0;
-let cachedResult: CouncilOptionsData | null = null;
+const cachedResults = new Map<string, { cachedAtMs: number; result: CouncilOptionsData }>();
 
-function unavailable(status: CouncilOptionsData['status'] = 'UNAVAILABLE'): CouncilOptionsData {
+function unavailable(
+  pair: string,
+  status: CouncilOptionsData['status'] = 'UNAVAILABLE',
+): CouncilOptionsData {
   return {
+    pair,
+    asset: getFreqtradePairBaseAsset(pair) ?? undefined,
     status,
     timestampMs: null,
     retrievedAtMs: null,
@@ -78,11 +83,13 @@ function isSummary(value: unknown): value is DeribitOptionSummary {
     isFiniteNumber(summary.creation_timestamp);
 }
 
-function parseOption(summary: DeribitOptionSummary, nowMs: number): ParsedOption | null {
-  const match = /^BTC-(\d{2})([A-Z]{3})(\d{2})-(\d+(?:\.\d+)?)-(C|P)$/.exec(summary.instrument_name);
+function parseOption(summary: DeribitOptionSummary, asset: string, nowMs: number): ParsedOption | null {
+  const match = /^([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-(\d+(?:\.\d+)?)-(C|P)$/
+    .exec(summary.instrument_name);
+  if (match?.[1] !== asset) return null;
   if (!match || summary.open_interest <= 0 || summary.mark_iv <= 0 ||
       summary.mark_iv > 500 || summary.underlying_price <= 0) return null;
-  const [, dayText, monthText, yearText, strikeText, type] = match;
+  const [, , dayText, monthText, yearText, strikeText, type] = match;
   const month = MONTHS[monthText];
   const day = Number(dayText);
   const year = 2000 + Number(yearText);
@@ -106,11 +113,14 @@ function parseOption(summary: DeribitOptionSummary, nowMs: number): ParsedOption
   };
 }
 
-async function fetchJson(fetcher: typeof fetch): Promise<{ payload: unknown; retrievedAtMs: number }> {
+async function fetchJson(fetcher: typeof fetch, asset: string): Promise<{ payload: unknown; retrievedAtMs: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetcher(DERIBIT_SUMMARY_ENDPOINT, {
+    const endpoint = new URL(DERIBIT_SUMMARY_ENDPOINT);
+    endpoint.searchParams.set('currency', asset);
+    endpoint.searchParams.set('kind', 'option');
+    const response = await fetcher(endpoint, {
       signal: controller.signal,
       cache: 'no-store',
       headers: { Accept: 'application/json' },
@@ -124,18 +134,23 @@ async function fetchJson(fetcher: typeof fetch): Promise<{ payload: unknown; ret
 }
 
 export async function fetchDeribitOptionsData(options: {
+  pair: string;
   nowMs?: number;
   fetcher?: typeof fetch;
-} = {}): Promise<CouncilOptionsData> {
+}): Promise<CouncilOptionsData> {
+  const asset = getFreqtradePairBaseAsset(options.pair);
+  if (!asset) return unavailable(options.pair);
+  if (asset !== 'BTC' && asset !== 'ETH') return unavailable(options.pair);
   const nowMs = options.nowMs ?? Date.now();
-  if (cachedResult && nowMs >= cachedAtMs && nowMs - cachedAtMs <= CACHE_TTL_MS) {
+  const cached = cachedResults.get(options.pair);
+  if (cached && nowMs >= cached.cachedAtMs && nowMs - cached.cachedAtMs <= CACHE_TTL_MS) {
     return {
-      ...cachedResult,
-      ageMs: cachedResult.timestampMs === null ? null : nowMs - cachedResult.timestampMs,
+      ...cached.result,
+      ageMs: cached.result.timestampMs === null ? null : nowMs - cached.result.timestampMs,
     };
   }
   try {
-    const { payload, retrievedAtMs } = await fetchJson(options.fetcher ?? fetch);
+    const { payload, retrievedAtMs } = await fetchJson(options.fetcher ?? fetch, asset);
     const evaluatedAtMs = Math.max(nowMs, retrievedAtMs);
     if (typeof payload !== 'object' || payload === null ||
         !('result' in payload) || !Array.isArray(payload.result)) {
@@ -159,7 +174,7 @@ export async function fetchDeribitOptionsData(options: {
     }
     const summaries = [...summariesByInstrument.values()];
     const candidates = summaries.flatMap((summary) => {
-      const parsed = parseOption(summary, evaluatedAtMs);
+      const parsed = parseOption(summary, asset, evaluatedAtMs);
       return parsed && parsed.strikePrice >= parsed.underlyingPrice * 0.75 &&
         parsed.strikePrice <= parsed.underlyingPrice * 1.25
         ? [{
@@ -201,9 +216,9 @@ export async function fetchDeribitOptionsData(options: {
       totalOpenInterest <= 0 ||
       timestampMs === null
     ) {
-      cachedResult = unavailable('UNAVAILABLE');
-      cachedAtMs = nowMs;
-      return cachedResult;
+      const result = unavailable(options.pair);
+      cachedResults.set(options.pair, { cachedAtMs: nowMs, result });
+      return result;
     }
 
     const weightedIv = (contracts: ParsedOption[]) => contracts.reduce(
@@ -216,6 +231,8 @@ export async function fetchDeribitOptionsData(options: {
     )[0];
     const ageMs = Math.max(0, evaluatedAtMs - timestampMs);
     const result: CouncilOptionsData = {
+      pair: options.pair,
+      asset,
       status: 'LIVE',
       timestampMs,
       retrievedAtMs,
@@ -232,16 +249,14 @@ export async function fetchDeribitOptionsData(options: {
       putOpenInterest,
       underlyingPrice: nearestAtm.underlyingPrice,
     };
-    cachedResult = result;
-    cachedAtMs = nowMs;
+    cachedResults.set(options.pair, { cachedAtMs: nowMs, result });
     return { ...result };
   } catch (error) {
     console.error('[DeribitOptionsData] Options source unavailable:', error);
-    return unavailable('UNAVAILABLE');
+    return unavailable(options.pair);
   }
 }
 
 export function resetDeribitOptionsDataCacheForTests(): void {
-  cachedAtMs = 0;
-  cachedResult = null;
+  cachedResults.clear();
 }
