@@ -83,6 +83,8 @@ const council = {
   })),
   longVotes: 5,
   shortVotes: 0,
+  weightedLongVotes: 5,
+  weightedShortVotes: 0,
   neutralVotes: 0,
   abstentions: 3,
   selectedDirection: 'LONG' as const,

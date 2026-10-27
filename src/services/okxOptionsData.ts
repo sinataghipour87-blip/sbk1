@@ -97,11 +97,12 @@ function isOkxEnvelope(value: unknown): value is { code: string; data: unknown[]
 }
 
 function isInstrument(value: unknown, asset: string): value is OkxInstrument {
+  const underlying = asset === 'ETH' ? 'ETH-USD' : `${asset}-USDT`;
   return isRecord(value) &&
     typeof value.instId === 'string' &&
     value.instType === 'OPTION' &&
-    value.uly === `${asset}-USDT` &&
-    value.instFamily === `${asset}-USDT` &&
+    value.uly === underlying &&
+    value.instFamily === underlying &&
     typeof value.ctVal === 'string' &&
     typeof value.ctMult === 'string' &&
     typeof value.ctValCcy === 'string' &&
@@ -140,7 +141,8 @@ export async function fetchOkxOptionsData(options: {
   fetcher?: typeof fetch;
 }): Promise<CouncilOptionsData> {
   const asset = getFreqtradePairBaseAsset(options.pair);
-  if (!asset || !['SOL', 'XRP', 'BNB'].includes(asset)) return unavailable(options.pair);
+  if (!asset || !['ETH', 'SOL', 'XRP', 'BNB'].includes(asset)) return unavailable(options.pair);
+  const underlying = asset === 'ETH' ? 'ETH-USD' : `${asset}-USDT`;
 
   const nowMs = options.nowMs ?? Date.now();
   const cached = cachedResults.get(options.pair);
@@ -155,7 +157,7 @@ export async function fetchOkxOptionsData(options: {
   try {
     const envelope = await request(fetcher, 'public/instruments', {
       instType: 'OPTION',
-      uly: `${asset}-USDT`,
+      uly: underlying,
     });
     if (!isOkxEnvelope(envelope)) throw new Error('OKX V5 instruments response is malformed.');
     const instruments = envelope.data.filter((item): item is OkxInstrument =>
@@ -178,15 +180,15 @@ export async function fetchOkxOptionsData(options: {
     if (eligibleInstruments.length === 0) {
       const result = unavailable(
         options.pair,
-        `OKX has no active OPTION contracts with underlying ${asset}-USDT; BTC/USD or another quote market was not substituted.`,
+        `OKX has no active OPTION contracts with underlying ${underlying}; another quote market was not substituted.`,
       );
       cachedResults.set(options.pair, { cachedAtMs: nowMs, result });
       return result;
     }
 
     const [summaryEnvelope, interestEnvelope, tickerEnvelope] = await Promise.all([
-      request(fetcher, 'public/opt-summary', { uly: `${asset}-USDT` }),
-      request(fetcher, 'public/open-interest', { instType: 'OPTION', uly: `${asset}-USDT` }),
+      request(fetcher, 'public/opt-summary', { uly: underlying }),
+      request(fetcher, 'public/open-interest', { instType: 'OPTION', uly: underlying }),
       request(fetcher, 'market/tickers', { instType: 'OPTION' }),
     ]);
     if (

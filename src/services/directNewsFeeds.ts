@@ -265,7 +265,12 @@ export async function fetchDirectNewsHeadlines(
         cache: 'no-store',
         headers: { Accept: 'application/rss+xml, application/xml, text/xml' },
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const restriction = response.status === 403 || response.status === 451
+          ? ' (regional/access restriction)'
+          : '';
+        throw new Error(`HTTP ${response.status}${restriction}`);
+      }
       const xml = await response.text();
       if (!/<rss\b|<rdf:RDF\b/i.test(xml)) throw new Error('Response is not an RSS or RDF feed.');
       const headlines = parseHeadlines(xml, source, pair, nowMs);

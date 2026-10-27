@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import type { AnalysisResult, MarketFeedQuality } from '../src/types/trading';
 import {
   evaluateEightMemberCouncil,
+  getCouncilWeightedVoteCounts,
   type EightMemberCouncilReport,
 } from '../src/services/eightMemberCouncil';
 import {
@@ -171,14 +172,18 @@ function runPostCouncilTradeControl(
   });
 }
 const baseCouncil = evaluateEightMemberCouncil({ nowMs });
+const councilMembers = baseCouncil.members.map((member, index) => ({
+  ...member,
+  vote: index < 5 ? 'LONG' as const : 'NEUTRAL' as const,
+}));
+const councilWeightedVotes = getCouncilWeightedVoteCounts(councilMembers);
 const council: EightMemberCouncilReport = {
   ...baseCouncil,
-  members: baseCouncil.members.map((member, index) => ({
-    ...member,
-    vote: index < 5 ? 'LONG' as const : 'NEUTRAL' as const,
-  })),
+  members: councilMembers,
   longVotes: 5,
   shortVotes: 0,
+  weightedLongVotes: councilWeightedVotes.long,
+  weightedShortVotes: councilWeightedVotes.short,
   neutralVotes: 3,
   abstentions: 0,
   quorumMet: true,
@@ -483,17 +488,21 @@ assert.equal(
   'the final pullback entry must pass the central price-deviation gate before approval',
 );
 
+const quorumWithAbstentionMembers = council.members.map((member, index) => ({
+  ...member,
+  vote: index === 0
+    ? 'ABSTAIN' as const
+    : index <= 5
+      ? 'LONG' as const
+      : 'NEUTRAL' as const,
+}));
+const quorumWithAbstentionWeightedVotes = getCouncilWeightedVoteCounts(quorumWithAbstentionMembers);
 const quorumWithAbstention: EightMemberCouncilReport = {
   ...council,
-  members: council.members.map((member, index) => ({
-    ...member,
-    vote: index === 0
-      ? 'ABSTAIN' as const
-      : index <= 5
-        ? 'LONG' as const
-        : 'NEUTRAL' as const,
-  })),
+  members: quorumWithAbstentionMembers,
   longVotes: 5,
+  weightedLongVotes: quorumWithAbstentionWeightedVotes.long,
+  weightedShortVotes: quorumWithAbstentionWeightedVotes.short,
   neutralVotes: 2,
   abstentions: 1,
 };

@@ -81,7 +81,12 @@ async function requestJson(url: URL, fetcher: typeof fetch): Promise<unknown> {
             : 250 * (2 ** attempt)));
         continue;
       }
-      if (!response.ok) throw new Error(`Etherscan returned HTTP ${response.status}.`);
+      if (!response.ok) {
+        const restriction = response.status === 403 || response.status === 451
+          ? ' (regional/access restriction)'
+          : '';
+        throw new Error(`Etherscan returned HTTP ${response.status}${restriction}.`);
+      }
       return await response.json();
     } catch (error) {
       if (attempt === 2 || (error instanceof Error && error.message.startsWith('Etherscan returned HTTP'))) {

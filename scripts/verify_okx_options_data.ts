@@ -71,6 +71,45 @@ assert.ok(requests.every((url) => url.searchParams.get('uly') === 'SOL-USDT' ||
   url.pathname.endsWith('/tickers')));
 
 resetOkxOptionsDataCacheForTests();
+const ethInstruments = instruments.map((instrument) => ({
+  ...instrument,
+  instId: instrument.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+  uly: 'ETH-USD',
+  instFamily: 'ETH-USD',
+  ctValCcy: 'ETH',
+  settleCcy: 'ETH',
+}));
+const ethRequests: URL[] = [];
+const ethOptions = await fetchOkxOptionsData({
+  pair: 'ETH/USDT:USDT',
+  nowMs,
+  fetcher: async (input) => {
+    const url = new URL(String(input));
+    ethRequests.push(url);
+    const path = url.pathname.split('/').at(-1);
+    if (path === 'instruments') return Response.json({ code: '0', data: ethInstruments, msg: '' });
+    if (path === 'opt-summary') return Response.json({ code: '0', data: summaries.map((item) => ({
+      ...item,
+      instId: item.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+    })), msg: '' });
+    if (path === 'open-interest') return Response.json({ code: '0', data: interests.map((item) => ({
+      ...item,
+      instId: item.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+    })), msg: '' });
+    if (path === 'tickers') return Response.json({ code: '0', data: tickers.map((item) => ({
+      ...item,
+      instId: item.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+    })), msg: '' });
+    throw new Error(`Unexpected OKX route ${url.pathname}`);
+  },
+});
+assert.equal(ethOptions.status, 'LIVE');
+assert.equal(ethOptions.asset, 'ETH');
+assert.equal(ethOptions.contractsCount, 20);
+assert.ok(ethRequests.every((url) => url.searchParams.get('uly') === 'ETH-USD' ||
+  url.pathname.endsWith('/tickers')));
+
+resetOkxOptionsDataCacheForTests();
 let secondaryRequests = 0;
 const noOptions = await fetchOkxOptionsData({
   pair: 'XRP/USDT:USDT',

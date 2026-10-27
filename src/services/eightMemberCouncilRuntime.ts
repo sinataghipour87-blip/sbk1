@@ -11,8 +11,10 @@ import {
   type CouncilMacroContext,
   type CouncilMemberVote,
   type CouncilMemberEvidenceCacheEntry,
+  type CouncilMemberSourceCheck,
   type CouncilModuleEvidence,
   type CouncilOptionsData,
+  type CouncilEthereumWhaleSignal,
   type CouncilWhaleFlowData,
   type EightMemberCouncilReport,
 } from './eightMemberCouncil';
@@ -51,6 +53,8 @@ interface RuntimeInput {
   freeMacroData?: FreeMacroDataResult;
   optionsData?: CouncilOptionsData;
   whaleFlowData?: CouncilWhaleFlowData;
+  ethereumWhaleSignals?: readonly CouncilEthereumWhaleSignal[];
+  memberSourceChecks?: Readonly<Record<number, readonly CouncilMemberSourceCheck[]>>;
   publicMarketFallback?: PublicMarketFallbackData;
   repositoryDir?: string;
   decisionSnapshotTimestampMs?: number;
@@ -67,6 +71,8 @@ type ModuleValue = {
 
 const COUNCIL_RETENTION_MS = 5 * 60 * 60_000;
 const COUNCIL_RETENTION_SWEEP_INTERVAL_MS = 60_000;
+const MAX_BTC_ONCHAIN_EVIDENCE_AGE_MS = 20 * 60_000;
+const MAX_ONCHAIN_EVIDENCE_AGE_MS = 5 * 60_000;
 const councilRetentionTimers = new Map<string, NodeJS.Timeout>();
 const councilRetentionLocks = new Map<string, Promise<void>>();
 const TRANSIENT_EVIDENCE_KEYS = new Set([
@@ -223,6 +229,9 @@ const MODULE_OUTPUTS_STORED_IN_MEMBER_SOURCE_DATA = new Set([
   'onchain.bitcoinActiveAddresses',
   'options.deribitPublicOptions',
   'onchain.bitcoinPublicTransfers',
+  'onchain.ethereumActiveAddresses',
+  'onchain.ethereumPublicTransfers',
+  'onchain.assetPublicTransfers',
   'macro.sp500',
   'macro.dxy',
   'macro.broadDollarProxy',
@@ -246,6 +255,17 @@ function isCouncilMemberVote(value: unknown): value is CouncilMemberVote {
     Array.isArray(value.inputIds) &&
     Array.isArray(value.moduleIds) &&
     ['LONG', 'SHORT', 'NEUTRAL', 'ABSTAIN'].includes(String(value.vote)) &&
+    (typeof value.sourceId === 'string' || value.sourceId === null) &&
+    (typeof value.fallbackSourceId === 'string' || value.fallbackSourceId === null) &&
+    (value.healthySourceCount === undefined || value.healthySourceCount === null ||
+      (Number.isInteger(value.healthySourceCount) && Number(value.healthySourceCount) >= 0 && Number(value.healthySourceCount) <= 4)) &&
+    (value.sourceChecks === undefined ||
+      (Array.isArray(value.sourceChecks) && value.sourceChecks.every((check) =>
+        isObject(check) &&
+        typeof check.sourceId === 'string' &&
+        ['HEALTHY', 'BROKEN', 'MISSING_API_KEY', 'REGION_RESTRICTED', 'UNTESTED'].includes(String(check.status)) &&
+        typeof check.detail === 'string'
+      ))) &&
     typeof value.rationaleFa === 'string' &&
     Array.isArray(value.qualityChecks) &&
     Array.isArray(value.supportingEvidence);
@@ -457,6 +477,7 @@ function sourceDataForMember(
   freeMacroData?: FreeMacroDataResult,
   optionsData?: CouncilOptionsData,
   whaleFlowData?: CouncilWhaleFlowData,
+  ethereumWhaleSignals?: readonly CouncilEthereumWhaleSignal[],
   publicMarketFallback?: PublicMarketFallbackData,
 ): Record<string, unknown> {
   const fallbackFeedSummary = (feed: {
@@ -621,7 +642,27 @@ function sourceDataForMember(
         whaleSentiment: isBitcoinPair ? macro.whaleSentiment : null,
         whaleNetflowBtc: isBitcoinPair ? macro.whaleNetflowBtc : null,
         provenance: scopedWhaleData?.provider ?? null,
-        bitcoinActiveAddresses: isBitcoinPair ? freeMacroData?.bitcoinActiveAddresses ?? null : null,
+        sourceId: scopedWhaleData?.sourceId ?? null,
+        fallbackSourceId: scopedWhaleData?.fallbackSourceId ?? null,
+        ...(isBitcoinPair
+          ? {
+            bitcoinActiveAddresses: freeMacroData?.bitcoinActiveAddresses ?? null,
+            bitcoinPublicTransfers: onchainEvidence?.values ?? [],
+          }
+          : getFreqtradePairBaseAsset(pair ?? '') === 'ETH'
+            ? {
+              ethereumActiveAddresses: null,
+              ethereumPublicTransfers: onchainEvidence?.values ?? [],
+              ethereumNativeTransfers: onchainEvidence?.values.filter((transfer) =>
+                transfer.asset.toUpperCase() === 'ETH' &&
+                transfer.transferId?.startsWith('erc20:') !== true
+              ) ?? [],
+              ethereumErc20Transfers: onchainEvidence?.values.filter((transfer) =>
+                transfer.transferId?.startsWith('erc20:') === true
+              ) ?? [],
+              whaleSignals: ethereumWhaleSignals ?? scopedWhaleData?.ethereumWhaleSignals ?? [],
+            }
+            : {}),
         publicOnChainData: scopedWhaleData
           ? {
             ...scopedWhaleData,
@@ -911,6 +952,13 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
     3 * 24 * 60 * 60_000,
     'شاخص تعداد آدرس‌های فعال شبکه بیت‌کوین؛ این داده جریان صرافی/نهنگ نیست و رأی جهت‌دار نمی‌سازد.',
   );
+  values['onchain.ethereumActiveAddresses'] = {
+    output: null,
+    sourceTimestampMs: null,
+    available: false,
+    resolvedStatus: 'UNAVAILABLE',
+    summaryFa: 'شاخص آدرس‌های فعال Ethereum در ورودی معتبر موجود نیست؛ دادهٔ بیت‌کوین جایگزین نمی‌شود.',
+  };
   const optionsData = input.optionsData;
   const optionsPairMatches = input.pair === undefined || optionsData?.pair === input.pair;
   const optionsAgeMs = optionsData?.timestampMs === null || optionsData?.timestampMs === undefined
@@ -937,19 +985,23 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
   const whaleFlowAgeMs = whaleFlow?.timestampMs === null || whaleFlow?.timestampMs === undefined
     ? null
     : (input.nowMs ?? Date.now()) - whaleFlow.timestampMs;
+  const maximumWhaleFlowAgeMs = whaleFlow?.asset === 'BTC'
+    ? MAX_BTC_ONCHAIN_EVIDENCE_AGE_MS
+    : MAX_ONCHAIN_EVIDENCE_AGE_MS;
   const whaleFlowAvailable = whaleFlow?.status === 'LIVE' &&
     whaleFlowAgeMs !== null &&
     whaleFlowAgeMs >= 0 &&
-    whaleFlowAgeMs <= 5 * 60_000 &&
+    whaleFlowAgeMs <= maximumWhaleFlowAgeMs &&
     whaleFlow.qualityPct >= 80 &&
     (Array.isArray(whaleFlow.largeTransfers) || isFiniteNumber(whaleFlow.netExchangeFlowBtc));
-  values['onchain.bitcoinPublicTransfers'] = {
+  const publicTransfersValue: ModuleValue = {
     output: whaleFlow ?? null,
     sourceTimestampMs: whaleFlow?.timestampMs ?? null,
     available: whaleFlowAvailable,
     resolvedStatus: whaleFlowAvailable
       ? 'AVAILABLE'
-      : whaleFlow?.status === 'STALE' || (whaleFlowAgeMs !== null && whaleFlowAgeMs > 5 * 60_000)
+      : whaleFlow?.status === 'STALE' ||
+          (whaleFlowAgeMs !== null && whaleFlowAgeMs > maximumWhaleFlowAgeMs)
         ? 'STALE'
         : 'UNAVAILABLE',
     summaryFa: whaleFlowAvailable
@@ -959,6 +1011,61 @@ function collectModuleValues(input: RuntimeInput, nowMs: number): Record<string,
           ? 'دادهٔ معتبر آن‌چین قدیمی‌تر از پنج دقیقه است و برای رأی استفاده نمی‌شود.'
           : 'دادهٔ خام زنجیره‌ای با کیفیت و تازگی لازم موجود نیست.'),
   };
+  const whaleAsset = input.pair === undefined
+    ? 'BTC'
+    : getFreqtradePairBaseAsset(input.pair);
+  const unavailableTransferValue: ModuleValue = {
+    output: null,
+    sourceTimestampMs: null,
+    available: false,
+    resolvedStatus: 'UNAVAILABLE',
+    summaryFa: 'این انتقال‌ها برای دارایی این جفت‌ارز نیستند و به‌عنوان شواهد این عضو استفاده نمی‌شوند.',
+  };
+  values['onchain.bitcoinPublicTransfers'] = whaleAsset === 'BTC'
+    ? publicTransfersValue
+    : unavailableTransferValue;
+  values['onchain.ethereumPublicTransfers'] = whaleAsset === 'ETH'
+    ? publicTransfersValue
+    : unavailableTransferValue;
+  values['onchain.assetPublicTransfers'] = {
+    output: whaleFlow ?? null,
+    sourceTimestampMs: whaleFlow?.timestampMs ?? null,
+    available: whaleFlowAvailable,
+    resolvedStatus: whaleFlowAvailable
+      ? 'AVAILABLE'
+      : whaleFlow?.status === 'STALE' ||
+          (whaleFlowAgeMs !== null && whaleFlowAgeMs > maximumWhaleFlowAgeMs)
+        ? 'STALE'
+        : 'UNAVAILABLE',
+    summaryFa: whaleFlowAvailable
+      ? `شواهد خامِ ${whaleAsset ?? 'دارایی نامشخص'} از ${whaleFlow.provider}؛ ${whaleFlow.transactionCount} انتقال مشاهده‌شده. نمونه‌گیری ناقص است و مالکیت، ورود/خروج از صرافی یا جهت خریدوفروش را ثابت نمی‌کند.`
+      : whaleFlow?.unavailableReason ??
+        'دادهٔ زنجیره‌ای معتبر و تازه برای دارایی همین اتاق موجود نیست.',
+  };
+  const ethereumWhaleSignals = input.ethereumWhaleSignals ??
+    (whaleAsset === 'ETH' ? whaleFlow?.ethereumWhaleSignals ?? [] : []);
+  const whaleSignalModuleIds: Readonly<Record<string, string>> = {
+    'onchain.hyperliquidWhales': 'whale.hyperliquid-accounts',
+    'onchain.deribitBlockTrades': 'whale.deribit-block-trades',
+    'onchain.ethLargeTransfers': 'onchain.ethereum-publicnode',
+    'onchain.exchangeLabels': 'onchain.ethereum-exchange-labels',
+  };
+  for (const [moduleId, sourceId] of Object.entries(whaleSignalModuleIds)) {
+    const signal = ethereumWhaleSignals.find((item) => item.sourceId === sourceId);
+    const available = signal?.status === 'LIVE' &&
+      signal.coverageComplete &&
+      signal.confidencePct > 0 &&
+      signal.weightPct > 0;
+    values[moduleId] = {
+      output: signal ?? null,
+      sourceTimestampMs: signal?.observedAtMs ?? null,
+      available,
+      resolvedStatus: available ? 'AVAILABLE' : 'UNAVAILABLE',
+      summaryFa: signal
+        ? `${signal.interpretationFa} ${signal.coverageComplete ? 'پوشش کامل.' : 'پوشش ناقص؛ وزن سیگنال کاهش یافته و منبع سالم محسوب نمی‌شود.'} وزن ${signal.weightPct}٪، اطمینان ${signal.confidencePct}٪.`
+        : 'پوشش ناقص: منبع سیگنال نهنگ در این اجرا داده‌ای ارائه نکرد.',
+    };
+  }
   values['macro.sp500'] = directMetricEvidence(
     macroData?.sp500,
     14 * 24 * 60 * 60_000,
@@ -1042,12 +1149,15 @@ export function evaluateEightMemberCouncilForSnapshot(input: {
   pair?: string;
   analysis: AnalysisResult;
   macroContext: CouncilMacroContext;
+  memberSourceChecks?: Readonly<Record<number, readonly CouncilMemberSourceCheck[]>>;
   nowMs?: number;
 }): EightMemberCouncilReport {
   return evaluateEightMemberCouncil({
     analysis: input.analysis,
     pair: input.pair,
     macroContext: makeMacroContext(input.macroContext, input.analysis.openSourceAdvisories, input.pair),
+    memberSourceChecks: input.memberSourceChecks,
+    requireMemberSourceQuorum: getFreqtradePairBaseAsset(input.pair ?? '') !== null,
     nowMs: input.nowMs,
   });
 }
@@ -1056,6 +1166,9 @@ export async function runEightMemberCouncilRuntime(
   input: RuntimeInput,
 ): Promise<EightMemberCouncilReport> {
   const nowMs = input.nowMs ?? Date.now();
+  const whaleFlowData = input.whaleFlowData && input.ethereumWhaleSignals
+    ? { ...input.whaleFlowData, ethereumWhaleSignals: [...input.ethereumWhaleSignals] }
+    : input.whaleFlowData;
   const pairScope = input.pair?.replace(/[^A-Z0-9]+/gi, '_');
   const scopedAdvisory = input.pair === undefined ||
     input.analysis.openSourceAdvisories?.pair === input.pair
@@ -1104,16 +1217,20 @@ export async function runEightMemberCouncilRuntime(
     : baseRepositoryDir;
   const memberSourceData = new Map(EIGHT_MEMBER_COUNCIL.map((member) => [
     member.id,
-    sourceDataForMember(
-      member.id,
+    {
+      ...sourceDataForMember(
+        member.id,
         input.pair,
         input.analysis,
-      macroContext,
-      input.freeMacroData,
-      input.optionsData,
-      input.whaleFlowData,
-      input.publicMarketFallback,
-    ),
+        macroContext,
+        input.freeMacroData,
+        input.optionsData,
+        whaleFlowData,
+        input.ethereumWhaleSignals,
+        input.publicMarketFallback,
+      ),
+      memberSourceChecks: input.memberSourceChecks?.[member.id] ?? [],
+    },
   ]));
   const evidenceFingerprints = Object.fromEntries(
     [...memberSourceData].map(([memberId, sourceData]) => [
@@ -1135,7 +1252,9 @@ export async function runEightMemberCouncilRuntime(
     macroContext,
     directMacroData: input.freeMacroData,
     optionsData: input.optionsData,
-    whaleFlowData: input.whaleFlowData,
+    whaleFlowData,
+    memberSourceChecks: input.memberSourceChecks,
+    requireMemberSourceQuorum: getFreqtradePairBaseAsset(input.pair ?? '') !== null,
     evidenceFingerprints,
     previousMemberEvidence,
     nowMs,

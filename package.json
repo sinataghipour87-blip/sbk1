@@ -18,6 +18,7 @@
     "verify:freqtrade:dry-run": "tsx scripts/verify_freqtrade_dry_run.ts",
     "verify:open-source-analysis": "tsx scripts/verify_open_source_advisories.ts",
     "verify:council-sources": "tsx scripts/verify_council_data_sources.ts",
+    "verify:council-eth-sources": "tsx scripts/verify_council_eth_sources.ts",
     "verify:council-sentiment": "tsx scripts/verify_council_sentiment_model.ts",
     "verify:market-fallback": "tsx scripts/verify_public_market_fallback.ts",
     "probe:market-fallback": "tsx scripts/probe_public_market_fallback.ts",

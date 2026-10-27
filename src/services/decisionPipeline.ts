@@ -27,7 +27,10 @@ import { realBayesianEngine } from './realBayesianEngine';
 import { realGarchEngine } from './realGarchEngine';
 import { entryOpportunityAndTiming } from './entryOpportunityAndTiming';
 import { calculateCentralRiskAllocation } from './centralRiskAllocation';
-import type { EightMemberCouncilReport } from './eightMemberCouncil';
+import {
+  getCouncilWeightedVoteCounts,
+  type EightMemberCouncilReport,
+} from './eightMemberCouncil';
 import type {
   IndependentModelPrediction,
   MultiBrainConsensusReport,
@@ -106,7 +109,8 @@ export function hasValidCouncilDelegationEvidence(
   const shortVotes = votes.filter((vote) => vote === 'SHORT').length;
   const neutralVotes = votes.filter((vote) => vote === 'NEUTRAL').length;
   const abstentions = votes.filter((vote) => vote === 'ABSTAIN').length;
-  const selectedDirection = longVotes >= 5 ? 'LONG' : shortVotes >= 5 ? 'SHORT' : null;
+  const weightedVotes = getCouncilWeightedVoteCounts(council.members);
+  const selectedDirection = weightedVotes.long >= 5 ? 'LONG' : weightedVotes.short >= 5 ? 'SHORT' : null;
   const memberIds = new Set(council.members.map(({ id }) => id));
 
   return council.quorumRequired === 5 &&
@@ -115,6 +119,8 @@ export function hasValidCouncilDelegationEvidence(
     [1, 2, 3, 4, 5, 6, 7, 8].every((id) => memberIds.has(id)) &&
     council.longVotes === longVotes &&
     council.shortVotes === shortVotes &&
+    (council.weightedLongVotes === undefined || Math.abs(council.weightedLongVotes - weightedVotes.long) < 1e-9) &&
+    (council.weightedShortVotes === undefined || Math.abs(council.weightedShortVotes - weightedVotes.short) < 1e-9) &&
     council.neutralVotes === neutralVotes &&
     council.abstentions === abstentions &&
     council.quorumMet === (selectedDirection !== null) &&

@@ -60,7 +60,9 @@ import {
   stopPublicBitcoinWhaleDataPrefetch,
 } from './publicBitcoinWhaleData';
 import { fetchPublicMarketFallback } from './publicMarketDataFallback';
-import { getConfiguredFreqtradePairs } from './freqtradePairs';
+import { getConfiguredFreqtradePairs, getFreqtradePairBaseAsset } from './freqtradePairs';
+import { checkCouncilMemberSources } from './councilSourceHealth';
+import { fetchEthereumWhaleEvidence } from './ethereumWhaleEvidence';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MINIMUM_CANDLES_FOR_ANALYSIS = 300;
@@ -877,7 +879,7 @@ export async function applyPublicMarketFallbackToCouncilAnalysis(
     sourceTimestampMs: number,
     maxAgeMs: number,
     detailsFa: string,
-    provider = fallback.provider,
+    provider: string = fallback.provider,
   ) => createMarketFeedQuality({
     feedName,
     source: provider,
@@ -1114,7 +1116,7 @@ async function analyzeSnapshot(
   councilReport?: EightMemberCouncilReport;
 }> {
   const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance, true);
-  const [freeMacroData, optionsData, whaleFlowData, publicMarketFallback] = await Promise.all([
+  const [freeMacroData, optionsData, whaleFlowData, publicMarketFallback, ethereumWhaleSignals] = await Promise.all([
     fetchFreeMacroData(),
     fetchCouncilOptionsData({ pair: snapshot.pair, nowMs }),
     fetchOnChainWhaleData({ pair: snapshot.pair, nowMs, priceUsd: analysis.price }),
@@ -1124,8 +1126,17 @@ async function analyzeSnapshot(
       market: snapshot.market,
       nowMs,
     }),
+    fetchEthereumWhaleEvidence({
+      pair: snapshot.pair,
+      priceUsd: analysis.price,
+      nowMs,
+    }),
   ]);
   const councilEvaluationNowMs = Math.max(nowMs, Date.now());
+  const councilAsset = getFreqtradePairBaseAsset(snapshot.pair);
+  const memberSourceChecks = councilAsset
+    ? await checkCouncilMemberSources(councilEvaluationNowMs, fetch, councilAsset, whaleFlowData)
+    : undefined;
   const latestCompletedCandleTimestampMs = snapshot.candles
     .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= councilEvaluationNowMs)
     .at(-1)?.timestampMs;
@@ -1180,6 +1191,8 @@ async function analyzeSnapshot(
     freeMacroData,
     optionsData,
     whaleFlowData,
+    ethereumWhaleSignals,
+    memberSourceChecks,
     publicMarketFallback,
     decisionSnapshotTimestampMs,
     nowMs: councilEvaluationNowMs,

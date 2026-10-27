@@ -8,7 +8,9 @@ import {
   UNWIRED_OR_LEGACY_ANALYSIS_MODULES,
   UNWIRED_TRADE_MANAGEMENT_MODULES,
   evaluateEightMemberCouncil,
+  getCouncilWeightedVoteCounts,
   getCouncilMacroBeta,
+  type CouncilMemberSourceCheck,
   validateCouncilModuleOwnership,
   type CouncilMacroContext,
 } from '../src/services/eightMemberCouncil';
@@ -855,6 +857,507 @@ const withOptions = evaluateEightMemberCouncil({
 });
 assert.equal(withOptions.members[4].vote, 'LONG');
 assert.equal(withOptions.longVotes, 6);
+
+const memberFiveSourceChecks: CouncilMemberSourceCheck[] = [
+  { sourceId: 'council.member5.deribit-options', status: 'HEALTHY', detail: 'Live Deribit options response.', dataValid: true, observedAtMs: nowMs, normalizedData: { putCallOpenInterestRatio: 0.7 } },
+  { sourceId: 'council.member5.okx-opt-summary', status: 'BROKEN', detail: 'HTTP 500.', dataValid: false },
+  { sourceId: 'council.member5.bybit-options', status: 'REGION_RESTRICTED', detail: 'HTTP 403.', dataValid: false },
+  { sourceId: 'council.member5.binance-eapi', status: 'MISSING_API_KEY', detail: 'API key absent.', dataValid: false },
+];
+const insufficientMemberSources = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  optionsData: {
+    pair: 'ETH/USDT:USDT',
+    asset: 'ETH',
+    sourceId: 'council.member5.deribit-options',
+    provider: 'Deribit',
+    status: 'LIVE',
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 90,
+    impliedVolatilityPct: 55,
+    putCallRatio: 0.7,
+    contractsCount: 24,
+    expiryTimestampMs: nowMs + 24 * 60 * 60_000,
+    strikePrice: 3_000,
+    skewPct: 2.5,
+  },
+  memberSourceChecks: { 5: memberFiveSourceChecks },
+  requireMemberSourceQuorum: true,
+  nowMs,
+});
+assert.equal(insufficientMemberSources.members[4].vote, 'ABSTAIN');
+assert.equal(insufficientMemberSources.members[4].healthySourceCount, 1);
+assert.equal(insufficientMemberSources.members[4].sourceChecks.length, 4);
+assert.match(insufficientMemberSources.members[4].rationaleFa, /1\/4/);
+
+const validMemberFiveVote = {
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  optionsData: {
+    pair: 'ETH/USDT:USDT',
+    asset: 'ETH',
+    sourceId: 'council.member5.deribit-options',
+    provider: 'Deribit',
+    status: 'LIVE' as const,
+    timestampMs: nowMs - 1_000,
+    ageMs: 1_000,
+    qualityPct: 90,
+    impliedVolatilityPct: 55,
+    putCallRatio: 1.6,
+    contractsCount: 24,
+    expiryTimestampMs: nowMs + 24 * 60 * 60_000,
+    strikePrice: 3_000,
+    skewPct: 2.5,
+  },
+  requireMemberSourceQuorum: true,
+  nowMs,
+};
+const fourHealthySources = memberFiveSourceChecks.map((check) => ({
+  ...check,
+  status: 'HEALTHY' as const,
+  dataValid: true,
+  observedAtMs: nowMs,
+  normalizedData: { putCallOpenInterestRatio: 0.7 },
+}));
+const twoHealthySources = memberFiveSourceChecks.map((check, index) => ({
+  ...check,
+  status: index < 2 ? 'HEALTHY' as const : check.status,
+  dataValid: index < 2,
+  observedAtMs: index < 2 ? nowMs : null,
+  normalizedData: index < 2 ? { putCallOpenInterestRatio: 0.7 } : {},
+}));
+const oneHealthySource = memberFiveSourceChecks.map((check, index) => ({
+  ...check,
+  status: index === 0 ? 'HEALTHY' as const : check.status,
+}));
+const fourHealthyVote = evaluateEightMemberCouncil({
+  ...validMemberFiveVote,
+  memberSourceChecks: { 5: fourHealthySources },
+}).members[4];
+const twoHealthyVote = evaluateEightMemberCouncil({
+  ...validMemberFiveVote,
+  memberSourceChecks: { 5: twoHealthySources },
+}).members[4];
+const oneHealthyVote = evaluateEightMemberCouncil({
+  ...validMemberFiveVote,
+  memberSourceChecks: { 5: oneHealthySource },
+}).members[4];
+assert.equal(fourHealthyVote.vote, 'LONG', 'four healthy sources preserve a normal member vote');
+assert.equal(fourHealthyVote.healthySourceCount, 4);
+assert.equal(twoHealthyVote.vote, 'LONG', 'two healthy sources meet the member quorum');
+assert.equal(twoHealthyVote.healthySourceCount, 2);
+assert.equal(oneHealthyVote.vote, 'ABSTAIN', 'one healthy source is below the member quorum');
+assert.equal(oneHealthyVote.healthySourceCount, 1);
+assert.equal(oneHealthyVote.sourceId, 'council.member5.deribit-options');
+
+const memberTwoIds = [
+  'council.member2.coinbase-trades',
+  'council.member2.kraken-trades',
+  'council.member2.okx-trades',
+  'council.member2.bitfinex-trades',
+];
+const memberTwoSourceChecks: CouncilMemberSourceCheck[] = memberTwoIds.map((sourceId, index) => ({
+  sourceId,
+  status: index < 2 ? 'HEALTHY' : 'BROKEN',
+  detail: 'Five-minute classified trade-flow measurement.',
+  dataValid: index < 2,
+  observedAtMs: nowMs,
+  normalizedData: index < 2
+    ? {
+      cvdEth: 2,
+      buyVolumeEth: 3,
+      sellVolumeEth: 1,
+      classifiedTradeCount: 6,
+      cvdWindowMs: 5 * 60_000,
+      tradeTimestampMs: nowMs - 1_000,
+    }
+    : {},
+}));
+const memberTwoVote = (checks: CouncilMemberSourceCheck[]) => evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: { 2: checks },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[1];
+const memberTwoFourSources = memberTwoVote(memberTwoSourceChecks.map((check) => ({
+  ...check,
+  status: 'HEALTHY',
+  dataValid: true,
+  normalizedData: {
+    cvdEth: 2,
+    buyVolumeEth: 3,
+    sellVolumeEth: 1,
+    classifiedTradeCount: 6,
+    cvdWindowMs: 5 * 60_000,
+    tradeTimestampMs: nowMs - 1_000,
+  },
+})));
+const memberTwoTwoSources = memberTwoVote(memberTwoSourceChecks);
+const memberTwoOneSource = memberTwoVote(memberTwoSourceChecks.map((check, index) => ({
+  ...check,
+  status: index === 3 ? 'HEALTHY' : 'BROKEN',
+  dataValid: index === 3,
+  normalizedData: index === 3
+    ? {
+      cvdEth: -2,
+      buyVolumeEth: 1,
+      sellVolumeEth: 3,
+      classifiedTradeCount: 8,
+      cvdWindowMs: 5 * 60_000,
+      tradeTimestampMs: nowMs - 1_000,
+    }
+    : {},
+})));
+assert.equal(memberTwoFourSources.vote, 'LONG');
+assert.equal(memberTwoFourSources.healthySourceCount, 4);
+assert.equal(memberTwoTwoSources.vote, 'LONG');
+assert.equal(memberTwoTwoSources.healthySourceCount, 2);
+assert.equal(memberTwoOneSource.vote, 'SHORT',
+  'member 2 may vote from a single valid exchange after automatic failover');
+assert.equal(memberTwoOneSource.healthySourceCount, 1);
+assert.equal(memberTwoOneSource.sourceId, 'council.member2.bitfinex-trades');
+assert.equal(memberTwoOneSource.fallbackSourceId, 'council.member2.bitfinex-trades');
+assert.match(memberTwoOneSource.rationaleFa, /Failover فعال/);
+
+const memberSevenSourceChecks: CouncilMemberSourceCheck[] = [
+  {
+    sourceId: 'council.member7.fred',
+    status: 'HEALTHY',
+    detail: 'Dated public FRED series with S&P and broad-dollar changes.',
+    dataValid: true,
+    observedAtMs: nowMs,
+    normalizedData: { macroDirectionValue: 1 },
+  },
+  {
+    sourceId: 'council.member7.cboe-vix',
+    status: 'HEALTHY',
+    detail: 'Dated VIX close and change.',
+    dataValid: true,
+    observedAtMs: nowMs,
+    normalizedData: { macroDirectionValue: -1 },
+  },
+  {
+    sourceId: 'council.member7.yahoo-chart',
+    status: 'HEALTHY',
+    detail: 'Unofficial dated daily Yahoo observations.',
+    dataValid: true,
+    observedAtMs: nowMs,
+    normalizedData: { macroDirectionValue: 1 },
+  },
+  {
+    sourceId: 'council.member7.fred-market-series',
+    status: 'HEALTHY',
+    detail: 'Additional dated FRED series from the same provider family.',
+    dataValid: true,
+    observedAtMs: nowMs,
+    normalizedData: { macroDirectionValue: 1 },
+  },
+];
+const memberSevenBase = {
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  requireMemberSourceQuorum: true,
+  nowMs,
+};
+const memberSevenFourSources = evaluateEightMemberCouncil({
+  ...memberSevenBase,
+  memberSourceChecks: { 7: memberSevenSourceChecks },
+}).members[6];
+const memberSevenTwoSources = evaluateEightMemberCouncil({
+  ...memberSevenBase,
+  memberSourceChecks: {
+    7: memberSevenSourceChecks.map((check, index) => index < 2
+      ? check
+      : { ...check, status: 'BROKEN', dataValid: false }),
+  },
+}).members[6];
+assert.equal(memberSevenFourSources.vote, 'LONG');
+assert.equal(memberSevenFourSources.healthySourceCount, 4);
+assert.ok((memberSevenFourSources.confidencePct ?? 100) <= 40);
+const memberSevenOneSource = evaluateEightMemberCouncil({
+  ...memberSevenBase,
+  memberSourceChecks: {
+    7: memberSevenSourceChecks.map((check, index) => index !== 0
+      ? { ...check, status: 'BROKEN', dataValid: false }
+      : check),
+  },
+}).members[6];
+assert.equal(memberSevenTwoSources.vote, 'NEUTRAL',
+  'two dated member-7 macro sources must produce a source-driven vote');
+assert.equal(memberSevenTwoSources.healthySourceCount, 2);
+assert.equal(memberSevenOneSource.vote, 'ABSTAIN',
+  'one dated member-7 macro source must abstain');
+assert.equal(memberSevenOneSource.healthySourceCount, 1);
+assert.ok((memberSevenTwoSources.confidencePct ?? 100) <= 40,
+  'member 7 macro heuristic confidence is capped at 40 percent');
+
+const memberSixDirectionalChecks: CouncilMemberSourceCheck[] = [
+  {
+    sourceId: 'council.member6.defillama',
+    status: 'HEALTHY',
+    detail: 'Seven-day stablecoin supply change, heuristic only.',
+    dataValid: true,
+    normalizedData: {
+      stablecoinSupplyChange7dPct: 0.8,
+      observationTimestampMs: nowMs - 60_000,
+    },
+  },
+  {
+    sourceId: 'council.member6.staking-deposits',
+    status: 'HEALTHY',
+    detail: '24-hour confirmed deposit-contract inflow.',
+    dataValid: true,
+    normalizedData: {
+      stakingDeposits24hEth: 1_500,
+      stakingDepositEventCount: 30,
+      stakingDepositIntervalHours: 24,
+      observationTimestampMs: nowMs - 30_000,
+    },
+  },
+  {
+    sourceId: 'council.member6.fee-history',
+    status: 'BROKEN',
+    detail: 'Recent network activity.',
+    dataValid: false,
+    voteValue: 'LOW_VALUE',
+    normalizedData: { meanGasUsedRatio: 0.5 },
+  },
+  {
+    sourceId: 'council.member6.defillama-dex-volume',
+    status: 'HEALTHY',
+    detail: 'Daily Ethereum DEX-volume activity context.',
+    dataValid: true,
+    voteValue: 'LOW_VALUE',
+    normalizedData: {
+      ethereumDexVolume24hUsd: 1_250_000_000,
+      ethereumDexVolumeChange1dPct: -9.6,
+      ethereumDexVolumeChange7dPct: -5.1,
+    },
+  },
+];
+const memberSixFourSourceVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: {
+    6: memberSixDirectionalChecks.map((check) => ({
+      ...check,
+      status: 'HEALTHY',
+      dataValid: true,
+    })),
+  },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[5];
+const memberSixTwoSourceVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: { 6: memberSixDirectionalChecks },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[5];
+const memberSixOneSourceVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: {
+    6: memberSixDirectionalChecks.map((check, index) => index === 1
+      ? { ...check, status: 'BROKEN', dataValid: false, normalizedData: {} }
+      : check),
+  },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[5];
+const memberSixConflictingVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: {
+    6: memberSixDirectionalChecks.map((check) => check.sourceId === 'council.member6.defillama'
+      ? { ...check, normalizedData: { stablecoinSupplyChange7dPct: -0.8 } }
+      : check),
+  },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[5];
+assert.equal(memberSixFourSourceVote.vote, 'LONG');
+assert.equal(memberSixFourSourceVote.healthySourceCount, 4);
+assert.equal(memberSixTwoSourceVote.vote, 'LONG',
+  'two valid member-6 heuristics that agree produce a low-confidence vote');
+assert.equal(memberSixTwoSourceVote.healthySourceCount, 3,
+  'the two directional sources plus healthy DEX context are reported in source-health count');
+assert.match(memberSixTwoSourceVote.rationaleFa, /حجم DEX روزانه/,
+  'member-6 rationale includes live on-chain DEX-volume context without treating it as direction');
+assert.ok((memberSixTwoSourceVote.confidencePct ?? 100) <= 40);
+assert.equal(memberSixTwoSourceVote.voteWeightPct, 40,
+  'member-6 on-chain heuristics contribute only 40 percent of a normal council vote');
+assert.deepEqual(getCouncilWeightedVoteCounts([
+  ...Array.from({ length: 4 }, () => ({ vote: 'LONG' as const, voteWeightPct: 100 })),
+  memberSixTwoSourceVote,
+]), { long: 4.4, short: 0 },
+  'the two agreeing on-chain metrics add only 0.4 weighted votes');
+assert.equal(memberSixOneSourceVote.vote, 'ABSTAIN',
+  'one valid member-6 directional metric is insufficient');
+assert.equal(memberSixConflictingVote.vote, 'NEUTRAL',
+  'conflicting member-6 on-chain heuristics must be neutral, not abstain');
+
+const memberEightNoFreshEthNewsChecks: CouncilMemberSourceCheck[] = [
+  'decrypt',
+  'the-block',
+  'coindesk',
+  'google-news',
+].map((provider) => ({
+  sourceId: `council.member8.${provider}`,
+  status: 'HEALTHY',
+  detail: 'RSS parsed with no recent ETH-specific matches.',
+  httpHealthy: true,
+  dataValid: true,
+  normalizedData: {
+    ethRelevantItemCount24h: 0,
+    freshEthItemCount: 0,
+    rssEthItemsJson: '[]',
+  },
+}));
+const memberEightFilteredVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: { 8: memberEightNoFreshEthNewsChecks },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[7];
+assert.equal(memberEightFilteredVote.vote, 'ABSTAIN');
+assert.match(memberEightFilteredVote.rationaleFa, /کمبود خبر/);
+assert.equal(memberEightFilteredVote.sourceId, 'council.member8.decrypt');
+
+const makeMemberEightNews = (
+  sourceId: string,
+  publisher: string,
+  title: string,
+): CouncilMemberSourceCheck => ({
+  sourceId,
+  status: 'HEALTHY',
+  detail: 'Live RSS fixture with one recent ETH item.',
+  dataValid: true,
+  observedAtMs: nowMs,
+  normalizedData: {
+    ethRelevantItemCount24h: 1,
+    freshEthItemCount: 1,
+    rssEthItemsJson: JSON.stringify([{
+      title,
+      description: '',
+      categories: [],
+      publisher,
+      publishedAt: new Date(nowMs - 30 * 60_000).toISOString(),
+      publishedAtMs: nowMs - 30 * 60_000,
+    }]),
+  },
+});
+const memberEightLiveChecks = [
+  makeMemberEightNews('council.member8.decrypt', 'Decrypt', 'Ethereum adoption gains momentum'),
+  makeMemberEightNews('council.member8.the-block', 'The Block', 'Ether rally draws strong inflows'),
+  makeMemberEightNews('council.member8.coindesk', 'CoinDesk', 'Ethereum upgrade improves network growth'),
+  makeMemberEightNews('council.member8.google-news', 'Crypto News', 'Ether bullish trend gains'),
+];
+const memberEightFourSources = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: { 8: memberEightLiveChecks },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[7];
+const memberEightTwoSources = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: { 8: memberEightLiveChecks.slice(0, 2) },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[7];
+const memberEightOneSource = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  memberSourceChecks: { 8: memberEightLiveChecks.slice(0, 1) },
+  requireMemberSourceQuorum: true,
+  nowMs,
+}).members[7];
+assert.equal(memberEightFourSources.vote, 'LONG');
+assert.equal(memberEightFourSources.healthySourceCount, 4);
+assert.ok((memberEightFourSources.confidencePct ?? 100) <= 40);
+assert.equal(memberEightTwoSources.vote, 'LONG',
+  'two publishers with fresh ETH news and lexicon scores produce a low-confidence vote');
+assert.equal(memberEightTwoSources.healthySourceCount, 2);
+assert.equal(memberEightOneSource.vote, 'ABSTAIN',
+  'one publisher does not meet the member-8 coverage requirement');
+
+const noHealthChecksVote = evaluateEightMemberCouncil(validMemberFiveVote).members[4];
+assert.equal(noHealthChecksVote.vote, 'SHORT',
+  'missing health observations alone must not turn an otherwise valid vote into abstention');
+assert.equal(noHealthChecksVote.healthySourceCount, null);
+
+const incompleteEthWhaleSignals = [
+  {
+    sourceId: 'whale.hyperliquid-accounts',
+    status: 'LIVE' as const,
+    direction: 'LONG' as const,
+    confidencePct: 50,
+    weightPct: 20,
+    coverage: 'configured accounts only',
+    coverageComplete: false,
+    observedAtMs: nowMs - 1_000,
+    interpretationFa: 'پوشش ناقص؛ وزن پایین.',
+    evidence: { positions: 1 },
+  },
+  {
+    sourceId: 'whale.deribit-block-trades',
+    status: 'LIVE' as const,
+    direction: 'LONG' as const,
+    confidencePct: 50,
+    weightPct: 20,
+    coverage: 'recent block trades only',
+    coverageComplete: false,
+    observedAtMs: nowMs - 1_000,
+    interpretationFa: 'پوشش ناقص؛ وزن پایین.',
+    evidence: { blockTradeCount: 2 },
+  },
+];
+const weightedEthWhaleVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    pair: 'ETH/USDT:USDT',
+    asset: 'ETH',
+    status: 'UNAVAILABLE',
+    provider: 'verification-only',
+    timestampMs: null,
+    ageMs: null,
+    qualityPct: 0,
+    coverageStatus: 'UNAVAILABLE',
+    ethereumWhaleSignals: incompleteEthWhaleSignals,
+    exchangeInflowsBtc: null,
+    exchangeOutflowsBtc: null,
+    netExchangeFlowBtc: null,
+    transactionCount: 0,
+    windowStartHeight: null,
+    windowEndHeight: null,
+  },
+  nowMs,
+}).members[5];
+assert.equal(weightedEthWhaleVote.vote, 'LONG',
+  'two agreeing, low-weight live ETH whale signals may contribute directionally');
+assert.equal(weightedEthWhaleVote.sourceId, 'whale.hyperliquid-accounts');
+assert.match(weightedEthWhaleVote.rationaleFa, /احتمال فروش|پوشش‌تعدیل‌شده/);
 
 const incompleteOptions = evaluateEightMemberCouncil({
   analysis,

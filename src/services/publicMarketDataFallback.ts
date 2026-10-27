@@ -424,7 +424,7 @@ async function fetchPublicCandlesWithFallback(options: {
       const feed = freshFeed(candles, latestCloseMs, evaluatedAtMs, candleMaxAgeMs(interval));
       return {
         ...feed,
-        provider: `${source.provider} public REST API`,
+        provider: providerForEndpoint(source.url),
         endpoint: source.url,
         receivedAtMs: retrievedAtMs,
         ...(errors.length > 0

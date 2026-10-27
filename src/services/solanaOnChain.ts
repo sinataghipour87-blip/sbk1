@@ -242,8 +242,18 @@ async function fetchWithoutApiKey(options: {
         observedAtMs,
         retrievedAtMs: checkedAtMs,
       });
-      cached.set(options.pair, { cachedAtMs: checkedAtMs, value: result });
-      return result;
+      const sourceId = provider.endpoint === PUBLIC_RPC_PROVIDERS[0].endpoint
+        ? 'onchain.solana-public-rpc'
+        : 'onchain.solana-publicnode';
+      const resultWithSource: CouncilWhaleFlowData = {
+        ...result,
+        sourceId,
+        fallbackSourceId: sourceId === 'onchain.solana-publicnode'
+          ? 'onchain.solana-public-rpc'
+          : undefined,
+      };
+      cached.set(options.pair, { cachedAtMs: checkedAtMs, value: resultWithSource });
+      return resultWithSource;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       providerErrors.push(`${provider.name}: ${reason}`);
@@ -432,8 +442,12 @@ export async function fetchSolanaOnChainData(options: {
       observedAtMs: latestObservedAtMs,
       retrievedAtMs,
     });
-    cached.set(options.pair, { cachedAtMs: nowMs, value: result });
-    return { ...result };
+    const resultWithSource: CouncilWhaleFlowData = {
+      ...result,
+      sourceId: 'onchain.helius-solana',
+    };
+    cached.set(options.pair, { cachedAtMs: nowMs, value: resultWithSource });
+    return { ...resultWithSource };
   } catch (error) {
     const reason = redactCredential(error, apiKey);
     console.error('[SolanaOnChain] Helius source unavailable:', reason);

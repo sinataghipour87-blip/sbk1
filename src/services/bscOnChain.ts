@@ -146,9 +146,16 @@ export async function fetchBscOnChainData(options: {
       fetcher: options.fetcher,
     });
     if (result.status !== 'UNAVAILABLE') {
+      const sourceId = result.provider.includes('PublicNode')
+        ? 'onchain.bsc-publicnode'
+        : 'onchain.bsc-public-rpc';
       return {
         ...result,
         provider: `${result.provider} (keyless fallback for BscScan)`,
+        sourceId,
+        fallbackSourceId: sourceId === 'onchain.bsc-publicnode'
+          ? 'onchain.bsc-public-rpc'
+          : undefined,
       };
     }
     return result;
@@ -206,14 +213,17 @@ export async function fetchBscOnChainData(options: {
         'BscScan returned no timestamped native-BNB transactions for the configured CEX wallets.',
       );
     }
-    const result = makeOnChainFlow({
-      pair: options.pair,
-      asset: 'BNB',
-      provider: ETHERSCAN_PROVIDER,
-      transfers,
-      observedAtMs: latestObservedAtMs,
-      retrievedAtMs,
-    });
+    const result = {
+      ...makeOnChainFlow({
+        pair: options.pair,
+        asset: 'BNB',
+        provider: ETHERSCAN_PROVIDER,
+        transfers,
+        observedAtMs: latestObservedAtMs,
+        retrievedAtMs,
+      }),
+      sourceId: 'onchain.bscscan-bnb',
+    };
     cached.set(options.pair, { cachedAtMs: nowMs, value: result });
     return { ...result };
   } catch (error) {

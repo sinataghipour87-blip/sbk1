@@ -12,7 +12,8 @@ const MEMPOOL_API = 'https://mempool.space/api';
 const BLOCKSTREAM_API = 'https://blockstream.info/api';
 const CACHE_TTL_MS = 60_000;
 const LAST_SUCCESSFUL_CACHE_TTL_MS = 20 * 60_000;
-const MAX_ONCHAIN_VOTE_AGE_MS = 5 * 60_000;
+const MAX_BITCOIN_SAMPLE_AGE_MS = 20 * 60_000;
+const MAX_ETH_TRANSFER_AGE_MS = 5 * 60_000;
 const DEFAULT_TIMEOUT_MS = 2_500;
 const DEFAULT_MAX_AGE_MS = 20 * 60_000;
 const DEFAULT_BTC_THRESHOLD = 10;
@@ -178,7 +179,7 @@ async function refreshPublicBitcoinWhaleData(options: {
       : cacheEvaluationNowMs - cachedResult.timestampMs;
     return {
       ...cachedResult,
-      status: ageMs !== null && ageMs <= MAX_ONCHAIN_VOTE_AGE_MS ? 'LIVE' : 'STALE',
+      status: ageMs !== null && ageMs <= MAX_BITCOIN_SAMPLE_AGE_MS ? 'LIVE' : 'STALE',
       largeTransfers: (cachedResult.largeTransfers ?? []).map((transfer) => ({
         ...transfer,
         estimatedUsd: finiteNumber(options.btcPriceUsd) && options.btcPriceUsd > 0
@@ -282,11 +283,21 @@ async function refreshPublicBitcoinWhaleData(options: {
     const latestBlock = blocks[0];
     const timestampMs = latestBlock.timestamp * 1_000;
     const ageMs = verificationNowMs - timestampMs;
+    const sourceId = sourceName === 'mempool.space'
+      ? 'onchain.mempool-blocks'
+      : 'onchain.blockstream-blocks';
+    const fallbackSourceId = sourceName === 'Blockstream'
+      ? 'onchain.mempool-blocks'
+      : undefined;
     if (ageMs < 0 || ageMs > maxAgeMs) {
-      return unavailable(`${sourceName} latest sampled block is stale or has a future timestamp.`, 'STALE');
+      return {
+        ...unavailable(`${sourceName} latest sampled block is stale or has a future timestamp.`, 'STALE'),
+        sourceId,
+        fallbackSourceId,
+      };
     }
     cachedResult = {
-      status: ageMs <= MAX_ONCHAIN_VOTE_AGE_MS ? 'LIVE' : 'STALE',
+      status: ageMs <= MAX_BITCOIN_SAMPLE_AGE_MS ? 'LIVE' : 'STALE',
       provider: `${sourceName} public REST API (sampled confirmed BTC outputs)`,
       timestampMs,
       retrievedAtMs: verificationNowMs,
@@ -300,6 +311,8 @@ async function refreshPublicBitcoinWhaleData(options: {
       transactionCount: transfers.length,
       windowStartHeight: blocks[blocks.length - 1].height,
       windowEndHeight: latestBlock.height,
+      sourceId,
+      fallbackSourceId,
     };
     cachedAtMs = nowMs;
     lastSuccessfulAtMs = nowMs;
@@ -317,7 +330,7 @@ async function refreshPublicBitcoinWhaleData(options: {
       const ageMs = timestampMs === null ? null : nowMs - timestampMs;
       return {
         ...lastSuccessfulResult,
-        status: ageMs !== null && ageMs <= MAX_ONCHAIN_VOTE_AGE_MS ? 'LIVE' : 'STALE',
+        status: ageMs !== null && ageMs <= MAX_BITCOIN_SAMPLE_AGE_MS ? 'LIVE' : 'STALE',
         ageMs,
         unavailableReason: `Public Bitcoin refresh failed (${reason}); using the last successful sample from ${Math.round((nowMs - lastSuccessfulAtMs) / 60_000)} minutes ago.`,
         largeTransfers: [...(lastSuccessfulResult.largeTransfers ?? [])],
@@ -432,53 +445,74 @@ export async function fetchOnChainWhaleData(options: {
     };
   }
   if (asset === 'ETH') {
-    try {
-      if (!process.env.ETHERSCAN_API_KEY?.trim()) {
-        const addresses = getConfiguredAddresses();
-        const threshold = Number(process.env.SBK1_WHALE_MIN_ETH ?? '100');
-        if (addresses.length === 0) {
-          return {
-            ...unavailable('Verified Ethereum CEX watchlist is not configured.'),
-            pair: options.pair,
-            asset,
-            provider: 'Ethereum mainnet public JSON-RPC (chainid=1)',
-          };
-        }
-        const publicRpcResult = await fetchPublicEvmOnChainData({
-          pair: options.pair,
-          asset: 'ETH',
-          blockchain: 'ethereum',
-          chainId: 1,
-          providers: [
-            { name: 'PublicNode Ethereum RPC', endpoint: 'https://ethereum-rpc.publicnode.com/' },
-            { name: '1RPC Ethereum', endpoint: 'https://1rpc.io/eth' },
-          ],
-          addresses,
-          threshold,
-          priceUsd: options.priceUsd,
-          nowMs: options.nowMs,
-          fetcher: options.fetcher,
-        });
+    const addresses = getConfiguredAddresses();
+    const threshold = Number(process.env.SBK1_WHALE_MIN_ETH ?? '100');
+    const fetchEthereumPublicRpcFallback = async (
+      primaryFailure?: string,
+    ): Promise<CouncilWhaleFlowData> => {
+      if (addresses.length === 0) {
         return {
-          ...publicRpcResult,
+          ...unavailable(primaryFailure
+            ? `Etherscan unavailable (${primaryFailure}); verified Ethereum CEX watchlist is not configured.`
+            : 'Verified Ethereum CEX watchlist is not configured.'),
           pair: options.pair,
           asset,
+          provider: 'Ethereum mainnet public JSON-RPC (chainid=1)',
+          sourceId: 'onchain.ethereum-publicnode',
+          fallbackSourceId: primaryFailure ? 'onchain.etherscan-v2' : undefined,
         };
       }
-      const transfers = (await fetchEtherscanWhaleTransfers({
+      const rpcResult = await fetchPublicEvmOnChainData({
+        pair: options.pair,
+        asset: 'ETH',
+        blockchain: 'ethereum',
+        chainId: 1,
+        providers: [
+          { name: 'PublicNode Ethereum RPC', endpoint: 'https://ethereum-rpc.publicnode.com/' },
+          { name: '1RPC Ethereum', endpoint: 'https://1rpc.io/eth' },
+        ],
+        addresses,
+        threshold,
+        priceUsd: options.priceUsd,
+        nowMs: options.nowMs,
+        fetcher: options.fetcher,
+      });
+      const usedOneRpc = rpcResult.provider.includes('1RPC');
+      const rpcSourceId = usedOneRpc ? 'onchain.ethereum-1rpc' : 'onchain.ethereum-publicnode';
+      return {
+        ...rpcResult,
+        pair: options.pair,
+        asset,
+        sourceId: rpcSourceId,
+        fallbackSourceId: primaryFailure
+          ? 'onchain.etherscan-v2'
+          : usedOneRpc
+            ? 'onchain.ethereum-publicnode'
+            : undefined,
+        unavailableReason: primaryFailure
+          ? `Etherscan unavailable (${primaryFailure}); ${rpcResult.unavailableReason ?? `using ${rpcResult.provider}.`}`
+          : rpcResult.unavailableReason,
+      };
+    };
+    try {
+      if (!process.env.ETHERSCAN_API_KEY?.trim()) {
+        return fetchEthereumPublicRpcFallback();
+      }
+      const transfers = await fetchEtherscanWhaleTransfers({
         nowMs: options.nowMs ?? Date.now(),
         ethPriceUsd: options.priceUsd,
         fetcher: options.fetcher,
-      })).filter((transfer) => transfer.asset === 'ETH');
+      });
       if (transfers.length > 0) {
         const timestampMs = Math.max(...transfers.map((transfer) => transfer.timestampMs));
         const ageMs = Math.max(0, (options.nowMs ?? Date.now()) - timestampMs);
-        const isFresh = ageMs <= MAX_ONCHAIN_VOTE_AGE_MS;
+        const isFresh = ageMs <= MAX_ETH_TRANSFER_AGE_MS;
         return {
           pair: options.pair,
           asset,
           status: isFresh ? 'LIVE' : 'STALE',
-          provider: 'Etherscan Ethereum native-asset configured address watchlist',
+          provider: 'Etherscan Ethereum configured address watchlist (native ETH and ERC-20)',
+          sourceId: 'onchain.etherscan-v2',
           timestampMs,
           retrievedAtMs: Date.now(),
           ageMs,
@@ -496,24 +530,12 @@ export async function fetchOnChainWhaleData(options: {
           windowEndHeight: null,
         };
       }
+      return fetchEthereumPublicRpcFallback('Etherscan returned no qualifying confirmed native ETH or configured ERC-20 transfers.');
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       console.error('[PublicBitcoinWhaleData] Ethereum on-chain source unavailable:', reason);
-      return {
-        ...unavailable(`Ethereum source unavailable: ${reason}`),
-        pair: options.pair,
-        asset,
-        provider: process.env.ETHERSCAN_API_KEY?.trim()
-          ? 'Etherscan Ethereum on-chain source'
-          : 'Ethereum mainnet public JSON-RPC (chainid=1)',
-      };
+      return fetchEthereumPublicRpcFallback(reason);
     }
-    return {
-      ...unavailable('No qualifying, confirmed Ethereum native-asset transfers are available from the configured watchlist.'),
-      pair: options.pair,
-      asset,
-      provider: 'Etherscan Ethereum native-asset configured address watchlist',
-    };
   }
   if (asset === 'SOL') {
     return fetchSolanaOnChainData({

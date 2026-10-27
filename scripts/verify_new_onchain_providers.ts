@@ -101,6 +101,7 @@ try {
   });
   assert.deepEqual(solMethods, ['getTransactionsForAddress', 'getSignatureStatuses']);
   assert.equal(solana.status, 'LIVE');
+  assert.equal(solana.sourceId, 'onchain.helius-solana');
   assert.equal(solana.largeTransfers?.length, 1);
   assert.equal(solana.largeTransfers?.[0].asset, 'SOL');
   assert.equal(solana.largeTransfers?.[0].blockchain, 'solana');
@@ -166,6 +167,7 @@ try {
     'getTransaction',
   ]);
   assert.equal(publicSolana.status, 'LIVE');
+  assert.equal(publicSolana.sourceId, 'onchain.solana-public-rpc');
   assert.match(publicSolana.provider, /keyless standard Solana JSON-RPC/);
   assert.equal(publicSolana.largeTransfers?.length, 1);
   assert.equal(publicSolana.largeTransfers?.[0].amount, 11);
@@ -203,6 +205,7 @@ try {
   });
   assert.equal(xrpCalls, 1);
   assert.equal(xrp.status, 'LIVE');
+  assert.equal(xrp.sourceId, 'onchain.xrpscan-xrp');
   assert.equal(xrp.largeTransfers?.length, 1);
   assert.equal(xrp.largeTransfers?.[0].asset, 'XRP');
   assert.equal(xrp.largeTransfers?.[0].blockchain, 'xrp');
@@ -244,6 +247,7 @@ try {
   });
   assert.equal(bscCalls, 1);
   assert.equal(bsc.status, 'LIVE');
+  assert.equal(bsc.sourceId, 'onchain.bscscan-bnb');
   assert.equal(bsc.largeTransfers?.length, 1);
   assert.equal(bsc.largeTransfers?.[0].asset, 'BNB');
   assert.equal(bsc.largeTransfers?.[0].blockchain, 'binance_smart_chain');
@@ -289,6 +293,7 @@ try {
   });
   assert.equal(publicBscMethods, 52);
   assert.equal(publicBsc.status, 'LIVE');
+  assert.equal(publicBsc.sourceId, 'onchain.bsc-public-rpc');
   assert.match(publicBsc.provider, /chainid=56/);
   assert.equal(publicBsc.largeTransfers?.length, 1);
   assert.equal(publicBsc.largeTransfers?.[0].amount, 6);

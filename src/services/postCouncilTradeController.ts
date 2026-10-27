@@ -277,7 +277,12 @@ function validateCouncilReport(report: EightMemberCouncilReport): string | null 
     typeof member === 'object' &&
     member !== null &&
     Number.isSafeInteger((member as { id?: unknown }).id) &&
-    validVotes.has(String((member as { vote?: unknown }).vote))
+    validVotes.has(String((member as { vote?: unknown }).vote)) &&
+    ((member as { voteWeightPct?: unknown }).voteWeightPct === undefined ||
+      (typeof (member as { voteWeightPct?: unknown }).voteWeightPct === 'number' &&
+        Number.isFinite((member as { voteWeightPct: number }).voteWeightPct) &&
+        (member as { voteWeightPct: number }).voteWeightPct >= 0 &&
+        (member as { voteWeightPct: number }).voteWeightPct <= 100))
   )) return 'گزارش شورا شامل شناسه یا رأی نامعتبر عضو است.';
   const votes = members.map((member) => (member as { vote: string }).vote);
   const longVotes = votes.filter((vote) => vote === 'LONG').length;
@@ -285,7 +290,16 @@ function validateCouncilReport(report: EightMemberCouncilReport): string | null 
   const neutralVotes = votes.filter((vote) => vote === 'NEUTRAL').length;
   const abstentions = votes.filter((vote) => vote === 'ABSTAIN').length;
   const memberIds = new Set(members.map((member) => (member as { id: number }).id));
-  const expectedDirection = longVotes >= 5 ? 'LONG' : shortVotes >= 5 ? 'SHORT' : null;
+  const weightedVotes = members.reduce<{ long: number; short: number }>((counts, member) => {
+    if (typeof member !== 'object' || member === null || !('vote' in member)) return counts;
+    const weightPct = 'voteWeightPct' in member && typeof member.voteWeightPct === 'number'
+      ? member.voteWeightPct
+      : 100;
+    if (member.vote === 'LONG') counts.long += weightPct / 100;
+    if (member.vote === 'SHORT') counts.short += weightPct / 100;
+    return counts;
+  }, { long: 0, short: 0 });
+  const expectedDirection = weightedVotes.long >= 5 ? 'LONG' : weightedVotes.short >= 5 ? 'SHORT' : null;
 
   if (
     report.quorumRequired !== 5 ||
@@ -294,6 +308,8 @@ function validateCouncilReport(report: EightMemberCouncilReport): string | null 
     ![1, 2, 3, 4, 5, 6, 7, 8].every((id) => memberIds.has(id)) ||
     report.longVotes !== longVotes ||
     report.shortVotes !== shortVotes ||
+    (report.weightedLongVotes !== undefined && Math.abs(report.weightedLongVotes - weightedVotes.long) >= 1e-9) ||
+    (report.weightedShortVotes !== undefined && Math.abs(report.weightedShortVotes - weightedVotes.short) >= 1e-9) ||
     report.neutralVotes !== neutralVotes ||
     report.abstentions !== abstentions ||
     report.quorumMet !== (expectedDirection !== null) ||

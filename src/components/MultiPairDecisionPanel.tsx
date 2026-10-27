@@ -8,6 +8,8 @@ type PairDecision = {
   councilReport?: {
     longVotes: number;
     shortVotes: number;
+    weightedLongVotes?: number;
+    weightedShortVotes?: number;
     neutralVotes: number;
     abstentions: number;
   } | null;
@@ -129,7 +131,7 @@ export const MultiPairDecisionPanel: React.FC<Props> = ({ onManualEntry, autoPil
               </p>
               {report && (
                 <p className="mt-1 text-[10px] text-slate-400">
-                  رأی LONG {report.longVotes} · SHORT {report.shortVotes} · خنثی {report.neutralVotes} · ممتنع {report.abstentions}
+                  رأی LONG {report.longVotes} ({report.weightedLongVotes?.toFixed(1) ?? report.longVotes}) · SHORT {report.shortVotes} ({report.weightedShortVotes?.toFixed(1) ?? report.shortVotes}) · خنثی {report.neutralVotes} · ممتنع {report.abstentions}
                 </p>
               )}
               <p className="mt-1 min-h-10 text-[10px] leading-4 text-slate-400">

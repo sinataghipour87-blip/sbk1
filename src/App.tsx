@@ -120,6 +120,10 @@ function isCouncilReport(value: unknown): value is EightMemberCouncilReport {
     !Array.isArray(value.members) ||
     !Number.isSafeInteger(value.longVotes) ||
     !Number.isSafeInteger(value.shortVotes) ||
+    (value.weightedLongVotes !== undefined &&
+      (typeof value.weightedLongVotes !== 'number' || !Number.isFinite(value.weightedLongVotes) || value.weightedLongVotes < 0)) ||
+    (value.weightedShortVotes !== undefined &&
+      (typeof value.weightedShortVotes !== 'number' || !Number.isFinite(value.weightedShortVotes) || value.weightedShortVotes < 0)) ||
     !Number.isSafeInteger(value.neutralVotes) ||
     !Number.isSafeInteger(value.abstentions) ||
     !(value.selectedDirection === 'LONG' || value.selectedDirection === 'SHORT' || value.selectedDirection === null) ||
@@ -143,6 +147,8 @@ function isCouncilReport(value: unknown): value is EightMemberCouncilReport {
     typeof member.rationaleFa === 'string' &&
     (member.sourceTimestampMs === null || Number.isSafeInteger(member.sourceTimestampMs)) &&
     (member.sourceAgeMs === null || Number.isFinite(member.sourceAgeMs)) &&
+    (member.voteWeightPct === undefined ||
+      (Number.isFinite(member.voteWeightPct) && Number(member.voteWeightPct) >= 0 && Number(member.voteWeightPct) <= 100)) &&
     (member.dataQualityPct === null || Number.isFinite(member.dataQualityPct)) &&
     (member.confidencePct === null || Number.isFinite(member.confidencePct)) &&
     Array.isArray(member.qualityChecks) &&

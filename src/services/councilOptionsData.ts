@@ -46,7 +46,46 @@ export async function fetchCouncilOptionsData(options: {
   const nowMs = options.nowMs ?? Date.now();
   if (asset === 'BTC' || asset === 'ETH') {
     const deribit = await fetchDeribitOptionsData(options);
-    if (hasFreshEvidence(deribit, Math.max(nowMs, Date.now()))) return deribit;
+    if (hasFreshEvidence(deribit, Math.max(nowMs, Date.now()))) {
+      return {
+        ...deribit,
+        sourceId: 'council.member5.deribit-options',
+      };
+    }
+
+    if (asset === 'ETH') {
+      const okx = await fetchOkxOptionsData(options);
+      if (hasFreshEvidence(okx, Math.max(nowMs, Date.now()))) {
+        return {
+          ...okx,
+          sourceId: 'council.member5.okx-opt-summary',
+          fallbackSourceId: 'council.member5.deribit-options',
+        };
+      }
+
+      const bybit = await fetchBybitOptionsData(options);
+      if (hasFreshEvidence(bybit, Math.max(nowMs, Date.now()))) {
+        return {
+          ...bybit,
+          sourceId: 'council.member5.bybit-options',
+          fallbackSourceId: 'council.member5.okx-opt-summary',
+        };
+      }
+
+      const binance = await fetchBinanceEuropeanOptionsData(options);
+      if (hasFreshEvidence(binance, Math.max(nowMs, Date.now()))) {
+        return {
+          ...binance,
+          sourceId: 'council.member5.binance-eapi',
+          fallbackSourceId: 'council.member5.bybit-options',
+        };
+      }
+
+      return unavailable(
+        options.pair,
+        `No fresh valid options evidence was available from Deribit (${deribit.unavailableReason ?? deribit.status}), OKX (${okx.unavailableReason ?? okx.status}), Bybit (${bybit.unavailableReason ?? bybit.status}), or Binance European Options (${binance.unavailableReason ?? binance.status}).`,
+      );
+    }
 
     const binance = await fetchBinanceEuropeanOptionsData(options);
     if (hasFreshEvidence(binance, Math.max(nowMs, Date.now()))) return binance;

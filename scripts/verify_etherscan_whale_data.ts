@@ -7,6 +7,7 @@ import {
   fetchOnChainWhaleData,
   resetPublicBitcoinWhaleDataCacheForTests,
 } from '../src/services/publicBitcoinWhaleData';
+import { evaluateEightMemberCouncil } from '../src/services/eightMemberCouncil';
 
 const address = '0x0000000000000000000000000000000000000001';
 const token = '0x0000000000000000000000000000000000000002';
@@ -136,11 +137,70 @@ const ethereumRoom = await fetchOnChainWhaleData({
 assert.equal(ethereumRoom.pair, 'ETH/USDT:USDT');
 assert.equal(ethereumRoom.asset, 'ETH');
 assert.equal(ethereumRoom.status, 'LIVE');
-assert.equal(ethereumRoom.largeTransfers?.length, 1);
+assert.equal(ethereumRoom.largeTransfers?.length, 2);
 assert.equal(ethereumRoom.largeTransfers?.[0].estimatedUsd, 252_500);
-assert.equal(ethereumRoom.largeTransfers?.every((transfer) =>
+assert.equal(ethereumRoom.largeTransfers?.some((transfer) =>
   transfer.blockchain === 'ethereum' && transfer.asset === 'ETH'
-), true, 'Ethereum room only receives native ETH chain evidence');
+), true, 'Ethereum native transfers remain visible');
+assert.equal(ethereumRoom.largeTransfers?.some((transfer) =>
+  transfer.blockchain === 'ethereum' && transfer.asset === 'FIX' &&
+  transfer.transferId?.startsWith('erc20:')
+), true, 'Ethereum ERC-20 transfers remain separately identifiable');
+assert.equal(ethereumRoom.sourceId, 'onchain.etherscan-v2');
+const ethereumEvidenceVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  whaleFlowData: ethereumRoom,
+  nowMs: nowMs + 2_000,
+}).members[5];
+assert.equal(ethereumEvidenceVote.vote, 'NEUTRAL');
+assert.equal(ethereumEvidenceVote.sourceId, 'onchain.etherscan-v2');
+assert.match(ethereumEvidenceVote.rationaleFa, /FIX/);
+
+resetEtherscanWhaleDataCacheForTests();
+resetPublicBitcoinWhaleDataCacheForTests();
+process.env.ETHERSCAN_API_KEY = 'fixture-only-key';
+process.env.SBK1_ETHERSCAN_WATCH_ADDRESSES = address;
+const fallbackSourceIds: string[] = [];
+const emptyEtherscanFallback = await fetchOnChainWhaleData({
+  pair: 'ETH/USDT:USDT',
+  nowMs: nowMs + 4_000,
+  fetcher: async (input, init) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'api.etherscan.io') {
+      const action = url.searchParams.get('action');
+      if (action === 'eth_blockNumber') return Response.json({ status: '1', result: '0x100' });
+      return Response.json({ status: '1', message: 'OK', result: [] });
+    }
+    assert.equal(init?.method, 'POST');
+    const payload = JSON.parse(String(init?.body)) as { method: string; params: unknown[] };
+    fallbackSourceIds.push(url.hostname);
+    if (payload.method === 'eth_chainId') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x1' });
+    if (payload.method === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x100' });
+    const height = Number.parseInt(String(payload.params[0]), 16);
+    const blockTimestamp = Math.floor(Date.now() / 1_000) - 2;
+    return Response.json({
+      jsonrpc: '2.0',
+      id: 1,
+      result: {
+        number: `0x${height.toString(16)}`,
+        timestamp: `0x${blockTimestamp.toString(16)}`,
+        transactions: [],
+      },
+    });
+  },
+});
+assert.equal(emptyEtherscanFallback.status, 'LIVE');
+assert.equal(emptyEtherscanFallback.sourceId, 'onchain.ethereum-publicnode');
+assert.equal(emptyEtherscanFallback.fallbackSourceId, 'onchain.etherscan-v2');
+assert.equal(fallbackSourceIds.every((hostname) => hostname === 'ethereum-rpc.publicnode.com'), true,
+  'empty Etherscan data falls back to PublicNode before 1RPC');
+const fallbackVote = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  whaleFlowData: emptyEtherscanFallback,
+  nowMs: nowMs + 4_000,
+}).members[5];
+assert.equal(fallbackVote.sourceId, 'onchain.ethereum-publicnode');
+assert.equal(fallbackVote.fallbackSourceId, 'onchain.etherscan-v2');
 
 let unsupportedChainRequested = false;
 for (const [pair, asset] of [

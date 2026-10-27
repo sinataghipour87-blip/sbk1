@@ -18,6 +18,7 @@ import type { SignalToExecutionResult } from '../src/services/signalToExecution'
 import type { FreeMacroDataResult, DirectMetricResult } from '../src/services/freeMacroData';
 import type { PublicMarketFallbackData } from '../src/services/publicMarketDataFallback';
 import type { FreqtradeMarketTrade } from '../src/services/freqtradeMarketDataBridge';
+import { getCouncilMemberSources } from '../src/services/councilSourceRegistry';
 
 const nowMs = Date.now();
 const sourceTimestampMs = nowMs - 1_000;
@@ -790,6 +791,7 @@ try {
   const connectedWhaleFlowData = {
     status: 'LIVE' as const,
     provider: 'mempool.space public REST API (sampled confirmed BTC outputs)',
+    sourceId: 'onchain.mempool-blocks',
     timestampMs: nowMs - 1_000,
     ageMs: 1_000,
     qualityPct: 85,
@@ -949,7 +951,9 @@ try {
   );
   assert.equal(whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinPublicTransfers').status, 'AVAILABLE');
   assert.equal('output' in whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinPublicTransfers'), false);
+  assert.equal(whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.assetPublicTransfers').status, 'AVAILABLE');
   assert.equal(whaleMember.sourceData.publicOnChainData.provider, 'mempool.space public REST API (sampled confirmed BTC outputs)');
+  assert.equal(whaleMember.sourceData.publicOnChainData.sourceId, 'onchain.mempool-blocks');
   assert.equal(whaleMember.vote, 'NEUTRAL');
 
   const pairRoomsRoot = path.join(repositoryDir, 'pair-rooms');
@@ -981,6 +985,75 @@ try {
   });
   assert.equal(ethRoomReport.members[4].vote, 'ABSTAIN');
   assert.equal(ethRoomReport.members[5].vote, 'ABSTAIN');
+  const memberFiveSources = getCouncilMemberSources(5);
+  const runMemberFiveHealthScenario = async (healthyCount: number, scenarioName: string) =>
+    runEightMemberCouncilRuntime({
+      pair: ethPair,
+      analysis,
+      multiBrainReport,
+      sbReport,
+      macroContext,
+      optionsData: { ...connectedOptionsData, pair: ethPair, asset: 'ETH' },
+      whaleFlowData: { ...connectedWhaleFlowData, pair: ethPair, asset: 'ETH' },
+      memberSourceChecks: {
+        5: memberFiveSources.map((source, index) => ({
+          sourceId: source.id,
+          status: index < healthyCount ? 'HEALTHY' : 'BROKEN',
+          detail: index < healthyCount ? 'Simulated live endpoint response.' : 'Simulated endpoint failure.',
+          dataValid: index < healthyCount,
+          observedAtMs: index < healthyCount ? sourceTimestampMs : null,
+          normalizedData: index < healthyCount ? { putCallOpenInterestRatio: 1 } : {},
+        })),
+      },
+      decisionSnapshotTimestampMs: sourceTimestampMs,
+      repositoryDir: path.join(pairRoomsRoot, `health-${scenarioName}`),
+      nowMs,
+    });
+  const fourHealthySourcesReport = await runMemberFiveHealthScenario(4, 'four');
+  const twoHealthySourcesReport = await runMemberFiveHealthScenario(2, 'two');
+  const oneHealthySourceReport = await runMemberFiveHealthScenario(1, 'one');
+  assert.notEqual(fourHealthySourcesReport.members[4].vote, 'ABSTAIN',
+    'the full runtime keeps a valid vote with four healthy member sources');
+  assert.equal(fourHealthySourcesReport.members[4].healthySourceCount, 4);
+  assert.notEqual(twoHealthySourcesReport.members[4].vote, 'ABSTAIN',
+    'the full runtime keeps a valid vote with exactly two healthy member sources');
+  assert.equal(twoHealthySourcesReport.members[4].healthySourceCount, 2);
+  assert.equal(oneHealthySourceReport.members[4].vote, 'ABSTAIN',
+    'the full runtime abstains with only one healthy member source');
+  assert.equal(oneHealthySourceReport.members[4].healthySourceCount, 1);
+  assert.equal(oneHealthySourceReport.members[4].sourceId, memberFiveSources[0].id,
+    'the vote must retain the source that produced its evidence even when quorum forces abstention');
+  const fallbackSourceReport = await runEightMemberCouncilRuntime({
+    pair: ethPair,
+    analysis,
+    multiBrainReport,
+    sbReport,
+    macroContext,
+    optionsData: {
+      ...connectedOptionsData,
+      provider: 'OKX public options API',
+      pair: ethPair,
+      asset: 'ETH',
+    },
+    whaleFlowData: { ...connectedWhaleFlowData, pair: ethPair, asset: 'ETH' },
+    memberSourceChecks: {
+      5: memberFiveSources.map((source, index) => ({
+        sourceId: source.id,
+        status: index === 1 || index === 2 ? 'HEALTHY' : 'BROKEN',
+        detail: index === 1 || index === 2 ? 'Simulated live endpoint response.' : 'Simulated endpoint failure.',
+        dataValid: index === 1 || index === 2,
+        observedAtMs: index === 1 || index === 2 ? sourceTimestampMs : null,
+        normalizedData: index === 1 || index === 2 ? { putCallOpenInterestRatio: 1 } : {},
+      })),
+    },
+    decisionSnapshotTimestampMs: sourceTimestampMs,
+    repositoryDir: path.join(pairRoomsRoot, 'health-fallback'),
+    nowMs,
+  });
+  assert.equal(fallbackSourceReport.members[4].healthySourceCount, 2);
+  assert.equal(fallbackSourceReport.members[4].sourceId, memberFiveSources[1].id);
+  assert.equal(fallbackSourceReport.members[4].fallbackSourceId, memberFiveSources[1].id,
+    'a healthy lower-priority provider is recorded as the used fallback when the primary is broken');
   const btcRoomMember = await readLatestJsonLine<{ sourceData: Record<string, unknown> }>(
     path.join(pairRoomsRoot, 'BTC_USDT_USDT', 'member-05.jsonl'),
   );

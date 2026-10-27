@@ -90,7 +90,12 @@ async function jsonRpc(
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
     });
-    if (!response.ok) throw new Error(`${provider.name} returned HTTP ${response.status}.`);
+    if (!response.ok) {
+      const restriction = response.status === 403 || response.status === 451
+        ? ' (regional/access restriction)'
+        : '';
+      throw new Error(`${provider.name} returned HTTP ${response.status}${restriction}.`);
+    }
     const payload: unknown = await response.json();
     if (!isRecord(payload) || payload.error || !Object.hasOwn(payload, 'result')) {
       throw new Error(`${provider.name} returned a malformed ${method} response.`);

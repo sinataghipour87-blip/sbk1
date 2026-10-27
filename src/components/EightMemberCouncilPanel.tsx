@@ -651,8 +651,8 @@ export const EightMemberCouncilPanel: React.FC<Props> = ({
             <span className="font-bold text-white">{report.summaryFa}</span>
           </div>
           <div className="flex gap-2 font-mono text-[10px]">
-            <span className="rounded border border-emerald-700/60 px-2 py-1 text-emerald-200">LONG {report.longVotes}</span>
-            <span className="rounded border border-rose-700/60 px-2 py-1 text-rose-200">SHORT {report.shortVotes}</span>
+            <span className="rounded border border-emerald-700/60 px-2 py-1 text-emerald-200">LONG {report.longVotes} ({report.weightedLongVotes?.toFixed(1) ?? report.longVotes})</span>
+            <span className="rounded border border-rose-700/60 px-2 py-1 text-rose-200">SHORT {report.shortVotes} ({report.weightedShortVotes?.toFixed(1) ?? report.shortVotes})</span>
             <span className="rounded border border-slate-700 px-2 py-1 text-slate-200">خنثی {report.neutralVotes}</span>
             <span className="rounded border border-amber-700/60 px-2 py-1 text-amber-200">ممتنع {report.abstentions}</span>
           </div>

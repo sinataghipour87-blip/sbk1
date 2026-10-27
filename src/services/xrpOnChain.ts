@@ -151,14 +151,17 @@ export async function fetchXrpOnChainData(options: {
         'XRPSCAN returned no timestamped validated payments for the configured CEX wallets.',
       );
     }
-    const result = makeOnChainFlow({
-      pair: options.pair,
-      asset: 'XRP',
-      provider: PROVIDER,
-      transfers,
-      observedAtMs: latestObservedAtMs,
-      retrievedAtMs,
-    });
+    const result = {
+      ...makeOnChainFlow({
+        pair: options.pair,
+        asset: 'XRP',
+        provider: PROVIDER,
+        transfers,
+        observedAtMs: latestObservedAtMs,
+        retrievedAtMs,
+      }),
+      sourceId: 'onchain.xrpscan-xrp',
+    };
     cached.set(options.pair, { cachedAtMs: nowMs, value: result });
     return { ...result };
   } catch (error) {
