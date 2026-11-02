@@ -89,9 +89,9 @@ assert.ok((clockSkewData.ageMs ?? Infinity) >= 0);
 const report = evaluateEightMemberCouncil({ whaleFlowData: data, nowMs });
 assert.equal(report.members.length, 8);
 assert.equal(report.quorumRequired, 5);
-assert.equal(report.members[5].vote, 'NEUTRAL');
+assert.equal(report.members[5].vote, 'ABSTAIN');
 assert.equal(report.members.filter((member) => member.id === 6).length, 1);
-assert.match(report.members[5].rationaleFa, /به‌تنهایی هویت مالک/);
+assert.match(report.members[5].rationaleFa, /CEX Watchlist/);
 
 const staleForCouncil = {
   ...data,
@@ -185,8 +185,8 @@ assert.equal(configuredThreshold.status, 'LIVE');
 assert.equal(configuredThreshold.largeTransfers?.length, 0);
 assert.equal(
   evaluateEightMemberCouncil({ whaleFlowData: configuredThreshold, nowMs }).members[5].vote,
-  'NEUTRAL',
-  'fresh sampled blocks without large transfers produce a conservative neutral vote',
+  'ABSTAIN',
+  'fresh sampled blocks without CEX-attributed direction remain abstentions',
 );
 if (priorThreshold === undefined) delete process.env.SBK1_WHALE_MIN_TRANSFER_BTC;
 else process.env.SBK1_WHALE_MIN_TRANSFER_BTC = priorThreshold;
@@ -206,8 +206,8 @@ assert.equal(
     whaleFlowData: typicalBitcoinBlockInterval,
     nowMs,
   }).members[5].vote,
-  'NEUTRAL',
-  'a fresh 6-minute Bitcoin block observation remains eligible given Bitcoin block cadence',
+  'ABSTAIN',
+  'a fresh Bitcoin block without CEX-attributed direction remains an abstention',
 );
 
 resetPublicBitcoinWhaleDataCacheForTests();
@@ -360,7 +360,7 @@ assert.equal(cachedOnProviderError.retrievedAtMs, cachedFreshSample.retrievedAtM
 assert.match(cachedOnProviderError.unavailableReason ?? '', /using the last successful sample/);
 assert.equal(
   evaluateEightMemberCouncil({ whaleFlowData: cachedOnProviderError, nowMs: nowMs + 2 * 60_000 }).members[5].vote,
-  'NEUTRAL',
+  'ABSTAIN',
 );
 const cachedTooOldForVote = await fetchPublicBitcoinWhaleData({
   nowMs: nowMs + 21 * 60_000,

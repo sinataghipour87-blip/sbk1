@@ -6,6 +6,7 @@ import {
 import { fetchCouncilOptionsData } from '../src/services/councilOptionsData';
 import { resetOkxOptionsDataCacheForTests } from '../src/services/okxOptionsData';
 
+console.log('[MOCK VERIFICATION] Binance European Options adapter tests use injected fixture fetchers; this is not live health evidence.');
 const nowMs = Date.now();
 const expiryMs = nowMs + 20 * 24 * 60 * 60_000;
 const expiryCode = new Date(expiryMs).toISOString().slice(2, 10).replaceAll('-', '');
@@ -36,7 +37,14 @@ function fixtures(asset: string, sourceTimestampMs = Date.now()) {
     sumOpenInterestUsd: '1000',
     timestamp: sourceTimestampMs,
   }));
-  return { instruments, marks, openInterest };
+  const tickers = instruments.map(({ symbol }) => ({
+    symbol,
+    bidPrice: '1',
+    askPrice: '1.01',
+    volume: '100',
+    closeTime: sourceTimestampMs,
+  }));
+  return { instruments, marks, openInterest, tickers };
 }
 
 function mockBinance(asset: string, openInterestTimestampMs = Date.now()): typeof fetch {
@@ -55,10 +63,19 @@ function mockBinance(asset: string, openInterestTimestampMs = Date.now()): typeo
       });
     }
     if (url.pathname.endsWith('/mark')) return Response.json(data.marks);
+    if (url.pathname.endsWith('/ticker')) return Response.json(data.tickers);
     if (url.pathname.endsWith('/openInterest')) {
       assert.equal(url.searchParams.get('underlyingAsset'), asset);
       assert.equal(url.searchParams.get('expiration'), expiryCode);
       return Response.json(data.openInterest);
+    }
+    if (url.pathname.endsWith('/depth')) {
+      assert.ok(url.searchParams.get('symbol')?.startsWith(`${asset}-`));
+      return Response.json({
+        E: Date.now(),
+        bids: [['1', '10']],
+        asks: [['1.01', '12']],
+      });
     }
     throw new Error(`Unexpected Binance options endpoint: ${url.pathname}`);
   };
@@ -87,6 +104,11 @@ for (const [asset, pair] of [
   assert.equal(result.impliedVolatilityPct, 50);
   assert.equal(result.callOpenInterest, 10_000);
   assert.equal(result.putOpenInterest, 10_000);
+  assert.equal(result.callContractsCount, 10);
+  assert.equal(result.putContractsCount, 10);
+  assert.equal(result.bidAskValidatedContracts, 20);
+  assert.equal(result.bidAskSizeValidatedContracts, 4);
+  assert.ok(result.medianBidAskSpreadPct !== null && result.medianBidAskSpreadPct! > 0);
 }
 
 resetBinanceEuropeanOptionsDataCacheForTests();
@@ -96,6 +118,9 @@ const fallback = await fetchCouncilOptionsData({
   nowMs,
   fetcher: async (input) => {
     const url = new URL(String(input));
+    if (url.hostname === 'api.bybit.com') {
+      return Response.json({ retCode: 0, time: nowMs, result: { list: [] } });
+    }
     if (url.hostname === 'www.okx.com') {
       assert.equal(url.pathname.endsWith('/public/instruments'), true);
       return Response.json({ code: '0', data: [], msg: '' });
@@ -105,6 +130,8 @@ const fallback = await fetchCouncilOptionsData({
 });
 assert.equal(fallback.status, 'LIVE');
 assert.match(fallback.provider, /Binance European Options/);
+assert.equal(fallback.sourceId, 'council.member5.SOL.binance-eapi');
+assert.equal(fallback.fallbackSourceId, 'council.member5.SOL.bybit-options');
 
 resetBinanceEuropeanOptionsDataCacheForTests();
 const stale = await fetchBinanceEuropeanOptionsData({
@@ -114,7 +141,7 @@ const stale = await fetchBinanceEuropeanOptionsData({
 });
 assert.equal(stale.status, 'UNAVAILABLE');
 assert.equal(stale.timestampMs, null);
-assert.match(stale.unavailableReason ?? '', /20 fresh/);
+assert.match(stale.unavailableReason ?? '', /6 fresh contracts/);
 
 resetBinanceEuropeanOptionsDataCacheForTests();
 const noOptions = await fetchCouncilOptionsData({
@@ -122,6 +149,9 @@ const noOptions = await fetchCouncilOptionsData({
   nowMs: nowMs + 30_000,
   fetcher: async (input) => {
     const url = new URL(String(input));
+    if (url.hostname === 'api.bybit.com') {
+      return Response.json({ retCode: 0, time: nowMs, result: { list: [] } });
+    }
     if (url.hostname === 'www.okx.com') return Response.json({ code: '0', data: [], msg: '' });
     if (url.pathname.endsWith('/exchangeInfo')) {
       return Response.json({ optionSymbols: [], optionContracts: [] });
@@ -131,6 +161,6 @@ const noOptions = await fetchCouncilOptionsData({
 });
 assert.equal(noOptions.status, 'UNAVAILABLE');
 assert.equal(noOptions.timestampMs, null);
-assert.match(noOptions.unavailableReason ?? '', /either OKX.*Binance European Options/);
+assert.match(noOptions.unavailableReason ?? '', /Bybit.*OKX is not configured for XRP.*Binance European Options/);
 
 console.log('Binance European Options freshness, pair isolation, USD OI normalization, fallback and abstention checks passed.');

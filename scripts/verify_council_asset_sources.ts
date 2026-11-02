@@ -5,14 +5,17 @@ import { getCouncilMemberSources } from '../src/services/councilSourceRegistry';
 import { fetchOnChainWhaleData } from '../src/services/publicBitcoinWhaleData';
 
 const assets = ['BTC', 'SOL', 'XRP', 'BNB'] as const;
+const liveVerificationStartedAtMs = Date.now();
+console.log(`[LIVE API VERIFICATION] startedAt=${new Date(liveVerificationStartedAtMs).toISOString()}`);
 const minimumHealthySources: Readonly<Record<number, number>> = {
   1: 2,
-  2: 1,
+  2: 2,
   3: 2,
   4: 2,
 };
 
 for (const asset of assets) {
+  console.log(`[LIVE API VERIFICATION] asset=${asset} startedAt=${new Date().toISOString()}`);
   const pair = `${asset}/USDT:USDT`;
   const whaleFlowData = await fetchOnChainWhaleData({
     pair,
@@ -35,29 +38,115 @@ for (const asset of assets) {
   for (const memberId of [1, 2, 3, 4]) {
     const sources = getCouncilMemberSources(memberId, asset);
     const checks = checksByMember[memberId] ?? [];
-    assert.equal(sources.length, 4, `${asset} member ${memberId} has four source entries`);
-    assert.equal(checks.length, 4, `${asset} member ${memberId} checked all four entries`);
-    const healthyCount = checks.filter(({ status, dataValid }) =>
+    const expectedCount = memberId === 2 ? asset === 'BNB' ? 5 : 6 : 4;
+    assert.equal(sources.length, expectedCount, `${asset} member ${memberId} has registered source entries`);
+    assert.equal(checks.length, expectedCount, `${asset} member ${memberId} checked every registered entry`);
+    if (memberId === 2) {
+      const gateCheck = checks.find(({ sourceId }) =>
+        sourceId === `council.member2.${asset}.gateio-trades`
+      );
+      assert.ok(gateCheck, `${asset} Gate spot trades were checked`);
+      assert.equal(gateCheck.status, 'HEALTHY', `${asset} Gate spot trade response is live and valid`);
+      assert.equal(gateCheck.dataValid, true, `${asset} Gate spot CVD passed validation`);
+      assert.equal(gateCheck.normalizedData?.marketType, 'spot');
+      assert.equal(gateCheck.normalizedData?.independenceGroup, 'gateio');
+      assert.ok(Number(gateCheck.normalizedData?.classifiedTradeCount) >= 5);
+      assert.equal(gateCheck.normalizedData?.cvdWindowMs, 5 * 60_000);
+      assert.ok(Number(gateCheck.normalizedData?.tradeTimestampMs) <= Date.now());
+      assert.equal(
+        Number(gateCheck.normalizedData?.cvdBase),
+        Number(gateCheck.normalizedData?.buyVolumeBase) -
+          Number(gateCheck.normalizedData?.sellVolumeBase),
+      );
+      assert.equal(gateCheck.normalizedData?.volumeUnit, `${asset} base units`);
+    }
+    const healthyChecks = checks.filter(({ status, dataValid }) =>
       status === 'HEALTHY' && dataValid === true
-    ).length;
+    );
+    const healthyCount = memberId === 2
+      ? new Set(healthyChecks.map(({ marketType, independenceGroup, sourceId }) =>
+        `${marketType ?? 'unknown'}:${independenceGroup ?? sourceId}`
+      )).size
+      : healthyChecks.length;
     const minimum = minimumHealthySources[memberId];
     const vote = report.members.find((member) => member.id === memberId);
     assert.ok(vote, `${asset} member ${memberId} vote is present`);
-    assert.ok(
-      healthyCount >= minimum,
-      `${asset} member ${memberId} has ${healthyCount}/4 healthy sources; needs ${minimum}.`,
-    );
-    assert.notEqual(
-      vote.vote,
-      'ABSTAIN',
-      `${asset} member ${memberId} must vote with its verified live sources.`,
-    );
+    const usedSourceIds = vote.sourceChecks
+      .filter(({ voteUsage }) => voteUsage === 'USED')
+      .map(({ sourceId }) => sourceId);
+    const abstainedEvidenceIds = vote.sourceChecks
+      .filter(({ voteUsage }) => voteUsage === 'ABSTAINED')
+      .map(({ sourceId }) => sourceId);
+    if (memberId === 2) {
+      const sourceDefinitions = new Map(
+        getCouncilMemberSources(2, asset).map((source) => [source.id, source]),
+      );
+      const signalsByMarket = new Map<string, Map<string, { sourceId: string; ratio: number }>>();
+      for (const check of healthyChecks) {
+        if (check.marketType !== 'spot' && check.marketType !== 'futures') continue;
+        const values = check.normalizedData;
+        const cvd = values?.cvdBase ?? values?.cvdEth;
+        const buyVolume = values?.buyVolumeBase ?? values?.buyVolumeEth;
+        const sellVolume = values?.sellVolumeBase ?? values?.sellVolumeEth;
+        const classifiedTradeCount = values?.classifiedTradeCount;
+        const timestampMs = values?.tradeTimestampMs;
+        const totalVolume = Number(buyVolume) + Number(sellVolume);
+        const maxAgeMs = sourceDefinitions.get(check.sourceId)?.maxAgeMs ?? 60_000;
+        if (
+          typeof cvd !== 'number' || typeof buyVolume !== 'number' ||
+          typeof sellVolume !== 'number' || typeof timestampMs !== 'number' ||
+          typeof classifiedTradeCount !== 'number' ||
+          !Number.isFinite(cvd) || !Number.isFinite(totalVolume) || totalVolume <= 0 ||
+          !Number.isFinite(classifiedTradeCount) ||
+          Math.abs(cvd - (buyVolume - sellVolume)) > Math.max(1e-8, totalVolume * 1e-9) ||
+          classifiedTradeCount < 5 ||
+          values?.cvdWindowMs !== 5 * 60_000 ||
+          timestampMs > Date.now() + 1_000 ||
+          Date.now() - timestampMs > maxAgeMs
+        ) continue;
+        const venue = check.independenceGroup ?? check.provider ?? check.sourceId;
+        const signals = signalsByMarket.get(check.marketType) ?? new Map();
+        if (!signals.has(venue)) signals.set(venue, { sourceId: check.sourceId, ratio: cvd / totalVolume });
+        signalsByMarket.set(check.marketType, signals);
+      }
+      const qualifiedMarkets = [...signalsByMarket.values()]
+        .filter((signals) => signals.size >= minimum);
+      const directionalVotes = new Set(qualifiedMarkets.map((signals) => {
+        const ratio = [...signals.values()].reduce((sum, signal) => sum + signal.ratio, 0) / signals.size;
+        return ratio >= 0.05 ? 'LONG' : ratio <= -0.05 ? 'SHORT' : 'NEUTRAL';
+      }).filter((direction) => direction !== 'NEUTRAL'));
+      const expectedAbstain = qualifiedMarkets.length === 0 || directionalVotes.size > 1;
+      assert.equal(
+        vote.vote === 'ABSTAIN',
+        expectedAbstain,
+        `${asset} member 2 must abstain without same-market quorum or when qualified spot/futures directions conflict.`,
+      );
+      if (expectedAbstain) {
+        assert.equal(usedSourceIds.length, 0, `${asset} member 2 abstentions must not claim used sources.`);
+      } else {
+        const expectedSourceIds = qualifiedMarkets.flatMap((signals) =>
+          [...signals.values()].map(({ sourceId }) => sourceId)
+        ).sort();
+        assert.deepEqual([...usedSourceIds].sort(), expectedSourceIds);
+      }
+    } else {
+      assert.ok(
+        healthyCount >= minimum,
+        `${asset} member ${memberId} has ${healthyCount}/${expectedCount} healthy sources; needs ${minimum}.`,
+      );
+      assert.notEqual(
+        vote.vote,
+        'ABSTAIN',
+        `${asset} member ${memberId} must vote with its verified live sources.`,
+      );
+    }
     console.log(
-      `${asset} | member ${memberId} | ${healthyCount}/4 healthy | ${vote.vote} | source=${vote.sourceId ?? 'none'} | fallback=${vote.fallbackSourceId ?? 'none'}`,
+      `${asset} | member ${memberId} | ${healthyCount}/${expectedCount} healthy | ${vote.vote} | used=${usedSourceIds.join(',') || 'none'} | abstainedEvidence=${abstainedEvidenceIds.join(',') || 'none'} | source=${vote.sourceId ?? 'none'} | fallback=${vote.fallbackSourceId ?? 'none'}`,
     );
     for (const check of checks) {
+      const reportCheck = vote.sourceChecks.find(({ sourceId }) => sourceId === check.sourceId) ?? check;
       console.log(
-        `  ${check.sourceId} | ${check.status} | HTTP=${check.httpHealthy} | data=${check.dataValid} | ${check.dataDetail ?? check.detail}`,
+        `  ${reportCheck.sourceId} | provider=${reportCheck.provider ?? 'unknown'} | endpoint=${reportCheck.endpoint ?? 'unknown'} | asset=${asset} | market=${reportCheck.marketType ?? 'unknown'} | fetchedAt=${reportCheck.observedAtMs === null || reportCheck.observedAtMs === undefined ? 'unknown' : new Date(reportCheck.observedAtMs).toISOString()} | dataAt=${reportCheck.sourceTimestampMs === null || reportCheck.sourceTimestampMs === undefined ? 'unknown' : new Date(reportCheck.sourceTimestampMs).toISOString()} | ${reportCheck.status} | HTTP=${reportCheck.httpHealthy} | data=${reportCheck.dataValid} | voteUsage=${reportCheck.voteUsage ?? 'unknown'} | ${reportCheck.dataDetail ?? reportCheck.detail}`,
       );
     }
   }
@@ -69,30 +158,39 @@ for (const asset of assets) {
     optionSources.length,
     `${asset} member 5 checks every registered options source`,
   );
-  const directionalCount = optionChecks.filter(({ status, dataValid, voteValue }) =>
+  const directionalChecks = optionChecks.filter(({ status, dataValid, voteValue }) =>
     status === 'HEALTHY' && dataValid === true && voteValue === 'USEFUL'
-  ).length;
+  );
+  const directionalCount = new Set(directionalChecks.map(({ independenceGroup, provider, sourceId }) =>
+    independenceGroup ?? provider ?? sourceId
+  )).size;
   const optionsVote = report.members.find((member) => member.id === 5);
   assert.ok(optionsVote, `${asset} member 5 vote is present`);
-  if (directionalCount < 2) {
+  const usedOptionSourceIds = optionsVote.sourceChecks
+    .filter(({ voteUsage }) => voteUsage === 'USED')
+    .map(({ sourceId }) => sourceId);
+  const abstainedOptionEvidenceIds = optionsVote.sourceChecks
+    .filter(({ voteUsage }) => voteUsage === 'ABSTAINED')
+    .map(({ sourceId }) => sourceId);
+  if (optionsVote.vote === 'ABSTAIN') {
     assert.equal(
-      optionsVote.vote,
-      'ABSTAIN',
-      `${asset} member 5 must abstain with fewer than two directional option sources.`,
+      usedOptionSourceIds.length,
+      0,
+      `${asset} member 5 must not report option evidence as used when it abstains.`,
     );
   } else {
-    assert.notEqual(
-      optionsVote.vote,
-      'ABSTAIN',
-      `${asset} member 5 should vote with two directional option sources.`,
+    assert.ok(
+      directionalCount >= 2 && usedOptionSourceIds.length >= 2,
+      `${asset} member 5 may vote only when at least two independent directional venues were actually selected.`,
     );
   }
   console.log(
-    `${asset} | member 5 | ${optionChecks.filter(({ status, dataValid }) => status === 'HEALTHY' && dataValid === true).length}/${optionSources.length} healthy | ${directionalCount} directional | ${optionsVote.vote} | source=${optionsVote.sourceId ?? 'none'} | fallback=${optionsVote.fallbackSourceId ?? 'none'}`,
+    `${asset} | member 5 | ${optionChecks.filter(({ status, dataValid }) => status === 'HEALTHY' && dataValid === true).length}/${optionSources.length} healthy | ${directionalCount} directional | ${optionsVote.vote} | used=${usedOptionSourceIds.join(',') || 'none'} | abstainedEvidence=${abstainedOptionEvidenceIds.join(',') || 'none'} | source=${optionsVote.sourceId ?? 'none'} | fallback=${optionsVote.fallbackSourceId ?? 'none'}`,
   );
   for (const check of optionChecks) {
+    const reportCheck = optionsVote.sourceChecks.find(({ sourceId }) => sourceId === check.sourceId) ?? check;
     console.log(
-      `  ${check.sourceId} | ${check.status} | HTTP=${check.httpHealthy} | data=${check.dataValid} | voteValue=${check.voteValue} | ${check.dataDetail ?? check.detail}`,
+      `  ${reportCheck.sourceId} | provider=${reportCheck.provider ?? 'unknown'} | endpoint=${reportCheck.endpoint ?? 'unknown'} | asset=${asset} | market=${reportCheck.marketType ?? 'unknown'} | fetchedAt=${reportCheck.observedAtMs === null || reportCheck.observedAtMs === undefined ? 'unknown' : new Date(reportCheck.observedAtMs).toISOString()} | dataAt=${reportCheck.sourceTimestampMs === null || reportCheck.sourceTimestampMs === undefined ? 'unknown' : new Date(reportCheck.sourceTimestampMs).toISOString()} | ${reportCheck.status} | HTTP=${reportCheck.httpHealthy} | data=${reportCheck.dataValid} | voteValue=${reportCheck.voteValue} | voteUsage=${reportCheck.voteUsage ?? 'unknown'} | ${reportCheck.dataDetail ?? reportCheck.detail}`,
     );
   }
 
@@ -189,4 +287,5 @@ for (const asset of assets) {
   }
 }
 
+console.log(`[LIVE API VERIFICATION] completedAt=${new Date().toISOString()} elapsedMs=${Date.now() - liveVerificationStartedAtMs}`);
 console.log('Live asset-specific council source checks passed for members 1-8.');

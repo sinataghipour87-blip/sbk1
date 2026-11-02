@@ -2,6 +2,7 @@ import type { CouncilOptionsData } from './eightMemberCouncil';
 import { deduplicateOptionContracts } from './councilEvidenceDeduplication';
 import { getFreqtradePairBaseAsset } from './freqtradePairs';
 import { isRecord, toPositiveNumber } from './onChainCexShared';
+import { getCouncilOptionsThresholds } from './councilOptionsThresholds';
 
 const API_ROOT = 'https://eapi.binance.com/eapi/v1';
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -9,7 +10,6 @@ const CACHE_TTL_MS = 15_000;
 const MAX_SOURCE_AGE_MS = 60_000;
 const MIN_EXPIRY_AGE_MS = 24 * 60 * 60_000;
 const MAX_EXPIRY_AGE_MS = 90 * 24 * 60 * 60_000;
-const MIN_LIQUID_CONTRACTS = 20;
 
 interface BinanceOptionInstrument {
   symbol: string;
@@ -40,6 +40,14 @@ interface BinanceOptionIndex {
   time: number;
 }
 
+interface BinanceOptionTicker {
+  symbol: string;
+  bidPrice: string;
+  askPrice: string;
+  volume: string;
+  closeTime: number;
+}
+
 interface ParsedContract {
   instrumentName: string;
   expiryTimestampMs: number;
@@ -49,6 +57,9 @@ interface ParsedContract {
   impliedVolatilityPct: number;
   underlyingPrice: number;
   timestampMs: number;
+  bidPrice: number;
+  askPrice: number;
+  volume24h: number;
 }
 
 const cachedResults = new Map<string, { cachedAtMs: number; result: CouncilOptionsData }>();
@@ -133,6 +144,12 @@ function expiryParam(expiryTimestampMs: number): string {
   return `${year}${month}${day}`;
 }
 
+function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
 export async function fetchBinanceEuropeanOptionsData(options: {
   pair: string;
   nowMs?: number;
@@ -140,6 +157,8 @@ export async function fetchBinanceEuropeanOptionsData(options: {
 }): Promise<CouncilOptionsData> {
   const asset = getFreqtradePairBaseAsset(options.pair);
   if (!asset || !['BTC', 'ETH', 'SOL', 'XRP', 'BNB'].includes(asset)) return unavailable(options.pair);
+  const thresholds = getCouncilOptionsThresholds(asset);
+  if (!thresholds) return unavailable(options.pair);
 
   const nowMs = options.nowMs ?? Date.now();
   const cached = cachedResults.get(options.pair);
@@ -173,9 +192,10 @@ export async function fetchBinanceEuropeanOptionsData(options: {
     }
 
     const expiryDates = [...new Set(eligible.map(({ expiryDate }) => expiryDate))];
-    const [markResponse, indexResponse, ...openInterestResponses] = await Promise.all([
+    const [markResponse, indexResponse, tickerResponse, ...openInterestResponses] = await Promise.all([
       request(fetcher, 'mark'),
       request(fetcher, 'index', { underlying: `${asset}USDT` }),
+      request(fetcher, 'ticker'),
       ...expiryDates.map((expiryDate) =>
         request(fetcher, 'openInterest', {
           underlyingAsset: asset,
@@ -185,8 +205,9 @@ export async function fetchBinanceEuropeanOptionsData(options: {
     ]);
     if (!isEnvelopeArray(markResponse.payload) ||
         !isRecord(indexResponse.payload) ||
+        !isEnvelopeArray(tickerResponse.payload) ||
         openInterestResponses.some(({ payload }) => !isEnvelopeArray(payload))) {
-      throw new Error('Binance European Options index, mark or openInterest response is malformed.');
+      throw new Error('Binance European Options index, mark, ticker or openInterest response is malformed.');
     }
     const indexPrice = toPositiveNumber(indexResponse.payload.indexPrice);
     const indexTimestampMs = parseTimestamp(indexResponse.payload.time);
@@ -233,29 +254,63 @@ export async function fetchBinanceEuropeanOptionsData(options: {
         interests.set(candidate.symbol, candidate as unknown as BinanceOptionOpenInterest);
       }
     }
+    const tickers = new Map<string, BinanceOptionTicker>();
+    for (const candidate of tickerResponse.payload) {
+      if (!isRecord(candidate) || typeof candidate.symbol !== 'string' ||
+          !contractNames.has(candidate.symbol)) continue;
+      if (
+        typeof candidate.bidPrice !== 'string' ||
+        typeof candidate.askPrice !== 'string' ||
+        typeof candidate.volume !== 'string' ||
+        parseTimestamp(candidate.closeTime) === null
+      ) continue;
+      const previous = tickers.get(candidate.symbol);
+      if (previous && (
+        previous.bidPrice !== candidate.bidPrice ||
+        previous.askPrice !== candidate.askPrice ||
+        previous.volume !== candidate.volume ||
+        previous.closeTime !== candidate.closeTime
+      )) {
+        throw new Error(`Binance returned conflicting option tickers for ${candidate.symbol}.`);
+      }
+      tickers.set(candidate.symbol, candidate as unknown as BinanceOptionTicker);
+    }
 
     const retrievedAtMs = Math.max(
       markResponse.receivedAtMs,
       indexResponse.receivedAtMs,
+      tickerResponse.receivedAtMs,
       ...openInterestResponses.map(({ receivedAtMs }) => receivedAtMs),
     );
     const parsed = eligible.flatMap((instrument): ParsedContract[] => {
       const mark = marks.get(instrument.symbol);
       const interest = interests.get(instrument.symbol);
+      const ticker = tickers.get(instrument.symbol);
       const markPrice = toPositiveNumber(mark?.markPrice);
       const markIv = toPositiveNumber(mark?.markIV);
       const openInterestUsd = toPositiveNumber(interest?.sumOpenInterestUsd);
       const openInterestTimestampMs = parseTimestamp(interest?.timestamp);
+      const bidPrice = toPositiveNumber(ticker?.bidPrice);
+      const askPrice = toPositiveNumber(ticker?.askPrice);
+      const volume24h = toPositiveNumber(ticker?.volume);
+      const tickerTimestampMs = parseTimestamp(ticker?.closeTime);
       if (
         markPrice === null ||
         markIv === null ||
         markIv > 5 ||
         openInterestUsd === null ||
         openInterestTimestampMs === null ||
+        bidPrice === null ||
+        askPrice === null ||
+        askPrice < bidPrice ||
+        volume24h === null ||
+        tickerTimestampMs === null ||
         openInterestTimestampMs > retrievedAtMs + 1_000 ||
-        retrievedAtMs - openInterestTimestampMs > MAX_SOURCE_AGE_MS
+        retrievedAtMs - openInterestTimestampMs > MAX_SOURCE_AGE_MS ||
+        tickerTimestampMs > retrievedAtMs + 1_000 ||
+        retrievedAtMs - tickerTimestampMs > MAX_SOURCE_AGE_MS
       ) return [];
-      const sourceTimestampMs = Math.min(openInterestTimestampMs, indexTimestampMs);
+      const sourceTimestampMs = Math.min(openInterestTimestampMs, indexTimestampMs, tickerTimestampMs);
       return [{
         instrumentName: instrument.symbol,
         expiryTimestampMs: instrument.expiryDate,
@@ -265,6 +320,9 @@ export async function fetchBinanceEuropeanOptionsData(options: {
         impliedVolatilityPct: markIv * 100,
         underlyingPrice: indexPrice,
         timestampMs: sourceTimestampMs,
+        bidPrice,
+        askPrice,
+        volume24h,
       }];
     });
     const deduplicated = deduplicateOptionContracts(parsed.map((contract) => ({
@@ -286,20 +344,72 @@ export async function fetchBinanceEuropeanOptionsData(options: {
     const callOpenInterest = calls.reduce((sum, contract) => sum + contract.openInterestUsd, 0);
     const putOpenInterest = puts.reduce((sum, contract) => sum + contract.openInterestUsd, 0);
     if (
-      contracts.length < MIN_LIQUID_CONTRACTS ||
-      calls.length === 0 ||
-      puts.length === 0 ||
+      contracts.length < thresholds.minimumContracts ||
+      calls.length < thresholds.minimumContractsPerSide ||
+      puts.length < thresholds.minimumContractsPerSide ||
       callOpenInterest <= 0 ||
       putOpenInterest <= 0
     ) {
       const result = unavailable(
         options.pair,
-        'Binance European Options did not provide at least 20 fresh, open-interest-positive contracts across calls and puts.',
+        `Binance European Options did not provide at least ${thresholds.minimumContracts} fresh contracts with ${thresholds.minimumContractsPerSide} calls and puts and positive OI on both sides.`,
       );
       cachedResults.set(options.pair, { cachedAtMs: nowMs, result });
       return result;
     }
-
+    const bookSample = [
+      ...[...calls].sort((left, right) => right.openInterestUsd - left.openInterestUsd)
+        .slice(0, thresholds.minimumContractsPerSide),
+      ...[...puts].sort((left, right) => right.openInterestUsd - left.openInterestUsd)
+        .slice(0, thresholds.minimumContractsPerSide),
+    ];
+    if (bookSample.length !== thresholds.minimumSizedOrderBooks) {
+      const result = unavailable(
+        options.pair,
+        `Binance European Options did not provide ${thresholds.minimumContractsPerSide} active contracts on each side for order-book validation.`,
+      );
+      cachedResults.set(options.pair, { cachedAtMs: nowMs, result });
+      return result;
+    }
+    const sampledBooks = await Promise.all(bookSample.map(async (contract) => {
+      const { payload, receivedAtMs } = await request(fetcher, 'depth', {
+        symbol: contract.instrumentName,
+        limit: '5',
+      });
+      if (!isRecord(payload) || !Array.isArray(payload.bids) || !Array.isArray(payload.asks)) return null;
+      const bestBid = Array.isArray(payload.bids[0]) ? payload.bids[0] : null;
+      const bestAsk = Array.isArray(payload.asks[0]) ? payload.asks[0] : null;
+      const bid = bestBid ? toPositiveNumber(bestBid[0]) : null;
+      const bidSize = bestBid ? toPositiveNumber(bestBid[1]) : null;
+      const ask = bestAsk ? toPositiveNumber(bestAsk[0]) : null;
+      const askSize = bestAsk ? toPositiveNumber(bestAsk[1]) : null;
+      const bookTimestampMs = parseTimestamp(payload.E ?? payload.T);
+      if (
+        bid === null ||
+        bidSize === null ||
+        ask === null ||
+        askSize === null ||
+        ask < bid ||
+        bookTimestampMs === null ||
+        bookTimestampMs > receivedAtMs + 1_000 ||
+        receivedAtMs - bookTimestampMs > MAX_SOURCE_AGE_MS
+      ) return null;
+      return { side: contract.side, spreadPct: (ask - bid) / ((ask + bid) / 2) * 100 };
+    }));
+    const validBookSamples = sampledBooks.filter(
+      (sample): sample is NonNullable<typeof sample> => sample !== null,
+    );
+    if (
+      validBookSamples.filter(({ side }) => side === 'call').length < thresholds.minimumContractsPerSide ||
+      validBookSamples.filter(({ side }) => side === 'put').length < thresholds.minimumContractsPerSide
+    ) {
+      const result = unavailable(
+        options.pair,
+        'Binance European Options order-book samples were missing, stale, crossed, or lacked positive top-level size.',
+      );
+      cachedResults.set(options.pair, { cachedAtMs: nowMs, result });
+      return result;
+    }
     const weightedIv = (values: ParsedContract[]) => values.reduce(
       (sum, contract) => sum + contract.impliedVolatilityPct * contract.openInterestUsd,
       0,
@@ -325,6 +435,14 @@ export async function fetchBinanceEuropeanOptionsData(options: {
       skewPct: Math.round((weightedIv(puts) - weightedIv(calls)) * 100) / 100,
       provider: 'Binance European Options public API (timestamped index/OI; OI-weighted USD open interest)',
       contractsCount: contracts.length,
+      callContractsCount: calls.length,
+      putContractsCount: puts.length,
+      bidAskValidatedContracts: contracts.length,
+      bidAskSizeValidatedContracts: validBookSamples.length,
+      medianBidAskSpreadPct: median(validBookSamples.map(({ spreadPct }) => spreadPct)),
+      volume24h: contracts.reduce((sum, contract) => sum + contract.volume24h, 0),
+      volumeUnit: 'Binance-reported option volume units',
+      openInterestUnit: 'USD notional open interest',
       callOpenInterest,
       putOpenInterest,
       underlyingPrice: nearestAtm.underlyingPrice,

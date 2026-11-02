@@ -4,16 +4,17 @@ import {
   resetOkxOptionsDataCacheForTests,
 } from '../src/services/okxOptionsData';
 
+console.log('[MOCK VERIFICATION] OKX options adapter tests use injected fixture fetchers; this is not live health evidence.');
 const nowMs = Date.now();
 const expiry = String(nowMs + 20 * 24 * 60 * 60_000);
 const timestamp = String(nowMs);
 const instruments = Array.from({ length: 20 }, (_, index) => {
   const optType = index % 2 === 0 ? 'C' : 'P';
   return {
-    instId: `SOL-USDT-${expiry}-${1_000 + index}-${optType}`,
+    instId: `SOL-USD-${expiry}-${1_000 + index}-${optType}`,
     instType: 'OPTION',
-    uly: 'SOL-USDT',
-    instFamily: 'SOL-USDT',
+    uly: 'SOL-USD',
+    instFamily: 'SOL-USD',
     ctVal: '1',
     ctMult: '1',
     ctValCcy: 'SOL',
@@ -39,6 +40,9 @@ const tickers = instruments.map((instrument) => ({
   instId: instrument.instId,
   bidPx: '0.01',
   askPx: '0.02',
+  bidSz: '10',
+  askSz: '12',
+  vol24h: '100',
   ts: timestamp,
 }));
 
@@ -66,14 +70,19 @@ assert.equal(result.contractsCount, 20);
 assert.equal(result.putCallRatio, 2);
 assert.equal(result.impliedVolatilityPct, 56.67);
 assert.equal(result.qualityPct, 100);
+assert.equal(result.bidAskValidatedContracts, 20);
+assert.equal(result.bidAskSizeValidatedContracts, 20);
+assert.equal(result.callContractsCount, 10);
+assert.equal(result.putContractsCount, 10);
+assert.equal(result.volume24h, 2_000);
 assert.ok(result.timestampMs !== null);
-assert.ok(requests.every((url) => url.searchParams.get('uly') === 'SOL-USDT' ||
+assert.ok(requests.every((url) => url.searchParams.get('uly') === 'SOL-USD' ||
   url.pathname.endsWith('/tickers')));
 
 resetOkxOptionsDataCacheForTests();
 const ethInstruments = instruments.map((instrument) => ({
   ...instrument,
-  instId: instrument.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+  instId: instrument.instId.replaceAll('SOL-USD', 'ETH-USD'),
   uly: 'ETH-USD',
   instFamily: 'ETH-USD',
   ctValCcy: 'ETH',
@@ -90,15 +99,15 @@ const ethOptions = await fetchOkxOptionsData({
     if (path === 'instruments') return Response.json({ code: '0', data: ethInstruments, msg: '' });
     if (path === 'opt-summary') return Response.json({ code: '0', data: summaries.map((item) => ({
       ...item,
-      instId: item.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+      instId: item.instId.replaceAll('SOL-USD', 'ETH-USD'),
     })), msg: '' });
     if (path === 'open-interest') return Response.json({ code: '0', data: interests.map((item) => ({
       ...item,
-      instId: item.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+      instId: item.instId.replaceAll('SOL-USD', 'ETH-USD'),
     })), msg: '' });
     if (path === 'tickers') return Response.json({ code: '0', data: tickers.map((item) => ({
       ...item,
-      instId: item.instId.replaceAll('SOL-USDT', 'ETH-USD'),
+      instId: item.instId.replaceAll('SOL-USD', 'ETH-USD'),
     })), msg: '' });
     throw new Error(`Unexpected OKX route ${url.pathname}`);
   },
@@ -165,7 +174,10 @@ const stale = await fetchOkxOptionsData({
     });
     return Response.json({
       code: '0',
-      data: assetInstruments.map(({ instId }) => ({ instId, bidPx: '1', askPx: '2', ts: expiredTimestamp })),
+      data: assetInstruments.map(({ instId }) => ({
+        instId, bidPx: '1', askPx: '2', bidSz: '10', askSz: '10', vol24h: '100',
+        ts: expiredTimestamp,
+      })),
       msg: '',
     });
   },

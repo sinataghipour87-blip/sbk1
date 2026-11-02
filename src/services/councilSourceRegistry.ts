@@ -47,6 +47,8 @@ export interface CouncilSourceRegistryEntry {
   apiKeyRequired?: boolean;
   memberSource?: boolean;
   additionalHealthUrls?: readonly string[];
+  marketType?: 'spot' | 'futures' | 'options';
+  independenceGroup?: string;
 }
 
 export interface CouncilSourceDefinition extends Omit<
@@ -61,10 +63,13 @@ export const COUNCIL_MEMBER_SOURCES: readonly CouncilSourceDefinition[] = [
   { id: 'council.member1.kraken-ohlc', group: 'trend', provider: 'Kraken', url: 'https://api.kraken.com/0/public/OHLC?pair=ETHUSD&interval=60', dataType: 'hourly ETH/USD OHLCV candles', symbol: 'ETHUSD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 65_000, priority: 2, fallbackGroup: 'council.member1.trend', memberIds: [1], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member1.okx-candles', group: 'trend', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/market/candles?instId=ETH-USDT&bar=1H', dataType: 'hourly ETH-USDT OHLCV candles', symbol: 'ETH-USDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 65_000, priority: 3, fallbackGroup: 'council.member1.trend', memberIds: [1], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member1.bitstamp-ohlc', group: 'trend', provider: 'Bitstamp', url: 'https://www.bitstamp.net/api/v2/ohlc/ethusd/?step=3600&limit=2', dataType: 'hourly ETH/USD OHLCV candles', symbol: 'ETH/USD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 65_000, priority: 4, fallbackGroup: 'council.member1.trend', memberIds: [1], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member2.coinbase-trades', group: 'tradeflow', provider: 'Coinbase Exchange', url: 'https://api.exchange.coinbase.com/products/ETH-USD/trades?limit=100', dataType: 'executed ETH-USD trades and aggressor side; 5-minute CVD; at least 5 classified trades', symbol: 'ETH-USD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 1, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member2.kraken-trades', group: 'tradeflow', provider: 'Kraken', url: 'https://api.kraken.com/0/public/Trades?pair=ETHUSD&count=100', dataType: 'executed ETH/USD trades and aggressor side; 5-minute CVD; at least 5 classified trades', symbol: 'ETHUSD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 2, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member2.okx-trades', group: 'tradeflow', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/market/trades?instId=ETH-USDT&limit=100', dataType: 'executed ETH-USDT trades and aggressor side; 5-minute CVD; at least 5 classified trades', symbol: 'ETH-USDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 3, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member2.bitfinex-trades', group: 'tradeflow', provider: 'Bitfinex public trades', url: 'https://api-pub.bitfinex.com/v2/trades/tETHUSD/hist?limit=100', dataType: 'executed ETH-USD trades with aggressor side encoded by amount sign; 5-minute CVD; at least 5 classified trades', symbol: 'tETHUSD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 4, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
+  { id: 'council.member2.coinbase-trades', group: 'tradeflow', provider: 'Coinbase Exchange', url: 'https://api.exchange.coinbase.com/products/ETH-USD/trades?limit=100', dataType: 'executed ETH-USD spot trades and aggressor side; 5-minute CVD; at least 5 classified trades', symbol: 'ETH-USD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 1, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'spot', independenceGroup: 'coinbase' },
+  { id: 'council.member2.kraken-trades', group: 'tradeflow', provider: 'Kraken', url: 'https://api.kraken.com/0/public/Trades?pair=ETHUSD&count=100', dataType: 'executed ETH/USD spot trades and aggressor side; 5-minute CVD; at least 5 classified trades', symbol: 'ETHUSD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 2, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'spot', independenceGroup: 'kraken' },
+  { id: 'council.member2.okx-trades', group: 'tradeflow', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/market/trades?instId=ETH-USDT&limit=100', dataType: 'executed ETH-USDT spot trades and aggressor side; 5-minute CVD; at least 5 classified trades', symbol: 'ETH-USDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 3, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'spot', independenceGroup: 'okx' },
+  { id: 'council.member2.bitfinex-trades', group: 'tradeflow', provider: 'Bitfinex public trades', url: 'https://api-pub.bitfinex.com/v2/trades/tETHUSD/hist?limit=100', dataType: 'executed ETH-USD spot trades with aggressor side encoded by amount sign; 5-minute CVD; at least 5 classified trades', symbol: 'tETHUSD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 4, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'spot', independenceGroup: 'bitfinex' },
+  { id: 'council.member2.binance-trades', group: 'tradeflow', provider: 'Binance USD-M Futures', url: 'https://fapi.binance.com/fapi/v1/aggTrades?symbol=ETHUSDT&limit=1000', dataType: 'executed ETHUSDT perpetual aggregate trades and taker side; five-minute base-asset CVD', symbol: 'ETHUSDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 5, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'futures', independenceGroup: 'binance' },
+  { id: 'council.member2.bybit-trades', group: 'tradeflow', provider: 'Bybit V5 Linear', url: 'https://api.bybit.com/v5/market/recent-trade?category=linear&symbol=ETHUSDT&limit=1000', dataType: 'executed ETHUSDT perpetual trades and taker side; five-minute base-asset CVD', symbol: 'ETHUSDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 6, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'futures', independenceGroup: 'bybit' },
+  { id: 'council.member2.gateio-trades', group: 'tradeflow', provider: 'Gate.io Spot API v4', url: 'https://api.gateio.ws/api/v4/spot/trades?currency_pair=ETH_USDT&limit=100', dataType: 'executed ETH-USDT spot trades with side, fill ID, price, base amount and millisecond timestamp; five-minute CVD', symbol: 'ETH_USDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 7, fallbackGroup: 'council.member2.trades', memberIds: [2], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'spot', independenceGroup: 'gateio' },
   { id: 'council.member3.coinbase-level2', group: 'orderbook', provider: 'Coinbase Exchange', url: 'https://api.exchange.coinbase.com/products/ETH-USD/book?level=2', dataType: 'ETH-USD level-2 order book', symbol: 'ETH-USD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 5_000, priority: 1, fallbackGroup: 'council.member3.book', memberIds: [3], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member3.kraken-depth', group: 'orderbook', provider: 'Kraken', url: 'https://api.kraken.com/0/public/Depth?pair=ETHUSD&count=10', dataType: 'ETH/USD market depth', symbol: 'ETHUSD', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 5_000, priority: 2, fallbackGroup: 'council.member3.book', memberIds: [3], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member3.okx-books', group: 'orderbook', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/market/books?instId=ETH-USDT&sz=20', dataType: 'ETH-USDT order-book depth', symbol: 'ETH-USDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 5_000, priority: 3, fallbackGroup: 'council.member3.book', memberIds: [3], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
@@ -73,14 +78,16 @@ export const COUNCIL_MEMBER_SOURCES: readonly CouncilSourceDefinition[] = [
   { id: 'council.member4.deribit-perpetual', group: 'derivatives', provider: 'Deribit', url: 'https://www.deribit.com/api/v2/public/ticker?instrument_name=ETH-PERPETUAL', dataType: 'ETH-PERPETUAL funding and open interest', symbol: 'ETH-PERPETUAL', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 2, fallbackGroup: 'council.member4.derivatives', memberIds: [4], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member4.hyperliquid', group: 'derivatives', provider: 'Hyperliquid', url: 'https://api.hyperliquid.xyz/info', dataType: 'ETH perpetual context and open interest', symbol: 'ETH', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 3, fallbackGroup: 'council.member4.derivatives', memberIds: [4], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member4.binance-fapi', group: 'derivatives', provider: 'Binance USD-M Futures', url: 'https://fapi.binance.com/fapi/v1/openInterest?symbol=ETHUSDT', dataType: 'ETHUSDT perpetual open interest and funding; final fallback', symbol: 'ETHUSDT', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 4, fallbackGroup: 'council.member4.derivatives', memberIds: [4], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member5.deribit-options', group: 'options', provider: 'Deribit', url: 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=ETH&kind=option', dataType: 'ETH options book summary and DVOL', symbol: 'ETH options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 1, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member5.okx-opt-summary', group: 'options', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/public/opt-summary?uly=ETH-USD', dataType: 'ETH option summary (live-tested public route)', symbol: 'ETH-USD options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 2, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member5.bybit-options', group: 'options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/tickers?category=option&baseCoin=ETH', dataType: 'ETH options market tickers', symbol: 'ETH options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 3, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member5.binance-eapi', group: 'options', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/mark', dataType: 'ETH option mark price and IV; timestamp is response-received time, not provider time; current put/call IV parity is non-directional', symbol: 'ETH options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 4, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member6.staking-deposits', group: 'onchain', provider: 'PublicNode Ethereum JSON-RPC', url: 'https://ethereum-rpc.publicnode.com/', dataType: 'Confirmed Ethereum staking-deposit contract DepositEvent logs over approximately 24 hours; public eth_getLogs, no key', symbol: 'ETH staking deposit flow', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member6.defillama', group: 'onchain', provider: 'DefiLlama', url: 'https://stablecoins.llama.fi/stablecoincharts/Ethereum', dataType: 'Ethereum stablecoin circulating supply and seven-day change; heuristic, not conclusive', symbol: 'Ethereum stablecoins', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 48 * 60 * 60_000, priority: 1, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member6.fee-history', group: 'onchain', provider: 'PublicNode Ethereum JSON-RPC', url: 'https://ethereum-rpc.publicnode.com/', dataType: 'Recent Ethereum feeHistory network activity; context, not a price-direction signal', symbol: 'ETH mainnet gas activity', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
-  { id: 'council.member6.defillama-dex-volume', group: 'onchain', provider: 'DefiLlama public DEX volumes', url: 'https://api.llama.fi/overview/dexs/ethereum?excludeTotalDataChart=false&excludeTotalDataChartBreakdown=true', dataType: 'Daily Ethereum DEX volume and one/seven-day changes; free, no key; activity context, not a standalone direction signal', symbol: 'Ethereum DEX volume USD', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 48 * 60 * 60_000, priority: 4, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
+  { id: 'council.member5.deribit-options', group: 'options', provider: 'Deribit', url: 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=ETH&kind=option', additionalHealthUrls: ['https://www.deribit.com/api/v2/public/get_order_book'], dataType: 'ETH active options summary with provider timestamps, OI, bid/ask and sampled order-book sizes', symbol: 'ETH options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 1, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'options', independenceGroup: 'deribit' },
+  { id: 'council.member5.okx-opt-summary', group: 'options', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/public/instruments?instType=OPTION&uly=ETH-USD', additionalHealthUrls: ['https://www.okx.com/api/v5/public/opt-summary?uly=ETH-USD', 'https://www.okx.com/api/v5/public/open-interest?instType=OPTION&uly=ETH-USD', 'https://www.okx.com/api/v5/market/tickers?instType=OPTION'], dataType: 'ETH active contracts, timestamped IV/OI, two-sided ticker price/size and volume', symbol: 'ETH-USD options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 2, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'options', independenceGroup: 'okx' },
+  { id: 'council.member5.bybit-options', group: 'options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/instruments-info?category=option&baseCoin=ETH&limit=1000', additionalHealthUrls: ['https://api.bybit.com/v5/market/tickers?category=option&baseCoin=ETH'], dataType: 'ETH active option contracts and fresh bid/ask price, size, turnover, OI and IV tickers', symbol: 'ETH options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 3, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'options', independenceGroup: 'bybit' },
+  { id: 'council.member5.binance-eapi', group: 'options', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/exchangeInfo', additionalHealthUrls: ['https://eapi.binance.com/eapi/v1/mark', 'https://eapi.binance.com/eapi/v1/index?underlying=ETHUSDT', 'https://eapi.binance.com/eapi/v1/ticker'], dataType: 'ETH active European option contracts, timestamped index/OI/ticker and sampled depth; OI normalized to USD notional', symbol: 'ETH options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 4, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'options', independenceGroup: 'binance-european-options' },
+  { id: 'council.member5.delta-options', group: 'options', provider: 'Delta Exchange India', url: 'https://api.india.delta.exchange/v2/products?contract_types=call_options,put_options', additionalHealthUrls: ['https://api.india.delta.exchange/v2/tickers?contract_types=call_options,put_options'], dataType: 'ETH active options within 75%-125% moneyness with microsecond timestamps, quote sizes, IV, turnover and USD-normalized OI', symbol: 'ETH options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 5, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'options', independenceGroup: 'delta-india-options' },
+  { id: 'council.member5.gateio-options', group: 'options', provider: 'Gate.io Options API v4', url: 'https://api.gateio.ws/api/v4/options/contracts?underlying=ETH_USDT', additionalHealthUrls: ['https://api.gateio.ws/api/v4/options/tickers?underlying=ETH_USDT', 'https://api.gateio.ws/api/v4/options/trades?limit=1000', 'https://api.gateio.ws/api/v4/options/order_book?contract={contract}&limit=10'], dataType: 'ETH active option contracts, position size, mark IV, two-sided quotes, 24-hour trade coverage and sampled timestamped order books', symbol: 'ETH_USDT options', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 60_000, priority: 6, fallbackGroup: 'council.member5.options', memberIds: [5], assets: ['ETH'], apiKeyRequired: false, memberSource: true, marketType: 'options', independenceGroup: 'gateio-options' },
+  { id: 'council.member6.staking-deposits', group: 'onchain', provider: 'PublicNode Ethereum JSON-RPC', url: 'https://ethereum-rpc.publicnode.com/', dataType: 'Confirmed Ethereum staking-deposit contract DepositEvent logs over approximately 24 hours; public eth_getLogs, context only and not an independent provider slot', symbol: 'ETH staking deposit flow', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: false },
+  { id: 'council.member6.defillama', group: 'onchain', provider: 'DefiLlama', url: 'https://stablecoins.llama.fi/stablecoincharts/Ethereum', dataType: 'Ethereum stablecoin circulating supply and seven-day change; heuristic, context only and not an independent provider slot', symbol: 'Ethereum stablecoins', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 48 * 60 * 60_000, priority: 1, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: false },
+  { id: 'council.member6.fee-history', group: 'onchain', provider: 'PublicNode Ethereum JSON-RPC', url: 'https://ethereum-rpc.publicnode.com/', dataType: 'Recent Ethereum feeHistory network activity; context only and not an independent provider slot', symbol: 'ETH mainnet gas activity', cadence: 'realtime', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: false },
+  { id: 'council.member6.defillama-dex-volume', group: 'onchain', provider: 'DefiLlama public DEX volumes', url: 'https://api.llama.fi/overview/dexs/ethereum?excludeTotalDataChart=false&excludeTotalDataChartBreakdown=true', dataType: 'Daily Ethereum DEX volume; free, no key; five-minute stale-data guard; infrastructure/context only, not a standalone direction signal', symbol: 'Ethereum DEX volume USD', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 5 * 60_000, priority: 6, fallbackGroup: 'council.member6.onchain', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, memberSource: false, independenceGroup: 'defillama-ethereum' },
   { id: 'council.member7.fred', group: 'macro', provider: 'FRED (public CSV; API key optional)', url: 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10', additionalHealthUrls: ['https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTWEXBGS', 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500', 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS', 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=WALCL'], dataType: 'Daily DGS10, DTWEXBGS, SP500, VIXCLS and weekly WALCL; dated CSV observations', symbol: 'U.S. yields, broad dollar, equities, volatility and Fed balance sheet', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 7 * 24 * 60 * 60_000, priority: 1, fallbackGroup: 'council.member7.macro', memberIds: [7], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member7.cboe-vix', group: 'macro', provider: 'Cboe', url: 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv', dataType: 'Dated daily VIX OHLC and close; risk context', symbol: 'VIX', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 7 * 24 * 60 * 60_000, priority: 2, fallbackGroup: 'council.member7.macro', memberIds: [7], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
   { id: 'council.member7.yahoo-chart', group: 'macro', provider: 'Yahoo Finance chart API (غیررسمی)', url: 'https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=5d&interval=1d', additionalHealthUrls: ['https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?range=5d&interval=1d'], dataType: 'Dated daily S&P 500 and U.S. dollar index observations; unofficial API', symbol: '^GSPC, DX-Y.NYB', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 7 * 24 * 60 * 60_000, priority: 3, fallbackGroup: 'council.member7.macro', memberIds: [7], assets: ['ETH'], apiKeyRequired: false, memberSource: true },
@@ -113,7 +120,7 @@ function makeAssetSource(
   memberId: number,
   priority: number,
   suffix: string,
-  details: Pick<CouncilSourceDefinition, 'group' | 'provider' | 'url' | 'dataType' | 'symbol' | 'cadence' | 'realtimeEligible' | 'maxAgeMs' | 'additionalHealthUrls'>,
+  details: Pick<CouncilSourceDefinition, 'group' | 'provider' | 'url' | 'dataType' | 'symbol' | 'cadence' | 'realtimeEligible' | 'maxAgeMs' | 'additionalHealthUrls' | 'marketType' | 'independenceGroup'>,
 ): CouncilSourceDefinition {
   return {
     ...details,
@@ -162,29 +169,59 @@ function buildAssetMarketSources(asset: MarketAsset): CouncilSourceDefinition[] 
     cadence: 'realtime', realtimeEligible: true, maxAgeMs: 65_000,
   });
 
-  add(2, 'coinbase-trades', {
-    group: 'tradeflow', provider: 'Coinbase Exchange',
-    url: `https://api.exchange.coinbase.com/products/${market.coinbase}/trades?limit=100`,
-    dataType: `Executed ${asset}/USD trades and aggressor side; five-minute CVD`,
-    symbol: market.coinbase, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
-  });
+  if (asset === 'BNB') {
+    add(2, 'bybit-trades', {
+      group: 'tradeflow', provider: 'Bybit V5 Linear',
+      url: `https://api.bybit.com/v5/market/recent-trade?category=linear&symbol=${market.bybitPerpetual}&limit=1000`,
+      dataType: 'Executed BNB perpetual trades with taker side; five-minute CVD',
+      symbol: market.bybitPerpetual, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+      marketType: 'futures', independenceGroup: 'bybit',
+    });
+  } else {
+    add(2, 'coinbase-trades', {
+      group: 'tradeflow', provider: 'Coinbase Exchange',
+      url: `https://api.exchange.coinbase.com/products/${market.coinbase}/trades?limit=100`,
+      dataType: `Executed ${asset}/USD trades and aggressor side; five-minute CVD`,
+      symbol: market.coinbase, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+      marketType: 'spot', independenceGroup: 'coinbase',
+    });
+  }
   add(2, 'kraken-trades', {
     group: 'tradeflow', provider: 'Kraken',
     url: `https://api.kraken.com/0/public/Trades?pair=${market.kraken}`,
     dataType: `Executed ${asset}/USD trades and aggressor side; five-minute CVD`,
     symbol: market.kraken, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+    marketType: 'spot', independenceGroup: 'kraken',
   });
   add(2, 'okx-trades', {
     group: 'tradeflow', provider: 'OKX V5',
     url: `https://www.okx.com/api/v5/market/trades?instId=${market.okx}&limit=100`,
     dataType: `Executed ${asset}-USDT trades and aggressor side; five-minute CVD`,
     symbol: market.okx, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+    marketType: 'spot', independenceGroup: 'okx',
   });
-  add(2, 'bitstamp-transactions', {
-    group: 'tradeflow', provider: 'Bitstamp',
-    url: `https://www.bitstamp.net/api/v2/transactions/${market.bitstamp}/?time=hour`,
-    dataType: `Executed ${asset}/USD transactions; aggressor side is not exposed and this source is not CVD-directional`,
-    symbol: market.bitstamp, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+  add(2, 'binance-trades', {
+    group: 'tradeflow', provider: 'Binance USD-M Futures',
+    url: `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${market.binancePerpetual}&limit=1000`,
+    dataType: `Executed ${asset} perpetual aggregate trades with taker side; five-minute CVD`,
+    symbol: market.binancePerpetual, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+    marketType: 'futures', independenceGroup: 'binance',
+  });
+  if (asset !== 'BNB') {
+    add(2, 'bybit-trades', {
+      group: 'tradeflow', provider: 'Bybit V5 Linear',
+      url: `https://api.bybit.com/v5/market/recent-trade?category=linear&symbol=${market.bybitPerpetual}&limit=1000`,
+      dataType: `Executed ${asset} perpetual trades with taker side; five-minute base-asset CVD`,
+      symbol: market.bybitPerpetual, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+      marketType: 'futures', independenceGroup: 'bybit',
+    });
+  }
+  add(2, 'gateio-trades', {
+    group: 'tradeflow', provider: 'Gate.io Spot API v4',
+    url: `https://api.gateio.ws/api/v4/spot/trades?currency_pair=${asset}_USDT&limit=100`,
+    dataType: `Executed ${asset}-USDT spot trades with side, fill ID, price, base amount and millisecond timestamp; five-minute CVD`,
+    symbol: `${asset}_USDT`, cadence: 'realtime', realtimeEligible: true, maxAgeMs: 60_000,
+    marketType: 'spot', independenceGroup: 'gateio',
   });
 
   add(3, 'coinbase-level2', {
@@ -272,28 +309,31 @@ const ASSET_SPECIFIC_MEMBER_SOURCES = (Object.keys(ASSET_MARKETS) as MarketAsset
 
 function buildAssetOptionsSources(): CouncilSourceDefinition[] {
   const providers: Readonly<Record<MarketAsset, readonly {
-    suffix: 'deribit-options' | 'okx-opt-summary' | 'bybit-options' | 'binance-eapi';
+    suffix: 'deribit-options' | 'okx-opt-summary' | 'bybit-options' | 'binance-eapi' | 'delta-options' | 'gateio-options';
     provider: string;
     url: string;
     dataType: string;
+    additionalHealthUrls?: readonly string[];
   }[]>> = {
     BTC: [
-      { suffix: 'deribit-options', provider: 'Deribit', url: 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option', dataType: 'BTC options open-interest and IV summary; timestamped contracts' },
-      { suffix: 'okx-opt-summary', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/public/opt-summary?uly=BTC-USD', dataType: 'BTC options put/call IV by contract; provider timestamped' },
-      { suffix: 'bybit-options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC', dataType: 'BTC options market tickers with mark IV and open interest' },
-      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/mark', dataType: 'BTC option mark price and IV; timestamp is response-received time, not provider time' },
+      { suffix: 'deribit-options', provider: 'Deribit', url: 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option', additionalHealthUrls: ['https://www.deribit.com/api/v2/public/get_order_book'], dataType: 'BTC active option summary with provider timestamps, OI, bid/ask and sampled order-book sizes' },
+      { suffix: 'okx-opt-summary', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/public/instruments?instType=OPTION&uly=BTC-USD', additionalHealthUrls: ['https://www.okx.com/api/v5/public/opt-summary?uly=BTC-USD', 'https://www.okx.com/api/v5/public/open-interest?instType=OPTION&uly=BTC-USD', 'https://www.okx.com/api/v5/market/tickers?instType=OPTION'], dataType: 'BTC active contracts, timestamped IV/OI, two-sided ticker price/size and volume' },
+      { suffix: 'bybit-options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/instruments-info?category=option&baseCoin=BTC&limit=1000', additionalHealthUrls: ['https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC'], dataType: 'BTC active option contracts and fresh bid/ask price, size, turnover, OI and IV tickers' },
+      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/exchangeInfo', additionalHealthUrls: ['https://eapi.binance.com/eapi/v1/mark', 'https://eapi.binance.com/eapi/v1/index?underlying=BTCUSDT', 'https://eapi.binance.com/eapi/v1/ticker'], dataType: 'BTC active European option contracts, timestamped index/OI/ticker and sampled depth; OI normalized to USD notional' },
+      { suffix: 'delta-options', provider: 'Delta Exchange India', url: 'https://api.india.delta.exchange/v2/products?contract_types=call_options,put_options', additionalHealthUrls: ['https://api.india.delta.exchange/v2/tickers?contract_types=call_options,put_options'], dataType: 'BTC active options within 75%-125% moneyness with microsecond timestamps, quote sizes, IV, turnover and USD-normalized OI' },
+      { suffix: 'gateio-options', provider: 'Gate.io Options API v4', url: 'https://api.gateio.ws/api/v4/options/contracts?underlying=BTC_USDT', additionalHealthUrls: ['https://api.gateio.ws/api/v4/options/tickers?underlying=BTC_USDT', 'https://api.gateio.ws/api/v4/options/trades?limit=1000', 'https://api.gateio.ws/api/v4/options/order_book?contract={contract}&limit=10'], dataType: 'BTC active option contracts, position size, mark IV, two-sided quotes, 24-hour trade coverage and sampled timestamped order books' },
     ],
     SOL: [
-      { suffix: 'okx-opt-summary', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/public/opt-summary?uly=SOL-USD', dataType: 'SOL options put/call IV by contract; provider timestamped' },
-      { suffix: 'bybit-options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/tickers?category=option&baseCoin=SOL', dataType: 'SOL options market tickers with mark IV and open interest' },
-      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/mark', dataType: 'SOL option mark price and IV; timestamp is response-received time, not provider time' },
+      { suffix: 'okx-opt-summary', provider: 'OKX V5', url: 'https://www.okx.com/api/v5/public/instruments?instType=OPTION&uly=SOL-USD', additionalHealthUrls: ['https://www.okx.com/api/v5/public/opt-summary?uly=SOL-USD', 'https://www.okx.com/api/v5/public/open-interest?instType=OPTION&uly=SOL-USD', 'https://www.okx.com/api/v5/market/tickers?instType=OPTION'], dataType: 'SOL active contracts, timestamped IV/OI, two-sided ticker price/size and volume' },
+      { suffix: 'bybit-options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/instruments-info?category=option&baseCoin=SOL&limit=1000', additionalHealthUrls: ['https://api.bybit.com/v5/market/tickers?category=option&baseCoin=SOL'], dataType: 'SOL active option contracts and fresh bid/ask price, size, turnover, OI and IV tickers' },
+      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/exchangeInfo', additionalHealthUrls: ['https://eapi.binance.com/eapi/v1/mark', 'https://eapi.binance.com/eapi/v1/index?underlying=SOLUSDT', 'https://eapi.binance.com/eapi/v1/ticker'], dataType: 'SOL active European option contracts, timestamped index/OI/ticker and sampled depth; OI normalized to USD notional' },
     ],
     XRP: [
-      { suffix: 'bybit-options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/tickers?category=option&baseCoin=XRP', dataType: 'XRP options market tickers with mark IV and open interest' },
-      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/mark', dataType: 'XRP option mark price and IV; timestamp is response-received time, not provider time' },
+      { suffix: 'bybit-options', provider: 'Bybit V5', url: 'https://api.bybit.com/v5/market/instruments-info?category=option&baseCoin=XRP&limit=1000', additionalHealthUrls: ['https://api.bybit.com/v5/market/tickers?category=option&baseCoin=XRP'], dataType: 'XRP active option contracts and fresh bid/ask price, size, turnover, OI and IV tickers; council minimum 6 contracts and 2 calls/puts' },
+      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/exchangeInfo', additionalHealthUrls: ['https://eapi.binance.com/eapi/v1/mark', 'https://eapi.binance.com/eapi/v1/index?underlying=XRPUSDT', 'https://eapi.binance.com/eapi/v1/ticker'], dataType: 'XRP active European option contracts, timestamped index/OI/ticker and sampled depth; OI normalized to USD notional' },
     ],
     BNB: [
-      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/mark', dataType: 'BNB option mark price and IV; timestamp is response-received time, not provider time' },
+      { suffix: 'binance-eapi', provider: 'Binance European Options', url: 'https://eapi.binance.com/eapi/v1/exchangeInfo', additionalHealthUrls: ['https://eapi.binance.com/eapi/v1/mark', 'https://eapi.binance.com/eapi/v1/index?underlying=BNBUSDT', 'https://eapi.binance.com/eapi/v1/ticker'], dataType: 'BNB active European option contracts, timestamped index/OI/ticker and sampled depth; only counts if live contracts and directional OI exist' },
     ],
   };
   return (Object.keys(providers) as MarketAsset[]).flatMap((asset) =>
@@ -311,12 +351,123 @@ function buildAssetOptionsSources(): CouncilSourceDefinition[] {
         cadence: 'realtime',
         realtimeEligible: true,
         maxAgeMs: 60_000,
+        marketType: 'options',
+        additionalHealthUrls: provider.additionalHealthUrls,
+        independenceGroup: provider.suffix === 'binance-eapi'
+          ? 'binance-european-options'
+          : provider.suffix === 'okx-opt-summary'
+            ? 'okx'
+            : provider.suffix === 'bybit-options'
+              ? 'bybit'
+              : provider.suffix === 'delta-options'
+                ? 'delta-india-options'
+                : provider.suffix === 'gateio-options'
+                  ? 'gateio-options'
+              : 'deribit',
       },
     ))
   );
 }
 
 const ASSET_SPECIFIC_OPTIONS_SOURCES = buildAssetOptionsSources();
+
+function buildAssetFuturesProxySources(): CouncilSourceDefinition[] {
+  const assets = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP'] as const;
+  const venues = [
+    {
+      id: 'binance',
+      provider: 'Binance USD-M Futures',
+      url: (asset: string) => `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${asset}USDT`,
+      additionalHealthUrls: (asset: string) => [
+        `https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=${asset}USDT&period=5m&limit=3`,
+        `https://fapi.binance.com/futures/data/openInterestHist?symbol=${asset}USDT&period=5m&limit=3`,
+        `https://fapi.binance.com/fapi/v1/klines?symbol=${asset}USDT&interval=1m&limit=5`,
+        `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${asset}USDT&limit=8`,
+      ],
+      independenceGroup: 'binance-usdm-futures',
+    },
+    {
+      id: 'bybit',
+      provider: 'Bybit V5 Linear Futures',
+      url: (asset: string) => `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${asset}USDT`,
+      additionalHealthUrls: (asset: string) => [
+        `https://api.bybit.com/v5/market/account-ratio?category=linear&symbol=${asset}USDT&period=5min&limit=3`,
+        `https://api.bybit.com/v5/market/open-interest?category=linear&symbol=${asset}USDT&intervalTime=5min&limit=3`,
+        `https://api.bybit.com/v5/market/kline?category=linear&symbol=${asset}USDT&interval=1&limit=5`,
+        `https://api.bybit.com/v5/market/funding/history?category=linear&symbol=${asset}USDT&limit=8`,
+      ],
+      independenceGroup: 'bybit-linear-futures',
+    },
+    {
+      id: 'okx',
+      provider: 'OKX V5 Swap',
+      url: (asset: string) => `https://www.okx.com/api/v5/public/funding-rate?instId=${asset}-USDT-SWAP`,
+      additionalHealthUrls: (asset: string) => [
+        `https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${asset}&period=5m`,
+        `https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=${asset}&period=5m`,
+        `https://www.okx.com/api/v5/market/candles?instId=${asset}-USDT-SWAP&bar=1m&limit=5`,
+        `https://www.okx.com/api/v5/public/funding-rate-history?instId=${asset}-USDT-SWAP&limit=8`,
+      ],
+      independenceGroup: 'okx-usdt-swap',
+    },
+    {
+      id: 'kucoin',
+      provider: 'KuCoin Futures',
+      url: (asset: string) =>
+        `https://api-futures.kucoin.com/api/v1/contracts/${asset === 'BTC' ? 'XBT' : asset}USDTM`,
+      additionalHealthUrls: (asset: string) => {
+        const symbol = `${asset === 'BTC' ? 'XBT' : asset}USDTM`;
+        return [
+          `https://api-futures.kucoin.com/api/v1/funding-rate/${symbol}/current`,
+          `https://api-futures.kucoin.com/api/v1/kline/query?symbol=${symbol}&granularity=1`,
+          `https://api-futures.kucoin.com/api/v1/trade/history?symbol=${symbol}`,
+        ];
+      },
+      independenceGroup: 'kucoin-usdtm-futures',
+    },
+    {
+      id: 'gateio',
+      provider: 'Gate.io USDT Futures',
+      url: (asset: string) =>
+        `https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract=${asset}_USDT&interval=5m&limit=5`,
+      additionalHealthUrls: (asset: string) => [
+        `https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=${asset}_USDT&interval=1m&limit=5`,
+      ],
+      independenceGroup: 'gateio-usdt-futures',
+    },
+  ] as const;
+  return assets.flatMap((asset) => {
+    const optionSourceCount = asset === 'ETH'
+      ? COUNCIL_MEMBER_SOURCES.filter((source) =>
+        source.memberIds?.includes(5) && source.group === 'options'
+      ).length
+      : ASSET_SPECIFIC_OPTIONS_SOURCES.filter((source) =>
+        source.assets?.includes(asset)
+      ).length;
+    return venues.map((venue, index): CouncilSourceDefinition => ({
+      id: `council.member5.proxy.${venue.id}-futures.${asset.toLowerCase()}`,
+      group: 'derivatives',
+      provider: venue.provider,
+      url: venue.url(asset),
+      dataType: `${asset} perpetual futures proxy: funding, venue-native positioning ratio, five-minute open-interest change, one-minute price impulse and realized volatility; KuCoin trade-side ratio is diagnostic-only and excluded from voting`,
+      symbol: `${asset}USDT`,
+      cadence: 'realtime',
+      realtimeEligible: true,
+      enabled: true,
+      maxAgeMs: 6 * 60_000,
+      priority: optionSourceCount + index + 1,
+      additionalHealthUrls: venue.additionalHealthUrls(asset),
+      memberIds: [5],
+      assets: [asset],
+      apiKeyRequired: false,
+      memberSource: true,
+      marketType: 'futures',
+      independenceGroup: venue.independenceGroup,
+    }));
+  });
+}
+
+const ASSET_SPECIFIC_FUTURES_PROXY_SOURCES = buildAssetFuturesProxySources();
 
 function buildAssetNewsSources(): CouncilSourceDefinition[] {
   const googleNewsQueries: Readonly<Record<MarketAsset, string>> = {
@@ -360,10 +511,21 @@ const ASSET_SPECIFIC_NEWS_SOURCES = buildAssetNewsSources();
 
 export function getCouncilMemberSources(memberId: number, asset = 'ETH'): CouncilSourceDefinition[] {
   const selectedDefinitions = asset === 'ETH'
-    ? COUNCIL_MEMBER_SOURCES
+    ? [
+        ...COUNCIL_MEMBER_SOURCES,
+        ...definitions.filter((source) =>
+          source.group === 'onchain' &&
+          source.memberIds?.includes(memberId) &&
+          source.assets?.includes(asset)
+        ),
+        ...ASSET_SPECIFIC_FUTURES_PROXY_SOURCES.filter((source) =>
+          source.assets?.includes(asset)
+        ),
+      ]
     : [
         ...ASSET_SPECIFIC_MEMBER_SOURCES,
         ...ASSET_SPECIFIC_OPTIONS_SOURCES,
+        ...ASSET_SPECIFIC_FUTURES_PROXY_SOURCES,
         ...ASSET_SPECIFIC_NEWS_SOURCES,
         ...(memberId === 7
           ? COUNCIL_MEMBER_SOURCES
@@ -387,9 +549,13 @@ export function getCouncilMemberSources(memberId: number, asset = 'ETH'): Counci
 
 const definitions: readonly CouncilSourceDefinition[] = [
   { id: 'council.member7.stooq', group: 'macro', provider: 'Stooq', url: 'https://stooq.com/q/d/l/?s=usd_i&i=d', dataType: 'USD index daily CSV; live-tested HTTP 403; excluded from voting sources', symbol: 'usd_i', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 7 * 24 * 60 * 60_000, memberIds: [7], assets: ['ETH'], apiKeyRequired: false },
-  { id: 'onchain.mempool-blocks', group: 'onchain', provider: 'mempool.space', url: 'https://mempool.space/api/v1/blocks', dataType: 'confirmed Bitcoin block sample', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 1, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false },
+  { id: 'onchain.mempool-blocks', group: 'onchain', provider: 'mempool.space', url: 'https://mempool.space/api/v1/blocks', dataType: 'independent health sample of latest confirmed Bitcoin block; 20-minute timestamp guard; CEX flow is counted only when verified wallet attribution is configured', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 1, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false, independenceGroup: 'mempool-space' },
   { id: 'onchain.mempool-transactions', group: 'onchain', provider: 'mempool.space', url: 'https://mempool.space/api/block/{hash}/txs', dataType: 'confirmed Bitcoin transactions', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000 },
-  { id: 'onchain.blockstream-blocks', group: 'onchain', provider: 'Blockstream Esplora', url: 'https://blockstream.info/api/blocks', dataType: 'confirmed Bitcoin block sample', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 2, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false },
+  { id: 'onchain.blockstream-blocks', group: 'onchain', provider: 'Blockstream Esplora', url: 'https://blockstream.info/api/blocks', dataType: 'independent health sample of latest confirmed Bitcoin block; 20-minute timestamp guard; CEX flow is counted only when verified wallet attribution is configured', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 2, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false, independenceGroup: 'blockstream-esplora' },
+  { id: 'onchain.blockchair-bitcoin', group: 'onchain', provider: 'Blockchair Bitcoin API', url: 'https://api.blockchair.com/bitcoin/stats', dataType: 'Bitcoin best-block height/hash/time from independent Blockchair API; 20-minute timestamp guard; health only, no CEX attribution', symbol: 'BTC/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 3, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false, independenceGroup: 'blockchair-bitcoin' },
+  { id: 'onchain.blockcypher-bitcoin', group: 'onchain', provider: 'BlockCypher Bitcoin API', url: 'https://api.blockcypher.com/v1/btc/main', dataType: 'Bitcoin latest block height/hash/time from BlockCypher; optional API token; 20-minute timestamp guard; health only', symbol: 'BTC.main', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 4, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false, independenceGroup: 'blockcypher-bitcoin' },
+  { id: 'onchain.btcscan-bitcoin', group: 'onchain', provider: 'BTCscan public Esplora mirror', url: 'https://btcscan.org/api/blocks', dataType: 'Bitcoin latest confirmed block from public Esplora-compatible mirror; 20-minute timestamp guard; no credentials', symbol: 'BTC/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 5, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false, independenceGroup: 'btcscan-esplora' },
+  { id: 'onchain.blockchain-com-bitcoin', group: 'onchain', provider: 'Blockchain.com public API', url: 'https://blockchain.info/latestblock', dataType: 'Bitcoin latest block height/hash/time; 20-minute timestamp guard; health only, no CEX attribution', symbol: 'BTC/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000, priority: 6, fallbackGroup: 'onchain.btc', memberIds: [6], assets: ['BTC'], apiKeyRequired: false, independenceGroup: 'blockchain-com-bitcoin' },
   { id: 'onchain.blockstream-transactions', group: 'onchain', provider: 'Blockstream Esplora', url: 'https://blockstream.info/api/block/{hash}/txs', dataType: 'confirmed Bitcoin transactions', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 20 * 60_000 },
   { id: 'onchain.mempool-ninja', group: 'onchain', provider: 'mempool.ninja', url: 'https://mempool.ninja/api/mempool/recent', dataType: 'recent Bitcoin mempool transactions', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: false, enabled: false, maxAgeMs: 5 * 60_000, disabledReason: 'Disabled: mirror schema, freshness, and operational ownership have not been verified.' },
   { id: 'onchain.mempool-emzy', group: 'onchain', provider: 'mempool.emzy.de', url: 'https://mempool.emzy.de/api/mempool/recent', dataType: 'recent Bitcoin mempool transactions', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: false, enabled: false, maxAgeMs: 5 * 60_000, disabledReason: 'Disabled: mirror schema, freshness, and operational ownership have not been verified.' },
@@ -400,16 +566,30 @@ const definitions: readonly CouncilSourceDefinition[] = [
   { id: 'onchain.blockchair-mempool', group: 'onchain', provider: 'Blockchair', url: 'https://api.blockchair.com/bitcoin/mempool', dataType: 'Bitcoin mempool statistics', symbol: 'BTC', cadence: 'periodic', realtimeEligible: false, enabled: false, maxAgeMs: 5 * 60_000, disabledReason: 'Disabled: endpoint schema, service limits, and timestamp semantics have not been verified.' },
   { id: 'onchain.btcscan-mempool', group: 'onchain', provider: 'BTCscan', url: 'https://btcscan.org/api/mempool/recent', dataType: 'recent Bitcoin mempool transactions', symbol: 'BTC', cadence: 'event-driven', realtimeEligible: false, enabled: false, maxAgeMs: 5 * 60_000, disabledReason: 'Disabled: endpoint schema and operational availability have not been verified.' },
   { id: 'onchain.coinmetrics-active-addresses', group: 'onchain', provider: 'Coin Metrics Community API', url: 'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=AdrActCnt&limit_per_asset=1&pretty=false', dataType: 'daily active addresses; network activity, not whale flow', symbol: 'BTC', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 3 * 24 * 60 * 60_000 },
-  { id: 'onchain.ethereum-public-rpc', group: 'onchain', provider: 'PublicNode Ethereum', url: 'https://ethereum-rpc.publicnode.com/', dataType: 'sampled confirmed native-ETH transfers to configured watchlist; no key', symbol: 'ETH/mainnet chainid=1', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false },
-  { id: 'onchain.ethereum-1rpc', group: 'onchain', provider: '1RPC Ethereum', url: 'https://1rpc.io/eth', dataType: 'sampled confirmed native-ETH transfers to configured watchlist; no key', symbol: 'ETH/mainnet chainid=1', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false },
-  { id: 'onchain.etherscan-transfers', group: 'onchain', provider: 'Etherscan V2 (optional)', url: 'https://api.etherscan.io/v2/api?chainid=1', dataType: 'configured-address native ETH and ERC-20 transfer watchlist; API key', symbol: 'ETH/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, memberIds: [6], assets: ['ETH'], apiKeyRequired: true },
-  { id: 'onchain.solana-public-rpc', group: 'onchain', provider: 'Solana mainnet-beta public RPC', url: 'https://api.mainnet-beta.solana.com/', dataType: 'sampled finalized native-SOL transfers to configured watchlist; no key, public RPC limits apply', symbol: 'SOL/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false },
-  { id: 'onchain.solana-publicnode', group: 'onchain', provider: 'PublicNode Solana', url: 'https://solana-rpc.publicnode.com/', dataType: 'sampled finalized native-SOL transfers to configured watchlist; no key, public RPC limits apply', symbol: 'SOL/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false },
-  { id: 'onchain.helius-solana', group: 'onchain', provider: 'Helius (optional)', url: 'https://mainnet.helius-rpc.com/', dataType: 'finalized native-SOL transfers to configured watchlist; API key', symbol: 'SOL/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: true },
-  { id: 'onchain.xrpscan-xrp', group: 'onchain', provider: 'XRPSCAN', url: 'https://api.xrpscan.com/api/v1/account/{address}/transactions', dataType: 'validated native-XRP payments to configured CEX wallets', symbol: 'XRP/XRPL', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.xrp', memberIds: [6], assets: ['XRP'], apiKeyRequired: false },
-  { id: 'onchain.bsc-public-rpc', group: 'onchain', provider: 'Binance BSC public RPC', url: 'https://bsc-dataseed.binance.org/', dataType: 'sampled confirmed native-BNB transfers to configured watchlist; no key', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false },
-  { id: 'onchain.bsc-publicnode', group: 'onchain', provider: 'PublicNode BSC', url: 'https://bsc-rpc.publicnode.com/', dataType: 'sampled confirmed native-BNB transfers to configured watchlist; no key', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false },
-  { id: 'onchain.bscscan-bnb', group: 'onchain', provider: 'Etherscan V2 BSC (optional)', url: 'https://api.etherscan.io/v2/api?chainid=56', dataType: 'confirmed native-BNB transfers to configured CEX wallets; API key', symbol: 'BNB/BNB Smart Chain', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: true },
+  { id: 'onchain.ethereum-public-rpc', group: 'onchain', provider: 'PublicNode Ethereum', url: 'https://ethereum-rpc.publicnode.com/', dataType: 'independent Ethereum mainnet RPC chain-id and latest-block timestamp validation; public, no key; CEX labels are used only for separately verified transfer attribution', symbol: 'ETH/mainnet chainid=1', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, independenceGroup: 'publicnode-ethereum' },
+  { id: 'onchain.ethereum-1rpc', group: 'onchain', provider: '1RPC Ethereum', url: 'https://1rpc.io/eth', dataType: 'independent Ethereum mainnet RPC chain-id and latest-block timestamp validation; public, no key; CEX labels are used only for separately verified transfer attribution', symbol: 'ETH/mainnet chainid=1', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, independenceGroup: '1rpc-ethereum' },
+  { id: 'onchain.ethereum-routescan', group: 'onchain', provider: 'Routescan public Ethereum API', url: 'https://api.routescan.io/v2/network/mainnet/evm/1/blocks?limit=1', dataType: 'Public Ethereum latest-block height/hash/timestamp; no key; five-minute freshness guard; health/context only', symbol: 'ETH/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, independenceGroup: 'routescan-ethereum' },
+  { id: 'onchain.ethereum-blockscout', group: 'onchain', provider: 'Blockscout Ethereum API', url: 'https://eth.blockscout.com/api/v2/blocks', dataType: 'Public Ethereum latest-block height/hash/timestamp; no key; five-minute freshness guard; health/context only', symbol: 'ETH/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 4, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, independenceGroup: 'blockscout-ethereum' },
+  { id: 'onchain.ethereum-blockchair', group: 'onchain', provider: 'Blockchair Ethereum public stats', url: 'https://api.blockchair.com/ethereum/blocks?limit=1', dataType: 'Public Ethereum latest-block height/hash/time; no key; five-minute freshness guard; health/context only', symbol: 'ETH/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 5, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, independenceGroup: 'blockchair-ethereum' },
+  { id: 'onchain.defillama-ethereum', group: 'onchain', provider: 'DefiLlama public DEX volumes', url: 'https://api.llama.fi/overview/dexs/ethereum?excludeTotalDataChart=false&excludeTotalDataChartBreakdown=true', dataType: 'Daily Ethereum DEX volume; free, no key; five-minute stale-data guard; infrastructure/context only, not a standalone direction signal', symbol: 'Ethereum DEX volume USD', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 5 * 60_000, priority: 6, fallbackGroup: 'onchain.eth', memberIds: [6], assets: ['ETH'], apiKeyRequired: false, independenceGroup: 'defillama-ethereum' },
+  { id: 'onchain.solana-public-rpc', group: 'onchain', provider: 'Solana mainnet-beta public RPC', url: 'https://api.mainnet-beta.solana.com/', dataType: 'Independent finalized-slot and block-time validation; five-minute freshness guard; public RPC; CEX attribution requires configured verified wallet watchlist', symbol: 'SOL/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false, independenceGroup: 'solana-mainnet-rpc' },
+  { id: 'onchain.solana-publicnode', group: 'onchain', provider: 'PublicNode Solana', url: 'https://solana-rpc.publicnode.com/', dataType: 'Independent finalized-slot and block-time validation; five-minute freshness guard; public RPC; CEX attribution requires configured verified wallet watchlist', symbol: 'SOL/mainnet', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false, independenceGroup: 'publicnode-solana' },
+  { id: 'onchain.dexscreener-solana', group: 'onchain', provider: 'DEX Screener Solana token-pairs API', url: 'https://api.dexscreener.com/token-pairs/v1/solana/So11111111111111111111111111111111111111112', dataType: 'Public Solana DEX pair/liquidity and 24-hour volume context; no key; API response health only, not CEX-attributed direction', symbol: 'WSOL', cadence: 'periodic', realtimeEligible: false, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false, independenceGroup: 'dexscreener-solana' },
+  { id: 'onchain.solana-status', group: 'onchain', provider: 'Solana public status feed', url: 'https://status.solana.com/api/v2/status.json', dataType: 'Public Solana network status/incident feed; no key; five-minute check TTL; not a transaction feed or directional signal', symbol: 'SOL/mainnet status', cadence: 'periodic', realtimeEligible: false, enabled: true, maxAgeMs: 5 * 60_000, priority: 4, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false, independenceGroup: 'solana-status' },
+  { id: 'onchain.jupiter-solana', group: 'onchain', provider: 'Jupiter Lite public price API', url: 'https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112', dataType: 'Public Jupiter wrapped-SOL price/liquidity context; no key; API response health only, not a CEX-attributed signal', symbol: 'WSOL/USD', cadence: 'periodic', realtimeEligible: false, enabled: true, maxAgeMs: 5 * 60_000, priority: 5, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false, independenceGroup: 'jupiter-solana' },
+  { id: 'onchain.geckoterminal-solana', group: 'onchain', provider: 'GeckoTerminal public Solana pools API', url: 'https://api.geckoterminal.com/api/v2/networks/solana/tokens/So11111111111111111111111111111111111111112/pools', dataType: 'Public Solana DEX pool/explorer feed; no key; five-minute check TTL; endpoint is not OpenBook-specific or CEX-attributed', symbol: 'WSOL pools', cadence: 'periodic', realtimeEligible: false, enabled: true, maxAgeMs: 5 * 60_000, priority: 6, fallbackGroup: 'onchain.sol', memberIds: [6], assets: ['SOL'], apiKeyRequired: false, independenceGroup: 'geckoterminal-solana' },
+  { id: 'onchain.bsc-publicnode', group: 'onchain', provider: 'PublicNode BSC', url: 'https://bsc-rpc.publicnode.com/', dataType: 'BSC chain-id and latest-block timestamp; public JSON-RPC, health only; CEX attribution requires a verified watchlist', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false, independenceGroup: 'publicnode-bsc' },
+  { id: 'onchain.bsc-1rpc', group: 'onchain', provider: '1RPC BSC', url: 'https://1rpc.io/bnb', dataType: 'BSC chain-id and latest-block timestamp; public JSON-RPC, health only; CEX attribution requires a verified watchlist', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false, independenceGroup: '1rpc-bsc' },
+  { id: 'onchain.bsc-defibit', group: 'onchain', provider: 'Defibit public BSC RPC', url: 'https://bsc-dataseed1.defibit.io/', dataType: 'BSC chain-id and latest-block timestamp; public JSON-RPC, health only; CEX attribution requires a verified watchlist', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false, independenceGroup: 'defibit-bsc' },
+  { id: 'onchain.bsc-bloxroute', group: 'onchain', provider: 'bloXroute public BSC RPC', url: 'https://bsc.rpc.blxrbdn.com/', dataType: 'BSC chain-id and latest-block timestamp; public JSON-RPC, health only; CEX attribution requires a verified watchlist', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 4, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false, independenceGroup: 'bloxroute-bsc' },
+  { id: 'onchain.bsc-blastapi', group: 'onchain', provider: 'BlastAPI public BSC RPC', url: 'https://bsc-mainnet.public.blastapi.io', dataType: 'BSC chain-id and latest-block timestamp; public JSON-RPC, health only; CEX attribution requires a verified watchlist', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 5, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false, independenceGroup: 'blastapi-bsc' },
+  { id: 'onchain.bsc-public-rpc', group: 'onchain', provider: 'Binance BSC public RPC', url: 'https://bsc-dataseed.binance.org/', dataType: 'BSC chain-id and latest-block timestamp; public JSON-RPC, health only; CEX attribution requires a verified watchlist', symbol: 'BNB/BSC chainid=56', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 6, fallbackGroup: 'onchain.bnb', memberIds: [6], assets: ['BNB'], apiKeyRequired: false, independenceGroup: 'binance-bsc' },
+  { id: 'onchain.xrpscan-xrp', group: 'onchain', provider: 'XRPSCAN public ledger API', url: 'https://api.xrpscan.com/api/v1/ledger', dataType: 'Latest validated XRPL ledger index/hash/time; public API, health only; CEX attribution requires a verified watchlist', symbol: 'XRP/XRPL', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 1, fallbackGroup: 'onchain.xrp', memberIds: [6], assets: ['XRP'], apiKeyRequired: false, independenceGroup: 'xrpscan-xrp' },
+  { id: 'onchain.xrplcluster-xrp', group: 'onchain', provider: 'XRPL Cluster public node', url: 'https://xrplcluster.com/', dataType: 'XRPL validated-ledger sequence/hash/age; public rippled JSON-RPC, health only', symbol: 'XRP/XRPL', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 2, fallbackGroup: 'onchain.xrp', memberIds: [6], assets: ['XRP'], apiKeyRequired: false, independenceGroup: 'xrplcluster-xrp' },
+  { id: 'onchain.xrpl-ws-xrp', group: 'onchain', provider: 'XRPL.ws public node', url: 'https://xrpl.ws/', dataType: 'XRPL validated-ledger sequence/hash/age; public rippled JSON-RPC, health only', symbol: 'XRP/XRPL', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 3, fallbackGroup: 'onchain.xrp', memberIds: [6], assets: ['XRP'], apiKeyRequired: false, independenceGroup: 'xrpl-ws' },
+  { id: 'onchain.ripple-s2-xrp', group: 'onchain', provider: 'Ripple S2 public node', url: 'https://s2.ripple.com:51234/', dataType: 'XRPL validated-ledger sequence/hash/age; public rippled JSON-RPC, health only', symbol: 'XRP/XRPL', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 4, fallbackGroup: 'onchain.xrp', memberIds: [6], assets: ['XRP'], apiKeyRequired: false, independenceGroup: 'ripple-s2-xrp' },
+  { id: 'onchain.blockchair-xrp', group: 'onchain', provider: 'Blockchair public XRP stats', url: 'https://api.blockchair.com/ripple/stats', dataType: 'Latest XRPL ledger index/hash/time and public market context; health only', symbol: 'XRP/XRPL', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000, priority: 5, fallbackGroup: 'onchain.xrp', memberIds: [6], assets: ['XRP'], apiKeyRequired: false, independenceGroup: 'blockchair-xrp' },
+  { id: 'onchain.coinpaprika-xrp', group: 'onchain', provider: 'CoinPaprika public XRP ticker', url: 'https://api.coinpaprika.com/v1/tickers/xrp-xrp', dataType: 'Timestamped public XRP market-price context; not on-chain flow or CEX-attributed evidence', symbol: 'XRP/USD', cadence: 'periodic', realtimeEligible: false, enabled: true, maxAgeMs: 5 * 60_000, priority: 6, fallbackGroup: 'onchain.xrp', memberIds: [6], assets: ['XRP'], apiKeyRequired: false, independenceGroup: 'coinpaprika-xrp' },
   { id: 'onchain.whale-alert', group: 'onchain', provider: 'Whale Alert', url: 'https://api.whale-alert.io/v1/transactions', dataType: 'large crypto transfers', symbol: 'multi-asset', cadence: 'event-driven', realtimeEligible: true, enabled: true, maxAgeMs: 5 * 60_000 },
 
   { id: 'macro.fred-sp500', group: 'macro', provider: 'FRED', url: 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500', dataType: 'daily closing index value', symbol: 'SP500', cadence: 'daily', realtimeEligible: false, enabled: true, maxAgeMs: 14 * 24 * 60 * 60_000 },
@@ -497,8 +677,8 @@ const definitions: readonly CouncilSourceDefinition[] = [
 
 for (let memberId = 1; memberId <= 8; memberId += 1) {
   const sources = getCouncilMemberSources(memberId);
-  if (sources.length !== 4 || sources.some((source, index) => source.priority !== index + 1)) {
-    throw new Error(`Council member ${memberId} must have exactly four prioritized sources.`);
+  if (sources.length < 1 || sources.some((source, index) => source.priority !== index + 1)) {
+    throw new Error(`Council member ${memberId} must have prioritized source slots starting at one.`);
   }
 }
 
@@ -511,6 +691,7 @@ export function buildCouncilSourceRegistry(
     ...COUNCIL_MEMBER_SOURCES,
     ...ASSET_SPECIFIC_MEMBER_SOURCES,
     ...ASSET_SPECIFIC_OPTIONS_SOURCES,
+    ...ASSET_SPECIFIC_FUTURES_PROXY_SOURCES,
     ...ASSET_SPECIFIC_NEWS_SOURCES,
   ];
   const unknownIds = Object.keys(observations).filter((id) =>

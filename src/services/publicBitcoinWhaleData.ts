@@ -459,7 +459,7 @@ export async function fetchOnChainWhaleData(options: {
           asset,
           provider: 'Ethereum mainnet public JSON-RPC (chainid=1)',
           sourceId: 'onchain.ethereum-publicnode',
-          fallbackSourceId: primaryFailure ? 'onchain.etherscan-v2' : undefined,
+          fallbackSourceId: primaryFailure ? 'onchain.etherscan-transfers' : undefined,
         };
       }
       const rpcResult = await fetchPublicEvmOnChainData({
@@ -485,7 +485,7 @@ export async function fetchOnChainWhaleData(options: {
         asset,
         sourceId: rpcSourceId,
         fallbackSourceId: primaryFailure
-          ? 'onchain.etherscan-v2'
+          ? 'onchain.etherscan-transfers'
           : usedOneRpc
             ? 'onchain.ethereum-publicnode'
             : undefined,
@@ -512,7 +512,7 @@ export async function fetchOnChainWhaleData(options: {
           asset,
           status: isFresh ? 'LIVE' : 'STALE',
           provider: 'Etherscan Ethereum configured address watchlist (native ETH and ERC-20)',
-          sourceId: 'onchain.etherscan-v2',
+          sourceId: 'onchain.etherscan-transfers',
           timestampMs,
           retrievedAtMs: Date.now(),
           ageMs,

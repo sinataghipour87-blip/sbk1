@@ -1,10 +1,23 @@
 import {
-  COUNCIL_MEMBER_SOURCES,
   getCouncilMemberSources,
   type CouncilSourceDefinition,
 } from './councilSourceRegistry';
+import { fetchBinanceEuropeanOptionsData } from './binanceEuropeanOptionsData';
+import { fetchBybitOptionsData } from './bybitOptionsData';
+import { fetchDeltaOptionsData } from './deltaOptionsData';
+import { fetchDeribitOptionsData } from './deribitOptionsData';
+import { fetchGateioOptionsData } from './gateioOptionsData';
+import { fetchOkxOptionsData } from './okxOptionsData';
+import {
+  fetchMemberFiveFuturesProxy,
+  MEMBER_FIVE_PROXY_CACHE_TTL_MS,
+  resetMemberFiveFuturesProxyCacheForTests,
+} from './memberFiveFuturesProxy';
+import { getCouncilOptionsThresholds } from './councilOptionsThresholds';
+import { deduplicateTrades } from './councilEvidenceDeduplication';
 import type {
   CouncilMemberSourceCheck,
+  CouncilOptionsData,
   CouncilWhaleFlowData,
 } from './eightMemberCouncil';
 
@@ -393,79 +406,145 @@ function validateData(
   if (source.id.startsWith('council.member2.')) {
     let trades: unknown[] = [];
     let readTrade: (trade: unknown) => {
+      id: string | number | null;
       price: number | null;
       size: number | null;
       timestamp: number | null;
       aggressor: 'BUY' | 'SELL' | null;
     } = () => ({
-      price: null, size: null, timestamp: null, aggressor: null,
+      id: null, price: null, size: null, timestamp: null, aggressor: null,
     });
     if (source.id.endsWith('coinbase-trades') && Array.isArray(json)) {
       trades = json;
       readTrade = (trade) => isRecord(trade)
         ? {
+          id: typeof trade.trade_id === 'string' || typeof trade.trade_id === 'number'
+            ? trade.trade_id
+            : null,
           price: positiveNumber(trade.price),
           size: positiveNumber(trade.size),
           timestamp: timestampMs(Date.parse(String(trade.time))),
           aggressor: trade.side === 'buy' ? 'BUY' : trade.side === 'sell' ? 'SELL' : null,
         }
-        : { price: null, size: null, timestamp: null, aggressor: null };
+        : { id: null, price: null, size: null, timestamp: null, aggressor: null };
     } else if (source.id.endsWith('kraken-trades') && isRecord(json) && isRecord(json.result)) {
       const series = Object.values(json.result).find(Array.isArray);
       if (Array.isArray(series)) trades = series;
       readTrade = (trade) => Array.isArray(trade)
         ? {
+          id: typeof trade[6] === 'string' || typeof trade[6] === 'number'
+            ? trade[6]
+            : null,
           price: positiveNumber(trade[0]),
           size: positiveNumber(trade[1]),
           timestamp: timestampMs(trade[2]),
           aggressor: trade[3] === 'b' ? 'BUY' : trade[3] === 's' ? 'SELL' : null,
         }
-        : { price: null, size: null, timestamp: null, aggressor: null };
+        : { id: null, price: null, size: null, timestamp: null, aggressor: null };
     } else if (source.id.endsWith('okx-trades') && isRecord(json) && Array.isArray(json.data)) {
       trades = json.data;
       readTrade = (trade) => isRecord(trade)
         ? {
+          id: typeof trade.tradeId === 'string' || typeof trade.tradeId === 'number'
+            ? trade.tradeId
+            : null,
           price: positiveNumber(trade.px),
           size: positiveNumber(trade.sz),
           timestamp: timestampMs(trade.ts),
           aggressor: trade.side === 'buy' ? 'BUY' : trade.side === 'sell' ? 'SELL' : null,
         }
-        : { price: null, size: null, timestamp: null, aggressor: null };
+        : { id: null, price: null, size: null, timestamp: null, aggressor: null };
+    } else if (source.id.endsWith('binance-trades') && Array.isArray(json)) {
+      trades = json;
+      readTrade = (trade) => isRecord(trade)
+        ? {
+          id: typeof trade.a === 'string' || typeof trade.a === 'number'
+            ? trade.a
+            : null,
+          price: positiveNumber(trade.p),
+          size: positiveNumber(trade.q),
+          timestamp: timestampMs(trade.T),
+          aggressor: trade.m === true ? 'SELL' : trade.m === false ? 'BUY' : null,
+        }
+        : { id: null, price: null, size: null, timestamp: null, aggressor: null };
+    } else if (source.id.endsWith('bybit-trades') && isRecord(json) &&
+        isRecord(json.result) && Array.isArray(json.result.list)) {
+      trades = json.result.list;
+      readTrade = (trade) => isRecord(trade)
+        ? {
+          id: typeof trade.execId === 'string' || typeof trade.execId === 'number'
+            ? trade.execId
+            : null,
+          price: positiveNumber(trade.price),
+          size: positiveNumber(trade.size),
+          timestamp: timestampMs(trade.time),
+          aggressor: trade.side === 'Buy' ? 'BUY' : trade.side === 'Sell' ? 'SELL' : null,
+        }
+        : { id: null, price: null, size: null, timestamp: null, aggressor: null };
+    } else if (source.id.endsWith('gateio-trades') && Array.isArray(json)) {
+      if (json.some((trade) =>
+        !isRecord(trade) || trade.currency_pair !== source.symbol
+      )) {
+        return invalid(`Gate.io returned a trade for a symbol other than ${source.symbol}.`);
+      }
+      trades = json;
+      readTrade = (trade) => isRecord(trade)
+        ? {
+          id: typeof trade.id === 'string' || typeof trade.id === 'number'
+            ? trade.id
+            : null,
+          price: positiveNumber(trade.price),
+          size: positiveNumber(trade.amount),
+          timestamp: timestampMs(trade.create_time_ms ?? trade.create_time),
+          aggressor: trade.side === 'buy' ? 'BUY' : trade.side === 'sell' ? 'SELL' : null,
+        }
+        : { id: null, price: null, size: null, timestamp: null, aggressor: null };
     } else if (source.id.endsWith('bitfinex-trades') && Array.isArray(json)) {
       trades = json;
       readTrade = (trade) => Array.isArray(trade)
         ? (() => {
           const amount = Number(trade[2]);
           return {
+            id: typeof trade[0] === 'string' || typeof trade[0] === 'number'
+              ? trade[0]
+              : null,
             price: positiveNumber(trade[3]),
             size: Number.isFinite(amount) ? positiveNumber(Math.abs(amount)) : null,
             timestamp: timestampMs(trade[1]),
             aggressor: amount > 0 ? 'BUY' : amount < 0 ? 'SELL' : null,
           };
         })()
-        : { price: null, size: null, timestamp: null, aggressor: null };
-    } else if (source.id.endsWith('bitstamp-transactions') && Array.isArray(json)) {
-      trades = json;
-      readTrade = (trade) => isRecord(trade)
-        ? {
-          price: positiveNumber(trade.price),
-          size: positiveNumber(trade.amount),
-          timestamp: timestampMs(trade.date),
-          aggressor: null,
-        }
-        : { price: null, size: null, timestamp: null, aggressor: null };
+        : { id: null, price: null, size: null, timestamp: null, aggressor: null };
     }
-    const parsedTrades = trades.map(readTrade).filter(({ price, size }) => price !== null && size !== null)
-      .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))[0];
-    const fiveMinuteStartMs = nowMs - 5 * 60_000;
-    const validTrades = trades.map(readTrade).filter(({ price, size, timestamp }) =>
-      price !== null && size !== null && timestamp !== null &&
-      timestamp >= fiveMinuteStartMs && timestamp <= nowMs && !stale(timestamp)
+    const parsedTrades = trades.map(readTrade).filter(({ price, size, id }) =>
+      price !== null && size !== null && id !== null
     );
-    const latest = parsedTrades;
-    if (!latest) return invalid('No trade has a positive price and size.');
-    if (latest.timestamp === null || stale(latest.timestamp)) {
-      return invalid(`Latest trade timestamp is missing or stale (age ${(nowMs - (latest.timestamp ?? 0)) / 1_000}s).`);
+    if (parsedTrades.length === 0) return invalid('No trade has a positive price, size, and stable trade identifier.');
+    const identifiedTrades = parsedTrades.map((trade) => ({
+      venue: source.independenceGroup ?? source.provider,
+      symbol: source.symbol,
+      tradeId: trade.id!,
+      timestampMs: trade.timestamp ?? undefined,
+      side: trade.aggressor ?? undefined,
+      price: trade.price ?? undefined,
+      amount: trade.size ?? undefined,
+      parsed: trade,
+    }));
+    const deduplicated = deduplicateTrades(identifiedTrades);
+    if (deduplicated.conflictingIdentity) {
+      return invalid('Conflicting duplicate trade identifiers were returned by the venue.');
+    }
+    const uniqueTrades = deduplicated.values.map(({ parsed }) => parsed);
+    const latest = [...uniqueTrades].sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))[0];
+    const fiveMinuteStartMs = nowMs - 5 * 60_000;
+    const validTrades = uniqueTrades.filter(({ price, size, timestamp }) =>
+      price !== null && size !== null && timestamp !== null &&
+      timestamp >= fiveMinuteStartMs && timestamp <= nowMs + 1_000 &&
+      nowMs - timestamp <= source.maxAgeMs
+    );
+    if (!latest || latest.timestamp === null || latest.timestamp > nowMs + 1_000 ||
+        nowMs - latest.timestamp > source.maxAgeMs) {
+      return invalid(`Latest trade timestamp is missing, future-dated, or stale (age ${(nowMs - (latest?.timestamp ?? 0)) / 1_000}s).`);
     }
     const classifiedTrades = validTrades.filter(({ aggressor }) => aggressor !== null);
     if (classifiedTrades.length < 5) {
@@ -473,26 +552,40 @@ function validateData(
         `Insufficient 5-minute CVD data: ${classifiedTrades.length} aggressor-classified trades; minimum is 5.`,
       );
     }
-    const buyVolumeBase = validTrades.reduce((sum, trade) =>
+    const buyVolumeBase = classifiedTrades.reduce((sum, trade) =>
       trade.aggressor === 'BUY' ? sum + (trade.size ?? 0) : sum, 0);
-    const sellVolumeBase = validTrades.reduce((sum, trade) =>
+    const sellVolumeBase = classifiedTrades.reduce((sum, trade) =>
       trade.aggressor === 'SELL' ? sum + (trade.size ?? 0) : sum, 0);
+    const asset = source.assets?.[0] ?? 'unknown';
+    const volumeUnit = `${asset} base units`;
     return valid(
-      `Latest trade age=${((nowMs - latest.timestamp) / 1_000).toFixed(2)}s (limit ${source.maxAgeMs / 1_000}s); 5-minute CVD uses ${classifiedTrades.length} classified trades (minimum 5).`,
+      `Latest ${source.marketType ?? 'unknown-market'} trade age=${((nowMs - latest.timestamp) / 1_000).toFixed(2)}s (limit ${source.maxAgeMs / 1_000}s); 5-minute CVD uses ${classifiedTrades.length} unique classified trades (removed ${deduplicated.duplicateCount} duplicates; ${volumeUnit}).`,
       null,
       {
       tradePrice: latest.price,
-      tradeSizeEth: latest.size,
+      tradeSizeBase: latest.size,
       tradeTimestampMs: latest.timestamp,
+      tradeId: String(latest.id),
+      baseAsset: asset,
+      marketType: source.marketType ?? 'unknown',
+      independenceGroup: source.independenceGroup ?? source.provider,
+      volumeUnit,
       buyVolumeBase,
       sellVolumeBase,
       cvdBase: buyVolumeBase - sellVolumeBase,
-      buyVolumeEth: buyVolumeBase,
-      sellVolumeEth: sellVolumeBase,
-      cvdEth: buyVolumeBase - sellVolumeBase,
       classifiedTradeCount: classifiedTrades.length,
+      uniqueTradeCount: uniqueTrades.length,
+      duplicateTradeCount: deduplicated.duplicateCount,
       cvdWindowMs: 5 * 60_000,
       minimumClassifiedTradeCount: 5,
+      ...(asset === 'ETH'
+        ? {
+            tradeSizeEth: latest.size,
+            buyVolumeEth: buyVolumeBase,
+            sellVolumeEth: sellVolumeBase,
+            cvdEth: buyVolumeBase - sellVolumeBase,
+          }
+        : {}),
       },
     );
   }
@@ -1347,6 +1440,13 @@ function validateResponse(
       ? { status: 'HEALTHY', detail: `Bybit returned a ${source.symbol} options list.` }
       : { status: 'BROKEN', detail: `Bybit returned no valid ${source.symbol} option list.` };
   }
+  if (source.id.endsWith('.bybit-trades')) {
+    return isRecord(json) && json.retCode === 0 &&
+      isRecord(json.result) && Array.isArray(json.result.list) &&
+      json.result.list.length > 0
+      ? { status: 'HEALTHY', detail: `Bybit returned ${json.result.list.length} recent trades for ${source.symbol}.` }
+      : { status: 'BROKEN', detail: `Bybit returned no valid recent trades for ${source.symbol}.` };
+  }
   if (source.id.endsWith('.binance-eapi')) {
     const asset = source.assets?.[0] ?? 'ETH';
     return Array.isArray(json) && json.some((item) => isRecord(item) &&
@@ -1480,19 +1580,847 @@ async function request(
   }
 }
 
+async function checkMemberSixOnChainSource(
+  source: CouncilSourceDefinition,
+  nowMs: number,
+  fetcher: typeof fetch,
+): Promise<HealthResult> {
+  const observedAtMs = Math.max(nowMs, Date.now());
+  const responseReceivedAtMs = () => Math.max(observedAtMs, Date.now());
+  const result = (
+    status: HealthResult['status'],
+    detail: string,
+    dataDetail: string,
+    normalizedData: Readonly<Record<string, number | string | null>> = {},
+    responseAtMs = responseReceivedAtMs(),
+  ): HealthResult => ({
+    status,
+    detail,
+    httpHealthy: status === 'HEALTHY',
+    dataValid: status === 'HEALTHY',
+    dataDetail,
+    observedAtMs: responseAtMs,
+    normalizedData,
+    voteValue: 'LOW_VALUE',
+  });
+  const fetchJson = async (url: string, init?: RequestInit): Promise<unknown> => {
+    const parsedUrl = new URL(url);
+    await paceHost(parsedUrl.hostname);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetcher(url, {
+        ...init,
+        signal: controller.signal,
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json',
+          ...(init?.headers ?? {}),
+        },
+      });
+      if (response.status === 403 || response.status === 451) {
+        throw new Error(`HTTP ${response.status} (regional/access restriction).`);
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}.`);
+      return await response.json() as unknown;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  const postRpc = async (url: string, method: string, params: unknown[]): Promise<unknown> => {
+    const payload = await fetchJson(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+    if (!isRecord(payload) || payload.error || !Object.hasOwn(payload, 'result')) {
+      throw new Error(`${source.provider} returned a malformed ${method} response.`);
+    }
+    return payload.result;
+  };
+  const stale = (timestamp: number): boolean => {
+    const checkedAtMs = responseReceivedAtMs();
+    return !Number.isSafeInteger(timestamp) ||
+      timestamp > checkedAtMs + 1_000 ||
+      checkedAtMs - timestamp > source.maxAgeMs;
+  };
+  const freshnessResult = (
+    height: number,
+    timestamp: number,
+    detailLabel: string,
+    extras: Readonly<Record<string, number | string | null>> = {},
+  ): HealthResult => {
+    const checkedAtMs = responseReceivedAtMs();
+    const ageMs = Math.max(0, checkedAtMs - timestamp);
+    const fresh = !stale(timestamp);
+    return result(
+      fresh ? 'HEALTHY' : 'BROKEN',
+      `${source.provider} ${detailLabel} is ${fresh ? 'fresh' : 'stale'} (${ageMs}ms old; limit ${source.maxAgeMs}ms).`,
+      fresh
+        ? 'Infrastructure/schema and provider timestamp validated; this is not CEX-attributed directional evidence.'
+        : 'Provider timestamp is future-dated or outside the source TTL; excluded from quorum and voting.',
+      {
+        blockHeight: height,
+        observationTimestampMs: timestamp,
+        sourceAgeMs: ageMs,
+        cexWatchlistMatched: 0,
+        ...extras,
+      },
+    );
+  };
+
+  try {
+    if (
+      source.id === 'onchain.mempool-blocks' ||
+      source.id === 'onchain.blockstream-blocks' ||
+      source.id === 'onchain.btcscan-bitcoin'
+    ) {
+      const payload = await fetchJson(source.url);
+      const block = Array.isArray(payload) && isRecord(payload[0]) ? payload[0] : null;
+      const timestamp = block ? timestampMs(block.timestamp) : null;
+      const height = block ? positiveNumber(block.height) : null;
+      const id = block && typeof block.id === 'string' ? block.id : '';
+      if (!block || !/^[0-9a-f]{64}$/i.test(id) || height === null || timestamp === null) {
+        return {
+          status: 'BROKEN',
+          detail: `${source.provider} returned an invalid latest-block sample.`,
+          httpHealthy: true,
+          dataValid: false,
+          dataDetail: 'Expected a block hash, positive height, and provider timestamp.',
+          observedAtMs,
+          voteValue: 'LOW_VALUE',
+        };
+      }
+      return freshnessResult(height, timestamp, 'latest block');
+    }
+
+    if (source.id === 'onchain.blockchair-bitcoin') {
+      const payload = await fetchJson(source.url);
+      const data = isRecord(payload) && isRecord(payload.data) ? payload.data : null;
+      const height = data ? positiveNumber(data.best_block_height) : null;
+      const hash = data && typeof data.best_block_hash === 'string' ? data.best_block_hash : '';
+      const time = data && typeof data.best_block_time === 'string'
+        ? Date.parse(data.best_block_time)
+        : Number.NaN;
+      if (!data || !height || !/^[0-9a-f]{64}$/i.test(hash) || !Number.isSafeInteger(time)) {
+        throw new Error('Blockchair returned missing/invalid best-block height, hash, or time.');
+      }
+      return freshnessResult(height, time, 'best block', { blockHash: hash });
+    }
+
+    if (source.id === 'onchain.blockcypher-bitcoin') {
+      const payload = await fetchJson(source.url);
+      if (!isRecord(payload) || typeof payload.hash !== 'string' ||
+          !/^[0-9a-f]{64}$/i.test(payload.hash) ||
+          typeof payload.time !== 'string') {
+        throw new Error('BlockCypher returned an invalid latest-block response.');
+      }
+      const height = positiveNumber(payload.height);
+      const timestamp = Date.parse(payload.time);
+      if (height === null || !Number.isSafeInteger(timestamp)) {
+        throw new Error('BlockCypher latest-block height or timestamp is invalid.');
+      }
+      return freshnessResult(height, timestamp, 'latest block', { blockHash: payload.hash });
+    }
+
+    if (source.id === 'onchain.blockchain-com-bitcoin') {
+      const payload = await fetchJson(source.url);
+      if (!isRecord(payload) || typeof payload.hash !== 'string' ||
+          !/^[0-9a-f]{64}$/i.test(payload.hash)) {
+        throw new Error('Blockchain.com returned an invalid latest-block response.');
+      }
+      const height = positiveNumber(payload.height ?? payload.block_index);
+      const timestamp = timestampMs(payload.time);
+      if (height === null || timestamp === null) {
+        throw new Error('Blockchain.com latest-block height or timestamp is invalid.');
+      }
+      return freshnessResult(height, timestamp, 'latest block', { blockHash: payload.hash });
+    }
+
+    if (
+      source.id === 'onchain.bsc-publicnode' ||
+      source.id === 'onchain.bsc-1rpc' ||
+      source.id === 'onchain.bsc-defibit' ||
+      source.id === 'onchain.bsc-bloxroute' ||
+      source.id === 'onchain.bsc-blastapi' ||
+      source.id === 'onchain.bsc-public-rpc'
+    ) {
+      const chainId = await postRpc(source.url, 'eth_chainId', []);
+      if (typeof chainId !== 'string' || Number.parseInt(chainId, 16) !== 56) {
+        throw new Error(`${source.provider} did not confirm BNB Smart Chain chainid=56.`);
+      }
+      const block = await postRpc(source.url, 'eth_getBlockByNumber', ['latest', false]);
+      if (!isRecord(block) || typeof block.number !== 'string' ||
+          typeof block.timestamp !== 'string' || !/^0x[0-9a-f]+$/i.test(block.timestamp)) {
+        throw new Error(`${source.provider} returned an invalid latest BSC block.`);
+      }
+      const height = Number.parseInt(block.number, 16);
+      const timestamp = Number.parseInt(block.timestamp, 16) * 1_000;
+      if (!Number.isSafeInteger(height) || height <= 0 || !Number.isSafeInteger(timestamp)) {
+        throw new Error(`${source.provider} returned invalid BSC block fields.`);
+      }
+      return freshnessResult(height, timestamp, 'BNB Smart Chain block', {
+        chainId: 56,
+        blockHash: typeof block.hash === 'string' ? block.hash : null,
+      });
+    }
+
+    if (source.id === 'onchain.xrpscan-xrp') {
+      const payload = await fetchJson(source.url);
+      const ledger = isRecord(payload) && Array.isArray(payload.ledgers) &&
+        isRecord(payload.ledgers[0]) ? payload.ledgers[0] : null;
+      const height = ledger ? positiveNumber(ledger.ledger_index) : null;
+      const hash = ledger && typeof ledger.ledger_hash === 'string' ? ledger.ledger_hash : '';
+      const timestamp = ledger && typeof ledger.close_time_human === 'string'
+        ? Date.parse(ledger.close_time_human)
+        : Number.NaN;
+      if (!ledger || height === null || !/^[0-9a-f]{64}$/i.test(hash) ||
+          !Number.isSafeInteger(timestamp)) {
+        throw new Error('XRPSCAN returned invalid latest validated-ledger fields.');
+      }
+      return freshnessResult(height, timestamp, 'validated XRPL ledger', { ledgerHash: hash });
+    }
+
+    if (
+      source.id === 'onchain.xrplcluster-xrp' ||
+      source.id === 'onchain.xrpl-ws-xrp' ||
+      source.id === 'onchain.ripple-s2-xrp'
+    ) {
+      const payload = await postRpc(source.url, 'server_info', []);
+      const info = isRecord(payload) && isRecord(payload.info) ? payload.info : null;
+      const ledger = info && isRecord(info.validated_ledger) ? info.validated_ledger : null;
+      const height = ledger ? positiveNumber(ledger.seq) : null;
+      const ageSeconds = ledger && typeof ledger.age === 'number' &&
+        Number.isFinite(ledger.age) && ledger.age >= 0
+        ? ledger.age
+        : null;
+      const hash = ledger && typeof ledger.hash === 'string' ? ledger.hash : '';
+      if (!info || !ledger || height === null || ageSeconds === null ||
+          !/^[0-9a-f]{64}$/i.test(hash)) {
+        throw new Error(`${source.provider} returned invalid validated-ledger status.`);
+      }
+      const ageMs = ageSeconds * 1_000;
+      const timestamp = observedAtMs - ageMs;
+      const fresh = ageMs <= source.maxAgeMs;
+      return {
+        status: fresh ? 'HEALTHY' : 'BROKEN',
+        detail: `${source.provider} validated ledger ${height} is ${fresh ? 'fresh' : 'stale'} (${ageMs}ms old; limit ${source.maxAgeMs}ms).`,
+        httpHealthy: true,
+        dataValid: fresh,
+        dataDetail: fresh
+          ? 'Public XRPL node and validated-ledger age are within TTL; no CEX wallet attribution is inferred.'
+          : 'Validated-ledger age exceeds TTL; source is excluded from freshness/quorum and directional evidence.',
+        observedAtMs,
+        normalizedData: {
+          blockHeight: height,
+          ledgerHash: hash,
+          observationTimestampMs: timestamp,
+          sourceAgeMs: ageMs,
+          cexWatchlistMatched: 0,
+        },
+        voteValue: 'LOW_VALUE',
+      };
+    }
+
+    if (source.id === 'onchain.blockchair-xrp') {
+      const payload = await fetchJson(source.url);
+      const data = isRecord(payload) && isRecord(payload.data) ? payload.data : null;
+      const height = data ? positiveNumber(data.best_ledger_height) : null;
+      const hash = data && typeof data.best_ledger_hash === 'string' ? data.best_ledger_hash : '';
+      const timestamp = data && typeof data.best_ledger_time === 'string'
+        ? Date.parse(`${data.best_ledger_time}Z`)
+        : Number.NaN;
+      if (!data || height === null || !/^[0-9a-f]{64}$/i.test(hash) ||
+          !Number.isSafeInteger(timestamp)) {
+        throw new Error('Blockchair returned invalid latest XRP ledger fields.');
+      }
+      return freshnessResult(height, timestamp, 'XRP best ledger', {
+        ledgerHash: hash,
+        priceUsd: positiveNumber(data.market_price_usd),
+      });
+    }
+
+    if (source.id === 'onchain.coinpaprika-xrp') {
+      const payload = await fetchJson(source.url);
+      const quotes = isRecord(payload) && isRecord(payload.quotes) ? payload.quotes : null;
+      const usd = quotes && isRecord(quotes.USD) ? quotes.USD : null;
+      const priceUsd = usd ? positiveNumber(usd.price) : null;
+      const timestamp = isRecord(payload) && typeof payload.last_updated === 'string'
+        ? Date.parse(payload.last_updated)
+        : Number.NaN;
+      if (!isRecord(payload) || payload.id !== 'xrp-xrp' ||
+          priceUsd === null || !Number.isSafeInteger(timestamp)) {
+        throw new Error('CoinPaprika returned invalid timestamped XRP market data.');
+      }
+      const ageMs = Math.max(0, responseReceivedAtMs() - timestamp);
+      const fresh = !stale(timestamp);
+      return {
+        status: fresh ? 'HEALTHY' : 'BROKEN',
+        detail: `CoinPaprika XRP ticker is ${fresh ? 'fresh' : 'stale'} (${ageMs}ms old; limit ${source.maxAgeMs}ms).`,
+        httpHealthy: true,
+        dataValid: fresh,
+        dataDetail: fresh
+          ? 'Timestamped public price context only; it is not on-chain flow or CEX-attributed direction.'
+          : 'XRP ticker timestamp is outside TTL and is excluded from freshness/quorum.',
+        observedAtMs,
+        normalizedData: {
+          priceUsd,
+          observationTimestampMs: timestamp,
+          sourceAgeMs: ageMs,
+          cexWatchlistMatched: 0,
+        },
+        voteValue: 'LOW_VALUE',
+      };
+    }
+
+    if (
+      source.id === 'onchain.solana-public-rpc' ||
+      source.id === 'onchain.solana-publicnode'
+    ) {
+      const endpoint = new URL(source.url);
+      const slot = await postRpc(endpoint.toString(), 'getSlot', [{ commitment: 'finalized' }]);
+      if (typeof slot !== 'number' || !Number.isSafeInteger(slot) || slot <= 0) {
+        throw new Error(`${source.provider} returned an invalid finalized slot.`);
+      }
+      const blockTime = await postRpc(endpoint.toString(), 'getBlockTime', [slot]);
+      if (typeof blockTime !== 'number' || !Number.isSafeInteger(blockTime) || blockTime <= 0) {
+        throw new Error(`${source.provider} returned no valid finalized block time.`);
+      }
+      const timestamp = blockTime * 1_000;
+      const ageMs = observedAtMs - timestamp;
+      const fresh = !stale(timestamp);
+      return {
+        status: fresh ? 'HEALTHY' : 'BROKEN',
+        detail: `${source.provider} finalized slot ${slot} is ${fresh ? 'fresh' : 'stale'} (${ageMs}ms old; limit ${source.maxAgeMs}ms).`,
+        httpHealthy: true,
+        dataValid: fresh,
+        dataDetail: 'Independent RPC and finalized-block freshness only; CEX attribution requires a configured verified SOL wallet watchlist.',
+        observedAtMs,
+        normalizedData: {
+          finalizedSlot: slot,
+          observationTimestampMs: timestamp,
+          sourceAgeMs: ageMs,
+          cexWatchlistMatched: 0,
+        },
+        voteValue: 'LOW_VALUE',
+      };
+    }
+
+    if (source.id === 'onchain.dexscreener-solana') {
+      const payload = await fetchJson(source.url);
+      const pairs = Array.isArray(payload)
+        ? payload.filter((entry): entry is Record<string, unknown> =>
+          isRecord(entry) && entry.chainId === 'solana' &&
+          typeof entry.pairAddress === 'string' &&
+          isRecord(entry.baseToken) && isRecord(entry.quoteToken) &&
+          isRecord(entry.volume)
+        )
+        : [];
+      if (pairs.length === 0) throw new Error('DEX Screener returned no valid Solana pair rows.');
+      const validPairs = pairs.filter((pair) =>
+        positiveNumber(pair.priceUsd) !== null &&
+        positiveNumber(isRecord(pair.volume) ? pair.volume.h24 : null) !== null
+      );
+      if (validPairs.length === 0) throw new Error('DEX Screener Solana rows lack valid price/volume data.');
+      return result(
+        'HEALTHY',
+        `DEX Screener returned ${validPairs.length} valid Solana pair records; provider observation timestamps are not supplied.`,
+        'Endpoint/schema availability only; response receipt time is not market-data time and this source is context-only, not a directional signal.',
+        {
+          pairCount: validPairs.length,
+          volume24hUsd: validPairs.reduce((sum, pair) =>
+            sum + (positiveNumber(isRecord(pair.volume) ? pair.volume.h24 : null) ?? 0), 0),
+          cexWatchlistMatched: 0,
+        },
+      );
+    }
+
+    if (source.id === 'onchain.solana-status') {
+      const payload = await fetchJson(source.url);
+      const status = isRecord(payload) && isRecord(payload.status) ? payload.status : null;
+      if (!status || typeof status.indicator !== 'string' ||
+          typeof status.description !== 'string') {
+        throw new Error('Solana status feed returned an invalid status payload.');
+      }
+      return result(
+        'HEALTHY',
+        `Solana public status feed is reachable; indicator=${status.indicator}.`,
+        'Provider status-page availability only; it is not chain transaction freshness or directional evidence.',
+        { cexWatchlistMatched: 0 },
+      );
+    }
+
+    if (source.id === 'onchain.jupiter-solana') {
+      const payload = await fetchJson(source.url);
+      const mint = new URL(source.url).searchParams.get('ids');
+      const token = mint && isRecord(payload) && isRecord(payload[mint])
+        ? payload[mint]
+        : null;
+      const priceUsd = token ? positiveNumber(token.usdPrice) : null;
+      if (!token || priceUsd === null) {
+        throw new Error('Jupiter public price feed returned no valid wrapped-SOL USD price.');
+      }
+      return result(
+        'HEALTHY',
+        'Jupiter Lite public SOL price endpoint returned a valid price and does not require credentials.',
+        'Price/liquidity is market context only; the provider does not expose a suitable observation timestamp for council direction.',
+        {
+          priceUsd,
+          liquidityUsd: positiveNumber(token.liquidity),
+          blockId: positiveNumber(token.blockId),
+          cexWatchlistMatched: 0,
+        },
+      );
+    }
+
+    if (source.id === 'onchain.geckoterminal-solana') {
+      const payload = await fetchJson(source.url);
+      const pools = isRecord(payload) && Array.isArray(payload.data)
+        ? payload.data.filter((entry): entry is Record<string, unknown> =>
+          isRecord(entry) && isRecord(entry.attributes)
+        )
+        : [];
+      const validPools = pools.filter((pool) => {
+        const attributes = pool.attributes;
+        if (!isRecord(attributes) || !isRecord(attributes.volume_usd)) return false;
+        return positiveNumber(attributes.base_token_price_usd) !== null &&
+          positiveNumber(attributes.volume_usd.h24) !== null;
+      });
+      if (validPools.length === 0) {
+        throw new Error('GeckoTerminal returned no valid public Solana pool records.');
+      }
+      return result(
+        'HEALTHY',
+        `GeckoTerminal returned ${validPools.length} public Solana DEX pools.`,
+        'Public pool/explorer availability only; pool values have no verified five-minute event timestamp and are not OpenBook-specific or CEX-attributed.',
+        {
+          poolCount: validPools.length,
+          cexWatchlistMatched: 0,
+        },
+      );
+    }
+
+    if (
+      source.id === 'onchain.ethereum-public-rpc' ||
+      source.id === 'onchain.ethereum-1rpc'
+    ) {
+      const chainId = await postRpc(source.url, 'eth_chainId', []);
+      if (typeof chainId !== 'string' || Number.parseInt(chainId, 16) !== 1) {
+        throw new Error(`${source.provider} did not confirm Ethereum mainnet chainid=1.`);
+      }
+      const block = await postRpc(source.url, 'eth_getBlockByNumber', ['latest', false]);
+      if (!isRecord(block) || typeof block.number !== 'string' ||
+          typeof block.timestamp !== 'string' || !/^0x[0-9a-f]+$/i.test(block.timestamp)) {
+        throw new Error(`${source.provider} returned an invalid Ethereum latest block.`);
+      }
+      const height = Number.parseInt(block.number, 16);
+      const timestamp = Number.parseInt(block.timestamp, 16) * 1_000;
+      if (!Number.isSafeInteger(height) || height <= 0 || !Number.isSafeInteger(timestamp)) {
+        throw new Error(`${source.provider} returned invalid Ethereum block fields.`);
+      }
+      return freshnessResult(height, timestamp, 'Ethereum mainnet block');
+    }
+
+    if (source.id === 'onchain.ethereum-routescan') {
+      const payload = await fetchJson(source.url);
+      const block = isRecord(payload) && Array.isArray(payload.items) &&
+        isRecord(payload.items[0]) ? payload.items[0] : null;
+      const height = block ? positiveNumber(block.number) : null;
+      const hash = block && typeof block.id === 'string' ? block.id : '';
+      const timestamp = block && typeof block.timestamp === 'string'
+        ? Date.parse(block.timestamp)
+        : Number.NaN;
+      if (!block || height === null || !/^0x[0-9a-f]{64}$/i.test(hash) ||
+          !Number.isSafeInteger(timestamp)) {
+        throw new Error('Routescan returned an invalid Ethereum latest-block response.');
+      }
+      return freshnessResult(height, timestamp, 'Ethereum latest block', { blockHash: hash });
+    }
+
+    if (source.id === 'onchain.ethereum-blockscout') {
+      const payload = await fetchJson(source.url);
+      const block = isRecord(payload) && Array.isArray(payload.items) &&
+        isRecord(payload.items[0]) ? payload.items[0] : null;
+      const height = block ? positiveNumber(block.height) : null;
+      const hash = block && typeof block.hash === 'string' ? block.hash : '';
+      const timestamp = block && typeof block.timestamp === 'string'
+        ? Date.parse(block.timestamp)
+        : Number.NaN;
+      if (!block || height === null || !/^0x[0-9a-f]{64}$/i.test(hash) ||
+          !Number.isSafeInteger(timestamp)) {
+        throw new Error('Blockscout returned an invalid Ethereum latest-block response.');
+      }
+      return freshnessResult(height, timestamp, 'Ethereum latest block', { blockHash: hash });
+    }
+
+    if (source.id === 'onchain.ethereum-blockchair') {
+      const payload = await fetchJson(source.url);
+      const block = isRecord(payload) && Array.isArray(payload.data) &&
+        isRecord(payload.data[0]) ? payload.data[0] : null;
+      const height = block ? positiveNumber(block.id) : null;
+      const hash = block && typeof block.hash === 'string' ? block.hash : '';
+      const timestamp = block && typeof block.time === 'string'
+        ? Date.parse(`${block.time}Z`)
+        : Number.NaN;
+      if (!block || height === null || !/^0x[0-9a-f]{64}$/i.test(hash) ||
+          !Number.isSafeInteger(timestamp)) {
+        throw new Error('Blockchair returned missing/invalid Ethereum latest-block fields.');
+      }
+      return freshnessResult(height, timestamp, 'Ethereum best block', { blockHash: hash });
+    }
+
+    if (source.id === 'onchain.defillama-ethereum') {
+      const payload = await fetchJson(source.url);
+      const observations = isRecord(payload) && Array.isArray(payload.totalDataChart)
+        ? payload.totalDataChart.flatMap((entry) => {
+          if (!Array.isArray(entry) || entry.length < 2) return [];
+          const timestamp = timestampMs(entry[0]);
+          const volumeUsd = positiveNumber(entry[1]);
+          return timestamp !== null && volumeUsd !== null
+            ? [{ timestamp, volumeUsd }]
+            : [];
+        }).sort((left, right) => left.timestamp - right.timestamp)
+        : [];
+      const latest = observations.at(-1);
+      if (!latest) throw new Error('DefiLlama returned no valid dated Ethereum DEX-volume data.');
+      const ageMs = observedAtMs - latest.timestamp;
+      const fresh = !stale(latest.timestamp);
+      return {
+        status: fresh ? 'HEALTHY' : 'BROKEN',
+        detail: `DefiLlama API is reachable; its latest daily Ethereum DEX value is ${ageMs}ms old (five-minute limit).`,
+        httpHealthy: true,
+        dataValid: fresh,
+        dataDetail: fresh
+          ? 'Daily DEX context is within the configured timestamp limit; it remains non-directional and cannot satisfy CEX Watchlist voting.'
+          : 'Daily DEX history exceeds the five-minute data freshness guard and is excluded from voting.',
+        observedAtMs: responseReceivedAtMs(),
+        normalizedData: {
+          ethereumDexVolume24hUsd: latest.volumeUsd,
+          observationTimestampMs: latest.timestamp,
+          sourceAgeMs: ageMs,
+          cexWatchlistMatched: 0,
+        },
+        voteValue: 'LOW_VALUE',
+      };
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      status: detail.includes('regional/access restriction') ? 'REGION_RESTRICTED' : 'BROKEN',
+      detail: `${source.provider} on-chain health check failed: ${detail}`,
+      httpHealthy: false,
+      dataValid: false,
+      dataDetail: 'Provider response or freshness validation failed; source excluded from directional evidence.',
+      observedAtMs,
+      voteValue: 'LOW_VALUE',
+    };
+  }
+
+  return {
+    status: 'UNTESTED',
+    detail: 'No independent Member 6 adapter is assigned to this registered source.',
+    httpHealthy: null,
+    dataValid: false,
+    dataDetail: 'No source adapter was executed.',
+    voteValue: 'LOW_VALUE',
+  };
+}
+
 async function checkSource(
   source: CouncilSourceDefinition,
   nowMs: number,
   fetcher: typeof fetch,
 ): Promise<HealthResult> {
-  const cacheKey = `${source.id}:${Boolean(process.env.FRED_API_KEY?.trim())}`;
-  const cached = sourceCache.get(cacheKey);
-  if (cached && nowMs >= cached.cachedAtMs && nowMs - cached.cachedAtMs < CACHE_TTL_MS) {
-    return cached.result;
+  const isFuturesProxy = source.id.startsWith('council.member5.') &&
+    source.id.includes('.proxy.');
+  const cacheKey = [
+    source.id,
+    Boolean(process.env.FRED_API_KEY?.trim()),
+    Boolean(process.env.ETHERSCAN_API_KEY?.trim()),
+  ].join(':');
+  if (!isFuturesProxy) {
+    const cached = sourceCache.get(cacheKey);
+    if (cached && nowMs >= cached.cachedAtMs && nowMs - cached.cachedAtMs < CACHE_TTL_MS) {
+      return cached.result;
+    }
   }
   const pending = sourceInFlight.get(cacheKey);
   if (pending) return pending;
   const operation = (async (): Promise<HealthResult> => {
+    if (
+      source.memberIds?.includes(6) &&
+      [
+        'onchain.mempool-blocks',
+        'onchain.blockstream-blocks',
+        'onchain.btcscan-bitcoin',
+        'onchain.blockchair-bitcoin',
+        'onchain.blockcypher-bitcoin',
+        'onchain.blockchain-com-bitcoin',
+        'onchain.ethereum-public-rpc',
+        'onchain.ethereum-1rpc',
+        'onchain.ethereum-routescan',
+        'onchain.ethereum-blockscout',
+        'onchain.ethereum-blockchair',
+        'onchain.defillama-ethereum',
+        'onchain.solana-public-rpc',
+        'onchain.solana-publicnode',
+        'onchain.dexscreener-solana',
+        'onchain.solana-status',
+        'onchain.jupiter-solana',
+        'onchain.geckoterminal-solana',
+        'onchain.bsc-publicnode',
+        'onchain.bsc-1rpc',
+        'onchain.bsc-defibit',
+        'onchain.bsc-bloxroute',
+        'onchain.bsc-blastapi',
+        'onchain.bsc-public-rpc',
+        'onchain.xrpscan-xrp',
+        'onchain.xrplcluster-xrp',
+        'onchain.xrpl-ws-xrp',
+        'onchain.ripple-s2-xrp',
+        'onchain.blockchair-xrp',
+        'onchain.coinpaprika-xrp',
+      ].includes(source.id)
+    ) {
+      return checkMemberSixOnChainSource(source, nowMs, fetcher);
+    }
+    if (source.id.startsWith('council.member5.')) {
+      const asset = source.assets?.[0] ?? 'ETH';
+      if (source.id.includes('.proxy.')) {
+        const venue = source.id.includes('.proxy.binance-futures.')
+          ? 'binance'
+          : source.id.includes('.proxy.bybit-futures.')
+            ? 'bybit'
+            : source.id.includes('.proxy.okx-futures.')
+              ? 'okx'
+              : source.id.includes('.proxy.kucoin-futures.')
+                ? 'kucoin'
+                : source.id.includes('.proxy.gateio-futures.')
+                  ? 'gateio'
+                  : null;
+        if (!venue) {
+          return {
+            status: 'UNTESTED',
+            detail: 'No futures proxy adapter is assigned to this registered source.',
+            httpHealthy: null,
+            dataValid: false,
+            dataDetail: 'No source adapter was executed.',
+            voteValue: 'LOW_VALUE',
+          };
+        }
+        let proxy;
+        try {
+          proxy = await fetchMemberFiveFuturesProxy({
+            asset,
+            venue,
+            nowMs: Math.max(nowMs, Date.now()),
+            fetcher,
+          });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          return {
+            status: 'BROKEN',
+            detail: `${source.provider} futures proxy request failed: ${detail}`,
+            httpHealthy: false,
+            dataValid: false,
+            dataDetail: 'One or more required public futures endpoints failed; source excluded from the aggregate.',
+            observedAtMs: Date.now(),
+            normalizedData: {
+              proxyHealthStatus: 'FAILED',
+              proxyCacheStatus: 'UNAVAILABLE',
+              proxyCacheAgeMs: null,
+              proxyCacheReceivedAtMs: null,
+            },
+            voteValue: 'LOW_VALUE',
+          };
+        }
+        if (!proxy) {
+          return {
+            status: 'BROKEN',
+            detail: `${source.provider} did not return a complete fresh proxy snapshot for ${asset}.`,
+            httpHealthy: true,
+            dataValid: false,
+            dataDetail: 'Requires fresh funding and one-minute candles (<=60s), plus five-minute position ratio and OI history (<=6m); missing, stale, or invalid fields are rejected.',
+            observedAtMs: Date.now(),
+            normalizedData: {
+              proxyHealthStatus: 'FAILED',
+              proxyCacheStatus: 'UNAVAILABLE',
+              proxyCacheAgeMs: null,
+              proxyCacheReceivedAtMs: null,
+            },
+            voteValue: 'LOW_VALUE',
+          };
+        }
+        if (proxy.healthStatus !== 'HEALTHY') {
+          return {
+            status: 'BROKEN',
+            detail: `${source.provider} is ${proxy.healthStatus}: ${proxy.detail}`,
+            httpHealthy: true,
+            dataValid: false,
+            dataDetail: proxy.detail,
+            observedAtMs: Date.now(),
+            normalizedData: proxy.normalizedData,
+            voteValue: 'LOW_VALUE',
+          };
+        }
+        const proxyCacheAgeMs = proxy.cacheAgeMs ?? 0;
+        const proxyCacheStatus = proxy.cacheStatus ?? 'UNAVAILABLE';
+        if (
+          (proxyCacheStatus !== 'FRESH' && proxyCacheStatus !== 'CACHED_OK') ||
+          proxyCacheAgeMs < 0 ||
+          proxyCacheAgeMs > MEMBER_FIVE_PROXY_CACHE_TTL_MS
+        ) {
+          return {
+            status: 'BROKEN',
+            detail: `${source.provider} proxy snapshot is not within the ${MEMBER_FIVE_PROXY_CACHE_TTL_MS}ms cache freshness limit.`,
+            httpHealthy: true,
+            dataValid: false,
+            dataDetail: `Cache status=${proxyCacheStatus}; age=${proxyCacheAgeMs}ms; snapshot excluded from quorum and aggregation.`,
+            observedAtMs: proxy.cacheReceivedAtMs ?? Date.now(),
+            normalizedData: {
+              proxyCacheStatus,
+              proxyCacheAgeMs,
+              proxyCacheReceivedAtMs: proxy.cacheReceivedAtMs ?? null,
+              proxyHealthStatus: 'FAILED',
+            },
+            voteValue: 'LOW_VALUE',
+          };
+        }
+        return {
+          status: 'HEALTHY',
+          detail: `${source.provider} returned a ${proxyCacheStatus.toLowerCase()} ${asset} futures proxy snapshot (${proxyCacheAgeMs}ms old); this is lower-confidence fallback evidence, not options-chain data.`,
+          httpHealthy: proxyCacheStatus === 'FRESH',
+          dataValid: true,
+          dataDetail: `Cache=${proxyCacheStatus}; age=${proxyCacheAgeMs}ms/${MEMBER_FIVE_PROXY_CACHE_TTL_MS}ms.${proxy.cacheFallbackReason ? ` Refresh issue=${proxy.cacheFallbackReason}.` : ''} Funding=${proxy.fundingRate}; funding deviation=${proxy.fundingDeviation}; long/short=${proxy.longShortRatio}; OI change=${proxy.openInterestChangePct}%; 1m return=${proxy.priceReturnPct}%; realized volatility=${proxy.realizedVolatilityPct}%; liquidation feed=${proxy.liquidationFeedStatus}, events=${proxy.liquidationEventCount}, long notional=${proxy.liquidationLongNotional ?? 'unavailable'}, short notional=${proxy.liquidationShortNotional ?? 'unavailable'}.`,
+          observedAtMs: proxy.cacheReceivedAtMs ?? Date.now(),
+          normalizedData: {
+            proxyCacheStatus,
+            proxyCacheAgeMs,
+            proxyCacheReceivedAtMs: proxy.cacheReceivedAtMs ?? null,
+            proxyCacheFallbackReason: proxy.cacheFallbackReason ?? null,
+            proxyTimestampMs: proxy.timestampMs,
+            proxyFundingTimestampMs: proxy.fundingTimestampMs,
+            proxyPositioningTimestampMs: proxy.positioningTimestampMs,
+            proxyPriceTimestampMs: proxy.priceTimestampMs,
+            proxyFundingRate: proxy.fundingRate,
+            proxyFundingBaselineRate: proxy.fundingBaselineRate,
+            proxyFundingDeviation: proxy.fundingDeviation,
+            proxyLongShortRatio: proxy.longShortRatio,
+            proxyOpenInterestChangePct: proxy.openInterestChangePct,
+            proxyPriceReturnPct: proxy.priceReturnPct,
+            proxyRealizedVolatilityPct: proxy.realizedVolatilityPct,
+            proxyLiquidationLongNotional: proxy.liquidationLongNotional,
+            proxyLiquidationShortNotional: proxy.liquidationShortNotional,
+            proxyLiquidationTimestampMs: proxy.liquidationTimestampMs,
+            proxyLiquidationEventCount: proxy.liquidationEventCount,
+            proxyLiquidationFeedStatus: proxy.liquidationFeedStatus,
+            proxyDirectionScore: proxy.directionScore,
+            proxyLongShortRatioMethod: proxy.longShortRatioMethod,
+            proxyHealthStatus: proxy.healthStatus,
+          },
+          voteValue: 'USEFUL',
+        };
+      }
+      const pair = `${asset}/USDT:USDT`;
+      let options: CouncilOptionsData;
+      if (source.id.endsWith('.deribit-options')) {
+        options = await fetchDeribitOptionsData({ pair, nowMs, fetcher });
+      } else if (source.id.endsWith('.okx-opt-summary')) {
+        options = await fetchOkxOptionsData({ pair, nowMs, fetcher });
+      } else if (source.id.endsWith('.bybit-options')) {
+        options = await fetchBybitOptionsData({ pair, nowMs, fetcher });
+      } else if (source.id.endsWith('.binance-eapi')) {
+        options = await fetchBinanceEuropeanOptionsData({ pair, nowMs, fetcher });
+      } else if (source.id.endsWith('.delta-options')) {
+        options = await fetchDeltaOptionsData({ pair, nowMs, fetcher });
+      } else if (source.id.endsWith('.gateio-options')) {
+        options = await fetchGateioOptionsData({ pair, nowMs, fetcher });
+      } else {
+        return {
+          status: 'UNTESTED',
+          detail: 'No production options adapter is assigned to this registered source.',
+          httpHealthy: null,
+          dataValid: false,
+          dataDetail: 'No source adapter was executed.',
+          voteValue: 'LOW_VALUE',
+        };
+      }
+      const thresholds = getCouncilOptionsThresholds(asset);
+      const hasDirectionalOpenInterest = options.status === 'LIVE' &&
+        thresholds !== null &&
+        options.qualityPct >= 80 &&
+        options.timestampMs !== null &&
+        options.timestampMs <= nowMs + 1_000 &&
+        nowMs - options.timestampMs <= Math.min(source.maxAgeMs, thresholds.maxAgeMs) &&
+        options.putCallRatio !== null && Number.isFinite(options.putCallRatio) &&
+        options.putCallRatio > 0 &&
+        options.callOpenInterest !== null && options.callOpenInterest > 0 &&
+        options.putOpenInterest !== null && options.putOpenInterest > 0 &&
+        options.impliedVolatilityPct !== null &&
+        Number.isFinite(options.impliedVolatilityPct) &&
+        options.impliedVolatilityPct > 0 &&
+        options.underlyingPrice !== undefined &&
+        Number.isFinite(options.underlyingPrice) &&
+        options.underlyingPrice > 0 &&
+        options.strikePrice !== null &&
+        Number.isFinite(options.strikePrice) &&
+        options.strikePrice > 0 &&
+        options.expiryTimestampMs !== null &&
+        options.expiryTimestampMs > nowMs &&
+        (options.contractsCount ?? 0) >= thresholds.minimumContracts &&
+        (options.callContractsCount ?? 0) >= thresholds.minimumContractsPerSide &&
+        (options.putContractsCount ?? 0) >= thresholds.minimumContractsPerSide &&
+        (options.bidAskValidatedContracts ?? 0) >= (options.contractsCount ?? 0) &&
+        (options.bidAskSizeValidatedContracts ?? 0) >= thresholds.minimumSizedOrderBooks &&
+        options.medianBidAskSpreadPct !== undefined &&
+        Number.isFinite(options.medianBidAskSpreadPct) &&
+        options.medianBidAskSpreadPct >= 0 &&
+        options.medianBidAskSpreadPct <= 20 &&
+        options.volume24h !== undefined &&
+        Number.isFinite(options.volume24h) &&
+        options.volume24h > 0;
+      return {
+        status: hasDirectionalOpenInterest ? 'HEALTHY' : 'BROKEN',
+        detail: hasDirectionalOpenInterest
+          ? `${options.provider} returned ${options.contractsCount} fresh ${asset} contracts with quality=${options.qualityPct}%, calls=${options.callContractsCount}, puts=${options.putContractsCount}, two-sided quotes, sampled sizes=${options.bidAskSizeValidatedContracts}, median spread=${options.medianBidAskSpreadPct?.toFixed(2)}%, and call/put OI.`
+          : options.unavailableReason ?? `${options.provider} did not return fresh directional ${asset} option data.`,
+        httpHealthy: hasDirectionalOpenInterest ? true : null,
+        dataValid: hasDirectionalOpenInterest,
+        dataDetail: hasDirectionalOpenInterest
+          ? `${options.contractsCount} active contracts (${options.callContractsCount} calls/${options.putContractsCount} puts); bid/ask=${options.bidAskValidatedContracts}; size-validated books=${options.bidAskSizeValidatedContracts}; median spread=${options.medianBidAskSpreadPct}%; 24h volume=${options.volume24h} ${options.volumeUnit ?? 'venue units'}; call OI=${options.callOpenInterest} ${options.openInterestUnit ?? ''}; put OI=${options.putOpenInterest}; PCR=${options.putCallRatio}; timestamp=${new Date(options.timestampMs!).toISOString()}.`
+          : options.unavailableReason ?? 'No fresh, liquid option contracts with positive call and put open interest.',
+        observedAtMs: options.retrievedAtMs ?? Date.now(),
+        normalizedData: hasDirectionalOpenInterest
+          ? {
+            optionInstrumentCount: options.contractsCount ?? 0,
+            optionQualityPct: options.qualityPct,
+            callContractCount: options.callContractsCount ?? 0,
+            putContractCount: options.putContractsCount ?? 0,
+            callOpenInterest: options.callOpenInterest,
+            putOpenInterest: options.putOpenInterest,
+            putCallOpenInterestRatio: options.putCallRatio,
+            putCallIvSpread: options.skewPct === null ? null : options.skewPct / 100,
+            optionImpliedVolatilityPct: options.impliedVolatilityPct,
+            optionUnderlyingPrice: options.underlyingPrice,
+            optionStrikePrice: options.strikePrice,
+            optionExpiryTimestampMs: options.expiryTimestampMs,
+            optionCallContractCount: options.callContractsCount ?? 0,
+            optionPutContractCount: options.putContractsCount ?? 0,
+            bidAskValidatedContracts: options.bidAskValidatedContracts ?? 0,
+            bidAskSizeValidatedContracts: options.bidAskSizeValidatedContracts ?? 0,
+            medianBidAskSpreadPct: options.medianBidAskSpreadPct ?? null,
+            optionsVolume24h: options.volume24h ?? null,
+            optionsVolumeUnit: options.volumeUnit ?? 'unknown',
+            openInterestUnit: options.openInterestUnit ?? 'unknown',
+            optionTimestampMs: options.timestampMs,
+            ...(source.id.endsWith('.gateio-options')
+              ? { timestampProvenance: 'sampled Gate.io order-book update' }
+              : {}),
+          }
+          : {},
+        voteValue: hasDirectionalOpenInterest ? 'USEFUL' : 'LOW_VALUE',
+      };
+    }
     const endpoints = [source.url, ...supplementalUrls(source, Date.now())];
     const dataResults: DataValidation[] = [];
     for (const endpoint of endpoints) {
@@ -1554,92 +2482,81 @@ export async function checkCouncilMemberSources(
   nowMs = Date.now(),
   fetcher: typeof fetch = fetch,
   asset = 'ETH',
-  onChainFlow?: CouncilWhaleFlowData | null,
+  _onChainFlow?: CouncilWhaleFlowData | null,
+  memberIdsToCheck: readonly number[] = [1, 2, 3, 4, 5, 6, 7, 8],
 ): Promise<Readonly<Record<number, readonly CouncilMemberSourceCheck[]>>> {
-  const memberDefinitions = asset === 'ETH'
-    ? COUNCIL_MEMBER_SOURCES
-    : [1, 2, 3, 4, 5, 6, 7, 8].flatMap((memberId) =>
-      getCouncilMemberSources(memberId, asset)
-    );
+  const requestedMembers = new Set(memberIdsToCheck);
+  const memberDefinitions = [...requestedMembers].flatMap((memberId) =>
+    getCouncilMemberSources(memberId, asset)
+  );
   const members = [...new Set(memberDefinitions.flatMap(({ memberIds }) => memberIds ?? []))];
   const checked = await Promise.all(members.map(async (memberId) => {
     const orderedSources = getCouncilMemberSources(memberId, asset);
-    if (memberId === 6 && asset !== 'ETH') {
-      const flowMatchesPair = onChainFlow?.pair === `${asset}/USDT:USDT` &&
-        onChainFlow.asset === asset;
-      const flowAgeMs = onChainFlow?.timestampMs === null ||
-        onChainFlow?.timestampMs === undefined
-        ? null
-        : nowMs - onChainFlow.timestampMs;
-      const flowIsFresh = flowAgeMs !== null && flowAgeMs >= 0 &&
-        flowAgeMs <= (asset === 'BTC' ? 20 * 60_000 : 5 * 60_000);
+    if (memberId === 6 && !['ETH', 'BTC', 'SOL', 'BNB', 'XRP'].includes(asset)) {
       return [
         memberId,
         orderedSources.map((source): CouncilMemberSourceCheck => {
-          const missingApiKey =
-            source.id === 'onchain.helius-solana' && !process.env.HELIUS_API_KEY?.trim() ||
-            source.id === 'onchain.bscscan-bnb' && !process.env.BSCSCAN_API_KEY?.trim();
-          if (missingApiKey) {
-            return {
-              sourceId: source.id,
-              status: 'MISSING_API_KEY',
-              detail: `Required key is not configured for this optional provider.`,
-              httpHealthy: null,
-              dataValid: false,
-              dataDetail: 'No request was made because the provider key is missing.',
-              voteValue: 'LOW_VALUE',
-            };
-          }
-          if (flowMatchesPair && onChainFlow?.sourceId === source.id) {
-            const healthy = onChainFlow.status === 'LIVE' &&
-              flowIsFresh &&
-              onChainFlow.coverageStatus === 'SAMPLED' &&
-              onChainFlow.qualityPct >= 80;
-            return {
-              sourceId: source.id,
-              status: healthy ? 'HEALTHY' : 'BROKEN',
-              detail: healthy
-                ? `${onChainFlow.provider} returned a fresh, confirmed ${asset} on-chain sample; it is context only and does not infer owner or trade direction.`
-                : onChainFlow.unavailableReason ??
-                  `${onChainFlow.provider} did not provide a fresh, sufficiently covered on-chain sample.`,
-              httpHealthy: null,
-              dataValid: healthy,
-              dataDetail: healthy
-                ? 'Valid on-chain sample; low-value/context-only for price direction.'
-                : onChainFlow.unavailableReason ?? 'The on-chain sample is unavailable, stale, or incomplete.',
-              observedAtMs: onChainFlow.timestampMs,
-              voteValue: 'LOW_VALUE',
-            };
-          }
+          const flowMatchesPair = _onChainFlow?.pair === `${asset}/USDT:USDT` &&
+            _onChainFlow.asset === asset;
+          const flowAgeMs = _onChainFlow?.timestampMs == null
+            ? null
+            : nowMs - _onChainFlow.timestampMs;
+          const maxAgeMs = asset === 'BTC' ? 20 * 60_000 : 5 * 60_000;
+          const healthy = flowMatchesPair &&
+            _onChainFlow?.sourceId === source.id &&
+            _onChainFlow.status === 'LIVE' &&
+            flowAgeMs !== null &&
+            flowAgeMs >= 0 &&
+            flowAgeMs <= maxAgeMs &&
+            _onChainFlow.coverageStatus === 'SAMPLED' &&
+            _onChainFlow.qualityPct >= 80;
           return {
             sourceId: source.id,
-            status: 'UNTESTED',
-            detail: onChainFlow?.unavailableReason ??
-              'This provider was not independently queried in the on-chain flow check; it is not counted as healthy.',
+            status: healthy ? 'HEALTHY' : 'UNTESTED',
+            detail: healthy
+              ? `${_onChainFlow!.provider} returned a fresh ${asset} on-chain sample; infrastructure health is reported separately from voting evidence.`
+              : _onChainFlow?.unavailableReason ??
+                'This asset/provider is outside the currently implemented independent Member 6 adapter set.',
             httpHealthy: null,
-            dataValid: false,
-            dataDetail: 'No independent provider response or direction-bearing metric was observed.',
+            dataValid: healthy,
+            dataDetail: healthy
+              ? 'Valid on-chain sample; low-value/context-only unless CEX attribution and direction are independently validated.'
+              : 'No independent provider response was observed.',
+            observedAtMs: healthy ? _onChainFlow?.timestampMs : null,
             voteValue: 'LOW_VALUE',
           };
         }),
       ] as const;
     }
-    const checks: CouncilMemberSourceCheck[] = [];
-    for (const source of orderedSources) {
+    const checks = await Promise.all(orderedSources.map(async (source): Promise<CouncilMemberSourceCheck> => {
       const result = await checkSource(source, nowMs, fetcher);
-      checks.push({
+      const normalizedData = result.normalizedData ?? {};
+      const sourceTimestampMs = [
+        normalizedData.tradeTimestampMs,
+        normalizedData.optionTimestampMs,
+        normalizedData.candleTimestampMs,
+        normalizedData.proxyTimestampMs,
+        normalizedData.observationTimestampMs,
+      ].find((value): value is number => typeof value === 'number' && Number.isFinite(value)) ?? null;
+      return {
         sourceId: source.id,
+        endpoint: source.url,
+        provider: source.provider,
+        symbol: source.symbol,
+        marketType: source.marketType,
+        independenceGroup: source.independenceGroup,
         status: result.status,
         detail: result.detail,
         httpHealthy: result.httpHealthy ?? null,
         dataValid: result.dataValid ?? null,
         dataDetail: result.dataDetail ?? result.detail,
         observedAtMs: result.observedAtMs ?? null,
-        normalizedData: result.normalizedData ?? {},
+        sourceTimestampMs,
+        normalizedData,
         ethPriceUsd: result.ethPriceUsd ?? null,
         voteValue: result.voteValue ?? 'UNKNOWN',
-      });
-    }
+      };
+    }));
     return [memberId, checks] as const;
   }));
   return Object.fromEntries(checked);
@@ -1650,4 +2567,5 @@ export function resetCouncilSourceHealthCacheForTests(): void {
   sourceInFlight.clear();
   hostQueues.clear();
   lastRequestByHost.clear();
+  resetMemberFiveFuturesProxyCacheForTests();
 }

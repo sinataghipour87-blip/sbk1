@@ -2,6 +2,7 @@ import type { CouncilOptionsData } from './eightMemberCouncil';
 import { deduplicateOptionContracts } from './councilEvidenceDeduplication';
 import { getFreqtradePairBaseAsset } from './freqtradePairs';
 import { isRecord, toPositiveNumber } from './onChainCexShared';
+import { getCouncilOptionsThresholds } from './councilOptionsThresholds';
 
 const OKX_API = 'https://www.okx.com/api/v5';
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -9,7 +10,6 @@ const CACHE_TTL_MS = 15_000;
 const MAX_SOURCE_AGE_MS = 60_000;
 const MIN_EXPIRY_AGE_MS = 7 * 24 * 60 * 60_000;
 const MAX_EXPIRY_AGE_MS = 90 * 24 * 60 * 60_000;
-const MIN_LIQUID_CONTRACTS = 20;
 
 interface OkxInstrument {
   instId: string;
@@ -43,6 +43,9 @@ interface OkxTicker {
   instId: string;
   bidPx: string;
   askPx: string;
+  bidSz: string;
+  askSz: string;
+  vol24h: string;
   ts: string;
 }
 
@@ -55,6 +58,8 @@ interface ParsedContract {
   impliedVolatilityPct: number;
   underlyingPrice: number;
   timestampMs: number;
+  bidAskSpreadPct: number;
+  volume24h: number;
 }
 
 const cachedResults = new Map<string, { cachedAtMs: number; result: CouncilOptionsData }>();
@@ -86,6 +91,12 @@ function positiveNumber(value: unknown): number | null {
   return toPositiveNumber(value);
 }
 
+function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
 function timestamp(value: unknown): number | null {
   if (typeof value !== 'string' || !/^\d{13}$/.test(value)) return null;
   const parsed = Number(value);
@@ -97,7 +108,9 @@ function isOkxEnvelope(value: unknown): value is { code: string; data: unknown[]
 }
 
 function isInstrument(value: unknown, asset: string): value is OkxInstrument {
-  const underlying = asset === 'ETH' ? 'ETH-USD' : `${asset}-USDT`;
+  const underlying = asset === 'ETH' || asset === 'SOL'
+    ? `${asset}-USD`
+    : `${asset}-USDT`;
   return isRecord(value) &&
     typeof value.instId === 'string' &&
     value.instType === 'OPTION' &&
@@ -142,7 +155,11 @@ export async function fetchOkxOptionsData(options: {
 }): Promise<CouncilOptionsData> {
   const asset = getFreqtradePairBaseAsset(options.pair);
   if (!asset || !['ETH', 'SOL', 'XRP', 'BNB'].includes(asset)) return unavailable(options.pair);
-  const underlying = asset === 'ETH' ? 'ETH-USD' : `${asset}-USDT`;
+  const thresholds = getCouncilOptionsThresholds(asset);
+  if (!thresholds) return unavailable(options.pair);
+  const underlying = asset === 'ETH' || asset === 'SOL'
+    ? `${asset}-USD`
+    : `${asset}-USDT`;
 
   const nowMs = options.nowMs ?? Date.now();
   const cached = cachedResults.get(options.pair);
@@ -224,9 +241,23 @@ export async function fetchOkxOptionsData(options: {
     const tickers = new Map<string, OkxTicker>();
     for (const item of tickerEnvelope.data) {
       if (!isRecord(item) || typeof item.instId !== 'string' || !contractIds.has(item.instId)) continue;
-      if (typeof item.bidPx !== 'string' || typeof item.askPx !== 'string' || typeof item.ts !== 'string') continue;
+      if (
+        typeof item.bidPx !== 'string' ||
+        typeof item.askPx !== 'string' ||
+        typeof item.bidSz !== 'string' ||
+        typeof item.askSz !== 'string' ||
+        typeof item.vol24h !== 'string' ||
+        typeof item.ts !== 'string'
+      ) continue;
       const previous = tickers.get(item.instId);
-      if (previous && (previous.bidPx !== item.bidPx || previous.askPx !== item.askPx || previous.ts !== item.ts)) {
+      if (previous && (
+        previous.bidPx !== item.bidPx ||
+        previous.askPx !== item.askPx ||
+        previous.bidSz !== item.bidSz ||
+        previous.askSz !== item.askSz ||
+        previous.vol24h !== item.vol24h ||
+        previous.ts !== item.ts
+      )) {
         throw new Error(`OKX returned conflicting option tickers for ${item.instId}.`);
       }
       tickers.set(item.instId, item as unknown as OkxTicker);
@@ -242,6 +273,9 @@ export async function fetchOkxOptionsData(options: {
       const openInterestBase = positiveNumber(interest?.oiCcy);
       const bid = positiveNumber(ticker?.bidPx);
       const ask = positiveNumber(ticker?.askPx);
+      const bidSize = positiveNumber(ticker?.bidSz);
+      const askSize = positiveNumber(ticker?.askSz);
+      const volume24h = positiveNumber(ticker?.vol24h);
       const timestamps = [
         timestamp(summary?.ts),
         timestamp(interest?.ts),
@@ -254,6 +288,9 @@ export async function fetchOkxOptionsData(options: {
         openInterestBase === null ||
         bid === null ||
         ask === null ||
+        bidSize === null ||
+        askSize === null ||
+        volume24h === null ||
         bid > ask ||
         timestamps.some((value) => value === null)
       ) return [];
@@ -271,6 +308,8 @@ export async function fetchOkxOptionsData(options: {
         impliedVolatilityPct: markVol * 100,
         underlyingPrice,
         timestampMs: sourceTimestampMs,
+        bidAskSpreadPct: Math.max(0, ask - bid) / ((ask + bid) / 2) * 100,
+        volume24h,
       }];
     });
     const deduplication = deduplicateOptionContracts(contracts.map((contract) => ({
@@ -291,15 +330,15 @@ export async function fetchOkxOptionsData(options: {
     const callOpenInterest = calls.reduce((sum, contract) => sum + contract.openInterestBase, 0);
     const putOpenInterest = puts.reduce((sum, contract) => sum + contract.openInterestBase, 0);
     if (
-      valid.length < MIN_LIQUID_CONTRACTS ||
-      calls.length === 0 ||
-      puts.length === 0 ||
+      valid.length < thresholds.minimumContracts ||
+      calls.length < thresholds.minimumContractsPerSide ||
+      puts.length < thresholds.minimumContractsPerSide ||
       callOpenInterest <= 0 ||
       putOpenInterest <= 0
     ) {
       const result = unavailable(
         options.pair,
-        'OKX options did not provide at least 20 fresh, open-interest-positive, two-sided liquid contracts across calls and puts.',
+        `OKX options did not provide at least ${thresholds.minimumContracts} fresh contracts with ${thresholds.minimumContractsPerSide} calls and puts, two-sided quotes, and positive OI on both sides.`,
       );
       cachedResults.set(options.pair, { cachedAtMs: nowMs, result });
       return result;
@@ -329,6 +368,14 @@ export async function fetchOkxOptionsData(options: {
       skewPct: Math.round((weightedIv(puts) - weightedIv(calls)) * 100) / 100,
       provider: 'OKX V5 public options API',
       contractsCount: valid.length,
+      callContractsCount: calls.length,
+      putContractsCount: puts.length,
+      bidAskValidatedContracts: valid.length,
+      bidAskSizeValidatedContracts: valid.length,
+      medianBidAskSpreadPct: median(valid.map(({ bidAskSpreadPct }) => bidAskSpreadPct)),
+      volume24h: valid.reduce((sum, contract) => sum + contract.volume24h, 0),
+      volumeUnit: 'OKX-reported option volume units',
+      openInterestUnit: 'OKX-reported option OI units; base-equivalent separately reported',
       callOpenInterest,
       putOpenInterest,
       underlyingPrice: nearestAtm.underlyingPrice,

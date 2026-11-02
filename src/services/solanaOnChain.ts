@@ -4,14 +4,11 @@ import {
   isRecord,
   makeOnChainFlow,
   parseCexWallets,
-  redactCredential,
   toPositiveNumber,
   unavailableOnChainFlow,
 } from './onChainCexShared';
 
 const PROVIDER = 'Solana mainnet on-chain provider';
-const HELIUS_PROVIDER = 'Helius Solana mainnet RPC';
-const HELIUS_RPC = 'https://mainnet.helius-rpc.com/';
 const PUBLIC_RPC_PROVIDERS = [
   { name: 'Solana mainnet-beta public RPC', endpoint: 'https://api.mainnet-beta.solana.com/' },
   { name: 'PublicNode Solana RPC', endpoint: 'https://solana-rpc.publicnode.com/' },
@@ -32,36 +29,6 @@ function positiveThreshold(name: string): number | null {
   if (!raw) return null;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-}
-
-async function rpc(
-  fetcher: typeof fetch,
-  apiKey: string,
-  method: string,
-  params: unknown[],
-): Promise<unknown> {
-  const url = new URL(HELIUS_RPC);
-  url.searchParams.set('api-key', apiKey);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5_000);
-  try {
-    const response = await fetcher(url, {
-      method: 'POST',
-      signal: controller.signal,
-      cache: 'no-store',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method,
-        params,
-      }),
-    });
-    if (!response.ok) throw new Error(`${HELIUS_PROVIDER} returned HTTP ${response.status}.`);
-    return await response.json();
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 async function publicRpc(
@@ -317,142 +284,14 @@ export async function fetchSolanaOnChainData(options: {
     };
   }
   const fetcher = options.fetcher ?? fetch;
-  const apiKey = process.env.HELIUS_API_KEY?.trim();
-  if (!apiKey) {
-    return fetchWithoutApiKey({
-      pair: options.pair,
-      wallets: watchlist.wallets,
-      threshold,
-      priceUsd: options.priceUsd,
-      nowMs,
-      fetcher,
-    });
-  }
-  try {
-    const transfers: CouncilWhaleTransfer[] = [];
-    let latestObservedAtMs = 0;
-    for (const wallet of watchlist.wallets) {
-      const transactionsResponse = await rpc(fetcher, apiKey, 'getTransactionsForAddress', [
-        wallet.address,
-        {
-          transactionDetails: 'full',
-          sortOrder: 'desc',
-          limit: 100,
-          filters: {
-            blockTime: { gte: Math.floor((nowMs - MAX_AGE_MS) / 1_000) },
-            status: 'succeeded',
-          },
-        },
-      ]);
-      if (!isRecord(transactionsResponse) || transactionsResponse.error) {
-        throw new Error('Helius getTransactionsForAddress request failed.');
-      }
-      const transactions: unknown[] = Array.isArray(transactionsResponse.result)
-        ? transactionsResponse.result
-        : [];
-      if (transactions.length > 0) {
-        const latestForWallet = transactions.flatMap((item) =>
-          isRecord(item) && typeof item.timestamp === 'number' && Number.isFinite(item.timestamp)
-            ? [item.timestamp * 1_000]
-            : []
-        );
-        latestObservedAtMs = Math.max(latestObservedAtMs, ...latestForWallet);
-      }
-      const candidates = transactions.flatMap((item) => {
-        if (
-          !isRecord(item) ||
-          typeof item.signature !== 'string' ||
-          !/^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(item.signature) ||
-          typeof item.slot !== 'number' ||
-          !Number.isSafeInteger(item.slot) ||
-          typeof item.timestamp !== 'number' ||
-          !Number.isFinite(item.timestamp) ||
-          !Array.isArray(item.nativeTransfers)
-        ) return [];
-        return item.nativeTransfers.flatMap((transfer, transferIndex) => {
-          if (!isRecord(transfer) || transfer.toUserAccount !== wallet.address) return [];
-          const lamports = toPositiveNumber(transfer.amount);
-          if (lamports === null) return [];
-          const amount = lamports / 1_000_000_000;
-          if (amount < threshold) return [];
-          return [{
-            signature: item.signature as string,
-            slot: item.slot as number,
-            timestampMs: (item.timestamp as number) * 1_000,
-            amount,
-            transferIndex,
-          }];
-        });
-      });
-      if (candidates.length === 0) continue;
-      const signatures = [...new Set(candidates.map(({ signature }) => signature))];
-      const statusResponse = await rpc(fetcher, apiKey, 'getSignatureStatuses', [
-        signatures,
-        { searchTransactionHistory: true },
-      ]);
-      if (
-        !isRecord(statusResponse) ||
-        statusResponse.error ||
-        !isRecord(statusResponse.result) ||
-        !Array.isArray(statusResponse.result.value)
-      ) {
-        throw new Error('Helius signature confirmation response is malformed.');
-      }
-      const statuses = statusResponse.result.value;
-      const statusBySignature = new Map(signatures.map((signature, index) =>
-        [signature, statuses[index]]
-      ));
-      for (const candidate of candidates) {
-        const status = statusBySignature.get(candidate.signature);
-        if (!isRecord(status) || status.confirmationStatus !== 'finalized' || status.err !== null) continue;
-        const observedAtMs = candidate.timestampMs;
-        if (observedAtMs > nowMs + 1_000 || nowMs - observedAtMs > MAX_AGE_MS) continue;
-        transfers.push({
-          transactionHash: candidate.signature,
-          blockchain: 'solana',
-          blockHeight: candidate.slot,
-          timestampMs: observedAtMs,
-          sourceProvider: `${HELIUS_PROVIDER} (configured ${wallet.exchange} destination)`,
-          asset: 'SOL',
-          amount: candidate.amount,
-          estimatedUsd: typeof options.priceUsd === 'number' &&
-            Number.isFinite(options.priceUsd) &&
-            options.priceUsd > 0
-            ? candidate.amount * options.priceUsd
-            : null,
-          confirmationStatus: 'CONFIRMED',
-          transferId: `native-transfer:${candidate.transferIndex}`,
-        });
-      }
-    }
-    const retrievedAtMs = Date.now();
-    if (latestObservedAtMs === 0) {
-      return unavailableOnChainFlow(
-        options.pair,
-        'SOL',
-        HELIUS_PROVIDER,
-        'Helius returned no timestamped transaction observations for the configured CEX wallets.',
-      );
-    }
-    const result = makeOnChainFlow({
-      pair: options.pair,
-      asset: 'SOL',
-      provider: HELIUS_PROVIDER,
-      transfers,
-      observedAtMs: latestObservedAtMs,
-      retrievedAtMs,
-    });
-    const resultWithSource: CouncilWhaleFlowData = {
-      ...result,
-      sourceId: 'onchain.helius-solana',
-    };
-    cached.set(options.pair, { cachedAtMs: nowMs, value: resultWithSource });
-    return { ...resultWithSource };
-  } catch (error) {
-    const reason = redactCredential(error, apiKey);
-    console.error('[SolanaOnChain] Helius source unavailable:', reason);
-    return unavailableOnChainFlow(options.pair, 'SOL', HELIUS_PROVIDER, reason);
-  }
+  return fetchWithoutApiKey({
+    pair: options.pair,
+    wallets: watchlist.wallets,
+    threshold,
+    priceUsd: options.priceUsd,
+    nowMs,
+    fetcher,
+  });
 }
 
 export function resetSolanaOnChainCacheForTests(): void {

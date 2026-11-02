@@ -6,9 +6,6 @@ import { fetchSolanaOnChainData, resetSolanaOnChainCacheForTests } from '../src/
 import { fetchXrpOnChainData, resetXrpOnChainCacheForTests } from '../src/services/xrpOnChain';
 
 const envNames = [
-  'HELIUS_API_KEY',
-  'XRPSCAN_API_KEY',
-  'BSCSCAN_API_KEY',
   'ETHERSCAN_API_KEY',
   'SBK1_ETHERSCAN_WATCH_ADDRESSES',
   'SBK1_SOL_WATCH_ADDRESSES',
@@ -62,54 +59,8 @@ try {
 
   const solWallet = 'A'.repeat(32);
   const solSignature = '5'.repeat(88);
-  setEnv('HELIUS_API_KEY', 'test-helius-key');
   setEnv('SBK1_SOL_WATCH_ADDRESSES', JSON.stringify({ [solWallet]: 'Verified exchange' }));
   setEnv('SBK1_WHALE_MIN_SOL', '10');
-  resetSolanaOnChainCacheForTests();
-  const solMethods: string[] = [];
-  const solana = await fetchSolanaOnChainData({
-    pair: 'SOL/USDT:USDT',
-    priceUsd: 150,
-    nowMs,
-    fetcher: async (input, init) => {
-      const url = new URL(String(input));
-      assert.equal(url.searchParams.get('api-key'), 'test-helius-key');
-      const body = JSON.parse(String(init?.body)) as { method: string; params: unknown[] };
-      solMethods.push(body.method);
-      if (body.method === 'getTransactionsForAddress') {
-        assert.equal(body.params[0], solWallet);
-        return Response.json({
-          jsonrpc: '2.0',
-          result: [{
-            signature: solSignature,
-            slot: 300,
-            timestamp: Math.floor(nowMs / 1_000),
-            nativeTransfers: [
-              { fromUserAccount: 'B'.repeat(32), toUserAccount: solWallet, amount: 11_000_000_000 },
-              { fromUserAccount: 'B'.repeat(32), toUserAccount: 'C'.repeat(32), amount: 99_000_000_000 },
-            ],
-          }],
-        });
-      }
-      assert.equal(body.method, 'getSignatureStatuses');
-      assert.deepEqual(body.params[0], [solSignature]);
-      return Response.json({
-        jsonrpc: '2.0',
-        result: { value: [{ confirmationStatus: 'finalized', err: null }] },
-      });
-    },
-  });
-  assert.deepEqual(solMethods, ['getTransactionsForAddress', 'getSignatureStatuses']);
-  assert.equal(solana.status, 'LIVE');
-  assert.equal(solana.sourceId, 'onchain.helius-solana');
-  assert.equal(solana.largeTransfers?.length, 1);
-  assert.equal(solana.largeTransfers?.[0].asset, 'SOL');
-  assert.equal(solana.largeTransfers?.[0].blockchain, 'solana');
-  assert.equal(solana.largeTransfers?.[0].amount, 11);
-  assert.equal(solana.largeTransfers?.[0].estimatedUsd, 1_650);
-  assert.equal(solana.largeTransfers?.[0].confirmationStatus, 'CONFIRMED');
-
-  setEnv('HELIUS_API_KEY', undefined);
   resetSolanaOnChainCacheForTests();
   const publicSolMethods: string[] = [];
   const publicSolana = await fetchSolanaOnChainData({
@@ -215,47 +166,8 @@ try {
 
   const bscWallet = `0x${'a'.repeat(40)}`;
   const bscHash = `0x${'b'.repeat(64)}`;
-  setEnv('BSCSCAN_API_KEY', 'test-bscscan-key');
   setEnv('SBK1_BNB_WATCH_ADDRESSES', JSON.stringify({ [bscWallet]: 'Verified exchange' }));
   setEnv('SBK1_WHALE_MIN_BNB', '5');
-  resetBscOnChainCacheForTests();
-  let bscCalls = 0;
-  const bsc = await fetchBscOnChainData({
-    pair: 'BNB/USDT:USDT',
-    priceUsd: 600,
-    nowMs,
-    fetcher: async (input) => {
-      bscCalls += 1;
-      const url = new URL(String(input));
-      assert.equal(url.searchParams.get('chainid'), '56');
-      assert.equal(url.searchParams.get('apikey'), 'test-bscscan-key');
-      assert.equal(url.searchParams.get('address'), bscWallet);
-      return Response.json({
-        status: '1',
-        message: 'OK',
-        result: [{
-          hash: bscHash,
-          timeStamp: String(Math.floor((nowMs - 1_000) / 1_000)),
-          blockNumber: '70000000',
-          confirmations: '20',
-          value: String(6n * 10n ** 18n),
-          to: bscWallet,
-          isError: '0',
-        }],
-      });
-    },
-  });
-  assert.equal(bscCalls, 1);
-  assert.equal(bsc.status, 'LIVE');
-  assert.equal(bsc.sourceId, 'onchain.bscscan-bnb');
-  assert.equal(bsc.largeTransfers?.length, 1);
-  assert.equal(bsc.largeTransfers?.[0].asset, 'BNB');
-  assert.equal(bsc.largeTransfers?.[0].blockchain, 'binance_smart_chain');
-  assert.equal(bsc.largeTransfers?.[0].amount, 6);
-  assert.equal(bsc.largeTransfers?.[0].estimatedUsd, 3_600);
-  assert.equal(bsc.largeTransfers?.[0].confirmationStatus, 'CONFIRMED');
-
-  setEnv('BSCSCAN_API_KEY', undefined);
   resetBscOnChainCacheForTests();
   const publicBscWallet = bscWallet;
   let publicBscMethods = 0;
@@ -265,6 +177,7 @@ try {
     nowMs,
     fetcher: async (_input, init) => {
       const body = JSON.parse(String(init?.body)) as { method: string; params: unknown[] };
+      assert.equal(new URL(String(_input)).hostname, 'bsc-rpc.publicnode.com');
       publicBscMethods += 1;
       if (body.method === 'eth_chainId') {
         return Response.json({ jsonrpc: '2.0', id: 1, result: '0x38' });
@@ -293,9 +206,11 @@ try {
   });
   assert.equal(publicBscMethods, 52);
   assert.equal(publicBsc.status, 'LIVE');
-  assert.equal(publicBsc.sourceId, 'onchain.bsc-public-rpc');
+  assert.equal(publicBsc.sourceId, 'onchain.bsc-publicnode');
   assert.match(publicBsc.provider, /chainid=56/);
   assert.equal(publicBsc.largeTransfers?.length, 1);
+  assert.equal(publicBsc.largeTransfers?.[0].asset, 'BNB');
+  assert.equal(publicBsc.largeTransfers?.[0].blockchain, 'binance_smart_chain');
   assert.equal(publicBsc.largeTransfers?.[0].amount, 6);
   assert.equal(publicBsc.largeTransfers?.[0].estimatedUsd, 3_600);
 
@@ -316,33 +231,58 @@ try {
 
   resetSolanaOnChainCacheForTests();
   setEnv('SBK1_WHALE_MIN_SOL', '10');
-  setEnv('HELIUS_API_KEY', 'test-helius-key');
   const underThreshold = await fetchSolanaOnChainData({
     pair: 'SOL/USDT:USDT',
     nowMs: nowMs + 20_000,
     fetcher: async (_input, init) => {
       const body = JSON.parse(String(init?.body)) as { method: string };
-      if (body.method === 'getTransactionsForAddress') {
+      if (body.method === 'getSlot') {
+        return Response.json({ jsonrpc: '2.0', id: 1, result: 501 });
+      }
+      if (body.method === 'getBlockTime') {
         return Response.json({
           jsonrpc: '2.0',
+          id: 1,
+          result: Math.floor((nowMs + 20_000) / 1_000) - 30,
+        });
+      }
+      if (body.method === 'getSignaturesForAddress') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: 1,
           result: [{
             signature: solSignature,
-            slot: 301,
-            timestamp: Math.floor((nowMs + 20_000) / 1_000),
-            nativeTransfers: [{ toUserAccount: solWallet, amount: 9_000_000_000 }],
+            slot: 500,
+            blockTime: Math.floor((nowMs + 20_000) / 1_000) - 30,
+            err: null,
+            confirmationStatus: 'finalized',
           }],
         });
       }
       return Response.json({
         jsonrpc: '2.0',
-        result: { value: [{ confirmationStatus: 'confirmed', err: null }] },
+        id: 1,
+        result: {
+          transaction: {
+            message: {
+              instructions: [{
+                program: 'system',
+                parsed: {
+                  type: 'transfer',
+                  info: { destination: solWallet, lamports: '9000000000' },
+                },
+              }],
+            },
+          },
+          meta: { err: null, innerInstructions: [] },
+        },
       });
     },
   });
   assert.equal(underThreshold.status, 'LIVE');
   assert.deepEqual(underThreshold.largeTransfers, []);
 
-  console.log('SOL/XRP/BNB on-chain providers, keyless Solana/BSC fallbacks, network isolation, threshold, confirmation and abstention checks passed.');
+  console.log('SOL/XRP/BNB on-chain providers, keyless Solana/BSC fallbacks, network isolation, threshold and abstention checks passed.');
 } finally {
   for (const name of envNames) setEnv(name, originalEnv[name]);
   resetSolanaOnChainCacheForTests();

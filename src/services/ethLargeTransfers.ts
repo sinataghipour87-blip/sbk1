@@ -44,6 +44,7 @@ export async function fetchEthereumLargeTransfers(options: {
       reason: 'No public-source-verified Ethereum exchange wallet labels are configured; no addresses were inferred.',
     };
   }
+  const nowMs = options.nowMs ?? Date.now();
   const evidence = await fetchPublicEvmOnChainData({
     pair: options.pair,
     asset: 'ETH',
@@ -53,7 +54,7 @@ export async function fetchEthereumLargeTransfers(options: {
     addresses: labels.map(({ address }) => address),
     threshold: thresholdEth,
     priceUsd: options.priceUsd,
-    nowMs: options.nowMs,
+    nowMs,
     fetcher: options.fetcher,
   });
   return {

@@ -88,6 +88,8 @@ export async function fetchEthereumWhaleEvidence(options: {
         : 'پوشش ناقص: verified exchange labels are not configured.',
       coverageComplete: false,
       observedAtMs: largeTransfers.evidence?.timestampMs ?? null,
+      cexWatchlistMatched: largeTransfers.coverage === 'VERIFIED_EXCHANGE_DESTINATIONS' &&
+        confirmedLargeTransfers.length > 0,
       interpretationFa: largeTransfers.status === 'LIVE' && confirmedLargeTransfers.length > 0
         ? 'ورود به آدرس صرافی فقط «احتمال فروش» است، نه فروش قطعی؛ پوشش نمونه‌ای و وزن ۱۰٪ است.'
         : 'انتقال بزرگ با برچسب قابل‌تأیید مشاهده نشد؛ نبود آن اثبات نبود جریان کل شبکه نیست.',

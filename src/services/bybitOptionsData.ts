@@ -1,6 +1,7 @@
 import type { CouncilOptionsData } from './eightMemberCouncil';
 import { getFreqtradePairBaseAsset } from './freqtradePairs';
 import { isRecord, toPositiveNumber } from './onChainCexShared';
+import { getCouncilOptionsThresholds } from './councilOptionsThresholds';
 
 const API_ROOT = 'https://api.bybit.com/v5/market';
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -8,7 +9,6 @@ const CACHE_TTL_MS = 15_000;
 const MAX_SOURCE_AGE_MS = 60_000;
 const MIN_EXPIRY_AGE_MS = 7 * 24 * 60 * 60_000;
 const MAX_EXPIRY_AGE_MS = 90 * 24 * 60 * 60_000;
-const MIN_LIQUID_CONTRACTS = 20;
 const MAX_INSTRUMENT_PAGES = 10;
 
 interface BybitInstrument {
@@ -41,6 +41,8 @@ interface ParsedContract {
   openInterest: number;
   impliedVolatilityPct: number;
   underlyingPrice: number;
+  bidAskSpreadPct: number;
+  turnover24h: number;
 }
 
 const cache = new Map<string, { cachedAtMs: number; value: CouncilOptionsData }>();
@@ -139,7 +141,15 @@ function parseContract(
     openInterest: openInterest!,
     impliedVolatilityPct: markIv! * 100,
     underlyingPrice: underlyingPrice!,
+    bidAskSpreadPct: ((ask! - bid!) / ((ask! + bid!) / 2)) * 100,
+    turnover24h: turnover!,
   };
+}
+
+function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)];
 }
 
 async function request(
@@ -215,9 +225,11 @@ export async function fetchBybitOptionsData(options: {
   fetcher?: typeof fetch;
 }): Promise<CouncilOptionsData> {
   const asset = getFreqtradePairBaseAsset(options.pair);
-  if (asset !== 'BTC' && asset !== 'ETH') {
-    return unavailable(options.pair, 'Bybit public options fallback is enabled only for BTC and ETH.');
+  if (!asset || !['BTC', 'ETH', 'SOL', 'XRP'].includes(asset)) {
+    return unavailable(options.pair, 'Bybit public options fallback is enabled only for BTC, ETH, SOL, and XRP.');
   }
+  const thresholds = getCouncilOptionsThresholds(asset);
+  if (!thresholds) return unavailable(options.pair, 'Bybit options has no council validation thresholds for this asset.');
   const nowMs = options.nowMs ?? Date.now();
   const cached = cache.get(options.pair);
   if (cached && nowMs >= cached.cachedAtMs && nowMs - cached.cachedAtMs <= CACHE_TTL_MS) {
@@ -276,13 +288,13 @@ export async function fetchBybitOptionsData(options: {
     const putOpenInterest = puts.reduce((sum, contract) => sum + contract.openInterest, 0);
     const totalOpenInterest = callOpenInterest + putOpenInterest;
     if (
-      valid.length < MIN_LIQUID_CONTRACTS ||
-      calls.length === 0 ||
-      puts.length === 0 ||
+      valid.length < thresholds.minimumContracts ||
+      calls.length < thresholds.minimumContractsPerSide ||
+      puts.length < thresholds.minimumContractsPerSide ||
       callOpenInterest <= 0 ||
       putOpenInterest <= 0
     ) {
-      throw new Error(`Bybit returned only ${valid.length} active liquid contracts; at least ${MIN_LIQUID_CONTRACTS} with calls and puts are required.`);
+      throw new Error(`Bybit returned ${valid.length} active liquid contracts (${calls.length} calls, ${puts.length} puts); minimums are ${thresholds.minimumContracts} total and ${thresholds.minimumContractsPerSide} per side for ${asset}.`);
     }
     const weightedIv = valid.reduce(
       (sum, contract) => sum + contract.impliedVolatilityPct * contract.openInterest,
@@ -310,6 +322,14 @@ export async function fetchBybitOptionsData(options: {
       skewPct: null,
       provider: 'Bybit V5 public options API',
       contractsCount: valid.length,
+      callContractsCount: calls.length,
+      putContractsCount: puts.length,
+      bidAskValidatedContracts: valid.length,
+      bidAskSizeValidatedContracts: valid.length,
+      medianBidAskSpreadPct: median(valid.map(({ bidAskSpreadPct }) => bidAskSpreadPct)),
+      volume24h: valid.reduce((sum, contract) => sum + contract.turnover24h, 0),
+      volumeUnit: 'USDT turnover',
+      openInterestUnit: 'Bybit-reported option OI units',
       callOpenInterest,
       putOpenInterest,
       underlyingPrice,

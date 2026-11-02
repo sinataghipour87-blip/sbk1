@@ -18,6 +18,8 @@ import { evaluateEightMemberCouncil } from '../src/services/eightMemberCouncil';
 
 dotenv.config();
 
+const liveVerificationStartedAtMs = Date.now();
+console.log(`[LIVE API VERIFICATION] startedAt=${new Date(liveVerificationStartedAtMs).toISOString()} asset=ETH`);
 const configuredPriceSources = getCouncilMemberSources(1);
 
 const sourceChecks = await checkCouncilMemberSources();
@@ -170,9 +172,20 @@ console.log('\nرأی مستقیم هر عضو با payloadهای همین بر�
 console.log('عضو | رأی | منابع سالم | sourceId | fallbackSourceId | توضیح');
 console.log('-----|-----|------------|----------|------------------|-------');
 for (const vote of liveCouncilReport.members) {
+  const registeredSourceCount = getCouncilMemberSources(vote.id, 'ETH').length;
   console.log(
-    `${vote.id} | ${vote.vote} | ${vote.healthySourceCount ?? 0}/4 | ${vote.sourceId ?? '—'} | ${vote.fallbackSourceId ?? '—'} | ${vote.rationaleFa}`,
+    `${vote.id} | ${vote.vote} | ${vote.healthySourceCount ?? 0}/${registeredSourceCount} | ${vote.sourceId ?? '—'} | ${vote.fallbackSourceId ?? '—'} | ${vote.rationaleFa}`,
   );
+}
+for (const memberId of [2, 5]) {
+  const vote = liveCouncilReport.members.find(({ id }) => id === memberId);
+  if (!vote) continue;
+  console.log(`\nLIVE source audit | member=${memberId} | vote=${vote.vote} | used=${vote.usedSourceIds?.join(',') ?? 'none'}`);
+  for (const check of vote.sourceChecks ?? []) {
+    console.log(
+      `${check.sourceId} | provider=${check.provider ?? 'unknown'} | endpoint=${check.endpoint ?? 'unknown'} | asset=ETH | symbol=${check.symbol ?? 'unknown'} | market=${check.marketType ?? 'unknown'} | fetchedAt=${check.observedAtMs === null || check.observedAtMs === undefined ? 'unknown' : new Date(check.observedAtMs).toISOString()} | dataAt=${check.sourceTimestampMs === null || check.sourceTimestampMs === undefined ? 'unknown' : new Date(check.sourceTimestampMs).toISOString()} | status=${check.status} | valid=${check.dataValid} | voteUsage=${check.voteUsage ?? 'unknown'} | reason=${check.dataDetail ?? check.detail}`,
+    );
+  }
 }
 
 const priceRows = rows.filter((row) =>
@@ -354,8 +367,10 @@ for (const source of COUNCIL_MEMBER_SOURCES.filter(({ memberSource }) => memberS
   }
 }
 for (let memberId = 1; memberId <= 8; memberId += 1) {
-  if (memberCounts.get(memberId) !== 4) {
-    throw new Error(`Member ${memberId} has ${memberCounts.get(memberId) ?? 0} registered sources; expected exactly 4.`);
+  const expectedCount = memberId === 2 ? 7 : memberId === 5 ? 6 : 4;
+  if (memberCounts.get(memberId) !== expectedCount) {
+    throw new Error(`Member ${memberId} has ${memberCounts.get(memberId) ?? 0} registered sources; expected exactly ${expectedCount}.`);
   }
 }
 if (rows.some(({ status }) => status !== 'HEALTHY')) process.exitCode = 1;
+console.log(`[LIVE API VERIFICATION] completedAt=${new Date().toISOString()} elapsedMs=${Date.now() - liveVerificationStartedAtMs}`);

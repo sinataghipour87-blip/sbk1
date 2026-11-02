@@ -772,9 +772,18 @@ try {
     contractsCount: 24,
     impliedVolatilityPct: 50,
     putCallRatio: 1,
+    callOpenInterest: 100,
+    putOpenInterest: 100,
+    callContractsCount: 12,
+    putContractsCount: 12,
+    bidAskValidatedContracts: 24,
+    bidAskSizeValidatedContracts: 8,
+    medianBidAskSpreadPct: 2,
+    volume24h: 100,
+    underlyingPrice: 100_000,
     expiryTimestampMs: nowMs + 15 * 24 * 60 * 60_000,
     strikePrice: 100_000,
-    skewPct: 2,
+    skewPct: 0,
   };
   const connectedTransfers = [{
     transactionHash: 'test-tx',
@@ -862,7 +871,7 @@ try {
     'LONG',
     'LONG',
     'NEUTRAL',
-    'NEUTRAL',
+    'ABSTAIN',
     'LONG',
     'LONG',
   ];
@@ -912,7 +921,7 @@ try {
   assert.match(connectedMemberRecords.get(4)!.rationaleFa, /Funding/);
   assert.equal(connectedMemberRecords.get(4)!.sourceData.fundingRate, -0.0003);
   assert.equal(connectedMemberRecords.get(4)!.sourceData.openInterest, 10_000);
-  assert.match(connectedMemberRecords.get(5)!.rationaleFa, /نسبت OI اختیار/);
+  assert.match(connectedMemberRecords.get(5)!.rationaleFa, /OI put\/call=1\.00/);
   assert.equal(getRecordField(connectedMemberRecords.get(5)!.sourceData, 'optionsData').provider, 'Deribit public options API');
   assert.match(connectedMemberRecords.get(6)!.rationaleFa, /تراکنش بزرگ bitcoin/);
   const onChainEvidence = getRecordField(connectedMemberRecords.get(6)!.sourceData, 'publicOnChainData');
@@ -954,7 +963,7 @@ try {
   assert.equal(whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.assetPublicTransfers').status, 'AVAILABLE');
   assert.equal(whaleMember.sourceData.publicOnChainData.provider, 'mempool.space public REST API (sampled confirmed BTC outputs)');
   assert.equal(whaleMember.sourceData.publicOnChainData.sourceId, 'onchain.mempool-blocks');
-  assert.equal(whaleMember.vote, 'NEUTRAL');
+  assert.equal(whaleMember.vote, 'ABSTAIN');
 
   const pairRoomsRoot = path.join(repositoryDir, 'pair-rooms');
   const btcPair = 'BTC/USDT:USDT';
@@ -986,6 +995,25 @@ try {
   assert.equal(ethRoomReport.members[4].vote, 'ABSTAIN');
   assert.equal(ethRoomReport.members[5].vote, 'ABSTAIN');
   const memberFiveSources = getCouncilMemberSources(5);
+  const memberFiveHealthNormalizedData = {
+    putCallOpenInterestRatio: 1,
+    putCallIvSpread: 0,
+    optionQualityPct: 90,
+    callOpenInterest: 100,
+    putOpenInterest: 100,
+    optionInstrumentCount: 24,
+    optionCallContractCount: 12,
+    optionPutContractCount: 12,
+    bidAskValidatedContracts: 24,
+    bidAskSizeValidatedContracts: 8,
+    medianBidAskSpreadPct: 2,
+    optionsVolume24h: 100,
+    optionImpliedVolatilityPct: 50,
+    optionUnderlyingPrice: 100_000,
+    optionStrikePrice: 100_000,
+    optionExpiryTimestampMs: nowMs + 15 * 24 * 60 * 60_000,
+    optionTimestampMs: nowMs - 1_000,
+  };
   const runMemberFiveHealthScenario = async (healthyCount: number, scenarioName: string) =>
     runEightMemberCouncilRuntime({
       pair: ethPair,
@@ -1002,7 +1030,7 @@ try {
           detail: index < healthyCount ? 'Simulated live endpoint response.' : 'Simulated endpoint failure.',
           dataValid: index < healthyCount,
           observedAtMs: index < healthyCount ? sourceTimestampMs : null,
-          normalizedData: index < healthyCount ? { putCallOpenInterestRatio: 1 } : {},
+          normalizedData: index < healthyCount ? memberFiveHealthNormalizedData : {},
         })),
       },
       decisionSnapshotTimestampMs: sourceTimestampMs,
@@ -1043,7 +1071,7 @@ try {
         detail: index === 1 || index === 2 ? 'Simulated live endpoint response.' : 'Simulated endpoint failure.',
         dataValid: index === 1 || index === 2,
         observedAtMs: index === 1 || index === 2 ? sourceTimestampMs : null,
-        normalizedData: index === 1 || index === 2 ? { putCallOpenInterestRatio: 1 } : {},
+        normalizedData: index === 1 || index === 2 ? memberFiveHealthNormalizedData : {},
       })),
     },
     decisionSnapshotTimestampMs: sourceTimestampMs,

@@ -141,19 +141,17 @@ for (const optionsRegistryId of optionsRegistryIds) recordObservation(optionsReg
     : undefined,
 });
 const onChainProviderId = onChainData.asset === 'ETH'
-  ? process.env.ETHERSCAN_API_KEY?.trim() && !onChainData.provider.includes('public JSON-RPC')
-    ? 'onchain.etherscan-transfers'
+  ? onChainData.provider.includes('1RPC')
+    ? 'onchain.ethereum-1rpc'
     : 'onchain.ethereum-public-rpc'
   : onChainData.asset === 'SOL'
-    ? process.env.HELIUS_API_KEY?.trim() && onChainData.provider.includes('Helius')
-      ? 'onchain.helius-solana'
-      : 'onchain.solana-public-rpc'
+    ? 'onchain.solana-public-rpc'
     : onChainData.asset === 'XRP'
       ? 'onchain.xrpscan-xrp'
       : onChainData.asset === 'BNB'
-        ? process.env.BSCSCAN_API_KEY?.trim() && !onChainData.provider.includes('public JSON-RPC')
-          ? 'onchain.bscscan-bnb'
-          : 'onchain.bsc-public-rpc'
+          ? onChainData.provider.includes('1RPC')
+            ? 'onchain.bsc-1rpc'
+            : 'onchain.bsc-publicnode'
         : onChainData.provider.includes('Blockstream')
           ? 'onchain.blockstream-blocks'
           : 'onchain.mempool-blocks';
@@ -217,15 +215,6 @@ for (const source of publicMarketFallback.exchangeQuoteSources) {
     url: source.endpoint,
     symbol: source.symbol,
     error: source.status === 'UNAVAILABLE' ? source.error : undefined,
-  });
-}
-if (!process.env.ETHERSCAN_API_KEY?.trim() ||
-    !process.env.SBK1_ETHERSCAN_WATCH_ADDRESSES?.trim()) {
-  recordObservation('onchain.etherscan-transfers', {
-    responseTimestampMs: null,
-    receivedAtMs: null,
-    status: 'UNAVAILABLE',
-    error: 'Optional Etherscan supplement inactive; keyless Ethereum public RPC is the default path, but a verified watchlist is still required.',
   });
 }
 if (!process.env.WHALE_ALERT_API_KEY?.trim()) {
@@ -490,10 +479,6 @@ const report = {
     fredApiKeyRequired: false,
     massiveApiKeyConfigured: Boolean(process.env.MASSIVE_API_KEY?.trim()),
     whaleAlertApiKeyConfigured: Boolean(process.env.WHALE_ALERT_API_KEY?.trim()),
-    heliusApiKeyConfigured: Boolean(process.env.HELIUS_API_KEY?.trim()),
-    xrpscanApiKeyConfigured: Boolean(process.env.XRPSCAN_API_KEY?.trim()),
-    xrpscanApiKeyUsed: false,
-    bscscanApiKeyConfigured: Boolean(process.env.BSCSCAN_API_KEY?.trim()),
     cexWatchlistsConfigured: {
       solana: Boolean(process.env.SBK1_SOL_WATCH_ADDRESSES?.trim()),
       xrpl: Boolean(process.env.SBK1_XRP_WATCH_ADDRESSES?.trim()),

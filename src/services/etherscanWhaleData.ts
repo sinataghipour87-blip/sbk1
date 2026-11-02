@@ -13,6 +13,7 @@ interface EtherscanTransaction {
   timeStamp: string;
   blockNumber: string;
   value: string;
+  to?: string;
   isError?: string;
 }
 
@@ -26,6 +27,7 @@ interface EtherscanTokenTransaction extends EtherscanTransaction {
 
 let cachedAtMs = 0;
 let cachedTransfers: CouncilWhaleTransfer[] = [];
+let cachedAddressKey = '';
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -37,6 +39,8 @@ function validTransaction(value: unknown): value is EtherscanTransaction {
     typeof value.timeStamp === 'string' && Number.isSafeInteger(Number(value.timeStamp)) &&
     typeof value.blockNumber === 'string' && Number.isSafeInteger(Number(value.blockNumber)) &&
     typeof value.value === 'string' && /^\d+$/.test(value.value) &&
+    (value.to === undefined || typeof value.to === 'string' &&
+      (value.to === '' || /^0x[a-f0-9]{40}$/i.test(value.to))) &&
     (value.isError === undefined || typeof value.isError === 'string');
 }
 
@@ -182,10 +186,17 @@ function getErc20Thresholds(): Map<string, number> {
 export async function fetchEtherscanWhaleTransfers(options: {
   nowMs: number;
   ethPriceUsd?: number | null;
+  cexWatchlistAddresses?: readonly string[];
   fetcher?: typeof fetch;
 }): Promise<CouncilWhaleTransfer[]> {
   const apiKey = process.env.ETHERSCAN_API_KEY?.trim();
-  const addresses = getConfiguredAddresses();
+  const addresses = options.cexWatchlistAddresses
+    ? [...new Set(options.cexWatchlistAddresses.map((address) => address.trim().toLowerCase()))]
+    : getConfiguredAddresses();
+  if (addresses.some((address) => !/^0x[a-f0-9]{40}$/.test(address)) || addresses.length > 10) {
+    throw new Error('Etherscan CEX watchlist must contain at most 10 valid Ethereum addresses.');
+  }
+  const addressKey = `${options.cexWatchlistAddresses ? 'verified-cex' : 'configured'}:${addresses.join(',')}`;
   if (!apiKey || addresses.length === 0) return [];
   const minimumEth = Number(process.env.SBK1_WHALE_MIN_ETH ?? '100');
   if (!Number.isFinite(minimumEth) || minimumEth <= 0) {
@@ -196,7 +207,8 @@ export async function fetchEtherscanWhaleTransfers(options: {
     throw new Error('SBK1_WHALE_MAX_AGE_MS must be a positive number no greater than 1200000.');
   }
   const tokenThresholds = getErc20Thresholds();
-  if (options.nowMs >= cachedAtMs && options.nowMs - cachedAtMs < CACHE_TTL_MS) {
+  if (addressKey === cachedAddressKey &&
+      options.nowMs >= cachedAtMs && options.nowMs - cachedAtMs < CACHE_TTL_MS) {
     return cachedTransfers.map((transfer) => ({
       ...transfer,
       estimatedUsd: transfer.asset === 'ETH' &&
@@ -209,11 +221,15 @@ export async function fetchEtherscanWhaleTransfers(options: {
 
   const fetcher = options.fetcher ?? fetch;
   const latestBlock = await queryLatestBlock(fetcher, apiKey);
-  const addressResponses: Array<[unknown[], unknown[]]> = [];
+  const addressResponses: Array<{
+    address: string;
+    nativeRows: unknown[];
+    tokenRows: unknown[];
+  }> = [];
   for (const address of addresses) {
     const nativeTransactions = await query(fetcher, apiKey, 'txlist', address);
     const tokenTransactions = await query(fetcher, apiKey, 'tokentx', address);
-    addressResponses.push([nativeTransactions, tokenTransactions]);
+    addressResponses.push({ address, nativeRows: nativeTransactions, tokenRows: tokenTransactions });
   }
   const ethThreshold = minimumEth;
   const transfers: CouncilWhaleTransfer[] = [];
@@ -224,7 +240,9 @@ export async function fetchEtherscanWhaleTransfers(options: {
     amount: number,
     transferId: string,
     estimatedUsd: number | null,
+    destinationAddress?: string,
   ) => {
+    if (destinationAddress && transaction.to?.toLowerCase() !== destinationAddress) return;
     const timestampSeconds = Number(transaction.timeStamp);
     const blockHeight = Number(transaction.blockNumber);
     if (transaction.isError === '1' || !Number.isFinite(timestampSeconds) ||
@@ -240,7 +258,9 @@ export async function fetchEtherscanWhaleTransfers(options: {
       blockchain: 'ethereum',
       blockHeight,
       timestampMs: timestampSeconds * 1_000,
-      sourceProvider: 'Etherscan API v2 (configured address watchlist)',
+      sourceProvider: destinationAddress
+        ? 'Etherscan API v2 (verified CEX destination watchlist)'
+        : 'Etherscan API v2 (configured address watchlist)',
       asset,
       amount,
       estimatedUsd,
@@ -249,8 +269,7 @@ export async function fetchEtherscanWhaleTransfers(options: {
     });
   };
 
-  for (const response of addressResponses) {
-    const [nativeRows, tokenRows] = response;
+  for (const { address, nativeRows, tokenRows } of addressResponses) {
     if (nativeRows.some((row) => !validTransaction(row)) ||
         tokenRows.some((row) => !validTokenTransaction(row))) {
       throw new Error('Etherscan transaction response contains malformed rows.');
@@ -260,7 +279,8 @@ export async function fetchEtherscanWhaleTransfers(options: {
       if (amount >= ethThreshold) {
         const ethPriceUsd = options.ethPriceUsd;
         add(transaction, 'ETH', amount, 'native:0', typeof ethPriceUsd === 'number' &&
-          Number.isFinite(ethPriceUsd) && ethPriceUsd > 0 ? amount * ethPriceUsd : null);
+          Number.isFinite(ethPriceUsd) && ethPriceUsd > 0 ? amount * ethPriceUsd : null,
+        options.cexWatchlistAddresses ? address : undefined);
       }
     }
     for (const transaction of tokenRows as EtherscanTokenTransaction[]) {
@@ -268,17 +288,20 @@ export async function fetchEtherscanWhaleTransfers(options: {
       const threshold = tokenThresholds.get(tokenContract);
       const amount = unitsToAmount(transaction.value, Number(transaction.tokenDecimal));
       if (threshold !== undefined && amount >= threshold) {
-        add(transaction, transaction.tokenSymbol, amount, `erc20:${tokenContract}:log:${transaction.logIndex}`, null);
+        add(transaction, transaction.tokenSymbol, amount, `erc20:${tokenContract}:log:${transaction.logIndex}`, null,
+          options.cexWatchlistAddresses ? address : undefined);
       }
     }
   }
   cachedTransfers = transfers;
   cachedAtMs = options.nowMs;
+  cachedAddressKey = addressKey;
   return transfers.map((transfer) => ({ ...transfer }));
 }
 
 export function resetEtherscanWhaleDataCacheForTests(): void {
   cachedAtMs = 0;
   cachedTransfers = [];
+  cachedAddressKey = '';
   lastRequestAtMs = 0;
 }

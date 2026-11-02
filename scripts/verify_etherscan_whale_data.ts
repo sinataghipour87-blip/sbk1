@@ -146,15 +146,15 @@ assert.equal(ethereumRoom.largeTransfers?.some((transfer) =>
   transfer.blockchain === 'ethereum' && transfer.asset === 'FIX' &&
   transfer.transferId?.startsWith('erc20:')
 ), true, 'Ethereum ERC-20 transfers remain separately identifiable');
-assert.equal(ethereumRoom.sourceId, 'onchain.etherscan-v2');
+assert.equal(ethereumRoom.sourceId, 'onchain.etherscan-transfers');
 const ethereumEvidenceVote = evaluateEightMemberCouncil({
   pair: 'ETH/USDT:USDT',
   whaleFlowData: ethereumRoom,
   nowMs: nowMs + 2_000,
 }).members[5];
-assert.equal(ethereumEvidenceVote.vote, 'NEUTRAL');
-assert.equal(ethereumEvidenceVote.sourceId, 'onchain.etherscan-v2');
-assert.match(ethereumEvidenceVote.rationaleFa, /FIX/);
+assert.equal(ethereumEvidenceVote.vote, 'ABSTAIN');
+assert.equal(ethereumEvidenceVote.sourceId, 'onchain.etherscan-transfers');
+assert.match(ethereumEvidenceVote.rationaleFa, /CEX Watchlist/);
 
 resetEtherscanWhaleDataCacheForTests();
 resetPublicBitcoinWhaleDataCacheForTests();
@@ -191,7 +191,7 @@ const emptyEtherscanFallback = await fetchOnChainWhaleData({
 });
 assert.equal(emptyEtherscanFallback.status, 'LIVE');
 assert.equal(emptyEtherscanFallback.sourceId, 'onchain.ethereum-publicnode');
-assert.equal(emptyEtherscanFallback.fallbackSourceId, 'onchain.etherscan-v2');
+assert.equal(emptyEtherscanFallback.fallbackSourceId, 'onchain.etherscan-transfers');
 assert.equal(fallbackSourceIds.every((hostname) => hostname === 'ethereum-rpc.publicnode.com'), true,
   'empty Etherscan data falls back to PublicNode before 1RPC');
 const fallbackVote = evaluateEightMemberCouncil({
@@ -200,7 +200,7 @@ const fallbackVote = evaluateEightMemberCouncil({
   nowMs: nowMs + 4_000,
 }).members[5];
 assert.equal(fallbackVote.sourceId, 'onchain.ethereum-publicnode');
-assert.equal(fallbackVote.fallbackSourceId, 'onchain.etherscan-v2');
+assert.equal(fallbackVote.fallbackSourceId, 'onchain.etherscan-transfers');
 
 let unsupportedChainRequested = false;
 for (const [pair, asset] of [
