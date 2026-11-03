@@ -4,6 +4,7 @@ import {
   COUNCIL_MEMBER_SOURCES,
   getCouncilMemberSources,
 } from '../src/services/councilSourceRegistry';
+import { ONCHAIN_MONITORING_FEEDS } from '../src/services/onChainFeedRegistry';
 
 const nowMs = Date.parse('2026-10-22T12:00:00.000Z');
 const registry = buildCouncilSourceRegistry({
@@ -44,6 +45,21 @@ const registry = buildCouncilSourceRegistry({
     error: 'HTTP 403 (regional/access restriction)',
   },
 }, nowMs);
+const monitoringFeeds = registry.filter((entry) => entry.id.startsWith('onchain.monitor.'));
+assert.equal(ONCHAIN_MONITORING_FEEDS.length, 30);
+assert.equal(monitoringFeeds.length, 30);
+const registryIds = new Set(registry.map(({ id }) => id));
+for (const asset of ['BTC', 'ETH', 'SOL', 'BNB', 'XRP']) {
+  const feeds = monitoringFeeds.filter((entry) => entry.assets?.includes(asset));
+  assert.equal(feeds.length, 6, `${asset} has six registered live transaction feeds`);
+  assert.ok(feeds.every((entry) => entry.enabled && entry.realtimeEligible));
+  assert.ok(
+    ONCHAIN_MONITORING_FEEDS
+      .filter((feed) => feed.asset === asset)
+      .every((feed) => feed.councilSourceId && registryIds.has(feed.councilSourceId)),
+    `${asset} monitoring feeds map to registered source IDs`,
+  );
+}
 
 const find = (id: string) => {
   const entry = registry.find((candidate) => candidate.id === id);
@@ -55,7 +71,7 @@ assert.deepEqual(
   [...new Set(registry.map((entry) => entry.group))].sort(),
   ['derivatives', 'macro', 'news', 'onchain', 'options', 'orderbook', 'tradeflow', 'trend'],
 );
-assert.equal(COUNCIL_MEMBER_SOURCES.length, 37);
+assert.equal(COUNCIL_MEMBER_SOURCES.length, 36);
 for (let memberId = 1; memberId <= 8; memberId += 1) {
   const expectedSourceCount = memberId === 2 ? 7 : memberId === 5 ? 11 : memberId === 6 ? 6 : 4;
   assert.deepEqual(
@@ -224,11 +240,11 @@ assert.deepEqual(
   getCouncilMemberSources(6, 'ETH').map(({ id }) => id),
   [
     'onchain.ethereum-public-rpc',
-    'onchain.ethereum-1rpc',
+    'onchain.ethereum-flashbots',
     'onchain.ethereum-routescan',
     'onchain.ethereum-blockscout',
     'onchain.ethereum-blockchair',
-    'onchain.defillama-ethereum',
+    'onchain.ethereum-drpc',
   ],
   'ETH has six public, keyless infrastructure/context sources',
 );
@@ -248,7 +264,7 @@ assert.deepEqual(
   getCouncilMemberSources(6, 'BNB').map(({ id }) => id),
   [
     'onchain.bsc-publicnode',
-    'onchain.bsc-1rpc',
+    'onchain.bsc-binance-dataseed',
     'onchain.bsc-defibit',
     'onchain.bsc-bloxroute',
     'onchain.bsc-blastapi',
@@ -264,24 +280,24 @@ assert.deepEqual(
     'onchain.xrpl-ws-xrp',
     'onchain.ripple-s2-xrp',
     'onchain.blockchair-xrp',
-    'onchain.coinpaprika-xrp',
+    'onchain.ripple-s1-xrp',
   ],
-  'XRP has six public, keyless ledger/market-health sources',
+  'XRP has six public, keyless validated-ledger sources',
 );
 for (const asset of ['BTC', 'ETH', 'SOL', 'BNB', 'XRP'] as const) {
   const sources = getCouncilMemberSources(6, asset);
   assert.ok(
     sources.every(({ apiKeyRequired }) => apiKeyRequired === false),
-    `${asset} Member 6 has no API-key-required sources`,
+    `${asset} Member 6 sources are keyless`,
   );
   assert.ok(
     sources.every(({ url }) => url.startsWith('https://') && !url.includes('{apiKey}')),
-    `${asset} Member 6 endpoints are public HTTPS URLs without embedded credentials`,
+    `${asset} Member 6 endpoints are HTTPS URLs without embedded credentials`,
   );
 }
 assert.ok(
   getCouncilMemberSources(6, 'BTC').every(({ maxAgeMs }) => maxAgeMs === 20 * 60_000),
-  'BTC Member 6 providers have a 20-minute freshness limit',
+  'BTC Member 6 health checks allow 20 minutes; the transaction adapter independently enforces five minutes',
 );
 assert.ok(
   getCouncilMemberSources(6, 'SOL').every(({ maxAgeMs }) => maxAgeMs === 5 * 60_000),
@@ -298,10 +314,11 @@ for (const asset of ['BNB', 'XRP'] as const) {
     `${asset} Member 6 providers have a five-minute freshness limit`,
   );
   assert.ok(
-    sources.every(({ apiKeyRequired, url }) =>
-      apiKeyRequired === false && url.startsWith('https://') && !url.includes('{apiKey}')
+    sources.every(({ apiKeyRequired, id, url }) =>
+      apiKeyRequired === false &&
+      url.startsWith('https://') && !url.includes('{apiKey}')
     ),
-    `${asset} Member 6 sources are public HTTPS endpoints without API keys`,
+    `${asset} Member 6 includes only HTTPS sources with documented API-key requirements`,
   );
 }
 for (const asset of ['BTC', 'SOL', 'XRP', 'BNB']) {
@@ -353,6 +370,10 @@ assert.equal(find('onchain.blockstream-transactions').health, 'UNOBSERVED');
 assert.match(find('onchain.blockstream-transactions').reason ?? '', /does not expose endpoint-level telemetry/);
 assert.equal(find('onchain.ethereum-public-rpc').enabled, true);
 assert.match(find('onchain.ethereum-public-rpc').dataType, /no key/);
+assert.equal(find('onchain.ethereum-flashbots').url, 'https://rpc.flashbots.net');
+assert.equal(find('onchain.ethereum-flashbots').apiKeyRequired, false);
+assert.equal(find('onchain.ethereum-drpc').url, 'https://eth.drpc.org/');
+assert.equal(find('onchain.ethereum-drpc').apiKeyRequired, false);
 assert.equal(find('onchain.solana-public-rpc').enabled, true);
 assert.match(find('onchain.solana-public-rpc').dataType, /public RPC/);
 assert.equal(find('onchain.bsc-public-rpc').enabled, true);

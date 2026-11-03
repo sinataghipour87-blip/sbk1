@@ -2,6 +2,7 @@ import type {
   CouncilWhaleFlowData,
   CouncilWhaleTransfer,
 } from './eightMemberCouncil';
+import { fetchOnChainProvider } from './onChainProviderHealth';
 
 export interface ConfiguredCexWallet {
   address: string;
@@ -117,11 +118,11 @@ export async function fetchJson(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5_000);
   try {
-    const response = await fetcher(url, {
+    const response = await fetchOnChainProvider(url, {
       signal: controller.signal,
       cache: 'no-store',
       headers: { Accept: 'application/json', ...headers },
-    });
+    }, fetcher);
     if (!response.ok) throw new Error(`${provider} returned HTTP ${response.status}.`);
     return await response.json();
   } finally {
@@ -137,4 +138,15 @@ export function toPositiveNumber(value: unknown): number | null {
   if (typeof value !== 'number' && typeof value !== 'string') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function nativeThreshold(
+  envName: string,
+  minimum: number,
+): number | null {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return minimum;
+  const configured = Number(raw);
+  if (!Number.isFinite(configured) || configured <= 0) return null;
+  return Math.max(minimum, configured);
 }

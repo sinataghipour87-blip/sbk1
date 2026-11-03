@@ -55,7 +55,8 @@ const report = evaluateEightMemberCouncil({
   nowMs,
 });
 assert.equal(report.members[5].vote, 'ABSTAIN');
-assert.match(report.members[5].rationaleFa, /ممتنع می‌ماند/);
+assert.match(report.members[5].rationaleFa, /رأی آن‌چین صادر نمی‌شود/);
+assert.match(report.members[5].rationaleFa, /تأیید حداقل دو منبع مستقل/);
 
 resetWhaleAlertFlowCacheForTests();
 let fetchedWithoutKey = false;

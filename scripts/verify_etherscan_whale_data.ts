@@ -95,7 +95,11 @@ const combined = await fetchOnChainWhaleData({
   priceUsd: 60_000,
   fetcher: async (input) => {
     const url = new URL(String(input));
-    if (url.hostname === 'mempool.space' && url.pathname.endsWith('/v1/blocks')) {
+    assert.ok(
+      ['mempool.space', 'blockstream.info', 'btcscan.org'].includes(url.hostname),
+      'Bitcoin scanning must use public feeds, not Etherscan credentials',
+    );
+    if (url.pathname.endsWith('/blocks')) {
       return Response.json([{
         id: 'c'.repeat(64),
         height: 900_003,
@@ -113,20 +117,21 @@ const combined = await fetchOnChainWhaleData({
         tx_count: 1,
       }]);
     }
-    if (url.hostname === 'mempool.space') {
+    if (url.pathname.includes('/block/')) {
       return Response.json([{
         txid: 'f'.repeat(64),
         status: { confirmed: true, block_height: 900_003, block_time: Math.floor((nowMs + 2_000) / 1_000) },
         vout: [{ value: 1_100_000_000 }],
       }]);
     }
-    throw new Error('cached Etherscan response should avoid a credential-bearing HTTP request');
+    throw new Error(`Unexpected public Bitcoin request ${url.toString()}`);
   },
 });
 assert.equal(combined.status, 'LIVE');
 assert.equal(combined.largeTransfers?.some((transfer) => transfer.blockchain === 'bitcoin'), true);
 assert.equal(combined.largeTransfers?.some((transfer) => transfer.blockchain === 'ethereum'), false,
   'Bitcoin room must not receive Ethereum watchlist transfers');
+assert.equal(combined.independentProviderCount, 3);
 
 const ethereumRoom = await fetchOnChainWhaleData({
   pair: 'ETH/USDT:USDT',
@@ -154,7 +159,7 @@ const ethereumEvidenceVote = evaluateEightMemberCouncil({
 }).members[5];
 assert.equal(ethereumEvidenceVote.vote, 'ABSTAIN');
 assert.equal(ethereumEvidenceVote.sourceId, 'onchain.etherscan-transfers');
-assert.match(ethereumEvidenceVote.rationaleFa, /CEX Watchlist/);
+assert.match(ethereumEvidenceVote.rationaleFa, /شواهد آن‌چین تازه و تأییدشده/);
 
 resetEtherscanWhaleDataCacheForTests();
 resetPublicBitcoinWhaleDataCacheForTests();
@@ -190,19 +195,22 @@ const emptyEtherscanFallback = await fetchOnChainWhaleData({
   },
 });
 assert.equal(emptyEtherscanFallback.status, 'LIVE');
-assert.equal(emptyEtherscanFallback.sourceId, 'onchain.ethereum-publicnode');
-assert.equal(emptyEtherscanFallback.fallbackSourceId, 'onchain.etherscan-transfers');
-assert.equal(fallbackSourceIds.every((hostname) => hostname === 'ethereum-rpc.publicnode.com'), true,
-  'empty Etherscan data falls back to PublicNode before 1RPC');
+assert.equal(emptyEtherscanFallback.sourceId, 'onchain.ethereum-public-rpc');
+assert.equal(emptyEtherscanFallback.fallbackSourceId, undefined,
+  'healthy multi-operator RPC scans are primary and do not claim Etherscan was used');
+assert.ok(new Set(fallbackSourceIds).size >= 2,
+  'empty Etherscan data falls back to multiple public Ethereum RPC endpoints');
+assert.ok((emptyEtherscanFallback.independentProviderCount ?? 0) >= 2,
+  'the fallback requires independent public RPC confirmation');
 const fallbackVote = evaluateEightMemberCouncil({
   pair: 'ETH/USDT:USDT',
   whaleFlowData: emptyEtherscanFallback,
   nowMs: nowMs + 4_000,
 }).members[5];
-assert.equal(fallbackVote.sourceId, 'onchain.ethereum-publicnode');
-assert.equal(fallbackVote.fallbackSourceId, 'onchain.etherscan-transfers');
+assert.equal(fallbackVote.sourceId, 'onchain.ethereum-public-rpc');
+assert.equal(fallbackVote.fallbackSourceId, null);
 
-let unsupportedChainRequested = false;
+let publicChainScanRequested = false;
 for (const [pair, asset] of [
   ['SOL/USDT:USDT', 'SOL'],
   ['XRP/USDT:USDT', 'XRP'],
@@ -213,7 +221,7 @@ for (const [pair, asset] of [
     nowMs,
     priceUsd: 150,
     fetcher: async () => {
-      unsupportedChainRequested = true;
+      publicChainScanRequested = true;
       throw new Error(`No ${asset} provider is configured.`);
     },
   });
@@ -221,8 +229,8 @@ for (const [pair, asset] of [
   assert.equal(unsupportedRoom.pair, pair);
   assert.equal(unsupportedRoom.asset, asset);
 }
-assert.equal(unsupportedChainRequested, false,
-  'unsupported chains must abstain rather than request BTC/ETH data');
+assert.equal(publicChainScanRequested, true,
+  'keyless chains scan their own public transaction feeds even without watchlists');
 
 resetEtherscanWhaleDataCacheForTests();
 await assert.rejects(

@@ -18,6 +18,7 @@ import {
   deduplicateNews,
   deduplicateOnChainTransfers,
 } from './councilEvidenceDeduplication';
+import { evaluateOnChainProtocolPressure } from './onChainProtocolFlow';
 
 export type CouncilVote = 'LONG' | 'SHORT' | 'NEUTRAL' | 'ABSTAIN';
 export type CouncilDirection = 'LONG' | 'SHORT' | null;
@@ -64,6 +65,16 @@ export interface CouncilWhaleFlowData {
   retrievedAtMs?: number | null;
   ageMs: number | null;
   qualityPct: number;
+  independentProviderCount?: number;
+  independentSourceIds?: readonly string[];
+  providerParticipation?: readonly {
+    sourceId: string;
+    provider: string;
+    status: 'VALID' | 'THROTTLED' | 'FAILED';
+    error?: string;
+  }[];
+  flowSignal?: OnChainFlowSignal;
+  protocolSwaps?: readonly import('./onChainProtocolFlow').OnChainProtocolSwap[];
   coverageStatus?: 'SAMPLED' | 'COMPLETE' | 'UNAVAILABLE';
   unavailableReason?: string;
   largeTransfers?: CouncilWhaleTransfer[];
@@ -102,6 +113,30 @@ export interface CouncilWhaleTransfer {
   estimatedUsd: number | null;
   confirmationStatus: 'CONFIRMED' | 'UNCONFIRMED' | 'UNKNOWN';
   transferId?: string;
+  fromAddress?: string;
+  fromAddresses?: readonly string[];
+  toAddress?: string;
+  providerConfirmations?: number;
+  confirmingSourceIds?: readonly string[];
+}
+
+export interface OnChainFlowSignal {
+  status: 'CONFIRMED' | 'ABSTAIN';
+  direction: 'LONG' | 'SHORT' | null;
+  asset: 'BTC' | 'ETH' | 'SOL' | 'BNB' | 'XRP';
+  inflowNative: number;
+  outflowNative: number;
+  selectedVolumeNative: number;
+  baselineMeanNative: number;
+  spikeRatio: number | null;
+  requiredSpikeRatio: number;
+  baselineWindows: number;
+  requiredBaselineWindows: number;
+  independentProviderCount: number;
+  sourceIds: readonly string[];
+  labeledTransferCount: number;
+  observedAtMs: number;
+  reason: string;
 }
 
 export interface CouncilModuleEvidence {
@@ -374,8 +409,7 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
 
 const MAX_OPTIONS_AGE_MS = 60_000;
 const MAX_ONCHAIN_AGE_MS = 10 * 60_000;
-const MAX_PUBLIC_ONCHAIN_AGE_MS = 5 * 60_000;
-const MAX_PUBLIC_BITCOIN_ONCHAIN_AGE_MS = 20 * 60_000;
+const MAX_PUBLIC_ONCHAIN_AGE_MS = 5 * 60_000 - 1;
 const MAX_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_NEWS_AGE_MS = 6 * 60 * 60_000;
 const MAX_DIRECT_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
@@ -1082,7 +1116,6 @@ function evaluateOptions(
 
 function evaluateOnChain(
   member: CouncilMemberDefinition,
-  macro: CouncilMacroContext | null | undefined,
   nowMs: number,
   directWhaleFlow?: CouncilWhaleFlowData,
   pair?: string,
@@ -1117,76 +1150,11 @@ function evaluateOnChain(
       directWhaleFlow.ageMs,
     );
   }
-  if (getFreqtradePairBaseAsset(pair ?? '') === 'ETH') {
-    const directionalSignals = [...new Map(
-      (directWhaleFlow?.ethereumWhaleSignals ?? [])
-        .filter((signal) =>
-          signal.status === 'LIVE' &&
-          signal.cexWatchlistMatched === true &&
-          (signal.direction === 'LONG' || signal.direction === 'SHORT') &&
-          Number.isFinite(signal.observedAtMs) &&
-          signal.observedAtMs !== null &&
-          signal.observedAtMs <= nowMs + 1_000 &&
-          nowMs - signal.observedAtMs <= MAX_PUBLIC_ONCHAIN_AGE_MS &&
-          Number.isFinite(signal.confidencePct) &&
-          signal.confidencePct > 0 &&
-          Number.isFinite(signal.weightPct) &&
-          signal.weightPct > 0
-        )
-        .map((signal) => [signal.sourceId, signal] as const),
-    ).values()];
-    const weightedScore = directionalSignals.reduce((total, signal) =>
-      total + (signal.direction === 'LONG' ? 1 : -1) *
-        signal.confidencePct * signal.weightPct / 100,
-    0);
-    const agreeingSignalCount = directionalSignals.filter((signal) =>
-      Math.sign(weightedScore) === (signal.direction === 'LONG' ? 1 : -1)
-    ).length;
-    if (agreeingSignalCount >= 2 && Math.abs(weightedScore) >= 15) {
-      const direction = weightedScore > 0 ? 'LONG' : 'SHORT';
-      const primarySignal = [...directionalSignals].sort((left, right) =>
-        right.confidencePct * right.weightPct - left.confidencePct * left.weightPct
-      )[0];
-      const sourceTimestampMs = Math.max(
-        ...directionalSignals
-          .map(({ observedAtMs }) => observedAtMs)
-          .filter(isFiniteNumber),
-      );
-      return createVote(
-        member,
-        direction,
-        `حداقل دو سیگنال مستقل ETH با وزن پوشش‌تعدیل‌شده هم‌جهت‌اند (امتیاز ${weightedScore.toFixed(1)}). جریان به صرافی فقط احتمال فروش و خروج از صرافی فقط احتمال انباشت است، نه قطعیت.`,
-        [
-          {
-            labelFa: 'هم‌جهتی سیگنال‌های نهنگ',
-            passed: true,
-            detailFa: `${agreeingSignalCount} سیگنال زنده و هم‌جهت؛ امتیاز وزن‌دار ${weightedScore.toFixed(1)}.`,
-          },
-          {
-            labelFa: 'پوشش ناقص و وزن کاهش‌یافته',
-            passed: directionalSignals.every(({ coverageComplete }) => coverageComplete),
-            detailFa: directionalSignals.map(({ sourceId, coverage, weightPct }) =>
-              `${sourceId}: ${coverage}; وزن ${weightPct}٪`
-            ).join('؛ '),
-          },
-        ],
-        {
-          sourceId: primarySignal.sourceId,
-          sourceTimestampMs: Number.isFinite(sourceTimestampMs) ? sourceTimestampMs : null,
-          sourceAgeMs: Number.isFinite(sourceTimestampMs) ? nowMs - sourceTimestampMs : null,
-          dataQualityPct: Math.min(60, directionalSignals.reduce((sum, signal) => sum + signal.weightPct, 0)),
-          confidencePct: Math.min(55, 25 + Math.round(Math.abs(weightedScore))),
-        },
-      );
-    }
-  }
   if (directWhaleFlow?.largeTransfers && (pair === undefined || directWhaleFlow.pair === pair)) {
     const expectedAsset = pair
       ? getFreqtradePairBaseAsset(pair)
       : directWhaleFlow.asset ?? null;
-    const maximumPublicAgeMs = expectedAsset === 'BTC'
-      ? MAX_PUBLIC_BITCOIN_ONCHAIN_AGE_MS
-      : MAX_PUBLIC_ONCHAIN_AGE_MS;
+    const maximumPublicAgeMs = MAX_PUBLIC_ONCHAIN_AGE_MS;
     const freshness = freshTimestamp(
       directWhaleFlow.timestampMs,
       directWhaleFlow.ageMs,
@@ -1247,7 +1215,9 @@ function evaluateOnChain(
     );
     const usable = directWhaleFlow.status === 'LIVE' &&
       freshness !== null &&
-      directWhaleFlow.coverageStatus === 'SAMPLED';
+      directWhaleFlow.coverageStatus === 'SAMPLED' &&
+      Number.isSafeInteger(directWhaleFlow.independentProviderCount) &&
+      (directWhaleFlow.independentProviderCount ?? 0) >= 2;
     const checks = [
       {
         labelFa: 'اعتبار دادهٔ بلوک‌های نمونه‌برداری‌شده',
@@ -1271,6 +1241,11 @@ function evaluateOnChain(
         detailFa: 'آدرس‌ها ناشناس‌اند؛ ورود، خروج، خرید یا فروش استنباط نمی‌شود.',
       },
       {
+        labelFa: 'تأیید مستقل منبع',
+        passed: (directWhaleFlow.independentProviderCount ?? 0) >= 2,
+        detailFa: `${directWhaleFlow.independentProviderCount ?? 0} منبع مستقل؛ حداقل ۲ منبع لازم است.`,
+      },
+      {
         labelFa: 'شناسهٔ یکتای انتقال',
         passed: !identifiedTransfers.conflictingIdentity && !missingTransferIdentity,
         detailFa: identifiedTransfers.conflictingIdentity
@@ -1280,13 +1255,124 @@ function evaluateOnChain(
             : `${identifiedTransfers.duplicateCount} انتقال تکراری از چند provider حذف شد.`,
       },
     ];
+    const protocolPressure = expectedAsset === 'ETH' || expectedAsset === 'BNB'
+      ? evaluateOnChainProtocolPressure({
+          asset: expectedAsset,
+          nowMs,
+          flow: directWhaleFlow,
+          swaps: directWhaleFlow.protocolSwaps ?? [],
+        })
+      : null;
+    if (protocolPressure?.status === 'CONFIRMED' && protocolPressure.direction) {
+      return createVote(
+        member,
+        protocolPressure.direction,
+        `فشار ${protocolPressure.direction === 'LONG' ? 'خرید دارایی بومی' : 'فروش دارایی بومی'} در ${protocolPressure.asset}: ` +
+          `${protocolPressure.verifiedSwapCount} رویداد Swap از ${protocolPressure.candidateWalletCount} کیف‌پول نامزد؛ ` +
+          `حجم ${protocolPressure.selectedVolumeNative.toFixed(4)} ${protocolPressure.asset}، غلبهٔ ${protocolPressure.pressurePct}٪ و ` +
+          `${protocolPressure.independentProviderCount} اپراتور مستقل. ${protocolPressure.reason}`,
+        [
+          ...checks,
+          {
+            labelFa: 'فشار رفتاری مبتنی بر Swap تأییدشده',
+            passed: true,
+            detailFa: protocolPressure.reason,
+          },
+        ],
+        {
+          sourceId: directWhaleFlow.sourceId,
+          fallbackSourceId: directWhaleFlow.fallbackSourceId,
+          sourceTimestampMs: protocolPressure.observedAtMs,
+          sourceAgeMs: Math.max(0, nowMs - protocolPressure.observedAtMs),
+          dataQualityPct: directWhaleFlow.qualityPct,
+          confidencePct: Math.min(95, Math.max(50, protocolPressure.confidencePct)),
+          sourceQuorumRequired: 2,
+          usedSourceIds: protocolPressure.sourceIds,
+        },
+      );
+    }
+    const flowSignal = directWhaleFlow.flowSignal;
+    const signalHasFreshEvidence = flowSignal?.status === 'CONFIRMED' &&
+      (flowSignal.direction === 'LONG' || flowSignal.direction === 'SHORT') &&
+      flowSignal.asset === expectedAsset &&
+      flowSignal.observedAtMs <= nowMs &&
+      nowMs - flowSignal.observedAtMs < MAX_PUBLIC_ONCHAIN_AGE_MS &&
+      flowSignal.requiredBaselineWindows === 288 &&
+      flowSignal.baselineWindows === flowSignal.requiredBaselineWindows &&
+      flowSignal.requiredSpikeRatio === 2 &&
+      (flowSignal.baselineMeanNative === 0
+        ? flowSignal.spikeRatio === null && flowSignal.selectedVolumeNative > 0
+        : isFiniteNumber(flowSignal.spikeRatio) && flowSignal.spikeRatio >= 2) &&
+      flowSignal.selectedVolumeNative >= ({
+        BTC: 10,
+        ETH: 100,
+        SOL: 10,
+        BNB: 5,
+        XRP: 1_000,
+      }[flowSignal.asset]) &&
+      flowSignal.independentProviderCount >= 2 &&
+      flowSignal.independentProviderCount === directWhaleFlow.independentProviderCount &&
+      new Set(flowSignal.sourceIds).size >= 2 &&
+      flowSignal.sourceIds.every((sourceId) =>
+        directWhaleFlow.independentSourceIds?.includes(sourceId)
+      ) &&
+      flowSignal.labeledTransferCount > 0;
+    if (
+      usable &&
+      freshness &&
+      !identifiedTransfers.conflictingIdentity &&
+      !missingTransferIdentity &&
+      signalHasFreshEvidence &&
+      flowSignal
+    ) {
+      const direction = flowSignal.direction as 'LONG' | 'SHORT';
+      const confidencePct = Math.min(
+        90,
+        60 + Math.round(Math.min(1, (flowSignal.spikeRatio ?? 2) / 4) * 30),
+      );
+      return createVote(
+        member,
+        direction,
+        direction === 'SHORT'
+          ? `ورود خالص ${flowSignal.selectedVolumeNative.toFixed(4)} ${expectedAsset} به کیف‌پول‌های صرافیِ برچسب‌خورده، با تأیید ${flowSignal.sourceIds.length} منبع مستقل و جهش ${flowSignal.spikeRatio === null ? 'نامحدود نسبت به baseline صفر' : `${flowSignal.spikeRatio.toFixed(2)}× میانگین ۲۴ساعته`}، رأی SHORT ایجاد کرد.`
+          : `خروج خالص ${flowSignal.selectedVolumeNative.toFixed(4)} ${expectedAsset} از کیف‌پول‌های صرافیِ برچسب‌خورده، با تأیید ${flowSignal.sourceIds.length} منبع مستقل و جهش ${flowSignal.spikeRatio === null ? 'نامحدود نسبت به baseline صفر' : `${flowSignal.spikeRatio.toFixed(2)}× میانگین ۲۴ساعته`}، رأی LONG ایجاد کرد.`,
+        [
+          {
+            labelFa: 'برچسب آدرس صرافی',
+            passed: true,
+            detailFa: `${flowSignal.labeledTransferCount} انتقال برچسب‌خورده با منبع و تاریخ بازبینی معتبر.`,
+          },
+          {
+            labelFa: 'شوک حجم خالص پنج‌دقیقه‌ای',
+            passed: true,
+            detailFa: `${flowSignal.selectedVolumeNative} ${expectedAsset} در برابر میانگین ${flowSignal.baselineMeanNative}؛ حداقل ۲× لازم است.`,
+          },
+          {
+            labelFa: 'baseline پیوسته ۲۴ساعته و منابع مستقل',
+            passed: true,
+            detailFa: `${flowSignal.baselineWindows}/288 پنجره و ${flowSignal.sourceIds.length} منبع: ${flowSignal.sourceIds.join(', ')}.`,
+          },
+        ],
+        {
+          sourceId: flowSignal.sourceIds[0],
+          fallbackSourceId: flowSignal.sourceIds[1] ?? directWhaleFlow.fallbackSourceId,
+          sourceTimestampMs: flowSignal.observedAtMs,
+          sourceAgeMs: nowMs - flowSignal.observedAtMs,
+          dataQualityPct: 90,
+          confidencePct,
+          voteWeightPct: 50,
+          sourceQuorumRequired: 2,
+          usedSourceIds: flowSignal.sourceIds,
+        },
+      );
+    }
     if (!usable || !freshness || identifiedTransfers.conflictingIdentity || missingTransferIdentity) {
       return abstain(member, directWhaleFlow.unavailableReason ?? 'شواهد آن‌چین تازه و تأییدشده برای رأی معتبر کافی نیست.', checks, freshness?.timestampMs, freshness?.ageMs);
     }
     if (confirmedTransfers.length === 0) {
       return abstain(
         member,
-        'در نمونهٔ تازه انتقال بزرگ مشاهده نشد، اما این داده فاقد تطبیق جهت‌دار با CEX Watchlist است؛ عضو ۶ ممتنع می‌ماند.',
+        'در بلوک‌های تازه و نمونه‌برداری‌شده انتقال بزرگِ واجد آستانه مشاهده نشد؛ این فقط نبود رویداد نهنگی در نمونهٔ محدود است، نه اثبات آرامش کل شبکه یا نبود فشار فروش.',
         checks,
         freshness.timestampMs,
         freshness.ageMs,
@@ -1311,6 +1397,7 @@ function evaluateOnChain(
     );
     const valid = directWhaleFlow.status === 'LIVE' &&
       freshness !== null &&
+      (directWhaleFlow.independentProviderCount ?? 0) >= 2 &&
       directWhaleFlow.qualityPct >= 80 &&
       isFiniteNumber(directWhaleFlow.netExchangeFlowBtc) &&
       directWhaleFlow.transactionCount > 0;
@@ -1329,7 +1416,7 @@ function evaluateOnChain(
       },
     ];
     if (!valid || !freshness || !isFiniteNumber(directWhaleFlow.netExchangeFlowBtc)) {
-      return abstain(member, 'بدون جریان تازه و برچسب‌خوردهٔ صرافی از انتقال‌های بزرگ BTC، رأی آن‌چین صادر نمی‌شود.', checks, freshness?.timestampMs, freshness?.ageMs);
+      return abstain(member, 'بدون جریان تازه با تأیید حداقل دو منبع مستقل، رأی آن‌چین صادر نمی‌شود.', checks, freshness?.timestampMs, freshness?.ageMs);
     }
 
     const netflow = directWhaleFlow.netExchangeFlowBtc;
@@ -1354,30 +1441,15 @@ function evaluateOnChain(
     );
   }
 
-  const freshness = getMacroAge(macro, nowMs, MAX_ONCHAIN_AGE_MS);
-  const hasFlow = macro?.whaleFlowStatus === 'LIVE' &&
-    isFiniteNumber(macro.whaleNetflowBtc) &&
-    macro.whaleSentiment !== null &&
-    macro.whaleSentiment !== 'UNKNOWN';
-  const checks = [
-    { labelFa: 'منبع آن‌چین زنده', passed: hasFlow, detailFa: hasFlow ? 'جریان و برچسب احساسات نهنگ در منبع زنده موجود است.' : 'داده جریان/رفتار کیف‌پول معتبر موجود نیست.' },
-    { labelFa: 'تازگی داده آن‌چین', passed: freshness !== null, detailFa: freshness ? `${Math.round(freshness.ageMs / 1000)}s` : 'زمان به‌روزرسانی معتبر یا تازه نیست.' },
-  ];
-  if (!hasFlow || !freshness || !macro) {
-    return abstain(member, 'بدون جریان آن‌چین زنده و زمان‌دار، این عضو رأی نمی‌دهد.', checks, freshness?.timestampMs, freshness?.ageMs);
-  }
-
-  const vote: CouncilVote = macro.whaleSentiment === 'ACCUMULATION'
-    ? 'LONG'
-    : macro.whaleSentiment === 'DISTRIBUTION'
-      ? 'SHORT'
-      : 'NEUTRAL';
   return createVote(
     member,
-    vote,
-    `برچسب جریان آن‌چین ${macro.whaleSentiment} و خالص جریان ${macro.whaleNetflowBtc} BTC از منبع تأییدشده دریافت شد.`,
-    checks,
-    { sourceTimestampMs: freshness.timestampMs, sourceAgeMs: freshness.ageMs }
+    'ABSTAIN',
+    'بدون دادهٔ تراکنشِ اختصاصیِ جفت‌ارز و تأیید مستقل، عضو آن‌چین از context کلی یا برچسب‌های نامطمئن جهت بازار را استنباط نمی‌کند.',
+    [{
+      labelFa: 'دادهٔ تراکنش مستقل و pair-scoped',
+      passed: false,
+      detailFa: 'فقط شواهد زنجیره‌ای زنده و تأییدشده از حداقل دو منبع مستقل قابل استفاده است.',
+    }],
   );
 }
 
@@ -2726,7 +2798,7 @@ export function evaluateEightMemberCouncil(input: {
     () => evaluateOrderBook(members[2], input.analysis, nowMs),
     () => evaluateDerivatives(members[3], input.analysis, nowMs),
     () => evaluateOptions(members[4], input.optionsData, nowMs, input.pair),
-    () => evaluateOnChain(members[5], input.macroContext, nowMs, input.whaleFlowData ?? undefined, input.pair),
+    () => evaluateOnChain(members[5], nowMs, input.whaleFlowData ?? undefined, input.pair),
     () => evaluateMacro(members[6], input.macroContext, nowMs, input.directMacroData, input.pair),
     () => evaluateNews(members[7], input.macroContext, nowMs, input.pair),
   ];
@@ -2741,7 +2813,7 @@ export function evaluateEightMemberCouncil(input: {
   const sourceDrivenVotes = input.requireMemberSourceQuorum && input.pair
     ? evaluatedVotes.map((vote) => {
       const sourceChecks = input.memberSourceChecks?.[vote.id];
-      return sourceChecks
+      return sourceChecks && vote.id !== 6
         ? evaluatePrimaryAssetSourceVote(
           EIGHT_MEMBER_COUNCIL[vote.id - 1],
           sourceChecks,
@@ -2924,11 +2996,16 @@ export function evaluateEightMemberCouncil(input: {
       .some((marketType) => [...member2MarketQuorum].filter((group) =>
         group.startsWith(`${marketType}:`)
       ).length >= minimumHealthySources);
-    const quorumPassed = vote.id === 2
-      ? member2QuorumPassed
-      : vote.id === 5
-        ? independentGroups.size >= minimumHealthySources
-        : healthySourceCount >= minimumHealthySources;
+    const memberSixEvidenceQuorumPassed = vote.id === 6 &&
+      vote.sourceQuorumRequired === 2 &&
+      new Set(vote.usedSourceIds ?? []).size >= 2;
+    const quorumPassed = vote.id === 6
+      ? vote.vote === 'ABSTAIN' || memberSixEvidenceQuorumPassed
+      : vote.id === 2
+        ? member2QuorumPassed
+        : vote.id === 5
+          ? independentGroups.size >= minimumHealthySources
+          : healthySourceCount >= minimumHealthySources;
     const usedFallback = usedSourceIndex > 0 &&
       sourceChecks.slice(0, usedSourceIndex).some(({ status, dataValid, voteValue }) =>
         status !== 'HEALTHY' || dataValid !== true || voteValue === 'LOW_VALUE'
@@ -2938,8 +3015,10 @@ export function evaluateEightMemberCouncil(input: {
       : usedFallback ? vote.sourceId : vote.fallbackSourceId;
     const failedSourceCheck: CouncilQualityCheck = {
       labelFa: 'سلامت منابع عضو',
-      passed: quorumPassed,
-      detailFa: `${healthySourceCount}/${registeredSources.length} منبع سالم؛ حداقل ${minimumHealthySources} لازم است؛ منبع دادهٔ رأی ${vote.sourceId ?? 'در شواهد خام مشخص نشده است.'}`,
+      passed: vote.id === 6 ? memberSixEvidenceQuorumPassed : quorumPassed,
+      detailFa: vote.id === 6
+        ? `${new Set(vote.usedSourceIds ?? []).size}/2 منبع مستقل برای جریان برچسب‌خورده؛ source health context=${healthySourceCount}/${registeredSources.length}.`
+        : `${healthySourceCount}/${registeredSources.length} منبع سالم؛ حداقل ${minimumHealthySources} لازم است؛ منبع دادهٔ رأی ${vote.sourceId ?? 'در شواهد خام مشخص نشده است.'}`,
     };
     return {
       ...vote,

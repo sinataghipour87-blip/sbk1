@@ -785,18 +785,18 @@ try {
     strikePrice: 100_000,
     skewPct: 0,
   };
-  const connectedTransfers = [{
+  const connectedTransfers = ['mempool.space', 'Blockstream Esplora'].map((sourceProvider) => ({
     transactionHash: 'test-tx',
     blockchain: 'bitcoin',
     blockHeight: 900_000,
     timestampMs: nowMs - 1_000,
-    sourceProvider: 'mempool.space',
+    sourceProvider,
     asset: 'BTC',
     amount: 12,
     estimatedUsd: null,
     confirmationStatus: 'CONFIRMED' as const,
     transferId: 'vout:0',
-  }];
+  }));
   const connectedWhaleFlowData = {
     status: 'LIVE' as const,
     provider: 'mempool.space public REST API (sampled confirmed BTC outputs)',
@@ -812,6 +812,7 @@ try {
     transactionCount: 1,
     windowStartHeight: 899_989,
     windowEndHeight: 900_000,
+    independentProviderCount: 2,
   };
   const connectedSourcesReport = await runEightMemberCouncilRuntime({
     analysis,

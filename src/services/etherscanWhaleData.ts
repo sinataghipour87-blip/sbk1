@@ -198,10 +198,11 @@ export async function fetchEtherscanWhaleTransfers(options: {
   }
   const addressKey = `${options.cexWatchlistAddresses ? 'verified-cex' : 'configured'}:${addresses.join(',')}`;
   if (!apiKey || addresses.length === 0) return [];
-  const minimumEth = Number(process.env.SBK1_WHALE_MIN_ETH ?? '100');
-  if (!Number.isFinite(minimumEth) || minimumEth <= 0) {
+  const configuredMinimumEth = Number(process.env.SBK1_WHALE_MIN_ETH ?? '100');
+  if (!Number.isFinite(configuredMinimumEth) || configuredMinimumEth <= 0) {
     throw new Error('SBK1_WHALE_MIN_ETH must be a positive number.');
   }
+  const minimumEth = Math.max(100, configuredMinimumEth);
   const configuredMaxAge = Number(process.env.SBK1_WHALE_MAX_AGE_MS ?? DEFAULT_MAX_TRANSFER_AGE_MS);
   if (!Number.isFinite(configuredMaxAge) || configuredMaxAge <= 0 || configuredMaxAge > DEFAULT_MAX_TRANSFER_AGE_MS) {
     throw new Error('SBK1_WHALE_MAX_AGE_MS must be a positive number no greater than 1200000.');

@@ -1,16 +1,17 @@
 import type { CouncilWhaleFlowData } from './eightMemberCouncil';
 import { loadVerifiedEthereumExchangeLabels } from './exchangeLabels';
 import { fetchPublicEvmOnChainData } from './publicEvmOnChain';
+import { loadOnChainWalletCandidates } from './onChainWalletDiscovery';
 
 const PUBLIC_RPC_PROVIDERS = [
   { name: 'PublicNode Ethereum RPC', endpoint: 'https://ethereum-rpc.publicnode.com/' },
-  { name: '1RPC Ethereum', endpoint: 'https://1rpc.io/eth' },
+  { name: 'Flashbots Ethereum RPC', endpoint: 'https://rpc.flashbots.net' },
 ] as const;
 const DEFAULT_THRESHOLD_ETH = 1_000;
 
 export interface EthereumLargeTransferResult {
   status: 'LIVE' | 'UNAVAILABLE';
-  sourceId: 'onchain.ethereum-publicnode' | 'onchain.ethereum-1rpc';
+  sourceId: 'onchain.ethereum-publicnode' | 'onchain.ethereum-flashbots';
   provider: string;
   thresholdEth: number;
   confirmationsRequired: 12;
@@ -36,7 +37,7 @@ export async function fetchEthereumLargeTransfers(options: {
     return {
       status: 'UNAVAILABLE',
       sourceId: 'onchain.ethereum-publicnode',
-      provider: 'PublicNode Ethereum RPC / 1RPC',
+      provider: 'PublicNode Ethereum RPC / Flashbots Ethereum RPC',
       thresholdEth,
       confirmationsRequired: 12,
       coverage: 'UNAVAILABLE',
@@ -45,6 +46,7 @@ export async function fetchEthereumLargeTransfers(options: {
     };
   }
   const nowMs = options.nowMs ?? Date.now();
+  const candidates = await loadOnChainWalletCandidates('ETH', nowMs);
   const evidence = await fetchPublicEvmOnChainData({
     pair: options.pair,
     asset: 'ETH',
@@ -52,6 +54,7 @@ export async function fetchEthereumLargeTransfers(options: {
     chainId: 1,
     providers: PUBLIC_RPC_PROVIDERS,
     addresses: labels.map(({ address }) => address),
+    candidateAddresses: candidates.map(({ address }) => address),
     threshold: thresholdEth,
     priceUsd: options.priceUsd,
     nowMs,
@@ -59,8 +62,8 @@ export async function fetchEthereumLargeTransfers(options: {
   });
   return {
     status: evidence.status === 'LIVE' ? 'LIVE' : 'UNAVAILABLE',
-    sourceId: evidence.provider.includes('1RPC')
-      ? 'onchain.ethereum-1rpc'
+    sourceId: evidence.provider.includes('Flashbots')
+      ? 'onchain.ethereum-flashbots'
       : 'onchain.ethereum-publicnode',
     provider: evidence.provider,
     thresholdEth,

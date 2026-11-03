@@ -1587,6 +1587,7 @@ async function checkMemberSixOnChainSource(
 ): Promise<HealthResult> {
   const observedAtMs = Math.max(nowMs, Date.now());
   const responseReceivedAtMs = () => Math.max(observedAtMs, Date.now());
+  const rpcUrl = source.url;
   const result = (
     status: HealthResult['status'],
     detail: string,
@@ -1642,7 +1643,7 @@ async function checkMemberSixOnChainSource(
     const checkedAtMs = responseReceivedAtMs();
     return !Number.isSafeInteger(timestamp) ||
       timestamp > checkedAtMs + 1_000 ||
-      checkedAtMs - timestamp > source.maxAgeMs;
+      checkedAtMs - timestamp >= source.maxAgeMs;
   };
   const freshnessResult = (
     height: number,
@@ -1739,17 +1740,17 @@ async function checkMemberSixOnChainSource(
 
     if (
       source.id === 'onchain.bsc-publicnode' ||
-      source.id === 'onchain.bsc-1rpc' ||
+      source.id === 'onchain.bsc-binance-dataseed' ||
       source.id === 'onchain.bsc-defibit' ||
       source.id === 'onchain.bsc-bloxroute' ||
       source.id === 'onchain.bsc-blastapi' ||
       source.id === 'onchain.bsc-public-rpc'
     ) {
-      const chainId = await postRpc(source.url, 'eth_chainId', []);
+      const chainId = await postRpc(rpcUrl, 'eth_chainId', []);
       if (typeof chainId !== 'string' || Number.parseInt(chainId, 16) !== 56) {
         throw new Error(`${source.provider} did not confirm BNB Smart Chain chainid=56.`);
       }
-      const block = await postRpc(source.url, 'eth_getBlockByNumber', ['latest', false]);
+      const block = await postRpc(rpcUrl, 'eth_getBlockByNumber', ['latest', false]);
       if (!isRecord(block) || typeof block.number !== 'string' ||
           typeof block.timestamp !== 'string' || !/^0x[0-9a-f]+$/i.test(block.timestamp)) {
         throw new Error(`${source.provider} returned an invalid latest BSC block.`);
@@ -1784,6 +1785,7 @@ async function checkMemberSixOnChainSource(
     if (
       source.id === 'onchain.xrplcluster-xrp' ||
       source.id === 'onchain.xrpl-ws-xrp' ||
+      source.id === 'onchain.ripple-s1-xrp' ||
       source.id === 'onchain.ripple-s2-xrp'
     ) {
       const payload = await postRpc(source.url, 'server_info', []);
@@ -1801,7 +1803,7 @@ async function checkMemberSixOnChainSource(
       }
       const ageMs = ageSeconds * 1_000;
       const timestamp = observedAtMs - ageMs;
-      const fresh = ageMs <= source.maxAgeMs;
+      const fresh = ageMs < source.maxAgeMs;
       return {
         status: fresh ? 'HEALTHY' : 'BROKEN',
         detail: `${source.provider} validated ledger ${height} is ${fresh ? 'fresh' : 'stale'} (${ageMs}ms old; limit ${source.maxAgeMs}ms).`,
@@ -1838,39 +1840,6 @@ async function checkMemberSixOnChainSource(
         ledgerHash: hash,
         priceUsd: positiveNumber(data.market_price_usd),
       });
-    }
-
-    if (source.id === 'onchain.coinpaprika-xrp') {
-      const payload = await fetchJson(source.url);
-      const quotes = isRecord(payload) && isRecord(payload.quotes) ? payload.quotes : null;
-      const usd = quotes && isRecord(quotes.USD) ? quotes.USD : null;
-      const priceUsd = usd ? positiveNumber(usd.price) : null;
-      const timestamp = isRecord(payload) && typeof payload.last_updated === 'string'
-        ? Date.parse(payload.last_updated)
-        : Number.NaN;
-      if (!isRecord(payload) || payload.id !== 'xrp-xrp' ||
-          priceUsd === null || !Number.isSafeInteger(timestamp)) {
-        throw new Error('CoinPaprika returned invalid timestamped XRP market data.');
-      }
-      const ageMs = Math.max(0, responseReceivedAtMs() - timestamp);
-      const fresh = !stale(timestamp);
-      return {
-        status: fresh ? 'HEALTHY' : 'BROKEN',
-        detail: `CoinPaprika XRP ticker is ${fresh ? 'fresh' : 'stale'} (${ageMs}ms old; limit ${source.maxAgeMs}ms).`,
-        httpHealthy: true,
-        dataValid: fresh,
-        dataDetail: fresh
-          ? 'Timestamped public price context only; it is not on-chain flow or CEX-attributed direction.'
-          : 'XRP ticker timestamp is outside TTL and is excluded from freshness/quorum.',
-        observedAtMs,
-        normalizedData: {
-          priceUsd,
-          observationTimestampMs: timestamp,
-          sourceAgeMs: ageMs,
-          cexWatchlistMatched: 0,
-        },
-        voteValue: 'LOW_VALUE',
-      };
     }
 
     if (
@@ -2002,13 +1971,14 @@ async function checkMemberSixOnChainSource(
 
     if (
       source.id === 'onchain.ethereum-public-rpc' ||
-      source.id === 'onchain.ethereum-1rpc'
+      source.id === 'onchain.ethereum-drpc' ||
+      source.id === 'onchain.ethereum-flashbots'
     ) {
-      const chainId = await postRpc(source.url, 'eth_chainId', []);
+      const chainId = await postRpc(rpcUrl, 'eth_chainId', []);
       if (typeof chainId !== 'string' || Number.parseInt(chainId, 16) !== 1) {
         throw new Error(`${source.provider} did not confirm Ethereum mainnet chainid=1.`);
       }
-      const block = await postRpc(source.url, 'eth_getBlockByNumber', ['latest', false]);
+      const block = await postRpc(rpcUrl, 'eth_getBlockByNumber', ['latest', false]);
       if (!isRecord(block) || typeof block.number !== 'string' ||
           typeof block.timestamp !== 'string' || !/^0x[0-9a-f]+$/i.test(block.timestamp)) {
         throw new Error(`${source.provider} returned an invalid Ethereum latest block.`);
@@ -2069,40 +2039,6 @@ async function checkMemberSixOnChainSource(
       return freshnessResult(height, timestamp, 'Ethereum best block', { blockHash: hash });
     }
 
-    if (source.id === 'onchain.defillama-ethereum') {
-      const payload = await fetchJson(source.url);
-      const observations = isRecord(payload) && Array.isArray(payload.totalDataChart)
-        ? payload.totalDataChart.flatMap((entry) => {
-          if (!Array.isArray(entry) || entry.length < 2) return [];
-          const timestamp = timestampMs(entry[0]);
-          const volumeUsd = positiveNumber(entry[1]);
-          return timestamp !== null && volumeUsd !== null
-            ? [{ timestamp, volumeUsd }]
-            : [];
-        }).sort((left, right) => left.timestamp - right.timestamp)
-        : [];
-      const latest = observations.at(-1);
-      if (!latest) throw new Error('DefiLlama returned no valid dated Ethereum DEX-volume data.');
-      const ageMs = observedAtMs - latest.timestamp;
-      const fresh = !stale(latest.timestamp);
-      return {
-        status: fresh ? 'HEALTHY' : 'BROKEN',
-        detail: `DefiLlama API is reachable; its latest daily Ethereum DEX value is ${ageMs}ms old (five-minute limit).`,
-        httpHealthy: true,
-        dataValid: fresh,
-        dataDetail: fresh
-          ? 'Daily DEX context is within the configured timestamp limit; it remains non-directional and cannot satisfy CEX Watchlist voting.'
-          : 'Daily DEX history exceeds the five-minute data freshness guard and is excluded from voting.',
-        observedAtMs: responseReceivedAtMs(),
-        normalizedData: {
-          ethereumDexVolume24hUsd: latest.volumeUsd,
-          observationTimestampMs: latest.timestamp,
-          sourceAgeMs: ageMs,
-          cexWatchlistMatched: 0,
-        },
-        voteValue: 'LOW_VALUE',
-      };
-    }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return {
@@ -2157,11 +2093,11 @@ async function checkSource(
         'onchain.blockcypher-bitcoin',
         'onchain.blockchain-com-bitcoin',
         'onchain.ethereum-public-rpc',
-        'onchain.ethereum-1rpc',
+        'onchain.ethereum-drpc',
+        'onchain.ethereum-flashbots',
         'onchain.ethereum-routescan',
         'onchain.ethereum-blockscout',
         'onchain.ethereum-blockchair',
-        'onchain.defillama-ethereum',
         'onchain.solana-public-rpc',
         'onchain.solana-publicnode',
         'onchain.dexscreener-solana',
@@ -2169,7 +2105,7 @@ async function checkSource(
         'onchain.jupiter-solana',
         'onchain.geckoterminal-solana',
         'onchain.bsc-publicnode',
-        'onchain.bsc-1rpc',
+        'onchain.bsc-binance-dataseed',
         'onchain.bsc-defibit',
         'onchain.bsc-bloxroute',
         'onchain.bsc-blastapi',
@@ -2177,9 +2113,9 @@ async function checkSource(
         'onchain.xrpscan-xrp',
         'onchain.xrplcluster-xrp',
         'onchain.xrpl-ws-xrp',
+        'onchain.ripple-s1-xrp',
         'onchain.ripple-s2-xrp',
         'onchain.blockchair-xrp',
-        'onchain.coinpaprika-xrp',
       ].includes(source.id)
     ) {
       return checkMemberSixOnChainSource(source, nowMs, fetcher);

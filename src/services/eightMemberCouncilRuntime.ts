@@ -71,7 +71,7 @@ type ModuleValue = {
 
 const COUNCIL_RETENTION_MS = 5 * 60 * 60_000;
 const COUNCIL_RETENTION_SWEEP_INTERVAL_MS = 60_000;
-const MAX_BTC_ONCHAIN_EVIDENCE_AGE_MS = 20 * 60_000;
+const MAX_BTC_ONCHAIN_EVIDENCE_AGE_MS = 5 * 60_000 - 1;
 const MAX_ONCHAIN_EVIDENCE_AGE_MS = 5 * 60_000;
 const councilRetentionTimers = new Map<string, NodeJS.Timeout>();
 const councilRetentionLocks = new Map<string, Promise<void>>();

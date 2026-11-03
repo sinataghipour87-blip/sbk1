@@ -141,18 +141,20 @@ for (const optionsRegistryId of optionsRegistryIds) recordObservation(optionsReg
     : undefined,
 });
 const onChainProviderId = onChainData.asset === 'ETH'
-  ? onChainData.provider.includes('1RPC')
-    ? 'onchain.ethereum-1rpc'
-    : 'onchain.ethereum-public-rpc'
+  ? onChainData.independentSourceIds?.includes('onchain.ethereum-drpc')
+    ? 'onchain.ethereum-drpc'
+    : onChainData.independentSourceIds?.includes('onchain.ethereum-flashbots')
+      ? 'onchain.ethereum-flashbots'
+      : 'onchain.ethereum-public-rpc'
   : onChainData.asset === 'SOL'
     ? 'onchain.solana-public-rpc'
     : onChainData.asset === 'XRP'
       ? 'onchain.xrpscan-xrp'
       : onChainData.asset === 'BNB'
-          ? onChainData.provider.includes('1RPC')
-            ? 'onchain.bsc-1rpc'
-            : 'onchain.bsc-publicnode'
-        : onChainData.provider.includes('Blockstream')
+            ? onChainData.independentSourceIds?.includes('onchain.bsc-binance-dataseed')
+              ? 'onchain.bsc-binance-dataseed'
+              : 'onchain.bsc-publicnode'
+            : onChainData.provider.includes('Blockstream')
           ? 'onchain.blockstream-blocks'
           : 'onchain.mempool-blocks';
 recordObservation(onChainProviderId, {

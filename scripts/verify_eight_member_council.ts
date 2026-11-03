@@ -331,6 +331,7 @@ const deduplicatedOnchainVote = evaluateEightMemberCouncil({
     timestampMs: nowMs - 1_000,
     ageMs: 1_000,
     qualityPct: 90,
+    independentProviderCount: 2,
     coverageStatus: 'SAMPLED',
     largeTransfers: [
       { ...repeatedTransfer, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', asset: 'BTC' },
@@ -359,6 +360,7 @@ const unidentifiedOnchainVote = evaluateEightMemberCouncil({
     timestampMs: nowMs - 1_000,
     ageMs: 1_000,
     qualityPct: 90,
+    independentProviderCount: 2,
     coverageStatus: 'SAMPLED',
     largeTransfers: [{
       ...repeatedTransfer,
@@ -1610,7 +1612,7 @@ const memberSixDirectionalChecks: CouncilMemberSourceCheck[] = [
     },
   },
   {
-    sourceId: 'onchain.ethereum-1rpc',
+    sourceId: 'onchain.ethereum-flashbots',
     status: 'HEALTHY',
     detail: 'Fresh Ethereum mainnet block from 1RPC.',
     dataValid: true,
@@ -1646,9 +1648,9 @@ const memberSixDirectionalChecks: CouncilMemberSourceCheck[] = [
     normalizedData: {},
   },
   {
-    sourceId: 'onchain.defillama-ethereum',
+    sourceId: 'onchain.ethereum-drpc',
     status: 'HEALTHY',
-    detail: 'Fresh Ethereum network context from DefiLlama.',
+    detail: 'Fresh Ethereum mainnet block from PublicNode alias.',
     dataValid: true,
     voteValue: 'LOW_VALUE',
     normalizedData: {
@@ -1696,7 +1698,7 @@ const memberSixConflictingVote = evaluateEightMemberCouncil({
   analysis,
   macroContext,
   memberSourceChecks: {
-    6: memberSixDirectionalChecks.map((check) => check.sourceId === 'onchain.defillama-ethereum'
+    6: memberSixDirectionalChecks.map((check) => check.sourceId === 'onchain.ethereum-drpc'
       ? { ...check, normalizedData: { stablecoinSupplyChange7dPct: -0.8 } }
       : check),
   },
@@ -1710,8 +1712,8 @@ assert.equal(memberSixTwoSourceVote.vote, 'ABSTAIN',
   'stablecoin and staking heuristics without CEX-watchlist attribution must abstain');
 assert.equal(memberSixTwoSourceVote.healthySourceCount, 2,
   'healthy source count remains independent from the Member 6 directional-vote quorum');
-assert.match(memberSixTwoSourceVote.rationaleFa, /CEX Watchlist/,
-  'member-6 requires explicit CEX-watchlist attribution for directional voting');
+assert.match(memberSixTwoSourceVote.rationaleFa, /pair-scoped|دارایی|آن‌چین/,
+  'source health checks alone cannot replace the pair-scoped flow signal');
 assert.equal(memberSixOneSourceVote.vote, 'ABSTAIN',
   'one valid member-6 directional metric is insufficient');
 assert.equal(memberSixConflictingVote.vote, 'ABSTAIN',
@@ -1864,6 +1866,40 @@ const weightedEthWhaleVote = evaluateEightMemberCouncil({
 }).members[5];
 assert.equal(weightedEthWhaleVote.vote, 'ABSTAIN',
   'derivatives signals without explicit CEX-watchlist matching must not vote directionally');
+const matchedButUnvalidatedEthSignals = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    pair: 'ETH/USDT:USDT',
+    asset: 'ETH',
+    status: 'LIVE',
+    provider: 'verification-only',
+    timestampMs: nowMs - 1_000,
+    retrievedAtMs: nowMs,
+    ageMs: 1_000,
+    qualityPct: 90,
+    independentProviderCount: 2,
+    independentSourceIds: ['eth-provider-a', 'eth-provider-b'],
+    coverageStatus: 'SAMPLED',
+    largeTransfers: [],
+    ethereumWhaleSignals: incompleteEthWhaleSignals.map((signal) => ({
+      ...signal,
+      cexWatchlistMatched: true,
+      confidencePct: 90,
+      weightPct: 90,
+    })),
+    exchangeInflowsBtc: null,
+    exchangeOutflowsBtc: null,
+    netExchangeFlowBtc: null,
+    transactionCount: 0,
+    windowStartHeight: null,
+    windowEndHeight: null,
+  },
+  nowMs,
+}).members[5];
+assert.equal(matchedButUnvalidatedEthSignals.vote, 'ABSTAIN',
+  'CEX-tagged ETH metrics cannot bypass labeled native flow and the 24-hour spike baseline');
 
 const incompleteOptions = evaluateEightMemberCouncil({
   analysis,
