@@ -610,11 +610,12 @@ async function fetchBitcoinActiveAddresses(
       !Array.isArray(value.data)
     ) throw new Error('Coin Metrics returned a malformed asset-metrics response.');
 
-    const row = value.data.find((item: unknown) =>
-      typeof item === 'object' && item !== null &&
-      'asset' in item && item.asset === 'btc' &&
-      'AdrActCnt' in item && 'time' in item
-    );
+    const observations = value.data
+      .filter((item): item is Record<string, unknown> =>
+        isRecord(item) && item.asset === 'btc' && typeof item.time === 'string'
+      )
+      .sort((left, right) => Date.parse(String(left.time)) - Date.parse(String(right.time)));
+    const row = observations.at(-1);
     if (!row || typeof row.time !== 'string') {
       throw new Error('Coin Metrics has no BTC active-address observation.');
     }

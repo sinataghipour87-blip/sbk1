@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "addresses": [
+    {
+      "chain": "BTC",
+      "address": "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s",
+      "exchange": "Binance",
+      "label": "Binance.com",
+      "sourceName": "WalletExplorer",
+      "sourceUrl": "https://www.walletexplorer.com/wallet/Binance.com/addresses",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Listed on WalletExplorer under Binance.com; cluster is not asserted to be hot-only."
+    },
+    {
+      "chain": "BTC",
+      "address": "12nxRsisUcJqCDeUpTYH2a7F5jcad3YhFG",
+      "exchange": "Coinbase",
+      "label": "Coinbase.com",
+      "sourceName": "GraphSense TagPacks",
+      "sourceUrl": "https://github.com/graphsense/graphsense-tagpacks",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community label identifies this address as Coinbase.com; hot/cold role is unspecified."
+    },
+    {
+      "chain": "BTC",
+      "address": "3G3VG4X1WquWjqXT27JRwrRoyZgdyWf1dT",
+      "exchange": "Kraken",
+      "label": "Kraken.com",
+      "sourceName": "WalletExplorer / GraphSense TagPacks",
+      "sourceUrl": "https://www.walletexplorer.com/address/3G3VG4X1WquWjqXT27JRwrRoyZgdyWf1dT",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "WalletExplorer and GraphSense identify this address as Kraken.com; hot/cold role is unspecified."
+    },
+    {
+      "chain": "BTC",
+      "address": "1129A9dFqy4ABDsGQ8RGusbMWYBoZc4myc",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex.com",
+      "sourceName": "WalletExplorer / GraphSense TagPacks",
+      "sourceUrl": "https://www.walletexplorer.com/address/1129A9dFqy4ABDsGQ8RGusbMWYBoZc4myc",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "WalletExplorer and GraphSense identify this address as Bitfinex.com; hot/cold role is unspecified."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x001866Ae5B3de6cAa5a51543FD9fB64f524F5478",
+      "exchange": "Binance",
+      "label": "Binance (hot wallet)",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained entry merged from cex-list, GraphSense, and Etherscan labels."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x71660c4005BA85c37ccec55d0C4493E66Fe775d3",
+      "exchange": "Coinbase",
+      "label": "Coinbase",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x2910543Af39abA0Cd09dBb2D50200b3E800A63D2",
+      "exchange": "Kraken",
+      "label": "Kraken",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x6cC5F688a315f3dC28A7781717a9A798a59fDA7b",
+      "exchange": "OKX",
+      "label": "OKX",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x1151314c646Ce4E0eFD76d1aF4760aE66a9Fe30F",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    },
+    {
+      "chain": "BNB",
+      "address": "0x01c952174c24e1210d26961d456a77a39e1f0bb0",
+      "exchange": "Binance",
+      "label": "Binance Hot Wallet 10",
+      "sourceName": "eth-labels / GraphSense / Etherscan labels",
+      "sourceUrl": "https://github.com/dawsbot/eth-labels",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "BSC record in the community attribution export; not inferred from an Ethereum-only label."
+    },
+    {
+      "chain": "SOL",
+      "address": "rTCAfDDrTAiP2hxBdfRtqnVZ9SF9E9JaQn617oStvPF",
+      "exchange": "Binance",
+      "label": "Binance (proof-of-reserves)",
+      "sourceName": "DefiLlama exchange attribution export",
+      "sourceUrl": "https://github.com/DefiLlama/DefiLlama-Adapters/blob/master/projects/binance/index.js",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Public PoR wallet attribution; ownership is attributed, but the source does not identify it as hot."
+    },
+    {
+      "chain": "SOL",
+      "address": "FxteHmLwG9nk1eL4pjNve3Eub2goGkkz6g6TbvdmW46a",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex (proof-of-reserves)",
+      "sourceName": "DefiLlama exchange attribution export",
+      "sourceUrl": "https://github.com/DefiLlama/DefiLlama-Adapters",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Public PoR wallet attribution; ownership is attributed, but the source does not identify it as hot."
+    },
+    {
+      "chain": "XRP",
+      "address": "rLW9gnQo7BQhU6igk5keqYnH3TVrCxGRzm",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex Ripple XRP hot wallet",
+      "sourceName": "GraphSense TagPacks",
+      "sourceUrl": "https://github.com/graphsense/graphsense-tagpacks",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community label explicitly identifies this as a Bitfinex XRP hot wallet."
+    }
+  ]
+}

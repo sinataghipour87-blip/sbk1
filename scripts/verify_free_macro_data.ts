@@ -53,6 +53,8 @@ assert.equal(live.sp500.observedAt, today);
 assert.ok(live.sp500.latencyMs !== null && live.sp500.latencyMs >= 0);
 assert.equal(live.bitcoinActiveAddresses.status, 'LIVE');
 assert.equal(live.bitcoinActiveAddresses.value, 650000);
+assert.equal(live.bitcoinActiveAddresses.previousValue, null);
+assert.equal(live.bitcoinActiveAddresses.changePct, null);
 assert.equal(live.sp500.provider, 'FRED public CSV');
 assert.equal(live.dxy.status, 'LIVE');
 assert.equal(live.dxy.value, 104.25);
