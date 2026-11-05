@@ -56,6 +56,15 @@ import {
   startPublicBitcoinWhaleDataPrefetch,
   stopPublicBitcoinWhaleDataPrefetch,
 } from './publicBitcoinWhaleData';
+import {
+  loadQuorumCandidateFlow,
+  QUORUM_ASSETS,
+  type QuorumAsset,
+} from './whaleConsensusCandidateRegistry';
+import {
+  startPublicWhaleObservationPoller,
+  stopPublicWhaleObservationPoller,
+} from './publicWhaleObservationPoller';
 import { fetchPublicMarketFallback } from './publicMarketDataFallback';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -69,6 +78,11 @@ const DEFAULT_DAILY_LOSS_LIMIT_PCT = 10;
 const MAX_DAILY_LOSS_LIMIT_PCT = 10;
 const DEFAULT_MAX_ATR_PCT = 2;
 const MAX_READY_ADVISORY_AGE_MS = 2 * 60_000;
+
+function quorumAssetFromPair(pair: string): QuorumAsset | null {
+  const symbol = /^([A-Z0-9]+)\/[A-Z0-9]+(?::[A-Z0-9]+)?$/i.exec(pair.trim())?.[1]?.toUpperCase();
+  return symbol && QUORUM_ASSETS.includes(symbol as QuorumAsset) ? symbol as QuorumAsset : null;
+}
 
 function historicalPatternCostConfig(): {
   feeBpsPerSide?: number;
@@ -1084,10 +1098,16 @@ async function analyzeSnapshot(
   openSourceAdvisories?: OpenSourceAdvisoryReport;
 }> {
   const analysis = await analyzeSnapshotData(snapshot, candles, nowMs, balance, true);
-  const [freeMacroData, optionsData, whaleFlowData, publicMarketFallback] = await Promise.all([
+  const asset = quorumAssetFromPair(snapshot.pair);
+  const [freeMacroData, optionsData, rawWhaleFlowData, quorumWhaleFlowData, publicMarketFallback] = await Promise.all([
     fetchFreeMacroData(),
     fetchDeribitOptionsData({ nowMs }),
-    fetchOnChainWhaleData({ nowMs, btcPriceUsd: analysis.price }),
+    asset === 'BTC'
+      ? fetchOnChainWhaleData({ nowMs, btcPriceUsd: analysis.price })
+      : Promise.resolve(undefined),
+    asset
+      ? loadQuorumCandidateFlow(asset, { nowMs })
+      : Promise.resolve(undefined),
     fetchPublicMarketFallback({
       pair: snapshot.pair,
       timeframe: snapshot.timeframe,
@@ -1095,6 +1115,14 @@ async function analyzeSnapshot(
       nowMs,
     }),
   ]);
+  const whaleFlowData = quorumWhaleFlowData?.status === 'LIVE'
+    ? quorumWhaleFlowData
+    : rawWhaleFlowData;
+  if (asset === 'BTC' && quorumWhaleFlowData?.status !== 'LIVE' &&
+      rawWhaleFlowData?.status === 'LIVE' && (rawWhaleFlowData.largeTransfers?.length ?? 0) > 0) {
+    // Sampled BTC outputs lack exchange attribution and cannot enter Member 6's quorum matrix.
+    console.info('[SBK1_MEMBER6] Raw BTC observations are available but unattributed; Member 6 will abstain without a verified candidate.');
+  }
   const councilEvaluationNowMs = Math.max(nowMs, Date.now());
   const latestCompletedCandleTimestampMs = snapshot.candles
     .filter((candle) => candle.timestampMs + timeframeToMs(snapshot.timeframe) <= councilEvaluationNowMs)
@@ -1361,6 +1389,9 @@ export class ServerSignalRunner {
   start(): void {
     if (this.timer) return;
     startPublicBitcoinWhaleDataPrefetch();
+    if (process.env.SBK1_DISABLE_PUBLIC_WHALE_OBSERVATION_POLLER !== 'true') {
+      startPublicWhaleObservationPoller();
+    }
     void this.runOnce();
     this.timer = setInterval(() => void this.runOnce(), this.pollIntervalMs);
     this.timer.unref();
@@ -1369,7 +1400,11 @@ export class ServerSignalRunner {
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    await Promise.all([this.inFlight, stopPublicBitcoinWhaleDataPrefetch()]);
+    await Promise.all([
+      this.inFlight,
+      stopPublicBitcoinWhaleDataPrefetch(),
+      stopPublicWhaleObservationPoller(),
+    ]);
   }
 
   async runOnce(): Promise<void> {

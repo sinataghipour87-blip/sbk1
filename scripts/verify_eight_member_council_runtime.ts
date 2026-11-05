@@ -18,6 +18,16 @@ import type { SignalToExecutionResult } from '../src/services/signalToExecution'
 import type { FreeMacroDataResult, DirectMetricResult } from '../src/services/freeMacroData';
 import type { PublicMarketFallbackData } from '../src/services/publicMarketDataFallback';
 import type { FreqtradeMarketTrade } from '../src/services/freqtradeMarketDataBridge';
+import {
+  createAttributedQuorumCandidate,
+  type ExchangeAddressRecord,
+} from '../src/services/exchangeAddressRegistry';
+import {
+  loadQuorumCandidateFlow,
+  QUORUM_ASSETS,
+  writeQuorumCandidateSnapshot,
+  type QuorumCandidateRecord,
+} from '../src/services/whaleConsensusCandidateRegistry';
 
 const nowMs = Date.now();
 const sourceTimestampMs = nowMs - 1_000;
@@ -351,6 +361,106 @@ try {
 
   assert.equal(report.members.length, 8);
   assert.equal(report.members[7].vote, 'LONG');
+  const shadowDirectory = await mkdtemp(path.join(os.tmpdir(), 'sbk1-member6-shadow-'));
+  const shadowLogPath = path.join(shadowDirectory, 'member6-shadow-votes.jsonl');
+  const shadowRepositoryDir = path.join(shadowDirectory, 'council');
+  const previousShadowMode = process.env.SBK1_MEMBER6_SHADOW_MODE;
+  const previousShadowPath = process.env.SBK1_MEMBER6_SHADOW_LOG_PATH;
+  try {
+    const exchangeAddress: ExchangeAddressRecord = {
+      chain: 'ETH',
+      address: '0x1111111111111111111111111111111111111111',
+      exchange: 'TEST_ONLY_SYNTHETIC_EXCHANGE',
+      label: 'TEST_ONLY_SYNTHETIC_ADDRESS',
+      sourceName: 'runtime verification fixture',
+      sourceUrl: 'https://example.invalid/runtime-test',
+      retrievedAt: new Date(nowMs).toISOString(),
+      confidence: 'HIGH',
+      note: 'Synthetic test-only address.',
+    };
+    const candidate = createAttributedQuorumCandidate({
+      assetSymbol: 'ETH',
+      blockchain: 'ethereum',
+      transactionHash: `0x${'a'.repeat(64)}`,
+      transferId: 'native:0',
+      timestampMs: nowMs - 1_000,
+      amount: 400,
+      unit: 'ETH',
+      blockHeight: 20_000_000,
+      sourceIds: ['ethereum-rpc-publicnode', 'ethereum-rpc-blockrazor'],
+      confirmationStatus: 'CONFIRMED',
+      fromAddresses: ['0x2222222222222222222222222222222222222222'],
+      toAddresses: [exchangeAddress.address],
+    }, [exchangeAddress], {
+      value: 30_000,
+      sourceTimestampMs: nowMs,
+      retrievedAtMs: nowMs,
+    }, nowMs);
+    assert.ok(candidate);
+    const candidates = Object.fromEntries(QUORUM_ASSETS.map((asset) =>
+      [asset, asset === 'ETH' ? [candidate] : []])) as Record<
+        typeof QUORUM_ASSETS[number],
+        QuorumCandidateRecord[]
+      >;
+    const quorumPath = path.join(shadowDirectory, 'quorum-candidates.json');
+    await writeQuorumCandidateSnapshot(candidates, {
+      nowMs,
+      filePath: quorumPath,
+      observedTransfersByAsset: { BTC: [], ETH: [], BNB: [], SOL: [], XRP: [] },
+    });
+    const shadowFlow = await loadQuorumCandidateFlow('ETH', { nowMs, filePath: quorumPath });
+    assert.equal(shadowFlow.status, 'LIVE');
+
+    process.env.SBK1_MEMBER6_SHADOW_MODE = 'true';
+    process.env.SBK1_MEMBER6_SHADOW_LOG_PATH = shadowLogPath;
+    const shadowReport = await runEightMemberCouncilRuntime({
+      analysis,
+      multiBrainReport,
+      sbReport,
+      pillars,
+      macroContext,
+      freeMacroData,
+      whaleFlowData: shadowFlow,
+      repositoryDir: shadowRepositoryDir,
+      nowMs,
+    });
+    assert.equal(shadowReport.members[5].vote, 'ABSTAIN');
+    const shadowRecord = await readLatestJsonLine<{
+      asset: string;
+      vote: string;
+      confidencePct: number | null;
+      transactionHashes: string[];
+      exchanges: string[];
+      priceAtVote: number | null;
+    }>(shadowLogPath);
+    assert.equal(shadowRecord.asset, 'ETH');
+    assert.equal(shadowRecord.vote, 'SHORT');
+    assert.ok((shadowRecord.confidencePct ?? 0) > 0);
+    assert.deepEqual(shadowRecord.transactionHashes, [`0x${'a'.repeat(64)}`]);
+    assert.deepEqual(shadowRecord.exchanges, ['TEST_ONLY_SYNTHETIC_EXCHANGE']);
+    assert.equal(shadowRecord.priceAtVote, analysis.price);
+
+    process.env.SBK1_MEMBER6_SHADOW_MODE = 'false';
+    const liveReport = await runEightMemberCouncilRuntime({
+      analysis,
+      multiBrainReport,
+      sbReport,
+      pillars,
+      macroContext,
+      freeMacroData,
+      whaleFlowData: shadowFlow,
+      repositoryDir: shadowRepositoryDir,
+      nowMs: nowMs + 1_000,
+    });
+    assert.equal(liveReport.members[5].vote, 'SHORT');
+  } finally {
+    if (previousShadowMode === undefined) delete process.env.SBK1_MEMBER6_SHADOW_MODE;
+    else process.env.SBK1_MEMBER6_SHADOW_MODE = previousShadowMode;
+    if (previousShadowPath === undefined) delete process.env.SBK1_MEMBER6_SHADOW_LOG_PATH;
+    else process.env.SBK1_MEMBER6_SHADOW_LOG_PATH = previousShadowPath;
+    await rm(shadowDirectory, { recursive: true, force: true });
+  }
+
   assert.deepEqual(
     (await readdir(repositoryDir)).filter((name) => name.startsWith('member-')).sort(),
     EIGHT_MEMBER_COUNCIL.map(({ id }) => `member-${String(id).padStart(2, '0')}.jsonl`).sort(),
@@ -782,8 +892,8 @@ try {
     timestampMs: nowMs - 1_000,
     sourceProvider: 'mempool.space',
     asset: 'BTC',
-    amount: 12,
-    estimatedUsd: null,
+    amount: 125,
+    estimatedUsd: 8_000_000,
     confirmationStatus: 'CONFIRMED' as const,
     transferId: 'vout:0',
   }];
@@ -795,6 +905,21 @@ try {
     qualityPct: 85,
     coverageStatus: 'SAMPLED' as const,
     largeTransfers: connectedTransfers,
+    consensusMatrix: {
+      candidates: [{
+        blockchain: 'bitcoin',
+        transactionHash: 'test-tx',
+        transferId: 'vout:0',
+        timestampMs: nowMs - 1_000,
+        amountBtc: 125,
+        direction: 'EXCHANGE_OUTFLOW' as const,
+        observations: [
+          { sourceId: 'mempool.space' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'test-tx', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+          { sourceId: 'blockstream' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'test-tx', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+          { sourceId: 'whale-alert' as const, evidenceType: 'ATTRIBUTION' as const, blockchain: 'bitcoin', transactionHash: 'test-tx', transferId: 'vout:0', direction: 'EXCHANGE_OUTFLOW' as const, amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+        ],
+      }],
+    },
     exchangeInflowsBtc: null,
     exchangeOutflowsBtc: null,
     netExchangeFlowBtc: null,
@@ -860,14 +985,14 @@ try {
     'LONG',
     'LONG',
     'NEUTRAL',
-    'NEUTRAL',
+    'ABSTAIN',
     'LONG',
     'LONG',
   ];
   assert.deepEqual(
     connectedSourcesReport.members.map(({ vote }) => vote),
     expectedConnectedVotes,
-    'all eight votes must follow their specialized fixture evidence',
+    'shadow-mode Member 6 evidence must not contribute a directional council vote',
   );
   const connectedVoteRecord = await readLatestJsonLine<{
     coordinator: { moduleId: string; excludedFromMemberVotes: boolean };
@@ -912,10 +1037,13 @@ try {
   assert.equal(connectedMemberRecords.get(4)!.sourceData.openInterest, 10_000);
   assert.match(connectedMemberRecords.get(5)!.rationaleFa, /نسبت OI اختیار/);
   assert.equal(getRecordField(connectedMemberRecords.get(5)!.sourceData, 'optionsData').provider, 'Deribit public options API');
-  assert.match(connectedMemberRecords.get(6)!.rationaleFa, /تراکنش بزرگ bitcoin/);
+  assert.match(connectedMemberRecords.get(6)!.rationaleFa, /خروج از صرافی غالب است/);
   const onChainEvidence = getRecordField(connectedMemberRecords.get(6)!.sourceData, 'publicOnChainData');
   assert.ok(Array.isArray(onChainEvidence.largeTransfers));
   assert.equal(onChainEvidence.largeTransfers.length, 1);
+  const consensusCandidates = getRecordField(onChainEvidence, 'consensusMatrix').candidates;
+  assert.ok(Array.isArray(consensusCandidates));
+  assert.equal(consensusCandidates.length, 1);
   assert.match(connectedMemberRecords.get(7)!.rationaleFa, /شاخص مستقیم و تازه/);
   assert.deepEqual(getRecordField(connectedMemberRecords.get(7)!.sourceData, 'directSources').sp500, freeMacroData.sp500);
   assert.match(connectedMemberRecords.get(8)!.rationaleFa, /امتیاز سنتیمنت خبر معتبر/);
@@ -950,7 +1078,7 @@ try {
   assert.equal(whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinPublicTransfers').status, 'AVAILABLE');
   assert.equal('output' in whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinPublicTransfers'), false);
   assert.equal(whaleMember.sourceData.publicOnChainData.provider, 'mempool.space public REST API (sampled confirmed BTC outputs)');
-  assert.equal(whaleMember.vote, 'NEUTRAL');
+  assert.equal(whaleMember.vote, 'ABSTAIN', 'shadow-mode Member 6 vote must persist as ABSTAIN in council records');
 
   const noSupportingModulesDir = path.join(repositoryDir, 'no-supporting-modules');
   await runEightMemberCouncilRuntime({

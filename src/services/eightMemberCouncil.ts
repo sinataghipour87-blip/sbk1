@@ -8,6 +8,7 @@ import {
   deduplicateNews,
   deduplicateOnChainTransfers,
 } from './councilEvidenceDeduplication';
+import { getWhaleSourceOperator } from './whaleConsensusSourceOperators';
 
 export type CouncilVote = 'LONG' | 'SHORT' | 'NEUTRAL' | 'ABSTAIN';
 export type CouncilDirection = 'LONG' | 'SHORT' | null;
@@ -33,6 +34,7 @@ export interface CouncilOptionsData {
 export interface CouncilWhaleFlowData {
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   provider: string;
+  assetSymbol?: string;
   timestampMs: number | null;
   retrievedAtMs?: number | null;
   ageMs: number | null;
@@ -40,6 +42,7 @@ export interface CouncilWhaleFlowData {
   coverageStatus?: 'SAMPLED' | 'COMPLETE' | 'UNAVAILABLE';
   unavailableReason?: string;
   largeTransfers?: CouncilWhaleTransfer[];
+  consensusMatrix?: CouncilWhaleConsensusMatrix;
   networkMetrics?: Record<string, number | string | null>;
   exchangeInflowsBtc: number | null;
   exchangeOutflowsBtc: number | null;
@@ -60,6 +63,83 @@ export interface CouncilWhaleTransfer {
   estimatedUsd: number | null;
   confirmationStatus: 'CONFIRMED' | 'UNCONFIRMED' | 'UNKNOWN';
   transferId?: string;
+}
+
+export type CouncilWhaleFlowDirection = 'EXCHANGE_INFLOW' | 'EXCHANGE_OUTFLOW';
+export type CouncilWhaleQuorumSourceId =
+  | 'mempool.space'
+  | 'blockstream'
+  | 'mempool-emzy'
+  | 'mempool-ninja'
+  | 'btcscan'
+  | 'mempool-bullbitcoin'
+  | 'mempool-sweetsats'
+  | 'whale-alert'
+  | 'etherscan'
+  | 'etherscan-metadata'
+  | 'blockscout'
+  | 'bscscan'
+  | 'solscan'
+  | 'helius'
+  | 'ethereum-rpc-publicnode'
+  | 'ethereum-rpc-mevblocker'
+  | 'ethereum-rpc-blockrazor'
+  | 'ethereum-rpc-flashbots'
+  | 'ethereum-rpc-meowrpc'
+  | 'ethereum-rpc-zan'
+  | 'ethereum-rpc-bloxroute'
+  | 'ethereum-rpc-nownodes'
+  | 'bsc-rpc-publicnode'
+  | 'bsc-rpc-blockrazor'
+  | 'bsc-rpc-meowrpc'
+  | 'bsc-rpc-bloxroute'
+  | 'bsc-rpc-48club'
+  | 'bsc-rpc-defibit'
+  | 'solana-rpc-solana-foundation'
+  | 'solana-rpc-solana-foundation-beta'
+  | 'solana-rpc-publicnode'
+  | 'solana-rpc-vibestation'
+  | 'solana-rpc-pocket'
+  | 'solana-rpc-web3cdn'
+  | 'solana-rpc-tatum'
+  | 'xrp-rpc-ripple-s1'
+  | 'xrp-rpc-ripple-s2'
+  | 'xrp-rpc-xrplcluster'
+  | 'xrp-rpc-xrpl-ws'
+  | 'xrp-rpc-honeycluster'
+  | 'xrp-rpc-ankr'
+  | 'xrp-rpc-unverified-backup';
+
+export interface CouncilWhaleQuorumObservation {
+  sourceId: CouncilWhaleQuorumSourceId | string;
+  evidenceType?: 'TRANSFER' | 'ATTRIBUTION';
+  blockchain?: string;
+  transactionHash?: string;
+  transferId?: string;
+  direction?: CouncilWhaleFlowDirection;
+  amountBtc?: number;
+  amount?: number;
+  timestampMs: number;
+  confirmationStatus?: 'CONFIRMED' | 'UNCONFIRMED' | 'UNKNOWN';
+  exchangeName?: string;
+  exchangeAddress?: string;
+}
+
+export interface CouncilWhaleConsensusCandidate {
+  blockchain: string;
+  transactionHash: string;
+  transferId: string;
+  timestampMs: number;
+  assetSymbol?: string;
+  amountBtc?: number;
+  amount?: number;
+  estimatedUsd?: number;
+  direction: CouncilWhaleFlowDirection;
+  observations: CouncilWhaleQuorumObservation[];
+}
+
+export interface CouncilWhaleConsensusMatrix {
+  candidates: CouncilWhaleConsensusCandidate[];
 }
 
 export interface CouncilModuleEvidence {
@@ -263,10 +343,16 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
 const MAX_OPTIONS_AGE_MS = 5 * 60_000;
 const MAX_ONCHAIN_AGE_MS = 10 * 60_000;
 const MAX_PUBLIC_ONCHAIN_AGE_MS = 5 * 60_000;
+const MAX_MEMBER_6_TIMESTAMP_SKEW_MS = 30_000;
 const MAX_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_NEWS_AGE_MS = 6 * 60 * 60_000;
 const MAX_DIRECT_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_DXY_AGE_MS = 7 * 24 * 60 * 60_000;
+const MEMBER_6_MIN_WHALE_VOLUME_BTC = 100;
+const MEMBER_6_MIN_NET_FLOW_BTC = 50;
+const MEMBER_6_MIN_WHALE_VOLUME_USD = 10_000_000;
+const MEMBER_6_MIN_NET_FLOW_USD = 5_000_000;
+const MEMBER_6_MIN_DIRECTIONAL_BIAS = 0.6;
 const MEMBER_EVIDENCE_MAX_AGE_MS: Readonly<Record<number, number>> = {
   1: 65_000,
   2: 5_000,
@@ -802,167 +888,263 @@ function evaluateOnChain(
   nowMs: number,
   directWhaleFlow?: CouncilWhaleFlowData,
 ): CouncilMemberVote {
-  if (directWhaleFlow?.largeTransfers) {
-    const freshness = freshTimestamp(
-      directWhaleFlow.timestampMs,
-      directWhaleFlow.ageMs,
-      nowMs,
-      MAX_PUBLIC_ONCHAIN_AGE_MS,
-    );
-    const eligibleTransfers = directWhaleFlow.largeTransfers.filter((transfer) =>
+  const assetSymbol = directWhaleFlow?.assetSymbol?.toUpperCase() ?? 'BTC';
+  const freshness = directWhaleFlow
+    ? freshTimestamp(directWhaleFlow.timestampMs, directWhaleFlow.ageMs, nowMs, MAX_PUBLIC_ONCHAIN_AGE_MS)
+    : null;
+  const eligibleTransfers = (Array.isArray(directWhaleFlow?.largeTransfers) ? directWhaleFlow.largeTransfers : [])
+    .filter((transfer) =>
+      isRecord(transfer) &&
       transfer.confirmationStatus === 'CONFIRMED' &&
-      transfer.blockchain.length > 0 &&
-      transfer.transactionHash.length > 0 &&
-      transfer.amount > 0 &&
-      Number.isFinite(transfer.timestampMs) &&
-      transfer.timestampMs <= nowMs &&
+      typeof transfer.blockchain === 'string' &&
+      typeof transfer.asset === 'string' && transfer.asset.toUpperCase() === assetSymbol &&
+      typeof transfer.transferId === 'string' && Boolean(transfer.transferId.trim()) &&
+      isFiniteNumber(transfer.amount) && transfer.amount > 0 &&
+      isFiniteNumber(transfer.timestampMs) && transfer.timestampMs <= nowMs &&
       nowMs - transfer.timestampMs <= MAX_PUBLIC_ONCHAIN_AGE_MS
     );
-    const identifiedTransfers = deduplicateOnChainTransfers(eligibleTransfers);
-    const confirmedTransfers = identifiedTransfers.values.filter((transfer) =>
-      Boolean(transfer.transferId?.trim())
-    );
-    const missingTransferIdentity = eligibleTransfers.some((transfer) =>
-      !transfer.transferId?.trim()
-    );
-    const usable = directWhaleFlow.status === 'LIVE' &&
-      freshness !== null &&
-      directWhaleFlow.coverageStatus === 'SAMPLED';
-    const checks = [
-      {
-        labelFa: 'اعتبار دادهٔ بلوک‌های نمونه‌برداری‌شده',
-        passed: usable,
-        detailFa: usable
-          ? confirmedTransfers.length > 0
-            ? `${confirmedTransfers.length} انتقال بزرگ تأییدشده؛ دادهٔ خام بدون انتساب مالکیت کیف‌پول`
-            : 'نمونهٔ تازه معتبر است؛ در بلوک‌های بررسی‌شده انتقال بزرگِ واجد آستانه پیدا نشد.'
-          : directWhaleFlow.unavailableReason ?? 'تراکنش بزرگِ تأییدشده و تازه برای تحلیل جهت‌دار موجود نیست.',
-      },
-      {
-        labelFa: 'تازگی و پوشش provider',
-        passed: freshness !== null && directWhaleFlow.coverageStatus !== 'UNAVAILABLE',
-        detailFa: freshness
-          ? `${Math.round(freshness.ageMs / 60_000)} دقیقه؛ پوشش ${directWhaleFlow.coverageStatus ?? 'نامشخص'}`
-          : 'منبع قدیمی یا زمان‌نامعتبر است.',
-      },
-      {
-        labelFa: 'انتساب مالکیت یا جهت جریان',
-        passed: false,
-        detailFa: 'آدرس‌ها ناشناس‌اند؛ ورود، خروج، خرید یا فروش استنباط نمی‌شود.',
-      },
-      {
-        labelFa: 'شناسهٔ یکتای انتقال',
-        passed: !identifiedTransfers.conflictingIdentity && !missingTransferIdentity,
-        detailFa: identifiedTransfers.conflictingIdentity
-          ? 'برای یک blockchain/txid/logIndex یا vout مقادیر متناقض دریافت شد.'
-          : missingTransferIdentity
-            ? 'حداقل یک انتقال فاقد logIndex/vout پایدار است و برای رأی قابل‌شمارش نیست.'
-            : `${identifiedTransfers.duplicateCount} انتقال تکراری از چند provider حذف شد.`,
-      },
-    ];
-    if (!usable || !freshness || identifiedTransfers.conflictingIdentity || missingTransferIdentity) {
-      return abstain(member, directWhaleFlow.unavailableReason ?? 'شواهد آن‌چین تازه و تأییدشده برای رأی معتبر کافی نیست.', checks, freshness?.timestampMs, freshness?.ageMs);
-    }
-    if (confirmedTransfers.length === 0) {
-      return createVote(
-        member,
-        'NEUTRAL',
-        'در بلوک‌های تازه و نمونه‌برداری‌شده انتقال بزرگِ واجد آستانه مشاهده نشد؛ این فقط نبود رویداد نهنگی در نمونهٔ محدود است، نه اثبات آرامش کل شبکه یا نبود فشار فروش.',
-        checks,
-        {
-          sourceTimestampMs: freshness.timestampMs,
-          sourceAgeMs: freshness.ageMs,
-          dataQualityPct: directWhaleFlow.qualityPct,
-          confidencePct: 0,
-        },
-      );
-    }
-    return createVote(
-      member,
-      'NEUTRAL',
-      `در ${confirmedTransfers.length} تراکنش بزرگ ${confirmedTransfers.map(({ blockchain, asset, amount, estimatedUsd }) =>
-        `${blockchain} ${amount} ${asset}${estimatedUsd === null ? '' : ` (حدود $${Math.round(estimatedUsd).toLocaleString('en-US')})`}`
-      ).join('، ')} مشاهده شد. تراکنش زنجیره‌ای به‌تنهایی هویت مالک یا قصد خریدوفروش را ثابت نمی‌کند؛ رأی جهت‌دار صادر نمی‌شود.`,
-      checks,
-      {
-        sourceTimestampMs: freshness.timestampMs,
-        sourceAgeMs: freshness.ageMs,
-        dataQualityPct: directWhaleFlow.qualityPct,
-        confidencePct: 0,
-      },
-    );
-  }
-  if (directWhaleFlow) {
-    const freshness = freshTimestamp(
-      directWhaleFlow.timestampMs,
-      directWhaleFlow.ageMs,
-      nowMs,
-      MAX_ONCHAIN_AGE_MS,
-    );
-    const valid = directWhaleFlow.status === 'LIVE' &&
-      freshness !== null &&
-      directWhaleFlow.qualityPct >= 80 &&
-      isFiniteNumber(directWhaleFlow.netExchangeFlowBtc) &&
-      directWhaleFlow.transactionCount > 0;
-    const checks = [
-      {
-        labelFa: 'برچسب‌گذاری جریان صرافی',
-        passed: valid,
-        detailFa: valid
-          ? `${directWhaleFlow.provider}؛ ${directWhaleFlow.transactionCount} انتقال برچسب‌خورده`
-          : `${directWhaleFlow.provider}؛ داده/انتساب کافی برای رأی معتبر نیست.`,
-      },
-      {
-        labelFa: 'تازگی داده زنجیره‌ای',
-        passed: freshness !== null,
-        detailFa: freshness ? `${Math.round(freshness.ageMs / 60_000)} دقیقه` : 'زمان منبع کهنه یا نامعتبر است.',
-      },
-    ];
-    if (!valid || !freshness || !isFiniteNumber(directWhaleFlow.netExchangeFlowBtc)) {
-      return abstain(member, 'بدون جریان تازه و برچسب‌خوردهٔ صرافی از انتقال‌های بزرگ BTC، رأی آن‌چین صادر نمی‌شود.', checks, freshness?.timestampMs, freshness?.ageMs);
-    }
+  const normalizeOnChainIdentifier = (value: string): string =>
+    assetSymbol === 'SOL' ? value : value.toLowerCase();
+  const candidateIdentity = (candidate: CouncilWhaleConsensusCandidate) =>
+    `${candidate.blockchain.toLowerCase()}:${normalizeOnChainIdentifier(candidate.transactionHash)}:${normalizeOnChainIdentifier(candidate.transferId)}`;
+  const transferIdentity = (transfer: CouncilWhaleTransfer) =>
+    `${transfer.blockchain.toLowerCase()}:${normalizeOnChainIdentifier(transfer.transactionHash)}:${normalizeOnChainIdentifier(transfer.transferId ?? '')}`;
+  const verifiedCandidates = new Map<string, {
+    direction: CouncilWhaleFlowDirection;
+    amount: number;
+    estimatedUsd: number | null;
+    timestampMs: number;
+  }>();
+  let conflictingEvidence = false;
 
-    const netflow = directWhaleFlow.netExchangeFlowBtc;
-    const vote: CouncilVote = 'NEUTRAL';
-    return createVote(
-      member,
-      vote,
-      `در دادهٔ ${directWhaleFlow.provider} جریان خالص منتسب به صرافی ${netflow.toFixed(4)} BTC دیده شد؛ این انتقال‌ها جهت معامله را اثبات نمی‌کنند و رأی جهت‌دار صادر نمی‌شود.`,
-      checks,
-      {
-        sourceTimestampMs: freshness.timestampMs,
-        sourceAgeMs: freshness.ageMs,
-        dataQualityPct: directWhaleFlow.qualityPct,
-        confidencePct: confidenceForStrength(Math.min(25, Math.abs(netflow) * 10)),
-      },
+  const matrixCandidates = Array.isArray(directWhaleFlow?.consensusMatrix?.candidates)
+    ? directWhaleFlow.consensusMatrix.candidates
+    : [];
+  for (const candidate of matrixCandidates) {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.blockchain !== 'string' ||
+      typeof candidate.transactionHash !== 'string' ||
+      typeof candidate.transferId !== 'string' ||
+      !isFiniteNumber(candidate.timestampMs) ||
+      (candidate.assetSymbol !== undefined && candidate.assetSymbol.toUpperCase() !== assetSymbol) ||
+      !isFiniteNumber(candidate.amount ?? candidate.amountBtc) ||
+      !['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(candidate.direction))
+    ) continue;
+    const identity = candidateIdentity(candidate);
+    const transfer = eligibleTransfers.find((item) => transferIdentity(item) === identity);
+    const candidateAgeMs = nowMs - candidate.timestampMs;
+    const observations = Array.isArray(candidate.observations) ? candidate.observations : [];
+    const freshObservations = observations.filter((observation) =>
+      isRecord(observation) &&
+      typeof observation.sourceId === 'string' &&
+      getWhaleSourceOperator(assetSymbol, observation.sourceId) !== null &&
+      typeof observation.blockchain === 'string' &&
+      observation.blockchain.toLowerCase() === candidate.blockchain.toLowerCase() &&
+      typeof observation.transactionHash === 'string' &&
+      normalizeOnChainIdentifier(observation.transactionHash) === normalizeOnChainIdentifier(candidate.transactionHash) &&
+      typeof observation.transferId === 'string' &&
+      normalizeOnChainIdentifier(observation.transferId) === normalizeOnChainIdentifier(candidate.transferId) &&
+      ['TRANSFER', 'ATTRIBUTION'].includes(String(observation.evidenceType)) &&
+      (observation.evidenceType === 'TRANSFER'
+        ? observation.direction === undefined
+        : ['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(observation.direction))) &&
+      observation.confirmationStatus === 'CONFIRMED' &&
+      isFiniteNumber(observation.timestampMs) &&
+      observation.timestampMs <= nowMs &&
+      nowMs - observation.timestampMs <= MAX_PUBLIC_ONCHAIN_AGE_MS &&
+      isFiniteNumber(observation.amount ?? observation.amountBtc) &&
+      (observation.amount ?? observation.amountBtc)! > 0
     );
+    const sourceOperators = new Set(freshObservations.flatMap(({ sourceId }) => {
+      const operator = getWhaleSourceOperator(assetSymbol, sourceId);
+      return operator ? [operator] : [];
+    }));
+    const transferOperators = new Set(freshObservations.flatMap((observation) => {
+      if (observation.evidenceType !== 'TRANSFER') return [];
+      const operator = getWhaleSourceOperator(assetSymbol, observation.sourceId);
+      return operator ? [operator] : [];
+    }));
+    const attributionDirections = new Set(freshObservations
+      .filter((observation) => observation.evidenceType === 'ATTRIBUTION')
+      .map(({ direction }) => direction));
+    const candidateAmount = candidate.amount ?? candidate.amountBtc!;
+    const estimatedUsdMatches = assetSymbol === 'BTC' || (
+      transfer !== undefined &&
+      isFiniteNumber(candidate.estimatedUsd) &&
+      isFiniteNumber(transfer.estimatedUsd) &&
+      Math.abs(candidate.estimatedUsd - transfer.estimatedUsd) <= Math.max(1, candidate.estimatedUsd * 1e-6)
+    );
+    const isFresh = Number.isFinite(candidate.timestampMs) &&
+      candidate.timestampMs <= nowMs &&
+      candidateAgeMs <= MAX_PUBLIC_ONCHAIN_AGE_MS;
+    const amountMatches = transfer !== undefined &&
+      Math.abs(transfer.amount - candidateAmount) <= Math.max(1e-8, candidateAmount * 1e-8) &&
+      Math.abs(transfer.timestampMs - candidate.timestampMs) <= MAX_MEMBER_6_TIMESTAMP_SKEW_MS &&
+      estimatedUsdMatches &&
+      freshObservations.every((observation) =>
+        Math.abs((observation.amount ?? observation.amountBtc!) - candidateAmount) <= Math.max(1e-8, candidateAmount * 1e-8));
+    const directionsAgree = attributionDirections.size === 1 &&
+      attributionDirections.has(candidate.direction);
+    if (!amountMatches || !directionsAgree) {
+      if (transfer && transferOperators.size >= 2 && isFresh) conflictingEvidence = true;
+      continue;
+    }
+    if (
+      sourceOperators.size < 2 ||
+      transferOperators.size < 2 ||
+      !isFresh ||
+      !transfer
+    ) continue;
+    if (verifiedCandidates.has(identity)) {
+      conflictingEvidence = true;
+      continue;
+    }
+    verifiedCandidates.set(identity, {
+      direction: candidate.direction,
+      amount: candidateAmount,
+      estimatedUsd: isFiniteNumber(candidate.estimatedUsd) ? candidate.estimatedUsd : transfer.estimatedUsd,
+      timestampMs: candidate.timestampMs,
+    });
   }
 
-  const freshness = getMacroAge(macro, nowMs, MAX_ONCHAIN_AGE_MS);
-  const hasFlow = macro?.whaleFlowStatus === 'LIVE' &&
-    isFiniteNumber(macro.whaleNetflowBtc) &&
-    macro.whaleSentiment !== null &&
-    macro.whaleSentiment !== 'UNKNOWN';
+  const candidates = [...verifiedCandidates.values()];
+  const inflow = candidates
+    .filter(({ direction }) => direction === 'EXCHANGE_INFLOW')
+    .reduce((sum, candidate) => sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
+  const outflow = candidates
+    .filter(({ direction }) => direction === 'EXCHANGE_OUTFLOW')
+    .reduce((sum, candidate) => sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
+  const totalVolume = inflow + outflow;
+  const netFlow = inflow - outflow;
+  const bias = totalVolume > 0 ? Math.abs(netFlow) / totalVolume : 0;
+  const sourceTimestampMs = candidates.length > 0
+    ? Math.max(...candidates.map(({ timestampMs }) => timestampMs))
+    : freshness?.timestampMs ?? null;
+  const sourceAgeMs = sourceTimestampMs === null ? null : nowMs - sourceTimestampMs;
+  const feedValid = directWhaleFlow?.status === 'LIVE' &&
+    directWhaleFlow.qualityPct >= 80 &&
+    (directWhaleFlow.coverageStatus === 'SAMPLED' || directWhaleFlow.coverageStatus === 'COMPLETE');
+  const quorumValid = candidates.length > 0 && !conflictingEvidence;
+  const minimumVolume = assetSymbol === 'BTC' ? MEMBER_6_MIN_WHALE_VOLUME_BTC : MEMBER_6_MIN_WHALE_VOLUME_USD;
+  const minimumNetFlow = assetSymbol === 'BTC' ? MEMBER_6_MIN_NET_FLOW_BTC : MEMBER_6_MIN_NET_FLOW_USD;
+  const volumeValid = totalVolume >= minimumVolume && Math.abs(netFlow) >= minimumNetFlow;
+  const biasValid = bias >= MEMBER_6_MIN_DIRECTIONAL_BIAS;
   const checks = [
-    { labelFa: 'منبع آن‌چین زنده', passed: hasFlow, detailFa: hasFlow ? 'جریان و برچسب احساسات نهنگ در منبع زنده موجود است.' : 'داده جریان/رفتار کیف‌پول معتبر موجود نیست.' },
-    { labelFa: 'تازگی داده آن‌چین', passed: freshness !== null, detailFa: freshness ? `${Math.round(freshness.ageMs / 1000)}s` : 'زمان به‌روزرسانی معتبر یا تازه نیست.' },
+    {
+      labelFa: 'تازگی دادهٔ جریان',
+      passed: feedValid && freshness !== null,
+      detailFa: freshness
+        ? `${Math.round(freshness.ageMs / 60_000)} دقیقه؛ منبع ${directWhaleFlow?.provider ?? 'نامشخص'}`
+        : directWhaleFlow?.unavailableReason ?? 'فید جریان تازه و معتبر موجود نیست.',
+    },
+    {
+      labelFa: 'تأیید مستقل Consensus Matrix',
+      passed: quorumValid,
+      detailFa: conflictingEvidence
+        ? 'هویت تکراری یا جهت/حجم متناقض در ماتریس اجماع مشاهده شد.'
+        : `${candidates.length} انتقال واجد quorum دو منبع مستقل؛ ورودی‌های فاقد quorum حذف شدند.`,
+    },
+    {
+      labelFa: 'حجم و سوگیری جهت‌دار',
+      passed: volumeValid && biasValid,
+      detailFa: assetSymbol === 'BTC'
+        ? `${totalVolume.toFixed(2)} BTC کل؛ خالص ${netFlow.toFixed(2)} BTC؛ سوگیری ${(bias * 100).toFixed(0)}٪.`
+        : `${assetSymbol}: $${totalVolume.toFixed(0)} کل؛ خالص $${netFlow.toFixed(0)}؛ سوگیری ${(bias * 100).toFixed(0)}٪.`,
+    },
   ];
-  if (!hasFlow || !freshness || !macro) {
-    return abstain(member, 'بدون جریان آن‌چین زنده و زمان‌دار، این عضو رأی نمی‌دهد.', checks, freshness?.timestampMs, freshness?.ageMs);
+  if (
+    !feedValid || !freshness || !quorumValid ||
+    !volumeValid || !biasValid
+  ) {
+    const reason = conflictingEvidence
+      ? 'شواهد اجماع آن‌چین متناقض است؛ عضو ششم abstain می‌کند.'
+      : 'برای رأی جهت‌دار، جریان تازه با quorum مستقل و حجم/سوگیری کافی لازم است.';
+    return abstain(member, reason, checks, sourceTimestampMs, sourceAgeMs);
   }
 
-  const vote: CouncilVote = macro.whaleSentiment === 'ACCUMULATION'
-    ? 'LONG'
-    : macro.whaleSentiment === 'DISTRIBUTION'
-      ? 'SHORT'
-      : 'NEUTRAL';
+  const direction = netFlow < 0 ? 'LONG' : 'SHORT';
+  const confidencePct = Math.min(90, 45 + bias * 35);
   return createVote(
     member,
-    vote,
-    `برچسب جریان آن‌چین ${macro.whaleSentiment} و خالص جریان ${macro.whaleNetflowBtc} BTC از منبع تأییدشده دریافت شد.`,
+    direction,
+    assetSymbol === 'BTC'
+      ? `جریان خالص ${netFlow.toFixed(2)} BTC با quorum مستقل تأیید شد؛ ${direction === 'LONG' ? 'خروج از صرافی' : 'ورود به صرافی'} غالب است. هیچ هویت کیف‌پولی استنباط نشده است.`
+      : `جریان خالص ${assetSymbol} به ارزش $${Math.abs(netFlow).toFixed(0)} با quorum مستقل تأیید شد؛ ${direction === 'LONG' ? 'خروج از صرافی' : 'ورود به صرافی'} غالب است.`,
     checks,
-    { sourceTimestampMs: freshness.timestampMs, sourceAgeMs: freshness.ageMs }
+    {
+      sourceTimestampMs,
+      sourceAgeMs,
+      dataQualityPct: directWhaleFlow.qualityPct,
+      confidencePct,
+    },
   );
+}
+
+export function member6ShadowModeEnabled(): boolean {
+  const raw = process.env.SBK1_MEMBER6_SHADOW_MODE?.trim().toLowerCase();
+  if (!raw || raw === 'true') return true;
+  if (raw === 'false') return false;
+  console.error('[EightMemberCouncil] Invalid SBK1_MEMBER6_SHADOW_MODE; defaulting to true.');
+  return true;
+}
+
+export function evaluateMember6VoteForShadow(input: {
+  macroContext?: CouncilMacroContext | null;
+  whaleFlowData?: CouncilWhaleFlowData | null;
+  nowMs?: number;
+}): CouncilMemberVote {
+  return evaluateOnChain(
+    EIGHT_MEMBER_COUNCIL[5],
+    input.macroContext,
+    input.nowMs ?? Date.now(),
+    input.whaleFlowData ?? undefined,
+  );
+}
+
+export function applyMember6ShadowMode(report: EightMemberCouncilReport): EightMemberCouncilReport {
+  const members = report.members.map((member) => {
+    if (member.id !== 6 || (member.vote !== 'LONG' && member.vote !== 'SHORT')) return member;
+    return {
+      ...abstain(
+      EIGHT_MEMBER_COUNCIL[5],
+      `Shadow-mode Member 6 ${member.vote} vote was recorded but excluded from council quorum. ${member.rationaleFa}`,
+      [
+        ...member.qualityChecks,
+        {
+          labelFa: 'رأی عضو ۶ در حالت shadow',
+          passed: true,
+          detailFa: 'جهت محاسبه و ثبت شد، اما در شورا به‌صورت ABSTAIN شمرده می‌شود.',
+        },
+      ],
+      member.sourceTimestampMs,
+      member.sourceAgeMs,
+      ),
+      supportingEvidence: member.supportingEvidence,
+    };
+  });
+  const longVotes = members.filter(({ vote }) => vote === 'LONG').length;
+  const shortVotes = members.filter(({ vote }) => vote === 'SHORT').length;
+  const neutralVotes = members.filter(({ vote }) => vote === 'NEUTRAL').length;
+  const abstentions = members.filter(({ vote }) => vote === 'ABSTAIN').length;
+  const selectedDirection: CouncilDirection = longVotes >= 5
+    ? 'LONG'
+    : shortVotes >= 5
+      ? 'SHORT'
+      : null;
+  return {
+    ...report,
+    members,
+    longVotes,
+    shortVotes,
+    neutralVotes,
+    abstentions,
+    selectedDirection,
+    quorumMet: selectedDirection !== null,
+    summaryFa: selectedDirection
+      ? `شورا با ${selectedDirection === 'LONG' ? longVotes : shortVotes} رأی از ۸ عضو جهت ${selectedDirection} را انتخاب کرد؛ این نتیجه به‌تنهایی مجوز اجرای معامله نیست.`
+      : `حدنصاب ۵ رأی از ۸ عضو حاصل نشد (LONG: ${longVotes}، SHORT: ${shortVotes}، خنثی: ${neutralVotes}، ممتنع: ${abstentions})؛ جهت انتخاب نشد.`,
+  };
 }
 
 function evaluateMacro(

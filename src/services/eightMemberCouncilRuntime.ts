@@ -5,8 +5,11 @@ import type { AnalysisResult } from '../types/trading';
 import type { MultiBrainConsensusReport } from './multiBrainEnsemble';
 import type { FreeMacroDataResult, DirectMetricResult } from './freeMacroData';
 import {
+  applyMember6ShadowMode,
   EIGHT_MEMBER_COUNCIL,
+  evaluateMember6VoteForShadow,
   evaluateEightMemberCouncil,
+  member6ShadowModeEnabled,
   type CouncilMacroContext,
   type CouncilMemberVote,
   type CouncilMemberEvidenceCacheEntry,
@@ -52,6 +55,72 @@ interface RuntimeInput {
   repositoryDir?: string;
   decisionSnapshotTimestampMs?: number;
   nowMs?: number;
+}
+
+interface Member6ShadowVoteRecord {
+  evaluatedAtMs: number;
+  asset: 'BTC' | 'ETH';
+  vote: CouncilMemberVote['vote'];
+  confidencePct: number | null;
+  totalVolume: number;
+  netVolume: number;
+  volumeUnit: 'BTC' | 'USD';
+  transactionHashes: string[];
+  exchanges: string[];
+  priceAtVote: number | null;
+}
+
+async function appendMember6ShadowVote(record: Member6ShadowVoteRecord): Promise<void> {
+  const filePath = path.resolve(
+    process.env.SBK1_MEMBER6_SHADOW_LOG_PATH?.trim() || '.cache/sbk1/member6-shadow-votes.jsonl',
+  );
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await appendFile(filePath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+function makeMember6ShadowVoteRecord(
+  input: RuntimeInput,
+  vote: CouncilMemberVote,
+  nowMs: number,
+): Member6ShadowVoteRecord | null {
+  if (!input.whaleFlowData) return null;
+  const asset = (input.whaleFlowData.assetSymbol ?? 'BTC').toUpperCase();
+  if (asset !== 'BTC' && asset !== 'ETH') return null;
+  const candidates = input.whaleFlowData?.consensusMatrix?.candidates ?? [];
+  const valueOf = (candidate: NonNullable<typeof candidates[number]>): number => {
+    const raw = asset === 'BTC'
+      ? candidate.amountBtc ?? candidate.amount
+      : candidate.estimatedUsd;
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0;
+  };
+  const inflow = candidates
+    .filter(({ direction }) => direction === 'EXCHANGE_INFLOW')
+    .reduce((sum, candidate) => sum + valueOf(candidate), 0);
+  const outflow = candidates
+    .filter(({ direction }) => direction === 'EXCHANGE_OUTFLOW')
+    .reduce((sum, candidate) => sum + valueOf(candidate), 0);
+  const transactionHashes = [...new Set(candidates
+    .map(({ transactionHash }) => transactionHash)
+    .filter((hash) => typeof hash === 'string' && hash.length > 0))];
+  const exchanges = [...new Set(candidates.flatMap((candidate) =>
+    candidate.observations?.flatMap((observation) =>
+      observation.evidenceType === 'ATTRIBUTION' && observation.exchangeName
+        ? [observation.exchangeName]
+        : []) ?? []
+  ))];
+  const price = input.analysis.price;
+  return {
+    evaluatedAtMs: nowMs,
+    asset,
+    vote: vote.vote,
+    confidencePct: vote.confidencePct,
+    totalVolume: inflow + outflow,
+    netVolume: inflow - outflow,
+    volumeUnit: asset === 'BTC' ? 'BTC' : 'USD',
+    transactionHashes,
+    exchanges,
+    priceAtVote: typeof price === 'number' && Number.isFinite(price) && price > 0 ? price : null,
+  };
 }
 
 type ModuleValue = {
@@ -1085,6 +1154,14 @@ export async function runEightMemberCouncilRuntime(
     Object.fromEntries(previousEntries.flatMap(([memberId, entry]) =>
       entry ? [[memberId, entry]] : []
     ));
+  const shadowMode = member6ShadowModeEnabled();
+  const shadowVote = shadowMode
+    ? evaluateMember6VoteForShadow({
+      macroContext,
+      whaleFlowData: input.whaleFlowData,
+      nowMs,
+    })
+    : null;
   const baseReport = input.councilReport ?? evaluateEightMemberCouncil({
     analysis: input.analysis,
     macroContext,
@@ -1092,10 +1169,12 @@ export async function runEightMemberCouncilRuntime(
     optionsData: input.optionsData,
     whaleFlowData: input.whaleFlowData,
     evidenceFingerprints,
-    previousMemberEvidence,
+    previousMemberEvidence: shadowMode
+      ? previousMemberEvidence
+      : Object.fromEntries(Object.entries(previousMemberEvidence).filter(([memberId]) => memberId !== '6')),
     nowMs,
   });
-  const report: EightMemberCouncilReport = {
+  const evaluatedReport: EightMemberCouncilReport = {
     ...baseReport,
     members: baseReport.members.map((member) => ({
       ...member,
@@ -1108,6 +1187,17 @@ export async function runEightMemberCouncilRuntime(
       }),
     })),
   };
+  const report = shadowMode ? applyMember6ShadowMode(evaluatedReport) : evaluatedReport;
+  if (shadowVote) {
+    const shadowRecord = makeMember6ShadowVoteRecord(input, shadowVote, nowMs);
+    if (shadowRecord) {
+      try {
+        await appendMember6ShadowVote(shadowRecord);
+      } catch (error) {
+        console.error('[EightMemberCouncilRuntime] Could not persist Member 6 shadow vote:', error);
+      }
+    }
+  }
   const entries: CouncilMemberRepositoryEntry[] = report.members.map((member) => ({
     snapshotId,
     evaluatedAtMs: nowMs,

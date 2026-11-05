@@ -2036,6 +2036,7 @@ async function startServer() {
     server: { middlewareMode: true, hmr: false, ws: false },
     appType: 'spa'
   });
+  await viteServer.environments.client.depsOptimizer?.scanProcessing;
   if (shutdownRequested) {
     await viteServer.close();
     return;

@@ -66,9 +66,9 @@ assert.equal(requests.length, 4);
 const report = evaluateEightMemberCouncil({ whaleFlowData: data, nowMs });
 assert.equal(report.members.length, 8);
 assert.equal(report.quorumRequired, 5);
-assert.equal(report.members[5].vote, 'NEUTRAL');
+assert.equal(report.members[5].vote, 'ABSTAIN');
 assert.equal(report.members.filter((member) => member.id === 6).length, 1);
-assert.match(report.members[5].rationaleFa, /به‌تنهایی هویت مالک/);
+assert.match(report.members[5].rationaleFa, /quorum مستقل/);
 
 const staleForCouncil = {
   ...data,
@@ -162,8 +162,8 @@ assert.equal(configuredThreshold.status, 'LIVE');
 assert.equal(configuredThreshold.largeTransfers?.length, 0);
 assert.equal(
   evaluateEightMemberCouncil({ whaleFlowData: configuredThreshold, nowMs }).members[5].vote,
-  'NEUTRAL',
-  'fresh sampled blocks without large transfers produce a conservative neutral vote',
+  'ABSTAIN',
+  'fresh sampled blocks without quorum candidates fail closed',
 );
 if (priorThreshold === undefined) delete process.env.SBK1_WHALE_MIN_TRANSFER_BTC;
 else process.env.SBK1_WHALE_MIN_TRANSFER_BTC = priorThreshold;
@@ -316,7 +316,7 @@ assert.equal(cachedOnProviderError.retrievedAtMs, cachedFreshSample.retrievedAtM
 assert.match(cachedOnProviderError.unavailableReason ?? '', /using the last successful sample/);
 assert.equal(
   evaluateEightMemberCouncil({ whaleFlowData: cachedOnProviderError, nowMs: nowMs + 2 * 60_000 }).members[5].vote,
-  'NEUTRAL',
+  'ABSTAIN',
 );
 const cachedTooOldForVote = await fetchPublicBitcoinWhaleData({
   nowMs: nowMs + 6 * 60_000,

@@ -54,8 +54,8 @@ const report = evaluateEightMemberCouncil({
   whaleFlowData: flow,
   nowMs,
 });
-assert.equal(report.members[5].vote, 'NEUTRAL');
-assert.match(report.members[5].rationaleFa, /رأی جهت‌دار صادر نمی‌شود/);
+assert.equal(report.members[5].vote, 'ABSTAIN');
+assert.match(report.members[5].rationaleFa, /quorum مستقل/);
 
 resetWhaleAlertFlowCacheForTests();
 let fetchedWithoutKey = false;

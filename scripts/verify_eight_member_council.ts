@@ -315,34 +315,246 @@ const uniqueTransfers = deduplicateOnChainTransfers([
 assert.equal(uniqueTransfers.values.length, 2,
   'member 6 merges the same blockchain transaction log across providers without merging adjacent logs');
 assert.equal(uniqueTransfers.duplicateCount, 1);
+const quorumConfirmedTransfer = {
+  ...repeatedTransfer,
+  blockchain: 'bitcoin',
+  transactionHash: 'tx-1',
+  transferId: 'vout:0',
+  asset: 'BTC',
+  amount: 125,
+  estimatedUsd: 8_000_000,
+};
+const quorumCandidate = {
+  blockchain: 'bitcoin',
+  transactionHash: 'tx-1',
+  transferId: 'vout:0',
+  timestampMs: nowMs - 1_000,
+  amountBtc: 125,
+  direction: 'EXCHANGE_OUTFLOW' as const,
+  observations: [
+    { sourceId: 'mempool.space' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+    { sourceId: 'blockstream' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+    { sourceId: 'whale-alert' as const, evidenceType: 'ATTRIBUTION' as const, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', direction: 'EXCHANGE_OUTFLOW' as const, amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+  ],
+};
+const quorumFlowData = {
+  status: 'LIVE' as const,
+  provider: 'two public mirrors',
+  timestampMs: nowMs - 1_000,
+  ageMs: 1_000,
+  qualityPct: 90,
+  coverageStatus: 'SAMPLED' as const,
+  largeTransfers: [
+    quorumConfirmedTransfer,
+    { ...quorumConfirmedTransfer, blockchain: 'BITCOIN', transactionHash: 'TX-1', transferId: 'VOUT:0', sourceProvider: 'mirror-b' },
+  ],
+  consensusMatrix: { candidates: [quorumCandidate] },
+  exchangeInflowsBtc: null,
+  exchangeOutflowsBtc: null,
+  netExchangeFlowBtc: null,
+  transactionCount: 1,
+  windowStartHeight: 100,
+  windowEndHeight: 100,
+};
 const deduplicatedOnchainVote = evaluateEightMemberCouncil({
   analysis,
   macroContext,
+  whaleFlowData: quorumFlowData,
+  nowMs,
+});
+assert.equal(deduplicatedOnchainVote.members[5].vote, 'LONG');
+assert.match(
+  deduplicatedOnchainVote.members[5].qualityChecks.find(({ labelFa }) => labelFa === 'تأیید مستقل Consensus Matrix')?.detailFa ?? '',
+  /1 انتقال واجد quorum دو منبع مستقل/,
+);
+const ethereumFlowData = {
+  ...quorumFlowData,
+  assetSymbol: 'ETH',
+  largeTransfers: [{
+    ...quorumConfirmedTransfer,
+    blockchain: 'ethereum',
+    transactionHash: 'eth-tx-1',
+    transferId: 'log:1',
+    asset: 'ETH',
+    amount: 4_000,
+    estimatedUsd: 12_000_000,
+  }],
+  consensusMatrix: {
+    candidates: [{
+      blockchain: 'ethereum',
+      transactionHash: 'eth-tx-1',
+      transferId: 'log:1',
+      timestampMs: nowMs - 1_000,
+      assetSymbol: 'ETH',
+      amount: 4_000,
+      estimatedUsd: 12_000_000,
+      direction: 'EXCHANGE_OUTFLOW' as const,
+      observations: [
+        { sourceId: 'ethereum-rpc-publicnode', evidenceType: 'TRANSFER' as const, blockchain: 'ethereum', transactionHash: 'eth-tx-1', transferId: 'log:1', amount: 4_000, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+        { sourceId: 'ethereum-rpc-blockrazor', evidenceType: 'TRANSFER' as const, blockchain: 'ethereum', transactionHash: 'eth-tx-1', transferId: 'log:1', amount: 4_000, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+        { sourceId: 'whale-alert', evidenceType: 'ATTRIBUTION' as const, blockchain: 'ethereum', transactionHash: 'eth-tx-1', transferId: 'log:1', direction: 'EXCHANGE_OUTFLOW' as const, amount: 4_000, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+      ],
+    }],
+  },
+};
+assert.equal(
+  evaluateEightMemberCouncil({ analysis, macroContext, whaleFlowData: ethereumFlowData, nowMs }).members[5].vote,
+  'LONG',
+  'Member 6 must evaluate fresh ETH candidates confirmed by independent operators',
+);
+const additionalAssetFixtures = [
+  {
+    assetSymbol: 'BNB',
+    blockchain: 'binance-smart-chain',
+    amount: 20_000,
+    transactionHash: `0x${'b'.repeat(64)}`,
+    transferId: 'log:2',
+    sourceIds: ['bsc-rpc-publicnode', 'bsc-rpc-blockrazor'] as const,
+  },
+  {
+    assetSymbol: 'SOL',
+    blockchain: 'solana',
+    amount: 100_000,
+    transactionHash: 'Ab'.repeat(22),
+    transferId: 'transfer:2',
+    sourceIds: ['solana-rpc-solana-foundation', 'solana-rpc-publicnode'] as const,
+  },
+  {
+    assetSymbol: 'XRP',
+    blockchain: 'xrpledger',
+    amount: 10_000_000,
+    transactionHash: 'c'.repeat(64),
+    transferId: 'payment:2',
+    sourceIds: ['xrp-rpc-xrplcluster', 'xrp-rpc-honeycluster'] as const,
+  },
+] as const;
+for (const fixture of additionalAssetFixtures) {
+  const assetFlow = {
+    ...quorumFlowData,
+    assetSymbol: fixture.assetSymbol,
+    largeTransfers: [{
+      ...quorumConfirmedTransfer,
+      blockchain: fixture.blockchain,
+      transactionHash: fixture.transactionHash,
+      transferId: fixture.transferId,
+      asset: fixture.assetSymbol,
+      amount: fixture.amount,
+      estimatedUsd: 12_000_000,
+    }],
+    consensusMatrix: {
+      candidates: [{
+        blockchain: fixture.blockchain,
+        transactionHash: fixture.transactionHash,
+        transferId: fixture.transferId,
+        timestampMs: nowMs - 1_000,
+        assetSymbol: fixture.assetSymbol,
+        amount: fixture.amount,
+        estimatedUsd: 12_000_000,
+        direction: 'EXCHANGE_OUTFLOW' as const,
+        observations: [
+          ...fixture.sourceIds.map((sourceId) => ({
+            sourceId,
+            evidenceType: 'TRANSFER' as const,
+            blockchain: fixture.blockchain,
+            transactionHash: fixture.transactionHash,
+            transferId: fixture.transferId,
+            amount: fixture.amount,
+            timestampMs: nowMs - 1_000,
+            confirmationStatus: 'CONFIRMED' as const,
+          })),
+          {
+            sourceId: fixture.assetSymbol === 'BNB' ? 'etherscan-metadata' : 'whale-alert',
+            evidenceType: 'ATTRIBUTION' as const,
+            blockchain: fixture.blockchain,
+            transactionHash: fixture.transactionHash,
+            transferId: fixture.transferId,
+            direction: 'EXCHANGE_OUTFLOW' as const,
+            amount: fixture.amount,
+            timestampMs: nowMs - 1_000,
+            confirmationStatus: 'CONFIRMED' as const,
+          },
+        ],
+      }],
+    },
+  };
+  assert.equal(
+    evaluateEightMemberCouncil({ analysis, macroContext, whaleFlowData: assetFlow, nowMs }).members[5].vote,
+    'LONG',
+    `Member 6 must evaluate independent quorum for ${fixture.assetSymbol}`,
+  );
+}
+const insufficientQuorumVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
   whaleFlowData: {
-    status: 'LIVE',
-    provider: 'two public mirrors',
-    timestampMs: nowMs - 1_000,
-    ageMs: 1_000,
-    qualityPct: 90,
-    coverageStatus: 'SAMPLED',
-    largeTransfers: [
-      { ...repeatedTransfer, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', asset: 'BTC' },
-      { ...repeatedTransfer, blockchain: 'BITCOIN', transactionHash: 'TX-1', transferId: 'VOUT:0', asset: 'BTC', sourceProvider: 'mirror-b' },
-    ],
-    exchangeInflowsBtc: null,
-    exchangeOutflowsBtc: null,
-    netExchangeFlowBtc: null,
-    transactionCount: 1,
-    windowStartHeight: 100,
-    windowEndHeight: 100,
+    ...quorumFlowData,
+    consensusMatrix: {
+      candidates: [{
+        ...quorumCandidate,
+        observations: [quorumCandidate.observations[0]],
+      }],
+    },
   },
   nowMs,
 });
-assert.equal(deduplicatedOnchainVote.members[5].vote, 'NEUTRAL');
-assert.match(
-  deduplicatedOnchainVote.members[5].qualityChecks.find(({ labelFa }) => labelFa === 'شناسهٔ یکتای انتقال')?.detailFa ?? '',
-  /1 انتقال تکراری/,
-);
+assert.equal(insufficientQuorumVote.members[5].vote, 'ABSTAIN',
+  'member 6 must ignore candidates confirmed by fewer than two independent sources');
+const mismatchedTransferIdentityVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    ...quorumFlowData,
+    consensusMatrix: {
+      candidates: [{
+        ...quorumCandidate,
+        observations: quorumCandidate.observations.map((observation, index) =>
+          index === 1 ? { ...observation, transferId: 'vout:1' } : observation),
+      }],
+    },
+  },
+  nowMs,
+});
+assert.equal(mismatchedTransferIdentityVote.members[5].vote, 'ABSTAIN',
+  'member 6 must reject quorum observations that do not reference the same transfer');
+const belowThresholdVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    ...quorumFlowData,
+    largeTransfers: [{ ...quorumConfirmedTransfer, amount: 25 }],
+    consensusMatrix: {
+      candidates: [{
+        ...quorumCandidate,
+        amountBtc: 25,
+        observations: quorumCandidate.observations.map((observation) => ({ ...observation, amountBtc: 25 })),
+      }],
+    },
+  },
+  nowMs,
+});
+assert.equal(belowThresholdVote.members[5].vote, 'ABSTAIN',
+  'member 6 must abstain when quorum-confirmed volume is below strict thresholds');
+
+const conflictingQuorumVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    ...quorumFlowData,
+    consensusMatrix: {
+      candidates: [{
+        ...quorumCandidate,
+        observations: [
+          quorumCandidate.observations[0],
+          { ...quorumCandidate.observations[2], direction: 'EXCHANGE_INFLOW' as const },
+        ],
+      }],
+    },
+  },
+  nowMs,
+});
+assert.equal(conflictingQuorumVote.members[5].vote, 'ABSTAIN',
+  'member 6 must abstain when quorum sources disagree on flow direction');
+
 const unidentifiedOnchainVote = evaluateEightMemberCouncil({
   analysis,
   macroContext,

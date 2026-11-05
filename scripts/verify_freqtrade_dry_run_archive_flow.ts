@@ -261,6 +261,7 @@ async function startSbk1(): Promise<ChildProcess> {
         FREQTRADE_USERNAME: rpcUsername,
         FREQTRADE_PASSWORD: rpcPassword,
         FREQTRADE_PAIR: pair,
+        SBK1_DISABLE_PUBLIC_WHALE_OBSERVATION_POLLER: 'true',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
@@ -292,7 +293,7 @@ async function stopSbk1(server: ChildProcess): Promise<void> {
     await Promise.race([
       exit,
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('Timed out stopping isolated SBK1.')), 10_000);
+        timeout = setTimeout(() => reject(new Error('Timed out stopping isolated SBK1 within the managed-service shutdown budget.')), 35_000);
         timeout.unref();
       }),
     ]);
