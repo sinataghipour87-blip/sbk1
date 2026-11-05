@@ -9,6 +9,7 @@ from pandas import DataFrame
 
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
+from yash.contracts.models import YashDecisionEnvelope
 from sbk_signal_contract import (
     is_signal_runtime,
     is_valid_sbk_exit_signal,
@@ -16,23 +17,32 @@ from sbk_signal_contract import (
     unresolved_inflight_signal_ids,
     validate_bridge_url,
 )
+from yash_adapter import (
+    build_request_from_freqtrade,
+    evaluate_enforcing,
+    format_audit_log,
+)
 
 
 logger = logging.getLogger(__name__)
 INFORMATIVE_TIMEFRAMES = ("1m", "5m", "1h", "4h")
 MARKET_SNAPSHOT_PUBLISH_INTERVAL_MS = 1_000
+MARKET_SNAPSHOTS_PER_LOOP = 3
 
 
 class SbkSignalStrategy(IStrategy):
     INTERFACE_VERSION = 3
-    timeframe = os.getenv("SBK1_FREQTRADE_TIMEFRAME", "15m")
+    timeframe = "15m"
     startup_candle_count = 300
     can_short = True
     process_only_new_candles = False
 
     minimal_roi = {}
     stoploss = -0.05
-    trailing_stop = False
+    trailing_stop = True
+    trailing_stop_positive = 0.01
+    trailing_stop_positive_offset = 0.02
+    trailing_only_offset_is_reached = True
     use_custom_stoploss = True
     use_exit_signal = True
     exit_profit_only = False
@@ -43,8 +53,14 @@ class SbkSignalStrategy(IStrategy):
         self._signals_by_pair: dict[str, dict[str, Any]] = {}
         self._exit_signals: dict[str, dict[str, Any]] = {}
         self._consumed_exit_ids: set[str] = set()
-        self._market_snapshot_last_publish_ms = 0
-        self._pair = os.getenv("SBK1_FREQTRADE_PAIR", "")
+        self._pairs = [
+            pair.strip()
+            for pair in os.getenv("SBK1_FREQTRADE_PAIRS", os.getenv("SBK1_FREQTRADE_PAIR", "")).split(",")
+            if pair.strip()
+        ]
+        self._pair = self._pairs[0] if self._pairs else ""
+        self._market_snapshot_last_publish_by_pair: dict[str, int] = {}
+        self._market_snapshot_pair_cursor = 0
         try:
             self._bridge_url = validate_bridge_url(
                 os.getenv("SBK1_BRIDGE_URL") or "http://127.0.0.1:3000"
@@ -55,15 +71,13 @@ class SbkSignalStrategy(IStrategy):
         self._bridge_token = os.getenv("SBK1_FREQTRADE_BRIDGE_TOKEN", "")
         if len(self._bridge_token) < 32:
             logger.error("SBK1 signal bridge is disabled: SBK1_FREQTRADE_BRIDGE_TOKEN must contain at least 32 characters.")
-        if not self._pair:
-            logger.error("SBK1 signal bridge is disabled: SBK1_FREQTRADE_PAIR must match FREQTRADE_PAIR on the SBK1 server.")
+        if not self._pairs:
+            logger.error("SBK1 signal bridge is disabled: SBK1_FREQTRADE_PAIRS must configure at least one pair.")
 
     def informative_pairs(self) -> list[tuple[str, str]]:
-        pair = os.getenv("SBK1_FREQTRADE_PAIR", "").strip()
-        if not pair:
-            return []
         return [
             (pair, timeframe)
+            for pair in self._pairs
             for timeframe in INFORMATIVE_TIMEFRAMES
             if timeframe != self.timeframe
         ]
@@ -78,7 +92,7 @@ class SbkSignalStrategy(IStrategy):
             self._publish_market_snapshot(current_time)
         if not is_signal_runtime(runmode):
             return
-        if len(self._bridge_token) < 32 or not self._pair or not self._bridge_url:
+        if len(self._bridge_token) < 32 or not self._pairs or not self._bridge_url:
             return
 
         try:
@@ -86,7 +100,7 @@ class SbkSignalStrategy(IStrategy):
             response = requests.get(
                 f"{self._bridge_url}/api/freqtrade/signals",
                 headers={"Authorization": f"Bearer {self._bridge_token}"},
-                params={"pair": self._pair, "timeframe": self.timeframe},
+                params={"pair": "*", "timeframe": self.timeframe},
                 timeout=(1.0, 2.0),
                 allow_redirects=False,
             )
@@ -107,7 +121,11 @@ class SbkSignalStrategy(IStrategy):
             self._exit_signals = {
                 signal["exitId"]: signal
                 for signal in exit_signals
-                if is_valid_sbk_exit_signal(signal, now_ms=now_ms, expected_pair=self._pair)
+                if (
+                    isinstance(signal, dict)
+                    and signal.get("pair") in self._pairs
+                    and is_valid_sbk_exit_signal(signal, now_ms=now_ms, expected_pair=signal["pair"])
+                )
             }
             logger.debug("SBK1 bridge returned %d signal record(s).", len(records))
 
@@ -261,15 +279,37 @@ class SbkSignalStrategy(IStrategy):
     def _publish_market_snapshot(self, current_time: datetime) -> bool:
         bridge_token = getattr(self, "_bridge_token", "")
         bridge_url = getattr(self, "_bridge_url", "")
-        pair = getattr(self, "_pair", "")
+        pairs = getattr(self, "_pairs", [])
         data_provider = getattr(self, "dp", None)
         now_ms = int(current_time.timestamp() * 1000)
         if (
-            len(bridge_token) < 32 or not bridge_url or not pair or data_provider is None
-            or now_ms - getattr(self, "_market_snapshot_last_publish_ms", 0) < MARKET_SNAPSHOT_PUBLISH_INTERVAL_MS
+            len(bridge_token) < 32 or not bridge_url or not pairs or data_provider is None
         ):
             return False
 
+        last_published_by_pair = getattr(self, "_market_snapshot_last_publish_by_pair", {})
+        published = False
+        for _ in range(min(MARKET_SNAPSHOTS_PER_LOOP, len(pairs))):
+            pair_cursor = getattr(self, "_market_snapshot_pair_cursor", 0) % len(pairs)
+            pair = pairs[pair_cursor]
+            self._market_snapshot_pair_cursor = (pair_cursor + 1) % len(pairs)
+            if now_ms - last_published_by_pair.get(pair, 0) < MARKET_SNAPSHOT_PUBLISH_INTERVAL_MS:
+                continue
+            if self._publish_market_snapshot_for_pair(pair, current_time, now_ms):
+                last_published_by_pair[pair] = now_ms
+                published = True
+        self._market_snapshot_last_publish_by_pair = last_published_by_pair
+        return published
+
+    def _publish_market_snapshot_for_pair(
+        self,
+        pair: str,
+        current_time: datetime,
+        now_ms: int,
+    ) -> bool:
+        bridge_token = getattr(self, "_bridge_token", "")
+        bridge_url = getattr(self, "_bridge_url", "")
+        data_provider = getattr(self, "dp", None)
         configured_exchange = str(self.config.get("exchange", {}).get("name", "")).lower()
         market = str(self.config.get("trading_mode", "spot")).lower()
         if not configured_exchange or market not in ("spot", "futures"):
@@ -314,8 +354,26 @@ class SbkSignalStrategy(IStrategy):
                 allow_redirects=False,
             )
             response.raise_for_status()
-            self._market_snapshot_last_publish_ms = generated_at_ms
             return True
+        except requests.HTTPError as exc:
+            response = exc.response
+            code = "unknown"
+            detail = str(exc)
+            if response is not None:
+                try:
+                    error_payload = response.json()
+                except ValueError:
+                    error_payload = None
+                if isinstance(error_payload, dict):
+                    code = str(error_payload.get("code", code))
+                    detail = str(error_payload.get("error", detail))
+            logger.error(
+                "Freqtrade market snapshot was rejected (HTTP %s, code=%s): %s",
+                response.status_code if response is not None else "unknown",
+                code,
+                detail,
+            )
+            return False
         except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
             logger.error("Freqtrade market snapshot push failed; no market data was cached by this strategy: %s", exc)
             return False
@@ -959,6 +1017,32 @@ class SbkSignalStrategy(IStrategy):
         after_fill: bool,
         **kwargs: Any,
     ) -> float | None:
+        try:
+            envelope = self._evaluate_yash(trade, pair, current_rate, current_time)
+            if (
+                envelope is not None
+                and envelope.expires_at_ms > int(current_time.timestamp() * 1000)
+                and envelope.plan.executable
+                and envelope.plan.decision.new_stoploss is not None
+            ):
+                decision = envelope.plan.decision
+                logger.info(
+                    "YASH_ENFORCING_APPLIED decision_id=%s reason_codes=%s action=stop",
+                    envelope.decision_id,
+                    ",".join(reason.value for reason in decision.reason_codes),
+                )
+                return stoploss_from_absolute(
+                    decision.new_stoploss,
+                    current_rate,
+                    is_short=trade.is_short,
+                    leverage=trade.leverage,
+                )
+        except Exception:
+            logger.exception(
+                "YASH_ENFORCING_SKIPPED reason_code=DATA_INCOMPLETE "
+                "callback=custom_stoploss; existing stop behavior is unchanged."
+            )
+
         signal = trade.get_custom_data("sbk_signal")
         if not isinstance(signal, dict):
             signal = self._signals.get(getattr(trade, "enter_tag", "") or "")
@@ -989,6 +1073,27 @@ class SbkSignalStrategy(IStrategy):
         current_profit: float,
         **kwargs: Any,
     ) -> str | None:
+        try:
+            envelope = self._evaluate_yash(trade, pair, current_rate, current_time)
+            if (
+                envelope is not None
+                and envelope.expires_at_ms > int(current_time.timestamp() * 1000)
+                and envelope.plan.executable
+                and envelope.plan.decision.custom_exit_reason is not None
+            ):
+                decision = envelope.plan.decision
+                logger.info(
+                    "YASH_ENFORCING_APPLIED decision_id=%s reason_codes=%s action=exit",
+                    envelope.decision_id,
+                    ",".join(reason.value for reason in decision.reason_codes),
+                )
+                return decision.custom_exit_reason
+        except Exception:
+            logger.exception(
+                "YASH_ENFORCING_SKIPPED reason_code=DATA_INCOMPLETE "
+                "callback=custom_exit; existing exit behavior is unchanged."
+            )
+
         entry_tag = getattr(trade, "enter_tag", None)
         trade_id = getattr(trade, "id", None)
         direction = "SHORT" if getattr(trade, "is_short", False) else "LONG"
@@ -1031,6 +1136,39 @@ class SbkSignalStrategy(IStrategy):
                 return f"sbk_exit_{exit_id}"
         return None
 
+    def _evaluate_yash(
+        self,
+        trade: Any,
+        pair: str,
+        current_rate: float,
+        current_time: datetime,
+    ) -> YashDecisionEnvelope | None:
+        data_provider = getattr(self, "dp", None)
+        primary = data_provider.get_pair_dataframe(pair, self.timeframe) if data_provider else None
+        context_1h = data_provider.get_pair_dataframe(pair, "1h") if data_provider else None
+        context_4h = data_provider.get_pair_dataframe(pair, "4h") if data_provider else None
+        fee_open = getattr(trade, "fee_open", None)
+        fee_close = getattr(trade, "fee_close", None)
+        fees = (
+            {"entry_fee_rate": float(fee_open), "exit_fee_rate": float(fee_close)}
+            if isinstance(fee_open, (int, float)) and isinstance(fee_close, (int, float))
+            else None
+        )
+        request = build_request_from_freqtrade(
+            trade,
+            current_rate,
+            current_time,
+            primary,
+            context_1h,
+            context_4h,
+            fees,
+        )
+        if request is None:
+            return None
+        envelope = evaluate_enforcing(request)
+        logger.info("%s", format_audit_log(envelope))
+        return envelope
+
     def confirm_trade_exit(
         self,
         pair: str,
@@ -1045,6 +1183,21 @@ class SbkSignalStrategy(IStrategy):
     ) -> bool:
         if exit_reason in ("stop_loss", "stoploss_on_exchange", "emergency_exit", "force_exit", "sbk_time_horizon"):
             return True
+        if exit_reason in ("yash_time_horizon_elapsed", "yash_invalidation_confirmed"):
+            try:
+                envelope = self._evaluate_yash(trade, pair, rate, current_time)
+                return bool(
+                    envelope is not None
+                    and envelope.expires_at_ms > int(current_time.timestamp() * 1000)
+                    and envelope.plan.executable
+                    and envelope.plan.decision.custom_exit_reason == exit_reason
+                )
+            except Exception:
+                logger.exception(
+                    "YASH_ENFORCING_SKIPPED reason_code=DATA_INCOMPLETE "
+                    "callback=confirm_trade_exit; rejecting unverified Yash exit."
+                )
+                return False
         if exit_reason == "sbk_take_profit":
             entry_signal = trade.get_custom_data("sbk_signal")
             entry_conditions = entry_signal.get("entryConditions") if isinstance(entry_signal, dict) else None
@@ -1090,12 +1243,14 @@ class SbkSignalStrategy(IStrategy):
         configured_market: str,
         require_fresh: bool = True,
     ) -> bool:
+        if not isinstance(signal, dict) or signal.get("pair") not in self._pairs:
+            return False
         return is_valid_sbk_signal(
             signal,
             now_ms=now_ms,
             expected_exchange=configured_exchange,
             expected_market=configured_market,
-            expected_pair=self._pair,
+            expected_pair=signal["pair"],
             expected_timeframe=self.timeframe,
             require_fresh=require_fresh,
         )

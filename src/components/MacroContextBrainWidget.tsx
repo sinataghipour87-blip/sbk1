@@ -128,7 +128,7 @@ export const MacroContextBrainWidget: React.FC<Props> = ({ currentPrice = 0 }) =
           onClick={handleRefreshMacro}
           disabled={isRefreshing}
           className="px-2.5 py-1 rounded-lg bg-teal-950 hover:bg-teal-900 border border-teal-500/50 text-teal-200 font-mono text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition-all"
-        >
+         type="button">
           <RefreshCw className={`w-3.5 h-3.5 text-teal-400 ${isRefreshing ? 'animate-spin' : ''}`} />
           <span>{isRefreshing ? 'بروزرسانی داده‌های زنده...' : 'بروزرسانی ماکرو'}</span>
         </button>

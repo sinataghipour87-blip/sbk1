@@ -157,7 +157,7 @@ export const TradeThesisAndSmartExitWidget: React.FC<Props> = ({
                       ? 'bg-cyan-500 text-slate-950 shadow-md'
                       : 'text-slate-300 hover:bg-slate-700/50'
                   }`}
-                >
+                 type="button">
                   {pos.dir} ({pos.name || `#${idx + 1}`})
                 </button>
               ))}

@@ -6,6 +6,7 @@ import {
 import { evaluateEightMemberCouncil } from '../src/services/eightMemberCouncil';
 import type { MarketFeedQuality, DataQualityReport } from '../src/types/trading';
 
+console.log('[MOCK VERIFICATION] Deribit options adapter tests use injected fixture fetchers; this is not live health evidence.');
 const nowMs = Date.now();
 const expiration = new Date(nowMs + 15 * 24 * 60 * 60_000);
 const day = String(expiration.getUTCDate()).padStart(2, '0');
@@ -20,25 +21,45 @@ const summaries = Array.from({ length: 24 }, (_, index) => {
     open_interest: optionType === 'call' ? 10 : 20,
     mark_iv: optionType === 'call' ? 40 : 50,
     underlying_price: 100_000,
-    creation_timestamp: nowMs - 30 * 24 * 60 * 60_000,
+    creation_timestamp: nowMs,
+    bid_price: 1,
+    ask_price: 1.01,
+    volume: 100,
   };
 });
 
 resetDeribitOptionsDataCacheForTests();
 const data = await fetchDeribitOptionsData({
+  pair: 'BTC/USDT:USDT',
   nowMs,
   fetcher: async (input) => {
-    assert.equal(String(input), 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option');
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/get_order_book')) {
+      return Response.json({
+        result: {
+          timestamp: Date.now(),
+          bids: [[1, 10]],
+          asks: [[1.01, 12]],
+        },
+      });
+    }
+    assert.equal(url.toString(), 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option');
     return Response.json({ jsonrpc: '2.0', result: summaries });
   },
 });
 assert.equal(data.status, 'LIVE');
+assert.equal(data.pair, 'BTC/USDT:USDT');
+assert.equal(data.asset, 'BTC');
 assert.equal(data.provider, 'Deribit public options API');
 assert.equal(data.contractsCount, 24);
 assert.equal(data.putCallRatio, 2);
 assert.equal(data.impliedVolatilityPct, 46.67);
 assert.equal(data.skewPct, 10);
 assert.equal(data.qualityPct, 100);
+assert.equal(data.callContractsCount, 12);
+assert.equal(data.putContractsCount, 12);
+assert.equal(data.bidAskValidatedContracts, 24);
+assert.equal(data.bidAskSizeValidatedContracts, 8);
 assert.ok(data.timestampMs !== null && data.timestampMs <= Date.now());
 assert.ok(data.retrievedAtMs !== null && data.retrievedAtMs >= nowMs);
 assert.ok(data.ageMs !== null && data.ageMs <= 1_000);
@@ -80,15 +101,16 @@ const council = evaluateEightMemberCouncil({
   nowMs: Date.now(),
 });
 assert.equal(council.members[4].vote, 'SHORT');
-assert.match(council.members[4].rationaleFa, /Deribit public options API/);
+assert.match(council.members[4].rationaleFa, /OI put\/call=2\.00/);
+assert.equal(council.members[4].sourceId, 'council.member5.deribit-options');
 
 resetDeribitOptionsDataCacheForTests();
 const duplicateContracts = await fetchDeribitOptionsData({
+  pair: 'BTC/USDT:USDT',
   nowMs,
-  fetcher: async () => Response.json({
-    jsonrpc: '2.0',
-    result: [...summaries, ...summaries],
-  }),
+  fetcher: async (input) => new URL(String(input)).pathname.endsWith('/get_order_book')
+    ? Response.json({ result: { timestamp: Date.now(), bids: [[1, 10]], asks: [[1.01, 12]] } })
+    : Response.json({ jsonrpc: '2.0', result: [...summaries, ...summaries] }),
 });
 assert.equal(duplicateContracts.status, 'LIVE');
 assert.equal(duplicateContracts.contractsCount, 24);
@@ -124,10 +146,66 @@ assert.equal(lowQualityCouncil.members[4].vote, 'ABSTAIN');
 
 resetDeribitOptionsDataCacheForTests();
 const malformed = await fetchDeribitOptionsData({
+  pair: 'BTC/USDT:USDT',
   nowMs,
   fetcher: async () => Response.json({ result: 'not-an-array' }),
 });
 assert.equal(malformed.status, 'UNAVAILABLE');
 assert.equal(malformed.putCallRatio, null);
+
+resetDeribitOptionsDataCacheForTests();
+const ethSummaries = Array.from({ length: 24 }, (_, index) => {
+  const type = index % 2 === 0 ? 'C' : 'P';
+  return {
+    instrument_name: `ETH-${day}${month}${year}-${2_700 + Math.floor(index / 2) * 50}-${type}`,
+    open_interest: type === 'C' ? 10 : 20,
+    mark_iv: type === 'C' ? 40 : 50,
+    underlying_price: 3_000,
+    creation_timestamp: nowMs,
+    bid_price: 1,
+    ask_price: 1.01,
+    volume: 100,
+  };
+});
+const ethData = await fetchDeribitOptionsData({
+  pair: 'ETH/USDT:USDT',
+  nowMs,
+  fetcher: async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/get_order_book')) {
+      return Response.json({ result: { timestamp: Date.now(), bids: [[1, 10]], asks: [[1.01, 12]] } });
+    }
+    assert.equal(url.searchParams.get('currency'), 'ETH');
+    return Response.json({ result: ethSummaries });
+  },
+});
+assert.equal(ethData.status, 'LIVE');
+assert.equal(ethData.pair, 'ETH/USDT:USDT');
+assert.equal(ethData.asset, 'ETH');
+assert.equal(ethData.contractsCount, 24);
+
+let unsupportedOptionsRequested = false;
+for (const pair of ['SOL/USDT:USDT', 'XRP/USDT:USDT', 'BNB/USDT:USDT']) {
+  const unsupportedOptions = await fetchDeribitOptionsData({
+    pair,
+    nowMs,
+    fetcher: async () => {
+      unsupportedOptionsRequested = true;
+      throw new Error(`Deribit must not be queried with BTC data for ${pair}.`);
+    },
+  });
+  assert.equal(unsupportedOptions.status, 'UNAVAILABLE');
+  assert.equal(unsupportedOptions.pair, pair);
+}
+assert.equal(unsupportedOptionsRequested, false);
+
+const wrongPairOptionsCouncil = evaluateEightMemberCouncil({
+  pair: 'ETH/USDT:USDT',
+  optionsData: data,
+  analysis: { price: 3_000, scoreLong: 0, scoreShort: 0, candles: [], dataQualityReport },
+  nowMs,
+});
+assert.equal(wrongPairOptionsCouncil.members[4].vote, 'ABSTAIN',
+  'BTC options evidence cannot vote in the ETH room');
 
 console.log('Deribit options source validation, aggregation, freshness, and council vote checks passed.');

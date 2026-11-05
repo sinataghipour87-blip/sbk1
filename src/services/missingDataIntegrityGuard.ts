@@ -45,8 +45,12 @@ export class MissingDataIntegrityGuardService {
   /**
    * Audits market data feed completeness and flags UNKNOWN states (Items 50, 51, 52)
    */
-  public auditMarketDataIntegrity(analysis: AnalysisResult | null | undefined): DataFeedIntegrityReport {
+  public auditMarketDataIntegrity(
+    analysis: AnalysisResult | null | undefined,
+    options: { allowDemoData?: boolean } = {},
+  ): DataFeedIntegrityReport {
     const now = Date.now();
+    const allowDemoData = options.allowDemoData === true;
     const features: FeatureAuditItem[] = [];
 
     if (!analysis) {
@@ -63,15 +67,40 @@ export class MissingDataIntegrityGuardService {
 
     const snapshotTimestamp = analysis.canonicalSnapshot?.timestampUtc;
     const snapshotAgeMs = typeof snapshotTimestamp === 'number' ? now - snapshotTimestamp : Number.POSITIVE_INFINITY;
-    const sourceIsLive = analysis.dataStatus === 'LIVE' || analysis.dataStatus === 'VERIFIED_REALTIME';
-    const provenanceValid = sourceIsLive &&
-      Number.isFinite(snapshotAgeMs) &&
-      snapshotAgeMs >= 0 &&
-      snapshotAgeMs <= 15000 &&
-      analysis.dataQualityReport?.status === 'LIVE' &&
-      analysis.dataQualityReport.isTradeAllowed === true;
+    const candleFeedTimestamp = analysis.dataQualityReport?.feeds?.candles?.timestamp;
+    const observedAtMs = Number.isFinite(snapshotTimestamp) ? snapshotTimestamp : candleFeedTimestamp;
+    const observedAgeMs = typeof observedAtMs === 'number' ? now - observedAtMs : Number.POSITIVE_INFINITY;
+    const sourceIsLive = analysis.dataStatus === 'LIVE' ||
+      analysis.dataStatus === 'VERIFIED_REALTIME' ||
+      (allowDemoData && analysis.dataStatus === 'SIMULATED');
+    const validDemoCandles = Array.isArray(analysis.candles) &&
+      analysis.candles.length >= 30 &&
+      analysis.candles.every(([open, high, low, close, volume]) =>
+        [open, high, low, close].every((value) => Number.isFinite(value) && value > 0) &&
+        high >= Math.max(open, low, close) &&
+        low <= Math.min(open, high, close) &&
+        (volume === undefined || (Number.isFinite(volume) && volume >= 0))
+      );
+    const demoProvenanceValid = allowDemoData &&
+      sourceIsLive &&
+      validDemoCandles &&
+      Number.isFinite(analysis.price) &&
+      analysis.price > 0 &&
+      Number.isFinite(analysis.atr) &&
+      analysis.atr > 0 &&
+      observedAgeMs >= -1_000 &&
+      observedAgeMs <= 15_000;
+    const provenanceValid = allowDemoData
+      ? demoProvenanceValid
+      : sourceIsLive &&
+        Number.isFinite(snapshotAgeMs) &&
+        snapshotAgeMs >= 0 &&
+        snapshotAgeMs <= 15000 &&
+        analysis.dataQualityReport?.status === 'LIVE' &&
+        analysis.dataQualityReport.isTradeAllowed === true;
+    const auditAgeMs = allowDemoData ? observedAgeMs : snapshotAgeMs;
     const validityFor = (hasValue: boolean): FeatureStatus3State =>
-      !sourceIsLive || snapshotAgeMs < 0 || snapshotAgeMs > 15000
+      !sourceIsLive || auditAgeMs < 0 || auditAgeMs > 15000
         ? 'STALE'
         : hasValue
           ? 'VALID'
@@ -205,7 +234,7 @@ export class MissingDataIntegrityGuardService {
     const validCount = features.filter(f => f.status === 'VALID').length;
     const overallFeedHealthPct = Math.round((validCount / features.length) * 100);
 
-    const isSynthetic = analysis.dataStatus === 'SIMULATED' ||
+    const isSynthetic = (!allowDemoData && analysis.dataStatus === 'SIMULATED') ||
       (analysis as any)?.__isSynthetic === true ||
       (analysis as any)?.__isSyntheticUnsafeForLive__ === true ||
       (analysis as any)?.__isLiveSafe === false;

@@ -231,13 +231,15 @@ export const RegimeClassifierWidget: React.FC<RegimeClassifierWidgetProps> = ({ 
             {(['1m', '5m', '15m', '1h', '4h'] as TradingTimeframe[]).map(tf => (
               <button
                 key={tf}
+                aria-pressed={selectedTimeframe === tf}
+                aria-label={`تایم‌فریم ${tf}`}
                 onClick={() => setSelectedTimeframe(tf)}
                 className={`px-2 py-0.5 rounded text-[11px] font-bold transition-all ${
                   selectedTimeframe === tf
                     ? 'bg-cyan-600 text-white shadow-sm'
                     : 'text-slate-400 hover:text-white'
                 }`}
-              >
+               type="button">
                 {tf}
               </button>
             ))}

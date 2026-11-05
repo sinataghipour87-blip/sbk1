@@ -130,7 +130,7 @@ export const AIRiskGovernor: React.FC<AIRiskGovernorProps> = ({
             <button
               onClick={onResetRiskGovernor}
               className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-purple-900/80 text-slate-300 hover:text-white transition-colors text-xs font-mono"
-            >
+             type="button">
               بازتنظیم
             </button>
           </div>

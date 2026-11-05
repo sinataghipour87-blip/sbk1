@@ -7,6 +7,7 @@ interface ChartTopBarProps {
   source: string;
   isLive?: boolean;
   isDeepBlack?: boolean;
+  isWalletOpen: boolean;
   onToggleTheme?: () => void;
   onOpenSidebar?: () => void;
   balance: number;
@@ -19,6 +20,7 @@ export const ChartTopBar: React.FC<ChartTopBarProps> = ({
   source,
   isLive = false,
   isDeepBlack = false,
+  isWalletOpen,
   onToggleTheme,
   onOpenSidebar,
   balance,
@@ -94,6 +96,10 @@ export const ChartTopBar: React.FC<ChartTopBarProps> = ({
         <div className="relative">
           <button
             id="wallet-topbar-button"
+            type="button"
+            aria-label="کیف پول شبیه‌سازی"
+            aria-expanded={isWalletOpen}
+            aria-controls="wallet-popup"
             onClick={onToggleWallet}
             className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-emerald-950 via-slate-900 to-indigo-950 hover:from-emerald-900 hover:to-indigo-900 text-slate-100 font-bold text-xs border border-emerald-400/60 transition cursor-pointer shadow-[0_0_18px_rgba(16,185,129,0.3)]"
             title="مشاهده کیف پول و موجودی"
@@ -105,6 +111,8 @@ export const ChartTopBar: React.FC<ChartTopBarProps> = ({
 
         {onOpenSidebar && (
           <button
+            type="button"
+            aria-label="باز کردن منوی سیستم"
             onClick={onOpenSidebar}
             className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-emerald-950 via-slate-900 to-indigo-950 hover:from-emerald-900 hover:to-indigo-900 text-slate-100 font-bold text-xs border border-emerald-400/60 transition cursor-pointer shadow-[0_0_18px_rgba(16,185,129,0.3)] hover:shadow-[0_0_28px_rgba(16,185,129,0.5)]"
           >
@@ -114,6 +122,7 @@ export const ChartTopBar: React.FC<ChartTopBarProps> = ({
         )}
 
         <button
+          type="button"
           onClick={onRefresh}
           disabled={isFetching}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-950/60 hover:bg-emerald-900/80 border border-emerald-800/80 hover:border-emerald-500 text-emerald-200 hover:text-white transition-all disabled:opacity-50 text-xs font-medium cursor-pointer"
@@ -124,6 +133,9 @@ export const ChartTopBar: React.FC<ChartTopBarProps> = ({
 
         {onToggleTheme && (
           <button
+            type="button"
+            aria-pressed={isDeepBlack}
+            aria-label={isDeepBlack ? 'تغییر به تم تاریک معمولی' : 'فعال‌سازی تم تاریک مطلق'}
             onClick={onToggleTheme}
             className={`p-1.5 rounded-lg border transition-all flex items-center gap-1 text-xs font-mono font-bold ${
               isDeepBlack

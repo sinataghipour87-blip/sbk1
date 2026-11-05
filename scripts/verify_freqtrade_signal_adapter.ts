@@ -101,6 +101,15 @@ try {
   });
   assert.equal(validated.signalId, ids.signalId);
   assert.equal(validated.authorization.decision, 'APPROVE_ENTRY');
+  assert.throws(
+    () => validateSbkFreqtradeSignal({
+      ...signal,
+      timeframe: '1h',
+      authorization: { ...signal.authorization, timeframe: '1h' },
+    }, { nowMs }),
+    (error: unknown) => error instanceof SbkSignalValidationError && error.code === 'TIMEFRAME_MISMATCH',
+    'higher timeframes must not authorize independent entry signals',
+  );
   const maxBoundedRiskSignal = validateSbkFreqtradeSignal({
     ...signal,
     riskLimits: { ...signal.riskLimits, riskBudgetPct: 10, maxLeverage: 25 },

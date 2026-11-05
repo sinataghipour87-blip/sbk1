@@ -73,6 +73,8 @@ interface ExecutionDashboard {
 
 interface Props {
     onModeSelected: (mode: ExecutionMode, isLocalSelection: boolean) => void;
+    onManualEntry: (direction: 'LONG' | 'SHORT') => Promise<void>;
+    serverAutoPilotEnabled: boolean;
     analysisStatus: string;
     lastAnalysisAtMs: number | null;
 }
@@ -81,10 +83,17 @@ function formatTimestamp(timestamp: number | null | undefined): string {
     return typeof timestamp === 'number' ? new Date(timestamp).toLocaleString() : 'نامشخص';
 }
 
-const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisStatus, lastAnalysisAtMs }) => {
+const ExecutionGovernorDashboard: React.FC<Props> = ({
+    onModeSelected,
+    onManualEntry,
+    serverAutoPilotEnabled,
+    analysisStatus,
+    lastAnalysisAtMs,
+}) => {
     const [dashboard, setDashboard] = useState<ExecutionDashboard | null>(null);
     const [activeView, setActiveView] = useState<'DEMO' | 'LIVE'>('DEMO');
     const [loading, setLoading] = useState(false);
+    const [manualEntryPending, setManualEntryPending] = useState(false);
     const [actionMessage, setActionMessage] = useState<string | null>(null);
     const [loadError, setLoadError] = useState<string | null>(null);
     const [adminTokenDraft, setAdminTokenDraft] = useState(() => localStorage.getItem('admin_token') ?? '');
@@ -218,6 +227,15 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
         }
     };
 
+    const submitManualEntry = async (direction: 'LONG' | 'SHORT') => {
+        setManualEntryPending(true);
+        try {
+            await onManualEntry(direction);
+        } finally {
+            setManualEntryPending(false);
+        }
+    };
+
     const freqtrade = dashboard?.freqtrade;
     const canEnqueueFixture = freqtrade?.dryRun === true &&
         freqtrade.demoTrading !== true &&
@@ -283,12 +301,15 @@ const ExecutionGovernorDashboard: React.FC<Props> = ({ onModeSelected, analysisS
                 <button type="button" disabled={loading || !canEnqueueFixture} onClick={() => void enqueueFixture()} title="فقط با RPC تأییدشدهٔ Freqtrade dry_run فعال می‌شود." className="rounded border border-cyan-700 bg-cyan-950 px-3 py-2 text-sm disabled:opacity-50">
                     صف Fixture شبیه‌سازی‌شدهٔ Dry-run
                 </button>
-                <button type="button" disabled={loading} onClick={() => enqueueFixture()} className="rounded border border-emerald-700 bg-emerald-950 px-3 py-2 text-sm">
-                    معامله دستی (Manual Signal)
+                <button type="button" disabled={loading || manualEntryPending} onClick={() => void submitManualEntry('LONG')} className="rounded border border-emerald-700 bg-emerald-950 px-3 py-2 text-sm disabled:opacity-50">
+                    درخواست دستی LONG
                 </button>
-                <button type="button" disabled={loading} onClick={() => alert('مدیریت خودکار از طریق تنظیمات Freqtrade انجام می‌شود.')} className="rounded border border-indigo-700 bg-indigo-950 px-3 py-2 text-sm">
-                    مدیریت خودکار (Auto-Trade Status)
+                <button type="button" disabled={loading || manualEntryPending} onClick={() => void submitManualEntry('SHORT')} className="rounded border border-rose-700 bg-rose-950 px-3 py-2 text-sm disabled:opacity-50">
+                    درخواست دستی SHORT
                 </button>
+                <span role="status" className="rounded border border-indigo-800 bg-indigo-950/50 px-3 py-2 text-sm">
+                    اتوپایلوت سرور: {serverAutoPilotEnabled ? 'فعال' : 'غیرفعال'}؛ کنترل آن در پنل Auto-Pilot است.
+                </span>
             </div>
 
 

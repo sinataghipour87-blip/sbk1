@@ -68,7 +68,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
             onClick={handleManualTrain}
             disabled={isTraining}
             className="px-2.5 py-1 rounded-lg bg-indigo-950/90 hover:bg-indigo-900 border border-indigo-500/50 text-indigo-200 font-mono text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition-all"
-          >
+           type="button">
             <RefreshCw className={`w-3 h-3 text-indigo-400 ${isTraining ? 'animate-spin' : ''}`} />
             <span>{isTraining ? 'در حال همگام‌سازی مدل‌ها...' : 'ارزیابی کالیبراسیون'}</span>
           </button>
@@ -151,7 +151,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                 ? 'bg-indigo-950/80 text-indigo-300 border-t border-x border-indigo-500/40'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <Cpu className="w-3.5 h-3.5 text-indigo-400" />
             <span>معماری پایپ‌لاین</span>
           </button>
@@ -162,7 +162,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                 ? 'bg-indigo-950/80 text-indigo-300 border-t border-x border-indigo-500/40'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <BarChart2 className="w-3.5 h-3.5 text-cyan-400" />
             <span>۴ مدل آماری مستقل</span>
           </button>
@@ -173,7 +173,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                 ? 'bg-indigo-950/80 text-indigo-300 border-t border-x border-indigo-500/40'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <Brain className="w-3.5 h-3.5" />
             <span>۲۱ بخش پردازشی</span>
           </button>
@@ -184,7 +184,7 @@ export const MultiBrainConsensusPanel: React.FC<Props> = ({
                 ? 'bg-indigo-950/80 text-indigo-300 border-t border-x border-indigo-500/40'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <Sparkles className="w-3.5 h-3.5 text-amber-400" />
             <span>پیشنهادهای اجرایی</span>
           </button>

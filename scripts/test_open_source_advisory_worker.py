@@ -99,7 +99,12 @@ class OpenSourceAdvisoryWorkerTests(unittest.TestCase):
 
     def test_request_returns_only_advisory_contract(self) -> None:
         candles = self.make_candles(4)
-        request = {"requestId": "test-1", "candles": candles, "headlines": []}
+        request = {
+            "requestId": "test-1",
+            "pair": "BTC/USDT:USDT",
+            "candles": candles,
+            "headlines": [],
+        }
         with patch.object(
             worker,
             "module_result",
@@ -108,6 +113,7 @@ class OpenSourceAdvisoryWorkerTests(unittest.TestCase):
             report = worker.analyze_request(request)
 
         self.assertEqual(report["requestId"], "test-1")
+        self.assertEqual(report["pair"], "BTC/USDT:USDT")
         self.assertEqual(report["status"], "UNAVAILABLE")
         self.assertEqual(report["decisionInfluence"], "ADVISORY_ONLY")
         self.assertEqual(len(report["modules"]), 6)

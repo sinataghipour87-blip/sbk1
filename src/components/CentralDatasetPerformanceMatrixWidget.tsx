@@ -50,7 +50,7 @@ export const CentralDatasetPerformanceMatrixWidget: React.FC = () => {
           onClick={handleManualBatchEvaluation}
           disabled={isEvaluating}
           className="px-2.5 py-1 rounded-lg bg-cyan-950 hover:bg-cyan-900 border border-cyan-500/50 text-cyan-200 font-mono text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition-all"
-        >
+         type="button">
           <RefreshCw className={`w-3 h-3 text-cyan-400 ${isEvaluating ? 'animate-spin' : ''}`} />
           <span>{isEvaluating ? 'در حال ارزیابی مدل‌ها...' : 'ارزیابی دسته‌ای مدل‌ها'}</span>
         </button>
@@ -66,7 +66,7 @@ export const CentralDatasetPerformanceMatrixWidget: React.FC = () => {
                 ? 'bg-cyan-950/80 text-cyan-300 border-t border-x border-cyan-500/40'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <BarChart3 className="w-3.5 h-3.5 text-cyan-400" />
             <span>ماتریس عملکرد چندبعدی</span>
           </button>
@@ -77,7 +77,7 @@ export const CentralDatasetPerformanceMatrixWidget: React.FC = () => {
                 ? 'bg-cyan-950/80 text-cyan-300 border-t border-x border-cyan-500/40'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <Database className="w-3.5 h-3.5 text-indigo-400" />
             <span>دیتابیس پیش‌بینی‌ها و اجرا ({predictions.length})</span>
           </button>
@@ -88,7 +88,7 @@ export const CentralDatasetPerformanceMatrixWidget: React.FC = () => {
                 ? 'bg-cyan-950/80 text-cyan-300 border-t border-x border-cyan-500/40'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-          >
+           type="button">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
             <span>ردیابی کامل شناسه (Audit Trail)</span>
           </button>

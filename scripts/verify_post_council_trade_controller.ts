@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import type { AnalysisResult, MarketFeedQuality } from '../src/types/trading';
 import {
   evaluateEightMemberCouncil,
+  getCouncilWeightedVoteCounts,
   type EightMemberCouncilReport,
 } from '../src/services/eightMemberCouncil';
 import {
@@ -124,7 +125,7 @@ const candleResearch: WalkForwardCandleResearchReport = {
   market: 'futures',
   pair: 'BTC/USDT:USDT',
   sourceTimestampMs: nowMs,
-  timeframe: '1m',
+  timeframe: '15m',
   candleCount: 1_000,
   trainingCandleCount: 700,
   testCandleCount: 300,
@@ -171,14 +172,18 @@ function runPostCouncilTradeControl(
   });
 }
 const baseCouncil = evaluateEightMemberCouncil({ nowMs });
+const councilMembers = baseCouncil.members.map((member, index) => ({
+  ...member,
+  vote: index < 5 ? 'LONG' as const : 'NEUTRAL' as const,
+}));
+const councilWeightedVotes = getCouncilWeightedVoteCounts(councilMembers);
 const council: EightMemberCouncilReport = {
   ...baseCouncil,
-  members: baseCouncil.members.map((member, index) => ({
-    ...member,
-    vote: index < 5 ? 'LONG' as const : 'NEUTRAL' as const,
-  })),
+  members: councilMembers,
   longVotes: 5,
   shortVotes: 0,
+  weightedLongVotes: councilWeightedVotes.long,
+  weightedShortVotes: councilWeightedVotes.short,
   neutralVotes: 3,
   abstentions: 0,
   quorumMet: true,
@@ -202,7 +207,7 @@ const controlRisk = {
   dailyLossLimitPct: 2,
 };
 const analysis = {
-  timeframe: '1m',
+  timeframe: '15m',
   price: 60_000,
   atr: 100,
   dataStatus: 'LIVE',
@@ -297,6 +302,36 @@ assert.equal('models' in valid, false, 'central control must not generate model 
 assert.equal(valid.gates.find((gate) => gate.id === 'VOLATILITY')?.passed, true);
 assert.equal(valid.executionPlan?.holdingHorizon.selectedHorizonMinutes, 60);
 assert.equal(valid.gates.find((gate) => gate.id === 'HOLDING_HORIZON')?.passed, true);
+
+const wrongEntryTimeframe = runPostCouncilTradeControl({
+  analysis: { ...analysis, timeframe: '1h' } as AnalysisResult,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(wrongEntryTimeframe.approved, false, 'central control must reject entries outside the 15m base timeframe');
+assert.equal(wrongEntryTimeframe.gates.at(-1)?.id, 'ENTRY_TIMEFRAME');
+
+const tooManyOpenTrades = runPostCouncilTradeControl({
+  analysis,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  maxOpenTrades: 4,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(tooManyOpenTrades.approved, false, 'central control must fail closed above the three-trade cap');
 
 const noResearchHorizon = runControlWithResearch({
   analysis,
@@ -433,17 +468,41 @@ assert.equal(
   'analysis price must be compared against the live Last reference, not a duplicate candle-close value',
 );
 
+const excessiveEntryDeviation = runPostCouncilTradeControl({
+  analysis: { ...analysis, pullbackLimitPrice: 61_000 } as AnalysisResult,
+  council,
+  balance: 1_000,
+  maxStakeQuote: 100,
+  maxLeverage: 5,
+  riskBudgetPct: 1,
+  ...controlRisk,
+  referencePrice: 60_000,
+  maxDeviationBps: 100,
+  nowMs,
+});
+assert.equal(excessiveEntryDeviation.approved, false);
+assert.equal(excessiveEntryDeviation.reason.includes('ENTRY_PRICE_DEVIATION_EXCEEDED'), true);
+assert.equal(
+  excessiveEntryDeviation.gates.find((gate) => gate.id === 'ENTRY_PRICE_DEVIATION')?.passed,
+  false,
+  'the final pullback entry must pass the central price-deviation gate before approval',
+);
+
+const quorumWithAbstentionMembers = council.members.map((member, index) => ({
+  ...member,
+  vote: index === 0
+    ? 'ABSTAIN' as const
+    : index <= 5
+      ? 'LONG' as const
+      : 'NEUTRAL' as const,
+}));
+const quorumWithAbstentionWeightedVotes = getCouncilWeightedVoteCounts(quorumWithAbstentionMembers);
 const quorumWithAbstention: EightMemberCouncilReport = {
   ...council,
-  members: council.members.map((member, index) => ({
-    ...member,
-    vote: index === 0
-      ? 'ABSTAIN' as const
-      : index <= 5
-        ? 'LONG' as const
-        : 'NEUTRAL' as const,
-  })),
+  members: quorumWithAbstentionMembers,
   longVotes: 5,
+  weightedLongVotes: quorumWithAbstentionWeightedVotes.long,
+  weightedShortVotes: quorumWithAbstentionWeightedVotes.short,
   neutralVotes: 2,
   abstentions: 1,
 };

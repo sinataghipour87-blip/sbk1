@@ -41,11 +41,13 @@ def main() -> None:
     headline_timestamp = datetime.now(timezone.utc).isoformat()
     report = analyze_request({
         "requestId": "open-source-local-runtime-verification",
+        "pair": "BTC/USDT:USDT",
         "candles": make_candles(),
         "headlines": [{
             "headline": "TEST ONLY: Company reports stronger quarterly revenue and improved outlook",
             "publisher": "Local test fixture",
             "publishedAt": headline_timestamp,
+            "pair": "BTC/USDT:USDT",
         }],
     })
     expected_modules = {
