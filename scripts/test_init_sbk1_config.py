@@ -36,6 +36,10 @@ class PrivateConfigInitializationTests(unittest.TestCase):
         config = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertEqual(env_values["FREQTRADE_PAIR"], env_values["SBK1_FREQTRADE_PAIR"])
+        self.assertEqual(
+            env_values["SBK1_FREQTRADE_PAIRS"].split(","),
+            config["exchange"]["pair_whitelist"],
+        )
         self.assertEqual(env_values["FREQTRADE_USERNAME"], config["api_server"]["username"])
         self.assertEqual(env_values["FREQTRADE_PASSWORD"], config["api_server"]["password"])
         self.assertEqual(env_values["FREQTRADE_USERNAME"], env_values["FREQTRADE__API_SERVER__USERNAME"])
@@ -44,7 +48,7 @@ class PrivateConfigInitializationTests(unittest.TestCase):
         self.assertRegex(env_values["SBK1_FREQTRADE_BRIDGE_TOKEN"], r"^[a-f0-9]{64}$")
         self.assertEqual(config["dry_run"], True)
         self.assertEqual(config["stake_amount"], "unlimited")
-        self.assertEqual(config["max_open_trades"], 1)
+        self.assertEqual(config["max_open_trades"], 3)
         self.assertEqual(env_values["SBK1_SIGNAL_RISK_PCT"], "1")
         self.assertEqual(env_values["SBK1_SIGNAL_MAX_LEVERAGE"], "25")
         self.assertEqual(env_values["SBK1_SIGNAL_MAX_STAKE_QUOTE"], "1000000000")

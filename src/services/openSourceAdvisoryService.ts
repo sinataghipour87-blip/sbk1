@@ -5,6 +5,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { FreqtradeMarketCandle } from './freqtradeMarketDataBridge';
 import type { DirectNewsHeadline } from './directNewsFeeds';
+import { getFreqtradePairBaseAsset } from './freqtradePairs';
 
 export interface AdvisoryModuleResult {
   status: 'AVAILABLE' | 'UNAVAILABLE';
@@ -15,6 +16,7 @@ export interface AdvisoryModuleResult {
 
 export interface OpenSourceAdvisoryReport {
   requestId: string;
+  pair: string;
   contractVersion: 'sbk1.open-source-advisories.v1';
   generatedAtMs: number;
   sourceTimestampMs: number;
@@ -33,6 +35,7 @@ export interface OpenSourceAdvisoryReport {
 }
 
 interface PendingRequest {
+  pair: string;
   resolve: (report: OpenSourceAdvisoryReport) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
@@ -49,9 +52,10 @@ function isModuleResult(value: unknown): value is AdvisoryModuleResult {
       (typeof value.sourceTimestampMs === 'number' && Number.isSafeInteger(value.sourceTimestampMs)));
 }
 
-function isAdvisoryReport(value: unknown, requestId: string): value is OpenSourceAdvisoryReport {
+function isAdvisoryReport(value: unknown, requestId: string, pair: string): value is OpenSourceAdvisoryReport {
   if (!isObject(value) ||
     value.requestId !== requestId ||
+    value.pair !== pair ||
     value.contractVersion !== 'sbk1.open-source-advisories.v1' ||
     !Number.isSafeInteger(value.generatedAtMs) ||
     !Number.isSafeInteger(value.sourceTimestampMs) ||
@@ -72,25 +76,32 @@ class OpenSourceAdvisoryService {
   private child: ChildProcessWithoutNullStreams | null = null;
   private output: ReadLineInterface | null = null;
   private pending = new Map<string, PendingRequest>();
-  private latest: OpenSourceAdvisoryReport | null = null;
+  private readonly latestByPair = new Map<string, OpenSourceAdvisoryReport>();
   private stopped = false;
 
-  getLatest(): OpenSourceAdvisoryReport | null {
-    return this.latest;
+  getLatest(pair: string): OpenSourceAdvisoryReport | null {
+    return this.latestByPair.get(pair) ?? null;
   }
 
   isStopped(): boolean {
     return this.stopped;
   }
 
-  publishUnavailable(reason: string, sourceTimestampMs: number, generatedAtMs: number): OpenSourceAdvisoryReport {
+  publishUnavailable(
+    pair: string,
+    reason: string,
+    sourceTimestampMs: number,
+    generatedAtMs: number,
+  ): OpenSourceAdvisoryReport {
+    if (!getFreqtradePairBaseAsset(pair)) throw new Error(`Unsupported pair for advisory report: ${pair}`);
     const unavailableModule = (): AdvisoryModuleResult => ({
       status: 'UNAVAILABLE',
       sourceTimestampMs,
       reason,
     });
-    this.latest = {
+    const report: OpenSourceAdvisoryReport = {
       requestId: `unavailable-${sourceTimestampMs}-${generatedAtMs}`,
+      pair,
       contractVersion: 'sbk1.open-source-advisories.v1',
       generatedAtMs,
       sourceTimestampMs,
@@ -105,17 +116,23 @@ class OpenSourceAdvisoryService {
         newsSentiment: unavailableModule(),
       },
     };
-    return this.latest;
+    this.latestByPair.set(pair, report);
+    return report;
   }
 
   async analyze(
+    pair: string,
     candles: FreqtradeMarketCandle[],
     headlines: DirectNewsHeadline[],
   ): Promise<OpenSourceAdvisoryReport> {
+    if (!getFreqtradePairBaseAsset(pair)) throw new Error(`Unsupported pair for advisory analysis: ${pair}`);
+    if (headlines.some((headline) => headline.pair !== pair)) {
+      throw new Error(`Advisory news headlines do not belong to ${pair}.`);
+    }
     if (this.stopped) throw new Error('Local advisory worker is stopping and cannot accept new requests.');
     const child = this.ensureWorker();
     const requestId = randomUUID();
-    const payload = JSON.stringify({ requestId, candles, headlines });
+    const payload = JSON.stringify({ requestId, pair, candles, headlines });
     return new Promise<OpenSourceAdvisoryReport>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(requestId);
@@ -124,8 +141,9 @@ class OpenSourceAdvisoryService {
         reject(error);
       }, 120_000);
       this.pending.set(requestId, {
+        pair,
         resolve: (report) => {
-          this.latest = report;
+          this.latestByPair.set(pair, report);
           resolve(report);
         },
         reject,
@@ -238,7 +256,7 @@ class OpenSourceAdvisoryService {
     if (!pending) return;
     clearTimeout(pending.timeout);
     this.pending.delete(requestId);
-    if (!isAdvisoryReport(response, requestId)) {
+    if (!isAdvisoryReport(response, requestId, pending.pair)) {
       pending.reject(new Error('Local advisory worker returned an incompatible advisory contract.'));
       return;
     }

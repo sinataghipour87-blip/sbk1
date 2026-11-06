@@ -79,7 +79,7 @@ const HistoryDashboardComponent: React.FC<HistoryDashboardProps> = ({
               onClick={handleClear}
               className="px-2.5 py-1 rounded bg-rose-950/80 hover:bg-rose-900 border border-rose-700/60 text-rose-300 hover:text-white transition-all text-xs font-mono font-medium flex items-center gap-1 cursor-pointer"
               title="پاک‌سازی کامل تاریخچه معاملات"
-            >
+             type="button">
               <Trash2 className="w-3.5 h-3.5" />
               <span>پاک‌سازی تاریخچه</span>
             </button>
@@ -187,7 +187,7 @@ const HistoryDashboardComponent: React.FC<HistoryDashboardProps> = ({
                       onClick={() => setSelectedAuditTrade(trade)}
                       className="px-2 py-0.5 rounded bg-cyan-950 hover:bg-cyan-900 border border-cyan-700/60 text-cyan-300 text-[10px] font-mono flex items-center gap-1 cursor-pointer transition-all"
                       title="مشاهده گزارش ممیزی کامل این معامله"
-                    >
+                     type="button">
                       <Eye className="w-3 h-3 text-cyan-400" />
                       <span>ممیزی (Audit)</span>
                     </button>
@@ -220,7 +220,7 @@ const HistoryDashboardComponent: React.FC<HistoryDashboardProps> = ({
               <button
                 onClick={() => setSelectedAuditTrade(null)}
                 className="text-slate-400 hover:text-white font-mono text-xs px-2 py-1 rounded bg-cyan-950 border border-cyan-800 cursor-pointer"
-              >
+               type="button">
                 ✕ بستن
               </button>
             </div>

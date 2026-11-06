@@ -1,6 +1,16 @@
 import type { AnalysisResult, DataQualityReport, MarketFeedQuality } from '../types/trading';
 import type { MacroCorrelationData } from './macroContextBrain';
 import type { FreeMacroDataResult } from './freeMacroData';
+import { getFreqtradePairBaseAsset, SUPPORTED_FREQTRADE_PAIRS } from './freqtradePairs';
+import { getCouncilMemberSources } from './councilSourceRegistry';
+import { getCouncilOptionsThresholds } from './councilOptionsThresholds';
+import {
+  aggregateMemberFiveProxyMetrics,
+  calculateMemberFiveProxyScore,
+  MEMBER_FIVE_PROXY_CACHE_TTL_MS,
+  MEMBER_FIVE_PROXY_QUORUM,
+  type MemberFiveProxyAggregate,
+} from './memberFiveFuturesProxy';
 import {
   deduplicateCandles,
   deduplicateDerivativeObservations,
@@ -8,12 +18,16 @@ import {
   deduplicateNews,
   deduplicateOnChainTransfers,
 } from './councilEvidenceDeduplication';
-import { getWhaleSourceOperator } from './whaleConsensusSourceOperators';
+import { evaluateOnChainProtocolPressure } from './onChainProtocolFlow';
 
 export type CouncilVote = 'LONG' | 'SHORT' | 'NEUTRAL' | 'ABSTAIN';
 export type CouncilDirection = 'LONG' | 'SHORT' | null;
 
 export interface CouncilOptionsData {
+  pair?: string;
+  asset?: string;
+  sourceId?: string;
+  fallbackSourceId?: string;
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   timestampMs: number | null;
   retrievedAtMs?: number | null;
@@ -26,25 +40,46 @@ export interface CouncilOptionsData {
   skewPct: number | null;
   provider?: string;
   contractsCount?: number;
+  callContractsCount?: number;
+  putContractsCount?: number;
+  bidAskValidatedContracts?: number;
+  bidAskSizeValidatedContracts?: number;
+  medianBidAskSpreadPct?: number;
+  volume24h?: number;
+  volumeUnit?: string;
+  openInterestUnit?: string;
   callOpenInterest?: number;
   putOpenInterest?: number;
   underlyingPrice?: number;
+  unavailableReason?: string;
 }
 
 export interface CouncilWhaleFlowData {
+  pair?: string;
+  asset?: string;
   status: 'LIVE' | 'STALE' | 'UNAVAILABLE';
   provider: string;
-  assetSymbol?: string;
+  sourceId?: string;
+  fallbackSourceId?: string;
   timestampMs: number | null;
   retrievedAtMs?: number | null;
   ageMs: number | null;
   qualityPct: number;
+  independentProviderCount?: number;
+  independentSourceIds?: readonly string[];
+  providerParticipation?: readonly {
+    sourceId: string;
+    provider: string;
+    status: 'VALID' | 'THROTTLED' | 'FAILED';
+    error?: string;
+  }[];
+  flowSignal?: OnChainFlowSignal;
+  protocolSwaps?: readonly import('./onChainProtocolFlow').OnChainProtocolSwap[];
   coverageStatus?: 'SAMPLED' | 'COMPLETE' | 'UNAVAILABLE';
   unavailableReason?: string;
   largeTransfers?: CouncilWhaleTransfer[];
-  consensusMatrix?: CouncilWhaleConsensusMatrix;
-  aggregateExchangeFlow?: CouncilAggregateExchangeFlow;
   networkMetrics?: Record<string, number | string | null>;
+  ethereumWhaleSignals?: CouncilEthereumWhaleSignal[];
   exchangeInflowsBtc: number | null;
   exchangeOutflowsBtc: number | null;
   netExchangeFlowBtc: number | null;
@@ -53,22 +88,18 @@ export interface CouncilWhaleFlowData {
   windowEndHeight: number | null;
 }
 
-export interface CouncilAggregateExchangeFlow {
-  observations: CouncilAggregateExchangeFlowObservation[];
-}
-
-export interface CouncilAggregateExchangeFlowObservation {
-  blockchain: string;
-  transactionHash: string;
-  transferId: string;
-  timestampMs: number;
-  direction: CouncilWhaleFlowDirection;
-  amount: number;
-  estimatedUsd: number;
-  exchangeName: string;
-  exchangeAddress: string;
-  attributionSourceId: 'local-exchange-address-list';
-  sourceIds: readonly string[];
+export interface CouncilEthereumWhaleSignal {
+  sourceId: string;
+  status: 'LIVE' | 'UNAVAILABLE' | 'REGION_RESTRICTED';
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL' | 'UNAVAILABLE';
+  confidencePct: number;
+  weightPct: number;
+  coverage: string;
+  coverageComplete: boolean;
+  observedAtMs: number | null;
+  cexWatchlistMatched?: boolean;
+  interpretationFa: string;
+  evidence: unknown;
 }
 
 export interface CouncilWhaleTransfer {
@@ -82,110 +113,30 @@ export interface CouncilWhaleTransfer {
   estimatedUsd: number | null;
   confirmationStatus: 'CONFIRMED' | 'UNCONFIRMED' | 'UNKNOWN';
   transferId?: string;
-  senderAddress?: string | null;
-  receiverAddress?: string | null;
-  senderIsExchange?: boolean;
-  receiverIsExchange?: boolean;
-  senderProfile?: CouncilWhaleBehaviorProfile;
-  receiverProfile?: CouncilWhaleBehaviorProfile;
+  fromAddress?: string;
+  fromAddresses?: readonly string[];
+  toAddress?: string;
+  providerConfirmations?: number;
+  confirmingSourceIds?: readonly string[];
 }
 
-export interface CouncilWhaleBehaviorProfile {
-  isWhale: boolean;
-  behaviorTag: 'ACCUMULATOR' | 'DISTRIBUTOR' | 'MM' | 'UNKNOWN';
-  confidenceScore: number;
-}
-
-export type CouncilWhaleFlowDirection = 'EXCHANGE_INFLOW' | 'EXCHANGE_OUTFLOW';
-export type CouncilWhaleQuorumSourceId =
-  | 'mempool.space'
-  | 'blockstream'
-  | 'mempool-emzy'
-  | 'mempool-ninja'
-  | 'btcscan'
-  | 'mempool-bullbitcoin'
-  | 'mempool-sweetsats'
-  | 'whale-alert'
-  | 'local-exchange-address-list'
-  | 'etherscan'
-  | 'etherscan-metadata'
-  | 'blockscout'
-  | 'bscscan'
-  | 'solscan'
-  | 'helius'
-  | 'ethereum-rpc-publicnode'
-  | 'ethereum-rpc-mevblocker'
-  | 'ethereum-rpc-blockrazor'
-  | 'ethereum-rpc-flashbots'
-  | 'ethereum-rpc-meowrpc'
-  | 'ethereum-rpc-zan'
-  | 'ethereum-rpc-bloxroute'
-  | 'ethereum-rpc-nownodes'
-  | 'bsc-rpc-publicnode'
-  | 'bsc-rpc-blockrazor'
-  | 'bsc-rpc-meowrpc'
-  | 'bsc-rpc-bloxroute'
-  | 'bsc-rpc-48club'
-  | 'bsc-rpc-defibit'
-  | 'solana-rpc-solana-foundation'
-  | 'solana-rpc-solana-foundation-beta'
-  | 'solana-rpc-publicnode'
-  | 'solana-rpc-vibestation'
-  | 'solana-rpc-pocket'
-  | 'solana-rpc-web3cdn'
-  | 'solana-rpc-tatum'
-  | 'xrp-rpc-ripple-s1'
-  | 'xrp-rpc-ripple-s2'
-  | 'xrp-rpc-xrplcluster'
-  | 'xrp-rpc-xrpl-ws'
-  | 'xrp-rpc-honeycluster'
-  | 'xrp-rpc-ankr'
-  | 'xrp-rpc-unverified-backup';
-
-export interface CouncilWhaleQuorumObservation {
-  sourceId: CouncilWhaleQuorumSourceId | string;
-  evidenceType?: 'TRANSFER' | 'ATTRIBUTION';
-  blockchain?: string;
-  transactionHash?: string;
-  transferId?: string;
-  direction?: CouncilWhaleFlowDirection;
-  amountBtc?: number;
-  amount?: number;
-  timestampMs: number;
-  confirmationStatus?: 'CONFIRMED' | 'UNCONFIRMED' | 'UNKNOWN';
-  exchangeName?: string;
-  exchangeAddress?: string;
-}
-
-export interface CouncilWhaleConsensusCandidate {
-  blockchain: string;
-  transactionHash: string;
-  transferId: string;
-  timestampMs: number;
-  assetSymbol?: string;
-  amountBtc?: number;
-  amount?: number;
-  estimatedUsd?: number;
-  direction: CouncilWhaleFlowDirection;
-  observations: CouncilWhaleQuorumObservation[];
-  senderAddress?: string | null;
-  receiverAddress?: string | null;
-  senderIsExchange?: boolean;
-  receiverIsExchange?: boolean;
-  senderProfile?: CouncilWhaleBehaviorProfile;
-  receiverProfile?: CouncilWhaleBehaviorProfile;
-}
-
-export interface Member6VerifiedCandidate {
-  direction: CouncilWhaleFlowDirection;
-  amount: number;
-  estimatedUsd: number | null;
-  transactionHash: string;
-  exchangeNames: string[];
-}
-
-export interface CouncilWhaleConsensusMatrix {
-  candidates: CouncilWhaleConsensusCandidate[];
+export interface OnChainFlowSignal {
+  status: 'CONFIRMED' | 'ABSTAIN';
+  direction: 'LONG' | 'SHORT' | null;
+  asset: 'BTC' | 'ETH' | 'SOL' | 'BNB' | 'XRP';
+  inflowNative: number;
+  outflowNative: number;
+  selectedVolumeNative: number;
+  baselineMeanNative: number;
+  spikeRatio: number | null;
+  requiredSpikeRatio: number;
+  baselineWindows: number;
+  requiredBaselineWindows: number;
+  independentProviderCount: number;
+  sourceIds: readonly string[];
+  labeledTransferCount: number;
+  observedAtMs: number;
+  reason: string;
 }
 
 export interface CouncilModuleEvidence {
@@ -230,6 +181,33 @@ export interface CouncilQualityCheck {
   detailFa: string;
 }
 
+export type CouncilSourceCheckStatus =
+  | 'HEALTHY'
+  | 'BROKEN'
+  | 'MISSING_API_KEY'
+  | 'REGION_RESTRICTED'
+  | 'UNTESTED';
+
+export interface CouncilMemberSourceCheck {
+  sourceId: string;
+  endpoint?: string;
+  provider?: string;
+  symbol?: string;
+  marketType?: 'spot' | 'futures' | 'options';
+  independenceGroup?: string;
+  status: CouncilSourceCheckStatus;
+  detail: string;
+  httpHealthy?: boolean | null;
+  dataValid?: boolean | null;
+  dataDetail?: string;
+  observedAtMs?: number | null;
+  sourceTimestampMs?: number | null;
+  normalizedData?: Readonly<Record<string, number | string | null>>;
+  ethPriceUsd?: number | null;
+  voteValue?: 'USEFUL' | 'LOW_VALUE' | 'UNKNOWN';
+  voteUsage?: 'USED' | 'REJECTED' | 'NOT_SELECTED' | 'ABSTAINED';
+}
+
 export interface CouncilMemberDefinition {
   id: number;
   nameFa: string;
@@ -241,6 +219,15 @@ export interface CouncilMemberDefinition {
 
 export interface CouncilMemberVote extends CouncilMemberDefinition {
   vote: CouncilVote;
+  voteWeightPct?: number;
+  evidenceTrack?: 'OPTIONS' | 'FUTURES_PROXY';
+  sourceQuorumRequired?: number;
+  sourceId: string | null;
+  fallbackSourceId: string | null;
+  healthySourceCount: number | null;
+  sourceChecks: CouncilMemberSourceCheck[];
+  usedSourceIds?: readonly string[];
+  proxyAggregate?: MemberFiveProxyAggregate;
   rationaleFa: string;
   sourceTimestampMs: number | null;
   sourceAgeMs: number | null;
@@ -256,11 +243,27 @@ export interface EightMemberCouncilReport {
   members: CouncilMemberVote[];
   longVotes: number;
   shortVotes: number;
+  weightedLongVotes?: number;
+  weightedShortVotes?: number;
   neutralVotes: number;
   abstentions: number;
   selectedDirection: CouncilDirection;
   quorumMet: boolean;
   summaryFa: string;
+}
+
+export function getCouncilWeightedVoteCounts(
+  members: readonly Pick<CouncilMemberVote, 'vote' | 'voteWeightPct'>[],
+): { long: number; short: number } {
+  return members.reduce(
+    (counts, member) => {
+      const weight = (member.voteWeightPct ?? 100) / 100;
+      if (member.vote === 'LONG') counts.long += weight;
+      if (member.vote === 'SHORT') counts.short += weight;
+      return counts;
+    },
+    { long: 0, short: 0 },
+  );
 }
 
 export interface CouncilMemberEvidenceCacheEntry {
@@ -365,8 +368,26 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
     nameFa: 'تحلیلگر آن‌چین و رفتار کیف‌پول‌ها',
     nameEn: 'On-Chain Analysis',
     questionFa: 'شواهد زنجیره‌ای معتبر از رفتار دارایی‌ها چه می‌گویند؟',
-    inputIds: ['macroContext.whaleFlowStatus', 'macroContext.whaleSentiment', 'macroContext.whaleNetflowBtc', 'macroSource.bitcoinActiveAddresses'],
-    moduleIds: ['brains.brain06OnChainWhaleFlow', 'brains.brain11OnChainWhaleSentiment', 'onchain.bitcoinActiveAddresses', 'onchain.bitcoinPublicTransfers'],
+    inputIds: [
+      'macroContext.whaleFlowStatus',
+      'macroContext.whaleSentiment',
+      'macroContext.whaleNetflowBtc',
+      'macroSource.bitcoinActiveAddresses',
+      'macroSource.ethereumActiveAddresses',
+    ],
+    moduleIds: [
+      'brains.brain06OnChainWhaleFlow',
+      'brains.brain11OnChainWhaleSentiment',
+      'onchain.bitcoinActiveAddresses',
+      'onchain.bitcoinPublicTransfers',
+      'onchain.ethereumActiveAddresses',
+      'onchain.ethereumPublicTransfers',
+      'onchain.assetPublicTransfers',
+      'onchain.hyperliquidWhales',
+      'onchain.deribitBlockTrades',
+      'onchain.ethLargeTransfers',
+      'onchain.exchangeLabels',
+    ],
   },
   {
     id: 7,
@@ -386,19 +407,13 @@ export const EIGHT_MEMBER_COUNCIL: readonly CouncilMemberDefinition[] = [
   },
 ] as const;
 
-const MAX_OPTIONS_AGE_MS = 5 * 60_000;
+const MAX_OPTIONS_AGE_MS = 60_000;
 const MAX_ONCHAIN_AGE_MS = 10 * 60_000;
-const MAX_PUBLIC_ONCHAIN_AGE_MS = 5 * 60_000;
-const MAX_MEMBER_6_TIMESTAMP_SKEW_MS = 30_000;
+const MAX_PUBLIC_ONCHAIN_AGE_MS = 5 * 60_000 - 1;
 const MAX_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_NEWS_AGE_MS = 6 * 60 * 60_000;
 const MAX_DIRECT_MACRO_AGE_MS = 14 * 24 * 60 * 60_000;
 const MAX_DXY_AGE_MS = 7 * 24 * 60 * 60_000;
-const MEMBER_6_MIN_WHALE_VOLUME_BTC = 100;
-const MEMBER_6_MIN_NET_FLOW_BTC = 50;
-const MEMBER_6_MIN_WHALE_VOLUME_USD = 10_000_000;
-const MEMBER_6_MIN_NET_FLOW_USD = 5_000_000;
-const MEMBER_6_MIN_DIRECTIONAL_BIAS = 0.6;
 const MEMBER_EVIDENCE_MAX_AGE_MS: Readonly<Record<number, number>> = {
   1: 65_000,
   2: 5_000,
@@ -412,6 +427,132 @@ const MEMBER_EVIDENCE_MAX_AGE_MS: Readonly<Record<number, number>> = {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+function sourceIdForProvider(memberId: number, provider: string | undefined): string | null {
+  if (!provider) return null;
+  const normalized = provider.toLowerCase();
+  const sourcesByMember: Readonly<Record<number, readonly [string, string][]>> = {
+    1: [
+      ['freqtrade', 'market.freqtrade-snapshot'],
+      ['binance', 'market.candles-binance'],
+      ['coinbase', 'council.member1.coinbase-candles'],
+      ['kraken', 'council.member1.kraken-ohlc'],
+      ['okx', 'council.member1.okx-candles'],
+      ['bitstamp', 'council.member1.bitstamp-ohlc'],
+    ],
+    2: [
+      ['freqtrade', 'market.freqtrade-snapshot'],
+      ['coinbase', 'council.member2.coinbase-trades'],
+      ['kraken', 'council.member2.kraken-trades'],
+      ['okx', 'council.member2.okx-trades'],
+      ['bitfinex', 'council.member2.bitfinex-trades'],
+    ],
+    3: [
+      ['freqtrade', 'market.freqtrade-snapshot'],
+      ['coinbase', 'council.member3.coinbase-level2'],
+      ['kraken', 'council.member3.kraken-depth'],
+      ['okx', 'council.member3.okx-books'],
+      ['bitstamp', 'council.member3.bitstamp-order-book'],
+    ],
+    4: [
+      ['freqtrade', 'market.freqtrade-snapshot'],
+      ['okx', 'council.member4.okx-derivatives'],
+      ['deribit', 'council.member4.deribit-perpetual'],
+      ['hyperliquid', 'council.member4.hyperliquid'],
+      ['binance', 'council.member4.binance-fapi'],
+    ],
+    5: [
+      ['deribit', 'council.member5.deribit-options'],
+      ['okx', 'council.member5.okx-opt-summary'],
+      ['bybit', 'council.member5.bybit-options'],
+      ['binance', 'council.member5.binance-eapi'],
+      ['delta', 'council.member5.delta-options'],
+      ['gate.io', 'council.member5.gateio-options'],
+    ],
+    6: [
+      ['defillama dex', 'council.member6.defillama-dex-volume'],
+      ['publicnode', 'council.member6.staking-deposits'],
+      ['defillama', 'council.member6.defillama'],
+      ['publicnode fee history', 'council.member6.fee-history'],
+    ],
+    7: [
+      ['fred', 'council.member7.fred'],
+      ['fred public csv', 'council.member7.fred-market-series'],
+      ['treasury', 'council.member7.treasury'],
+      ['stooq', 'council.member7.stooq'],
+      ['ecb', 'council.member7.ecb'],
+    ],
+    8: [
+      ['ethereum foundation', 'council.member8.ethereum-foundation'],
+      ['coindesk', 'council.member8.coindesk'],
+      ['cointelegraph', 'council.member8.cointelegraph'],
+      ['google news', 'council.member8.google-news'],
+      ['alternative.me', 'council.member8.alternative-fng'],
+    ],
+  };
+  return sourcesByMember[memberId]?.find(([providerName]) =>
+    normalized.includes(providerName)
+  )?.[1] ?? null;
+}
+
+const DEFAULT_MACRO_BETA_BY_PAIR: Readonly<Record<string, number>> = {
+  'BTC/USDT:USDT': 1,
+  'ETH/USDT:USDT': 1.05,
+  'SOL/USDT:USDT': 1.3,
+  'XRP/USDT:USDT': 1.2,
+  'BNB/USDT:USDT': 1.15,
+};
+
+function readMacroBeta(pair: string): number | null {
+  if (!getFreqtradePairBaseAsset(pair)) return null;
+  const raw = process.env.SBK1_MACRO_BETA_BY_PAIR?.trim();
+  if (!raw) return DEFAULT_MACRO_BETA_BY_PAIR[pair] ?? null;
+  let values: Record<string, unknown>;
+  if (raw.startsWith('{')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('SBK1_MACRO_BETA_BY_PAIR must be a valid JSON object or pair=number list.');
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('SBK1_MACRO_BETA_BY_PAIR must be a JSON object keyed by full Freqtrade pair.');
+    }
+    values = parsed as Record<string, unknown>;
+  } else {
+    values = {};
+    for (const entry of raw.split(',')) {
+      const separator = entry.lastIndexOf('=');
+      if (separator < 1) {
+        throw new Error('SBK1_MACRO_BETA_BY_PAIR must contain comma-separated full-pair=number entries.');
+      }
+      const configuredPair = entry.slice(0, separator).trim();
+      const beta = Number(entry.slice(separator + 1).trim());
+      if (!configuredPair || Object.hasOwn(values, configuredPair)) {
+        throw new Error('SBK1_MACRO_BETA_BY_PAIR contains an empty or duplicate pair entry.');
+      }
+      values[configuredPair] = beta;
+    }
+  }
+  for (const [configuredPair, beta] of Object.entries(values)) {
+    if (
+      !SUPPORTED_FREQTRADE_PAIRS.includes(configuredPair as (typeof SUPPORTED_FREQTRADE_PAIRS)[number]) ||
+      !isFiniteNumber(beta) ||
+      beta <= 0 ||
+      beta > 5
+    ) {
+      throw new Error('SBK1_MACRO_BETA_BY_PAIR values must map supported full pairs to numbers in (0, 5].');
+    }
+  }
+  const beta = values[pair];
+  return isFiniteNumber(beta) && beta > 0 && beta <= 5
+    ? beta
+    : (raw ? null : DEFAULT_MACRO_BETA_BY_PAIR[pair] ?? null);
+}
+
+export function getCouncilMacroBeta(pair: string): number | null {
+  return readMacroBeta(pair);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -480,15 +621,33 @@ function createVote(
   rationaleFa: string,
   qualityChecks: CouncilQualityCheck[],
   options: {
+    sourceId?: string | null;
+    fallbackSourceId?: string | null;
     sourceTimestampMs?: number | null;
     sourceAgeMs?: number | null;
     dataQualityPct?: number | null;
     confidencePct?: number | null;
+    voteWeightPct?: number;
+    evidenceTrack?: 'OPTIONS' | 'FUTURES_PROXY';
+    sourceQuorumRequired?: number;
+    usedSourceIds?: readonly string[];
+    proxyAggregate?: MemberFiveProxyAggregate;
   } = {}
 ): CouncilMemberVote {
   return {
     ...member,
     vote,
+    voteWeightPct: options.voteWeightPct ?? 100,
+    ...(options.evidenceTrack ? { evidenceTrack: options.evidenceTrack } : {}),
+    ...(options.sourceQuorumRequired !== undefined
+      ? { sourceQuorumRequired: options.sourceQuorumRequired }
+      : {}),
+    sourceId: options.sourceId ?? null,
+    fallbackSourceId: options.fallbackSourceId ?? null,
+    healthySourceCount: null,
+    sourceChecks: [],
+    ...(options.usedSourceIds ? { usedSourceIds: options.usedSourceIds } : {}),
+    ...(options.proxyAggregate ? { proxyAggregate: options.proxyAggregate } : {}),
     rationaleFa,
     sourceTimestampMs: options.sourceTimestampMs ?? null,
     sourceAgeMs: options.sourceAgeMs ?? null,
@@ -873,631 +1032,425 @@ function evaluateDerivatives(
 function evaluateOptions(
   member: CouncilMemberDefinition,
   options: CouncilOptionsData | null | undefined,
-  nowMs: number
+  nowMs: number,
+  pair?: string,
 ): CouncilMemberVote {
+  const pairMatches = pair === undefined || (
+    options?.pair === pair &&
+    options.asset === getFreqtradePairBaseAsset(pair)
+  );
+  const asset = getFreqtradePairBaseAsset(pair ?? options?.pair ?? '') ?? options?.asset ?? 'ETH';
+  const thresholds = getCouncilOptionsThresholds(asset);
   const sourceFreshness = options
-    ? freshTimestamp(options.timestampMs, options.ageMs, nowMs, MAX_OPTIONS_AGE_MS)
+    ? freshTimestamp(options.timestampMs, options.ageMs, nowMs, thresholds?.maxAgeMs ?? MAX_OPTIONS_AGE_MS)
     : null;
-  const valid = !!options &&
+  const valid = pairMatches && !!options && thresholds !== null &&
     options.status === 'LIVE' &&
     sourceFreshness !== null &&
     isFiniteNumber(options.qualityPct) &&
     options.qualityPct >= 80 &&
     options.qualityPct <= 100 &&
     isFiniteNumber(options.contractsCount) &&
-    options.contractsCount >= 20 &&
+    options.contractsCount >= thresholds.minimumContracts &&
     typeof options.provider === 'string' &&
     options.provider.length > 0 &&
     isFiniteNumber(options.impliedVolatilityPct) &&
-    options.impliedVolatilityPct >= 0 &&
+    options.impliedVolatilityPct > 0 &&
     isFiniteNumber(options.putCallRatio) &&
     options.putCallRatio > 0 &&
+    isFiniteNumber(options.callOpenInterest) &&
+    options.callOpenInterest > 0 &&
+    isFiniteNumber(options.putOpenInterest) &&
+    options.putOpenInterest > 0 &&
+    Math.abs(options.putCallRatio - options.putOpenInterest / options.callOpenInterest) <=
+      Math.max(0.01, options.putCallRatio * 0.02) &&
+    isFiniteNumber(options.callContractsCount) &&
+    options.callContractsCount >= thresholds.minimumContractsPerSide &&
+    isFiniteNumber(options.putContractsCount) &&
+    options.putContractsCount >= thresholds.minimumContractsPerSide &&
+    isFiniteNumber(options.bidAskValidatedContracts) &&
+    options.bidAskValidatedContracts >= options.contractsCount &&
+    isFiniteNumber(options.bidAskSizeValidatedContracts) &&
+    options.bidAskSizeValidatedContracts >= thresholds.minimumSizedOrderBooks &&
+    isFiniteNumber(options.medianBidAskSpreadPct) &&
+    options.medianBidAskSpreadPct >= 0 &&
+    options.medianBidAskSpreadPct <= 20 &&
+    isFiniteNumber(options.volume24h) &&
+    options.volume24h > 0 &&
+    isFiniteNumber(options.underlyingPrice) &&
+    options.underlyingPrice > 0 &&
     isFiniteNumber(options.expiryTimestampMs) &&
     options.expiryTimestampMs > nowMs &&
     options.expiryTimestampMs <= 8_640_000_000_000_000 &&
     isFiniteNumber(options.strikePrice) &&
     options.strikePrice > 0 &&
-    isFiniteNumber(options.skewPct);
+    (options.skewPct === null || isFiniteNumber(options.skewPct));
   const checks = [
+    { labelFa: 'تطبیق جفت‌ارز', passed: pairMatches, detailFa: pairMatches ? `دادهٔ اختیار برای ${pair ?? options?.pair ?? 'جفت نامشخص'} است.` : `دادهٔ جفت ${options?.pair ?? 'نامشخص'} برای ${pair} رد شد.` },
     { labelFa: 'فید اختیار معامله', passed: !!options && options.status === 'LIVE', detailFa: options ? `${options.provider ?? 'منبع نامشخص'}؛ وضعیت: ${options.status}` : 'فید اختیار معامله به سیستم متصل نیست.' },
-    { labelFa: 'تازگی و کیفیت منبع', passed: sourceFreshness !== null && !!options && isFiniteNumber(options.qualityPct) && options.qualityPct >= 80 && isFiniteNumber(options.contractsCount) && options.contractsCount >= 20, detailFa: sourceFreshness && options ? `${Math.round(sourceFreshness.ageMs)}ms؛ کیفیت ${options.qualityPct}/100؛ قرارداد معتبر ${options.contractsCount ?? 0}` : 'زمان/کیفیت معتبر برای منبع موجود نیست.' },
-    { labelFa: 'نوسان ضمنی', passed: !!options && isFiniteNumber(options.impliedVolatilityPct) && options.impliedVolatilityPct >= 0, detailFa: options && isFiniteNumber(options.impliedVolatilityPct) ? `IV: ${options.impliedVolatilityPct}%` : 'IV معتبر موجود نیست.' },
-    { labelFa: 'Put/Call معتبر', passed: !!options && isFiniteNumber(options.putCallRatio) && options.putCallRatio > 0, detailFa: options && isFiniteNumber(options.putCallRatio) ? `Put/Call: ${options.putCallRatio}` : 'نسبت معتبر Put/Call موجود نیست.' },
-    { labelFa: 'سررسید، Strike و Skew', passed: !!options && isFiniteNumber(options.expiryTimestampMs) && options.expiryTimestampMs > nowMs && isFiniteNumber(options.strikePrice) && options.strikePrice > 0 && isFiniteNumber(options.skewPct), detailFa: options && isFiniteNumber(options.expiryTimestampMs) && isFiniteNumber(options.strikePrice) && isFiniteNumber(options.skewPct) ? `سررسید ${new Date(options.expiryTimestampMs).toISOString()}؛ Strike ${options.strikePrice}؛ Skew ${options.skewPct}%` : 'سررسید/Strike/Skew معتبر موجود نیست.' },
+    { labelFa: 'تازگی و کیفیت منبع', passed: sourceFreshness !== null && !!options && thresholds !== null && isFiniteNumber(options.qualityPct) && options.qualityPct >= 80 && isFiniteNumber(options.contractsCount) && options.contractsCount >= thresholds.minimumContracts, detailFa: sourceFreshness && options && thresholds ? `${Math.round(sourceFreshness.ageMs)}ms؛ کیفیت ${options.qualityPct}/100؛ قرارداد معتبر ${options.contractsCount ?? 0}/${thresholds.minimumContracts} حداقل` : 'زمان/کیفیت معتبر برای منبع موجود نیست.' },
+    { labelFa: 'OI، نقدشوندگی و قیمت زیرین', passed: !!options && thresholds !== null && isFiniteNumber(options.callOpenInterest) && options.callOpenInterest > 0 && isFiniteNumber(options.putOpenInterest) && options.putOpenInterest > 0 && isFiniteNumber(options.callContractsCount) && options.callContractsCount >= thresholds.minimumContractsPerSide && isFiniteNumber(options.putContractsCount) && options.putContractsCount >= thresholds.minimumContractsPerSide && isFiniteNumber(options.bidAskValidatedContracts) && options.bidAskValidatedContracts >= (options.contractsCount ?? Number.POSITIVE_INFINITY) && isFiniteNumber(options.bidAskSizeValidatedContracts) && options.bidAskSizeValidatedContracts >= thresholds.minimumSizedOrderBooks && isFiniteNumber(options.medianBidAskSpreadPct) && options.medianBidAskSpreadPct >= 0 && options.medianBidAskSpreadPct <= 20 && isFiniteNumber(options.volume24h) && options.volume24h > 0 && isFiniteNumber(options.underlyingPrice) && options.underlyingPrice > 0, detailFa: 'OI دوطرفه، bid/ask، اندازهٔ سفارش، اسپرد، حجم و قیمت زیرین باید معتبر باشند.' },
+    { labelFa: 'سررسید، Strike و Skew', passed: !!options && isFiniteNumber(options.expiryTimestampMs) && options.expiryTimestampMs > nowMs && isFiniteNumber(options.strikePrice) && options.strikePrice > 0 && (options.skewPct === null || isFiniteNumber(options.skewPct)), detailFa: options && isFiniteNumber(options.expiryTimestampMs) && isFiniteNumber(options.strikePrice) ? `سررسید ${new Date(options.expiryTimestampMs).toISOString()}؛ Strike ${options.strikePrice}؛ Skew ${options.skewPct ?? 'ناموجود'}%` : 'سررسید/Strike معتبر موجود نیست.' },
   ];
-  if (!valid || !options || !sourceFreshness || !isFiniteNumber(options.putCallRatio) || !isFiniteNumber(options.impliedVolatilityPct)) {
+  const direction = options
+    ? getOptionsDirectionalScore(options.putCallRatio, options.skewPct)
+    : null;
+  if (!valid || !options || !sourceFreshness || direction === null) {
     return abstain(member, 'داده تازه و معتبر IV، Put/Call، Strike و سررسید اختیار معامله کامل نیست؛ عضو از ساختن تحلیل خودداری کرد.', checks, sourceFreshness?.timestampMs, sourceFreshness?.ageMs);
   }
 
-  const vote: CouncilVote = options.putCallRatio > 1.2
-    ? 'SHORT'
-    : options.putCallRatio < 0.8
-      ? 'LONG'
-      : 'NEUTRAL';
+  const vote: CouncilVote = direction < 0 ? 'SHORT' : direction > 0 ? 'LONG' : 'NEUTRAL';
   return createVote(
     member,
     vote,
-    `رأی مبتنی بر نسبت OI اختیار فروش به خرید (${options.putCallRatio.toFixed(2)}) از ${options.provider ?? 'منبع نامشخص'} است؛ IV ${options.impliedVolatilityPct}%، Skew ${options.skewPct}% و ${options.contractsCount ?? 'تعداد نامشخص'} قرارداد معتبر ثبت شد. نسبت اختیارها ممکن است پوشش ریسک باشد و به‌تنهایی اثبات جهت نیست.`,
+    `رأی Options از OI put/call=${options.putCallRatio.toFixed(2)} و IV=${options.impliedVolatilityPct}%${options.skewPct === null ? '' : ` با skew=${options.skewPct}%`} برای ${options.contractsCount ?? 'تعداد نامشخص'} قرارداد با قیمت زیرین ${options.underlyingPrice} گرفته شد؛ در صورت تعارض جهت OI و skew، امتیاز آن منبع خنثی می‌شود.`,
     checks,
     {
       sourceTimestampMs: sourceFreshness.timestampMs,
       sourceAgeMs: sourceFreshness.ageMs,
       dataQualityPct: options.qualityPct,
-      confidencePct: confidenceForStrength(Math.min(25, Math.abs(options.putCallRatio - 1) * 50)),
+      confidencePct: confidenceForStrength(Math.min(25, Math.abs(direction) * 20)),
     }
   );
 }
 
 function evaluateOnChain(
   member: CouncilMemberDefinition,
-  macro: CouncilMacroContext | null | undefined,
   nowMs: number,
   directWhaleFlow?: CouncilWhaleFlowData,
-  verifiedEvidenceOutput?: Member6VerifiedCandidate[],
+  pair?: string,
 ): CouncilMemberVote {
-  const assetSymbol = directWhaleFlow?.assetSymbol?.toUpperCase() ?? 'BTC';
-  const freshness = directWhaleFlow
-    ? freshTimestamp(directWhaleFlow.timestampMs, directWhaleFlow.ageMs, nowMs, MAX_PUBLIC_ONCHAIN_AGE_MS)
-    : null;
-  const eligibleTransfers = (Array.isArray(directWhaleFlow?.largeTransfers) ? directWhaleFlow.largeTransfers : [])
-    .filter((transfer) =>
-      isRecord(transfer) &&
+  if (pair !== undefined && directWhaleFlow && directWhaleFlow.pair !== pair) {
+    return abstain(
+      member,
+      `دادهٔ آن‌چین برای ${directWhaleFlow.pair ?? 'جفت نامشخص'} است و برای ${pair} قابل استفاده نیست.`,
+      [{
+        labelFa: 'تطبیق جفت‌ارز و شبکه',
+        passed: false,
+        detailFa: `انتظار ${pair}؛ دریافت ${directWhaleFlow.pair ?? 'دادهٔ بدون جفت'}.`,
+      }],
+      directWhaleFlow.timestampMs,
+      directWhaleFlow.ageMs,
+    );
+  }
+  if (
+    pair !== undefined &&
+    directWhaleFlow &&
+    directWhaleFlow.asset !== getFreqtradePairBaseAsset(pair)
+  ) {
+    return abstain(
+      member,
+      `شبکه/دارایی دادهٔ آن‌چین با دارایی ${pair} تطبیق ندارد.`,
+      [{
+        labelFa: 'تطبیق دارایی زنجیره',
+        passed: false,
+        detailFa: `انتظار ${getFreqtradePairBaseAsset(pair)}؛ دریافت ${directWhaleFlow.asset ?? 'دارایی نامشخص'}.`,
+      }],
+      directWhaleFlow.timestampMs,
+      directWhaleFlow.ageMs,
+    );
+  }
+  if (directWhaleFlow?.largeTransfers && (pair === undefined || directWhaleFlow.pair === pair)) {
+    const expectedAsset = pair
+      ? getFreqtradePairBaseAsset(pair)
+      : directWhaleFlow.asset ?? null;
+    const maximumPublicAgeMs = MAX_PUBLIC_ONCHAIN_AGE_MS;
+    const freshness = freshTimestamp(
+      directWhaleFlow.timestampMs,
+      directWhaleFlow.ageMs,
+      nowMs,
+      maximumPublicAgeMs,
+    );
+    const expectedBlockchain: Record<string, string> = {
+      BTC: 'bitcoin',
+      ETH: 'ethereum',
+      SOL: 'solana',
+      XRP: 'xrp',
+      BNB: 'binance_smart_chain',
+    };
+    const hasForeignTransfer = expectedAsset !== null &&
+      directWhaleFlow.largeTransfers.some((transfer) => {
+        const isEthereumTokenTransfer = expectedAsset === 'ETH' &&
+          transfer.blockchain.toLowerCase() === 'ethereum' &&
+          transfer.asset.toUpperCase() !== 'ETH' &&
+          transfer.transferId?.startsWith('erc20:') === true;
+        return !isEthereumTokenTransfer &&
+          (transfer.asset.toUpperCase() !== expectedAsset ||
+            transfer.blockchain.toLowerCase() !== expectedBlockchain[expectedAsset]);
+      });
+    if (hasForeignTransfer) {
+      return abstain(
+        member,
+        `provider برای ${pair} انتقالی از شبکه یا دارایی دیگری فرستاد؛ کل شواهد رد شد.`,
+        [{
+          labelFa: 'تطبیق شبکهٔ انتقال‌ها',
+          passed: false,
+          detailFa: `شبکه و دارایی مورد انتظار ${expectedBlockchain[expectedAsset!]}/${expectedAsset}.`,
+        }],
+        directWhaleFlow.timestampMs,
+        directWhaleFlow.ageMs,
+      );
+    }
+    const eligibleTransfers = directWhaleFlow.largeTransfers.filter((transfer) =>
       transfer.confirmationStatus === 'CONFIRMED' &&
-      typeof transfer.blockchain === 'string' &&
-      typeof transfer.asset === 'string' && transfer.asset.toUpperCase() === assetSymbol &&
-      typeof transfer.transferId === 'string' && Boolean(transfer.transferId.trim()) &&
-      isFiniteNumber(transfer.amount) && transfer.amount > 0 &&
-      isFiniteNumber(transfer.timestampMs) && transfer.timestampMs <= nowMs &&
-      nowMs - transfer.timestampMs <= MAX_PUBLIC_ONCHAIN_AGE_MS
+      transfer.blockchain.length > 0 &&
+      transfer.transactionHash.length > 0 &&
+      transfer.amount > 0 &&
+      Number.isFinite(transfer.timestampMs) &&
+      transfer.timestampMs <= nowMs &&
+      nowMs - transfer.timestampMs <= maximumPublicAgeMs
     );
-  const normalizeOnChainIdentifier = (value: string): string =>
-    assetSymbol === 'SOL' ? value : value.toLowerCase();
-  const candidateIdentity = (candidate: CouncilWhaleConsensusCandidate) =>
-    `${candidate.blockchain.toLowerCase()}:${normalizeOnChainIdentifier(candidate.transactionHash)}:${normalizeOnChainIdentifier(candidate.transferId)}`;
-  const transferIdentity = (transfer: CouncilWhaleTransfer) =>
-    `${transfer.blockchain.toLowerCase()}:${normalizeOnChainIdentifier(transfer.transactionHash)}:${normalizeOnChainIdentifier(transfer.transferId ?? '')}`;
-  const verifiedCandidates = new Map<string, {
-    direction: CouncilWhaleFlowDirection;
-    amount: number;
-    estimatedUsd: number | null;
-    timestampMs: number;
-    transactionHash: string;
-    exchangeNames: string[];
-    senderAddress?: string | null;
-    receiverAddress?: string | null;
-    senderIsExchange?: boolean;
-    receiverIsExchange?: boolean;
-    senderProfile?: CouncilWhaleBehaviorProfile;
-    receiverProfile?: CouncilWhaleBehaviorProfile;
-  }>();
-  let conflictingEvidence = false;
-
-  const matrixCandidates = Array.isArray(directWhaleFlow?.consensusMatrix?.candidates)
-    ? directWhaleFlow.consensusMatrix.candidates
-    : [];
-  for (const candidate of matrixCandidates) {
-    if (
-      !isRecord(candidate) ||
-      typeof candidate.blockchain !== 'string' ||
-      typeof candidate.transactionHash !== 'string' ||
-      typeof candidate.transferId !== 'string' ||
-      !isFiniteNumber(candidate.timestampMs) ||
-      (candidate.assetSymbol !== undefined && candidate.assetSymbol.toUpperCase() !== assetSymbol) ||
-      !isFiniteNumber(candidate.amount ?? candidate.amountBtc) ||
-      !['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(candidate.direction))
-    ) continue;
-    const identity = candidateIdentity(candidate);
-    const transfer = eligibleTransfers.find((item) => transferIdentity(item) === identity);
-    const candidateAgeMs = nowMs - candidate.timestampMs;
-    const observations = Array.isArray(candidate.observations) ? candidate.observations : [];
-    const freshObservations = observations.filter((observation) =>
-      isRecord(observation) &&
-      typeof observation.sourceId === 'string' &&
-      (getWhaleSourceOperator(assetSymbol, observation.sourceId) !== null ||
-        (observation.evidenceType === 'ATTRIBUTION' &&
-          observation.sourceId === 'local-exchange-address-list')) &&
-      typeof observation.blockchain === 'string' &&
-      observation.blockchain.toLowerCase() === candidate.blockchain.toLowerCase() &&
-      typeof observation.transactionHash === 'string' &&
-      normalizeOnChainIdentifier(observation.transactionHash) === normalizeOnChainIdentifier(candidate.transactionHash) &&
-      typeof observation.transferId === 'string' &&
-      normalizeOnChainIdentifier(observation.transferId) === normalizeOnChainIdentifier(candidate.transferId) &&
-      ['TRANSFER', 'ATTRIBUTION'].includes(String(observation.evidenceType)) &&
-      (observation.evidenceType === 'TRANSFER'
-        ? observation.direction === undefined
-        : observation.sourceId === 'local-exchange-address-list' &&
-          ['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(observation.direction)) &&
-          typeof observation.exchangeName === 'string' && Boolean(observation.exchangeName.trim()) &&
-          typeof observation.exchangeAddress === 'string' && Boolean(observation.exchangeAddress.trim())) &&
-      observation.confirmationStatus === 'CONFIRMED' &&
-      isFiniteNumber(observation.timestampMs) &&
-      observation.timestampMs <= nowMs &&
-      nowMs - observation.timestampMs <= MAX_PUBLIC_ONCHAIN_AGE_MS &&
-      isFiniteNumber(observation.amount ?? observation.amountBtc) &&
-      (observation.amount ?? observation.amountBtc)! > 0
+    const identifiedTransfers = deduplicateOnChainTransfers(eligibleTransfers);
+    const confirmedTransfers = identifiedTransfers.values.filter((transfer) =>
+      Boolean(transfer.transferId?.trim())
     );
-    const sourceOperators = new Set(freshObservations.flatMap(({ sourceId }) => {
-      const operator = getWhaleSourceOperator(assetSymbol, sourceId);
-      return operator ? [operator] : [];
-    }));
-    const transferOperators = new Set(freshObservations.flatMap((observation) => {
-      if (observation.evidenceType !== 'TRANSFER') return [];
-      const operator = getWhaleSourceOperator(assetSymbol, observation.sourceId);
-      return operator ? [operator] : [];
-    }));
-    const attributionDirections = new Set(freshObservations
-      .filter((observation) => observation.evidenceType === 'ATTRIBUTION')
-      .map(({ direction }) => direction));
-    const candidateAmount = candidate.amount ?? candidate.amountBtc!;
-    const estimatedUsdMatches = assetSymbol === 'BTC' || (
-      transfer !== undefined &&
-      isFiniteNumber(candidate.estimatedUsd) &&
-      isFiniteNumber(transfer.estimatedUsd) &&
-      Math.abs(candidate.estimatedUsd - transfer.estimatedUsd) <= Math.max(1, candidate.estimatedUsd * 1e-6)
+    const nativeTransfers = confirmedTransfers.filter((transfer) =>
+      transfer.asset.toUpperCase() === expectedAsset
     );
-    const isFresh = Number.isFinite(candidate.timestampMs) &&
-      candidate.timestampMs <= nowMs &&
-      candidateAgeMs <= MAX_PUBLIC_ONCHAIN_AGE_MS;
-    const amountMatches = transfer !== undefined &&
-      Math.abs(transfer.amount - candidateAmount) <= Math.max(1e-8, candidateAmount * 1e-8) &&
-      Math.abs(transfer.timestampMs - candidate.timestampMs) <= MAX_MEMBER_6_TIMESTAMP_SKEW_MS &&
-      transfer.senderAddress === candidate.senderAddress &&
-      transfer.receiverAddress === candidate.receiverAddress &&
-      transfer.senderIsExchange === candidate.senderIsExchange &&
-      transfer.receiverIsExchange === candidate.receiverIsExchange &&
-      estimatedUsdMatches &&
-      freshObservations.every((observation) =>
-        Math.abs((observation.amount ?? observation.amountBtc!) - candidateAmount) <= Math.max(1e-8, candidateAmount * 1e-8));
-    const directionsAgree = attributionDirections.size === 1 &&
-      attributionDirections.has(candidate.direction);
-    if (!amountMatches || !directionsAgree) {
-      if (transfer && transferOperators.size >= 2 && isFresh) conflictingEvidence = true;
-      continue;
+    const tokenTransfers = expectedAsset === 'ETH'
+      ? confirmedTransfers.filter((transfer) => transfer.transferId?.startsWith('erc20:') === true)
+      : [];
+    const missingTransferIdentity = eligibleTransfers.some((transfer) =>
+      !transfer.transferId?.trim()
+    );
+    const usable = directWhaleFlow.status === 'LIVE' &&
+      freshness !== null &&
+      directWhaleFlow.coverageStatus === 'SAMPLED' &&
+      Number.isSafeInteger(directWhaleFlow.independentProviderCount) &&
+      (directWhaleFlow.independentProviderCount ?? 0) >= 2;
+    const checks = [
+      {
+        labelFa: 'اعتبار دادهٔ بلوک‌های نمونه‌برداری‌شده',
+        passed: usable,
+        detailFa: usable
+          ? confirmedTransfers.length > 0
+              ? `${nativeTransfers.length} انتقال بومی ${expectedAsset} و ${tokenTransfers.length} انتقال ERC-20 تأییدشده؛ دادهٔ خام بدون انتساب مالکیت کیف‌پول`
+            : 'نمونهٔ تازه معتبر است؛ در بلوک‌های بررسی‌شده انتقال بزرگِ واجد آستانه پیدا نشد.'
+          : directWhaleFlow.unavailableReason ?? 'تراکنش بزرگِ تأییدشده و تازه برای تحلیل جهت‌دار موجود نیست.',
+      },
+      {
+        labelFa: 'تازگی و پوشش provider',
+        passed: freshness !== null && directWhaleFlow.coverageStatus !== 'UNAVAILABLE',
+        detailFa: freshness
+          ? `${Math.round(freshness.ageMs / 60_000)} دقیقه؛ پوشش ${directWhaleFlow.coverageStatus ?? 'نامشخص'}`
+          : 'منبع قدیمی یا زمان‌نامعتبر است.',
+      },
+      {
+        labelFa: 'انتساب مالکیت یا جهت جریان',
+        passed: false,
+        detailFa: 'آدرس‌ها ناشناس‌اند؛ ورود، خروج، خرید یا فروش استنباط نمی‌شود.',
+      },
+      {
+        labelFa: 'تأیید مستقل منبع',
+        passed: (directWhaleFlow.independentProviderCount ?? 0) >= 2,
+        detailFa: `${directWhaleFlow.independentProviderCount ?? 0} منبع مستقل؛ حداقل ۲ منبع لازم است.`,
+      },
+      {
+        labelFa: 'شناسهٔ یکتای انتقال',
+        passed: !identifiedTransfers.conflictingIdentity && !missingTransferIdentity,
+        detailFa: identifiedTransfers.conflictingIdentity
+          ? 'برای یک blockchain/txid/logIndex یا vout مقادیر متناقض دریافت شد.'
+          : missingTransferIdentity
+            ? 'حداقل یک انتقال فاقد logIndex/vout پایدار است و برای رأی قابل‌شمارش نیست.'
+            : `${identifiedTransfers.duplicateCount} انتقال تکراری از چند provider حذف شد.`,
+      },
+    ];
+    const protocolPressure = expectedAsset === 'ETH' || expectedAsset === 'BNB'
+      ? evaluateOnChainProtocolPressure({
+          asset: expectedAsset,
+          nowMs,
+          flow: directWhaleFlow,
+          swaps: directWhaleFlow.protocolSwaps ?? [],
+        })
+      : null;
+    if (protocolPressure?.status === 'CONFIRMED' && protocolPressure.direction) {
+      return createVote(
+        member,
+        protocolPressure.direction,
+        `فشار ${protocolPressure.direction === 'LONG' ? 'خرید دارایی بومی' : 'فروش دارایی بومی'} در ${protocolPressure.asset}: ` +
+          `${protocolPressure.verifiedSwapCount} رویداد Swap از ${protocolPressure.candidateWalletCount} کیف‌پول نامزد؛ ` +
+          `حجم ${protocolPressure.selectedVolumeNative.toFixed(4)} ${protocolPressure.asset}، غلبهٔ ${protocolPressure.pressurePct}٪ و ` +
+          `${protocolPressure.independentProviderCount} اپراتور مستقل. ${protocolPressure.reason}`,
+        [
+          ...checks,
+          {
+            labelFa: 'فشار رفتاری مبتنی بر Swap تأییدشده',
+            passed: true,
+            detailFa: protocolPressure.reason,
+          },
+        ],
+        {
+          sourceId: directWhaleFlow.sourceId,
+          fallbackSourceId: directWhaleFlow.fallbackSourceId,
+          sourceTimestampMs: protocolPressure.observedAtMs,
+          sourceAgeMs: Math.max(0, nowMs - protocolPressure.observedAtMs),
+          dataQualityPct: directWhaleFlow.qualityPct,
+          confidencePct: Math.min(95, Math.max(50, protocolPressure.confidencePct)),
+          sourceQuorumRequired: 2,
+          usedSourceIds: protocolPressure.sourceIds,
+        },
+      );
     }
+    const flowSignal = directWhaleFlow.flowSignal;
+    const signalHasFreshEvidence = flowSignal?.status === 'CONFIRMED' &&
+      (flowSignal.direction === 'LONG' || flowSignal.direction === 'SHORT') &&
+      flowSignal.asset === expectedAsset &&
+      flowSignal.observedAtMs <= nowMs &&
+      nowMs - flowSignal.observedAtMs < MAX_PUBLIC_ONCHAIN_AGE_MS &&
+      flowSignal.requiredBaselineWindows === 288 &&
+      flowSignal.baselineWindows === flowSignal.requiredBaselineWindows &&
+      flowSignal.requiredSpikeRatio === 2 &&
+      (flowSignal.baselineMeanNative === 0
+        ? flowSignal.spikeRatio === null && flowSignal.selectedVolumeNative > 0
+        : isFiniteNumber(flowSignal.spikeRatio) && flowSignal.spikeRatio >= 2) &&
+      flowSignal.selectedVolumeNative >= ({
+        BTC: 10,
+        ETH: 100,
+        SOL: 10,
+        BNB: 5,
+        XRP: 1_000,
+      }[flowSignal.asset]) &&
+      flowSignal.independentProviderCount >= 2 &&
+      flowSignal.independentProviderCount === directWhaleFlow.independentProviderCount &&
+      new Set(flowSignal.sourceIds).size >= 2 &&
+      flowSignal.sourceIds.every((sourceId) =>
+        directWhaleFlow.independentSourceIds?.includes(sourceId)
+      ) &&
+      flowSignal.labeledTransferCount > 0;
     if (
-      sourceOperators.size < 2 ||
-      transferOperators.size < 2 ||
-      !isFresh ||
-      !transfer
-    ) continue;
-    if (verifiedCandidates.has(identity)) {
-      conflictingEvidence = true;
-      continue;
-    }
-    verifiedCandidates.set(identity, {
-      direction: candidate.direction,
-      amount: candidateAmount,
-      estimatedUsd: isFiniteNumber(candidate.estimatedUsd) ? candidate.estimatedUsd : transfer.estimatedUsd,
-      timestampMs: candidate.timestampMs,
-      transactionHash: candidate.transactionHash,
-      senderAddress: candidate.senderAddress,
-      receiverAddress: candidate.receiverAddress,
-      senderIsExchange: candidate.senderIsExchange,
-      receiverIsExchange: candidate.receiverIsExchange,
-      senderProfile: candidate.senderProfile,
-      receiverProfile: candidate.receiverProfile,
-      exchangeNames: [...new Set(freshObservations.flatMap((observation) =>
-        observation.evidenceType === 'ATTRIBUTION' &&
-        typeof observation.exchangeName === 'string' &&
-        observation.exchangeName.trim()
-          ? [observation.exchangeName.trim()]
-          : []
-      ))],
-    });
-  }
-
-  const candidates = [...verifiedCandidates.values()];
-  verifiedEvidenceOutput?.push(...candidates.map((candidate) => ({
-    direction: candidate.direction,
-    amount: candidate.amount,
-    estimatedUsd: candidate.estimatedUsd,
-    transactionHash: candidate.transactionHash,
-    exchangeNames: candidate.exchangeNames,
-  })));
-  const isValidBehaviorProfile = (profile: CouncilWhaleBehaviorProfile | undefined): profile is CouncilWhaleBehaviorProfile =>
-    isRecord(profile) &&
-    typeof profile.isWhale === 'boolean' &&
-    ['ACCUMULATOR', 'DISTRIBUTOR', 'MM', 'UNKNOWN'].includes(String(profile.behaviorTag)) &&
-    isFiniteNumber(profile.confidenceScore) &&
-    profile.confidenceScore >= 0 &&
-    profile.confidenceScore <= 1;
-  type BehaviorCandidate = (typeof candidates)[number] & {
-    voteDirection: 'LONG' | 'SHORT';
-    highConfidenceAccumulator: boolean;
-  };
-  const behaviorCandidates: BehaviorCandidate[] = [];
-  for (const candidate of candidates) {
-    if (
-      typeof candidate.senderAddress !== 'string' || !candidate.senderAddress ||
-      typeof candidate.receiverAddress !== 'string' || !candidate.receiverAddress ||
-      typeof candidate.senderIsExchange !== 'boolean' ||
-      typeof candidate.receiverIsExchange !== 'boolean' ||
-      !isValidBehaviorProfile(candidate.senderProfile) ||
-      !isValidBehaviorProfile(candidate.receiverProfile)
-    ) continue;
-    if (candidate.senderIsExchange && candidate.receiverIsExchange) continue;
-    if (
-      !candidate.senderIsExchange &&
-      candidate.receiverIsExchange &&
-      candidate.direction === 'EXCHANGE_INFLOW' &&
-      candidate.senderProfile.isWhale &&
-      candidate.senderProfile.behaviorTag === 'ACCUMULATOR'
+      usable &&
+      freshness &&
+      !identifiedTransfers.conflictingIdentity &&
+      !missingTransferIdentity &&
+      signalHasFreshEvidence &&
+      flowSignal
     ) {
-      behaviorCandidates.push({
-        ...candidate,
-        voteDirection: 'SHORT',
-        highConfidenceAccumulator: candidate.senderProfile.confidenceScore > 0.8,
-      });
-      continue;
+      const direction = flowSignal.direction as 'LONG' | 'SHORT';
+      const confidencePct = Math.min(
+        90,
+        60 + Math.round(Math.min(1, (flowSignal.spikeRatio ?? 2) / 4) * 30),
+      );
+      return createVote(
+        member,
+        direction,
+        direction === 'SHORT'
+          ? `ورود خالص ${flowSignal.selectedVolumeNative.toFixed(4)} ${expectedAsset} به کیف‌پول‌های صرافیِ برچسب‌خورده، با تأیید ${flowSignal.sourceIds.length} منبع مستقل و جهش ${flowSignal.spikeRatio === null ? 'نامحدود نسبت به baseline صفر' : `${flowSignal.spikeRatio.toFixed(2)}× میانگین ۲۴ساعته`}، رأی SHORT ایجاد کرد.`
+          : `خروج خالص ${flowSignal.selectedVolumeNative.toFixed(4)} ${expectedAsset} از کیف‌پول‌های صرافیِ برچسب‌خورده، با تأیید ${flowSignal.sourceIds.length} منبع مستقل و جهش ${flowSignal.spikeRatio === null ? 'نامحدود نسبت به baseline صفر' : `${flowSignal.spikeRatio.toFixed(2)}× میانگین ۲۴ساعته`}، رأی LONG ایجاد کرد.`,
+        [
+          {
+            labelFa: 'برچسب آدرس صرافی',
+            passed: true,
+            detailFa: `${flowSignal.labeledTransferCount} انتقال برچسب‌خورده با منبع و تاریخ بازبینی معتبر.`,
+          },
+          {
+            labelFa: 'شوک حجم خالص پنج‌دقیقه‌ای',
+            passed: true,
+            detailFa: `${flowSignal.selectedVolumeNative} ${expectedAsset} در برابر میانگین ${flowSignal.baselineMeanNative}؛ حداقل ۲× لازم است.`,
+          },
+          {
+            labelFa: 'baseline پیوسته ۲۴ساعته و منابع مستقل',
+            passed: true,
+            detailFa: `${flowSignal.baselineWindows}/288 پنجره و ${flowSignal.sourceIds.length} منبع: ${flowSignal.sourceIds.join(', ')}.`,
+          },
+        ],
+        {
+          sourceId: flowSignal.sourceIds[0],
+          fallbackSourceId: flowSignal.sourceIds[1] ?? directWhaleFlow.fallbackSourceId,
+          sourceTimestampMs: flowSignal.observedAtMs,
+          sourceAgeMs: nowMs - flowSignal.observedAtMs,
+          dataQualityPct: 90,
+          confidencePct,
+          voteWeightPct: 50,
+          sourceQuorumRequired: 2,
+          usedSourceIds: flowSignal.sourceIds,
+        },
+      );
     }
-    if (
-      candidate.senderIsExchange &&
-      !candidate.receiverIsExchange &&
-      candidate.direction === 'EXCHANGE_OUTFLOW' &&
-      candidate.receiverProfile.isWhale &&
-      candidate.receiverProfile.behaviorTag === 'ACCUMULATOR'
-    ) {
-      behaviorCandidates.push({
-        ...candidate,
-        voteDirection: 'LONG',
-        highConfidenceAccumulator: candidate.receiverProfile.confidenceScore > 0.8,
-      });
+    if (!usable || !freshness || identifiedTransfers.conflictingIdentity || missingTransferIdentity) {
+      return abstain(member, directWhaleFlow.unavailableReason ?? 'شواهد آن‌چین تازه و تأییدشده برای رأی معتبر کافی نیست.', checks, freshness?.timestampMs, freshness?.ageMs);
     }
+    if (confirmedTransfers.length === 0) {
+      return abstain(
+        member,
+        'در بلوک‌های تازه و نمونه‌برداری‌شده انتقال بزرگِ واجد آستانه مشاهده نشد؛ این فقط نبود رویداد نهنگی در نمونهٔ محدود است، نه اثبات آرامش کل شبکه یا نبود فشار فروش.',
+        checks,
+        freshness.timestampMs,
+        freshness.ageMs,
+      );
+    }
+    return abstain(
+      member,
+      `در ${confirmedTransfers.length} تراکنش بزرگ ${confirmedTransfers.map(({ blockchain, asset, amount, estimatedUsd }) =>
+        `${blockchain} ${amount} ${asset}${estimatedUsd === null ? '' : ` (حدود $${Math.round(estimatedUsd).toLocaleString('en-US')})`}`
+      ).join('، ')} مشاهده شد، اما دادهٔ خامِ بدون تطبیق CEX Watchlist جهت معامله را ثابت نمی‌کند؛ عضو ۶ ممتنع می‌ماند.`,
+      checks,
+      freshness.timestampMs,
+      freshness.ageMs,
+    );
   }
-  const longVolume = behaviorCandidates
-    .filter(({ voteDirection }) => voteDirection === 'LONG')
-    .reduce<number>((sum, candidate) =>
-      sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
-  const shortVolume = behaviorCandidates
-    .filter(({ voteDirection }) => voteDirection === 'SHORT')
-    .reduce<number>((sum, candidate) =>
-      sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
-  const totalVolume = longVolume + shortVolume;
-  const netFlow = shortVolume - longVolume;
-  const bias = totalVolume > 0 ? Math.abs(netFlow) / totalVolume : 0;
-  const feedValid = directWhaleFlow?.status === 'LIVE' &&
-    directWhaleFlow.qualityPct >= 80 &&
-    (directWhaleFlow.coverageStatus === 'SAMPLED' || directWhaleFlow.coverageStatus === 'COMPLETE');
-  const quorumValid = behaviorCandidates.length > 0 && !conflictingEvidence;
-  const minimumVolume = assetSymbol === 'BTC' ? MEMBER_6_MIN_WHALE_VOLUME_BTC : MEMBER_6_MIN_WHALE_VOLUME_USD;
-  const highConfidenceAccumulatorPresent = behaviorCandidates.some(({ highConfidenceAccumulator }) =>
-    highConfidenceAccumulator);
-  const effectiveMinimumVolume = highConfidenceAccumulatorPresent
-    ? minimumVolume / 4
-    : minimumVolume;
-  const minimumNetFlow = assetSymbol === 'BTC' ? MEMBER_6_MIN_NET_FLOW_BTC : MEMBER_6_MIN_NET_FLOW_USD;
-  const effectiveMinimumNetFlow = highConfidenceAccumulatorPresent
-    ? minimumNetFlow / 4
-    : minimumNetFlow;
-  const volumeValid = totalVolume >= effectiveMinimumVolume &&
-    Math.abs(netFlow) >= effectiveMinimumNetFlow;
-  const biasValid = bias >= MEMBER_6_MIN_DIRECTIONAL_BIAS;
-  const channelOneEligible = feedValid && freshness !== null &&
-    quorumValid && volumeValid && biasValid;
-  const channelOneDirection = channelOneEligible
-    ? netFlow < 0 ? 'LONG' as const : 'SHORT' as const
-    : null;
-  const feeMetrics = directWhaleFlow?.networkMetrics;
-  const feeSourceIds = typeof feeMetrics?.fee_source_ids === 'string'
-    ? feeMetrics.fee_source_ids.split(',').map((sourceId) => sourceId.trim()).filter(Boolean)
-    : [];
-  const feeOperators = new Set(feeSourceIds.flatMap((sourceId) => {
-    const operator = getWhaleSourceOperator(assetSymbol, sourceId);
-    return operator ? [operator] : [];
-  }));
-  const baselineSourceIds = typeof feeMetrics?.fee_baseline_source_ids === 'string'
-    ? feeMetrics.fee_baseline_source_ids.split(',').map((sourceId) => sourceId.trim()).filter(Boolean)
-    : [];
-  const baselineOperators = new Set(baselineSourceIds.flatMap((sourceId) => {
-    const operator = getWhaleSourceOperator(assetSymbol, sourceId);
-    return operator ? [operator] : [];
-  }));
-  const feeObservedAtMs = feeMetrics?.fee_observed_at_ms;
-  const feeAgeMs = isFiniteNumber(feeObservedAtMs) ? nowMs - feeObservedAtMs : Number.NaN;
-  const expectedFeeMetric = assetSymbol === 'BTC'
-    ? 'mempool_median_fee_rate'
-    : assetSymbol === 'ETH' || assetSymbol === 'BNB'
-      ? 'priority_fee_gwei'
-      : assetSymbol === 'SOL'
-        ? 'prioritization_fee_micro_lamports'
-        : assetSymbol === 'XRP' ? 'validated_base_fee_xrp' : null;
-  const feeQuorumValid = feeMetrics?.fee_status === 'QUORUM' &&
-    feeMetrics.fee_metric === expectedFeeMetric &&
-    isFiniteNumber(feeMetrics.fee_value) && feeMetrics.fee_value >= 0 &&
-    isFiniteNumber(feeObservedAtMs) &&
-    isFiniteNumber(feeAgeMs) && feeAgeMs >= 0 && feeAgeMs <= MAX_PUBLIC_ONCHAIN_AGE_MS &&
-    feeSourceIds.length === new Set(feeSourceIds).size &&
-    feeOperators.size >= 2 &&
-    feeOperators.size === feeSourceIds.length &&
-    feeMetrics.fee_operator_count === feeOperators.size;
-  const baselineSpanMs = feeMetrics?.fee_baseline_span_ms;
-  const baselineSampleCount = feeMetrics?.fee_baseline_sample_count;
-  const feeSpikeRatio = feeMetrics?.fee_spike_ratio;
-  const feeSpikeEligible = feeQuorumValid &&
-    feeMetrics?.fee_spike_status === 'SPIKE' &&
-    isFiniteNumber(feeMetrics?.fee_value) && feeMetrics.fee_value > 0 &&
-    isFiniteNumber(feeMetrics?.fee_baseline_value) && feeMetrics.fee_baseline_value > 0 &&
-    isFiniteNumber(feeSpikeRatio) && feeSpikeRatio >= 2 &&
-    isFiniteNumber(baselineSampleCount) && baselineSampleCount >= 10 &&
-    isFiniteNumber(baselineSpanMs) && baselineSpanMs >= 10 * 60_000 &&
-    feeOperators.size >= 2 &&
-    feeMetrics.fee_operator_count === feeOperators.size &&
-    baselineOperators.size === feeOperators.size &&
-    [...feeOperators].every((operator) => baselineOperators.has(operator));
-
-  const expectedBlockchain: Record<string, string> = {
-    BTC: 'bitcoin',
-    ETH: 'ethereum',
-    BNB: 'binance-smart-chain',
-    SOL: 'solana',
-    XRP: 'xrpledger',
-  };
-  const macroObservations = Array.isArray(directWhaleFlow?.aggregateExchangeFlow?.observations)
-    ? directWhaleFlow.aggregateExchangeFlow.observations
-    : [];
-  const verifiedMacroObservations: CouncilAggregateExchangeFlowObservation[] = [];
-  const macroIdentities = new Set<string>();
-  let conflictingMacroEvidence = false;
-  for (const observation of macroObservations) {
-    if (!isRecord(observation) ||
-        observation.blockchain !== expectedBlockchain[assetSymbol] ||
-        typeof observation.transactionHash !== 'string' ||
-        typeof observation.transferId !== 'string' ||
-        !isFiniteNumber(observation.timestampMs) ||
-        observation.timestampMs > nowMs ||
-        nowMs - observation.timestampMs > MAX_PUBLIC_ONCHAIN_AGE_MS ||
-        !['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(observation.direction)) ||
-        !isFiniteNumber(observation.amount) || observation.amount <= 0 ||
-        !isFiniteNumber(observation.estimatedUsd) || observation.estimatedUsd <= 0 ||
-        typeof observation.exchangeName !== 'string' || !observation.exchangeName.trim() ||
-        typeof observation.exchangeAddress !== 'string' || !observation.exchangeAddress.trim() ||
-        observation.attributionSourceId !== 'local-exchange-address-list' ||
-        !Array.isArray(observation.sourceIds) || observation.sourceIds.length < 2 ||
-        observation.sourceIds.some((sourceId) => typeof sourceId !== 'string' || !sourceId.trim())) continue;
-    const sourceIds = observation.sourceIds as string[];
-    const operators = sourceIds.flatMap((sourceId) => {
-      const operator = getWhaleSourceOperator(assetSymbol, sourceId);
-      return operator ? [operator] : [];
-    });
-    if (new Set(sourceIds).size !== sourceIds.length ||
-        operators.length !== sourceIds.length ||
-        new Set(operators).size !== operators.length ||
-        operators.length < 2) continue;
-    const identity = `${observation.blockchain}:${normalizeOnChainIdentifier(observation.transactionHash)}:${normalizeOnChainIdentifier(observation.transferId)}`;
-    if (macroIdentities.has(identity)) {
-      conflictingMacroEvidence = true;
-      continue;
+  if (directWhaleFlow) {
+    const freshness = freshTimestamp(
+      directWhaleFlow.timestampMs,
+      directWhaleFlow.ageMs,
+      nowMs,
+      MAX_ONCHAIN_AGE_MS,
+    );
+    const valid = directWhaleFlow.status === 'LIVE' &&
+      freshness !== null &&
+      (directWhaleFlow.independentProviderCount ?? 0) >= 2 &&
+      directWhaleFlow.qualityPct >= 80 &&
+      isFiniteNumber(directWhaleFlow.netExchangeFlowBtc) &&
+      directWhaleFlow.transactionCount > 0;
+    const checks = [
+      {
+        labelFa: 'برچسب‌گذاری جریان صرافی',
+        passed: valid,
+        detailFa: valid
+          ? `${directWhaleFlow.provider}؛ ${directWhaleFlow.transactionCount} انتقال برچسب‌خورده`
+          : `${directWhaleFlow.provider}؛ داده/انتساب کافی برای رأی معتبر نیست.`,
+      },
+      {
+        labelFa: 'تازگی داده زنجیره‌ای',
+        passed: freshness !== null,
+        detailFa: freshness ? `${Math.round(freshness.ageMs / 60_000)} دقیقه` : 'زمان منبع کهنه یا نامعتبر است.',
+      },
+    ];
+    if (!valid || !freshness || !isFiniteNumber(directWhaleFlow.netExchangeFlowBtc)) {
+      return abstain(member, 'بدون جریان تازه با تأیید حداقل دو منبع مستقل، رأی آن‌چین صادر نمی‌شود.', checks, freshness?.timestampMs, freshness?.ageMs);
     }
-    macroIdentities.add(identity);
-    verifiedMacroObservations.push(observation as CouncilAggregateExchangeFlowObservation);
-  }
-  const macroInflow = verifiedMacroObservations
-    .filter(({ direction }) => direction === 'EXCHANGE_INFLOW')
-    .reduce((sum, observation) =>
-      sum + (assetSymbol === 'BTC' ? observation.amount : observation.estimatedUsd), 0);
-  const macroOutflow = verifiedMacroObservations
-    .filter(({ direction }) => direction === 'EXCHANGE_OUTFLOW')
-    .reduce((sum, observation) =>
-      sum + (assetSymbol === 'BTC' ? observation.amount : observation.estimatedUsd), 0);
-  const macroTotalVolume = macroInflow + macroOutflow;
-  const macroNetFlow = macroInflow - macroOutflow;
-  const macroBias = macroTotalVolume > 0 ? Math.abs(macroNetFlow) / macroTotalVolume : 0;
-  const macroTimestampMs = verifiedMacroObservations.length > 0
-    ? Math.max(...verifiedMacroObservations.map(({ timestampMs }) => timestampMs))
-    : null;
-  const macroFreshness = macroTimestampMs === null
-    ? null
-    : freshTimestamp(macroTimestampMs, nowMs - macroTimestampMs, nowMs, MAX_PUBLIC_ONCHAIN_AGE_MS);
-  const macroQuorumValid = verifiedMacroObservations.length > 0 &&
-    !conflictingMacroEvidence && macroFreshness !== null;
-  const macroVolumeValid = macroTotalVolume >= minimumVolume &&
-    Math.abs(macroNetFlow) >= minimumNetFlow;
-  const macroBiasValid = macroBias >= MEMBER_6_MIN_DIRECTIONAL_BIAS;
-  const channelTwoEligible = feedValid && macroQuorumValid &&
-    macroVolumeValid && macroBiasValid && feeSpikeEligible;
-  const channelTwoDirection = channelTwoEligible
-    ? macroNetFlow < 0 ? 'LONG' as const : 'SHORT' as const
-    : null;
-  verifiedEvidenceOutput?.push(...verifiedMacroObservations.map((observation) => ({
-    direction: observation.direction,
-    amount: observation.amount,
-    estimatedUsd: observation.estimatedUsd,
-    transactionHash: observation.transactionHash,
-    exchangeNames: [observation.exchangeName],
-  })));
 
-  const channelsConflict = channelOneDirection !== null &&
-    channelTwoDirection !== null &&
-    channelOneDirection !== channelTwoDirection;
-  const selectedDirection = channelsConflict
-    ? null
-    : channelOneDirection ?? channelTwoDirection;
-  const selectedBias = channelOneDirection ? bias : macroBias;
-  const selectedTimestampMs = Math.max(
-    ...(channelOneDirection && behaviorCandidates.length > 0
-      ? behaviorCandidates.map(({ timestampMs }) => timestampMs)
-      : []),
-    ...(channelTwoDirection && macroTimestampMs !== null ? [macroTimestampMs] : []),
-  );
-  const sourceTimestampMs = Number.isFinite(selectedTimestampMs)
-    ? selectedTimestampMs
-    : freshness?.timestampMs ?? macroFreshness?.timestampMs ?? null;
-  const sourceAgeMs = sourceTimestampMs === null ? null : nowMs - sourceTimestampMs;
-  const checks = [
-    {
-      labelFa: 'تازگی دادهٔ جریان',
-      passed: feedValid && (freshness !== null || macroFreshness !== null),
-      detailFa: freshness || macroFreshness
-        ? `${Math.round(Math.min(freshness?.ageMs ?? Number.POSITIVE_INFINITY, macroFreshness?.ageMs ?? Number.POSITIVE_INFINITY) / 60_000)} دقیقه؛ منبع ${directWhaleFlow?.provider ?? 'نامشخص'}`
-        : directWhaleFlow?.unavailableReason ?? 'فید جریان تازه و معتبر موجود نیست.',
-    },
-    {
-      labelFa: 'کانال ۱: رفتار نهنگ و انتساب صرافی',
-      passed: channelOneEligible,
-      detailFa: conflictingEvidence
-        ? 'هویت تکراری یا جهت/حجم متناقض در ماتریس اجماع مشاهده شد.'
-        : behaviorCandidates.length > 0
-          ? `${behaviorCandidates.length} انتقالِ نهنگ accumulator با پروفایل و quorum معتبر؛ حدنصاب حجم ${effectiveMinimumVolume} و حدنصاب خالص ${effectiveMinimumNetFlow}؛ رأی مستقل از telemetry کارمزد است.`
-          : directWhaleFlow?.unavailableReason ??
-            'هیچ انتقال تازه با پروفایل accumulator، انتساب صرافی و quorum مستقل در دسترس نیست.',
-    },
-    {
-      labelFa: 'کانال ۱: حدنصاب حجم و سوگیری',
-      passed: volumeValid && biasValid,
-      detailFa: assetSymbol === 'BTC'
-        ? `${totalVolume.toFixed(2)} BTC کل؛ خالص ${netFlow.toFixed(2)} BTC؛ سوگیری ${(bias * 100).toFixed(0)}٪.`
-        : `${assetSymbol}: $${totalVolume.toFixed(0)} کل؛ خالص $${netFlow.toFixed(0)}؛ سوگیری ${(bias * 100).toFixed(0)}٪.`,
-    },
-    {
-      labelFa: 'کانال ۲: netflow تجمیعی مستقل از ماتریس نامزدها',
-      passed: channelTwoEligible,
-      detailFa: conflictingMacroEvidence
-        ? 'هویت تکراری در جریان تجمیعی تشخیص داده شد؛ کانال ۲ رد شد.'
-        : `${verifiedMacroObservations.length} انتقال تجمیعی؛ حجم ${assetSymbol === 'BTC' ? `${macroTotalVolume.toFixed(2)} BTC` : `$${macroTotalVolume.toFixed(0)}`}؛ خالص ${assetSymbol === 'BTC' ? `${macroNetFlow.toFixed(2)} BTC` : `$${macroNetFlow.toFixed(0)}`}؛ سوگیری ${(macroBias * 100).toFixed(0)}٪. برای رأی، جهش کارمزد چنداپراتوری هم لازم است.`,
-    },
-    {
-      labelFa: 'کارمزد چندمنبعی / شرط کانال ۲',
-      passed: feeQuorumValid,
-      detailFa: !feeQuorumValid
-        ? 'کارمزد تازه با quorum دو اپراتور مستقل احراز نشد؛ کانال ۲ بسته است، اما کانال ۱ می‌تواند مستقل رأی دهد.'
-        : feeSpikeEligible
-          ? `مقدار ${feeMetrics.fee_value} ${String(feeMetrics.fee_unit ?? '')} و جهش ${feeSpikeRatio!.toFixed(2)} برابری از ${feeOperators.size} اپراتور مستقل تأیید شد.`
-          : `مقدار ${feeMetrics.fee_value} ${String(feeMetrics.fee_unit ?? '')} از ${feeOperators.size} اپراتور مستقل تأیید شد، اما baseline برای جهش واجد شرایط نیست؛ کانال ۲ رأی نمی‌دهد.`,
-    },
-  ];
-  if (!selectedDirection || channelsConflict) {
-    const reasons = [
-      channelsConflict
-        ? `کانال ۱ (${channelOneDirection}) و کانال ۲ (${channelTwoDirection}) جهت‌های متناقض صادر کردند.`
-        : null,
-      !feedValid ? 'فید آن‌چین موجود یا باکیفیت کافی نیست.' : null,
-      !channelOneEligible && !channelTwoEligible
-        ? directWhaleFlow?.unavailableReason ?? null
-        : null,
-      !channelOneEligible
-        ? conflictingEvidence
-          ? 'کانال ۱ شواهد اجماع متناقض یا تکراری دارد.'
-          : !quorumValid
-            ? 'کانال ۱ انتقال تازه با پروفایل رفتاری معتبر، انتساب صرافی و quorum مستقل ندارد.'
-            : !volumeValid || !biasValid
-              ? 'کانال ۱ به حدنصاب حجم، خالص جریان یا سوگیری جهت‌دار نرسید.'
-              : null
-        : null,
-      !channelTwoEligible
-        ? conflictingMacroEvidence
-          ? 'کانال ۲ شواهد تجمیعی تکراری یا متناقض دارد.'
-          : !macroQuorumValid
-            ? 'کانال ۲ جریان تجمیعی با quorum دو اپراتور مستقل و تازگی کافی ندارد.'
-            : !macroVolumeValid || !macroBiasValid
-              ? 'کانال ۲ به حدنصاب حجم، خالص جریان یا سوگیری جهت‌دار نرسید.'
-              : !feeQuorumValid
-                ? 'کانال ۲ به telemetry کارمزد تازه با quorum حداقل دو اپراتور مستقل نیاز دارد.'
-                : 'کانال ۲ جهش کارمزد معتبر با baseline کافی ندارد.'
-        : null,
-    ].filter((reason): reason is string => reason !== null);
-    const reason = `${reasons.join(' ')} عضو ششم abstain می‌کند.`;
-    return abstain(member, reason, checks, sourceTimestampMs, sourceAgeMs);
+    const netflow = directWhaleFlow.netExchangeFlowBtc;
+    return abstain(
+      member,
+      `در دادهٔ ${directWhaleFlow.provider} جریان خالص منتسب به صرافی ${netflow.toFixed(4)} BTC دیده شد، اما این مسیر شواهد جهت‌دار مستقل و تأییدشدهٔ کافی ارائه نمی‌کند؛ عضو ۶ ممتنع می‌ماند.`,
+      checks,
+      freshness.timestampMs,
+      freshness.ageMs,
+    );
   }
 
-  const direction = selectedDirection;
-  const confidencePct = Math.min(90, 45 + selectedBias * 35 + (channelTwoDirection ? 5 : 0));
-  const selectedChannel = channelOneDirection && channelTwoDirection
-    ? 'هر دو کانال'
-    : channelOneDirection ? 'کانال ۱ (آدرس‌های پیکربندی‌شده)' : 'کانال ۲ (netflow تجمیعی + جهش کارمزد)';
-  const rationaleFlow = direction === 'LONG'
-    ? 'خروج از صرافی غالب است'
-    : 'ورود به صرافی غالب است';
+  if (pair !== undefined) {
+    return abstain(
+      member,
+      `دادهٔ آن‌چین pair-scoped برای ${pair} موجود نیست؛ context قدیمی BTCمحور برای این عضو استفاده نشد.`,
+      [{
+        labelFa: 'دادهٔ اختصاصی دارایی',
+        passed: false,
+        detailFa: 'منبع آن‌چین فاقد جفت/شبکهٔ منطبق است.',
+      }],
+    );
+  }
+
   return createVote(
     member,
-    direction,
-    assetSymbol === 'BTC'
-      ? `${selectedChannel} با quorum مستقل رأی ${direction} داد؛ خالص ${channelOneDirection ? netFlow : macroNetFlow} BTC است و ${rationaleFlow}. این جریان اثبات قصد معامله یا تضمین جهت قیمت نیست؛ confidence امتیاز heuristic است، نه احتمال کالیبره‌شده.`
-      : `${selectedChannel} با quorum مستقل رأی ${direction} داد؛ خالص ${assetSymbol} برابر $${Math.abs(channelOneDirection ? netFlow : macroNetFlow).toFixed(0)} است و ${rationaleFlow}. این جریان اثبات قصد معامله یا تضمین جهت قیمت نیست؛ confidence امتیاز heuristic است، نه احتمال کالیبره‌شده.`,
-    checks,
-    {
-      sourceTimestampMs,
-      sourceAgeMs,
-      dataQualityPct: directWhaleFlow.qualityPct,
-      confidencePct,
-    },
+    'ABSTAIN',
+    'بدون دادهٔ تراکنشِ اختصاصیِ جفت‌ارز و تأیید مستقل، عضو آن‌چین از context کلی یا برچسب‌های نامطمئن جهت بازار را استنباط نمی‌کند.',
+    [{
+      labelFa: 'دادهٔ تراکنش مستقل و pair-scoped',
+      passed: false,
+      detailFa: 'فقط شواهد زنجیره‌ای زنده و تأییدشده از حداقل دو منبع مستقل قابل استفاده است.',
+    }],
   );
-}
-
-export function member6ShadowModeEnabled(): boolean {
-  const raw = process.env.SBK1_MEMBER6_SHADOW_MODE?.trim().toLowerCase();
-  if (!raw || raw === 'false') return false;
-  if (raw === 'true') return true;
-  console.error('[EightMemberCouncil] Invalid SBK1_MEMBER6_SHADOW_MODE; defaulting to false.');
-  return false;
-}
-
-export function evaluateMember6VoteForShadow(input: {
-  macroContext?: CouncilMacroContext | null;
-  whaleFlowData?: CouncilWhaleFlowData | null;
-  nowMs?: number;
-}): CouncilMemberVote {
-  return evaluateMember6VoteAndEvidenceForShadow(input).vote;
-}
-
-export function evaluateMember6VoteAndEvidenceForShadow(input: {
-  macroContext?: CouncilMacroContext | null;
-  whaleFlowData?: CouncilWhaleFlowData | null;
-  nowMs?: number;
-}): { vote: CouncilMemberVote; verifiedCandidates: Member6VerifiedCandidate[] } {
-  const verifiedCandidates: Member6VerifiedCandidate[] = [];
-  const vote = evaluateOnChain(
-    EIGHT_MEMBER_COUNCIL[5],
-    input.macroContext,
-    input.nowMs ?? Date.now(),
-    input.whaleFlowData ?? undefined,
-    verifiedCandidates,
-  );
-  return { vote, verifiedCandidates };
-}
-
-export function applyMember6ShadowMode(report: EightMemberCouncilReport): EightMemberCouncilReport {
-  const members = report.members.map((member) => {
-    if (member.id !== 6 || (member.vote !== 'LONG' && member.vote !== 'SHORT')) return member;
-    return {
-      ...abstain(
-      EIGHT_MEMBER_COUNCIL[5],
-      `Shadow-mode Member 6 ${member.vote} vote was recorded but excluded from council quorum. ${member.rationaleFa}`,
-      [
-        ...member.qualityChecks,
-        {
-          labelFa: 'رأی عضو ۶ در حالت shadow',
-          passed: true,
-          detailFa: 'جهت محاسبه و ثبت شد، اما در شورا به‌صورت ABSTAIN شمرده می‌شود.',
-        },
-      ],
-      member.sourceTimestampMs,
-      member.sourceAgeMs,
-      ),
-      supportingEvidence: member.supportingEvidence,
-    };
-  });
-  const longVotes = members.filter(({ vote }) => vote === 'LONG').length;
-  const shortVotes = members.filter(({ vote }) => vote === 'SHORT').length;
-  const neutralVotes = members.filter(({ vote }) => vote === 'NEUTRAL').length;
-  const abstentions = members.filter(({ vote }) => vote === 'ABSTAIN').length;
-  const selectedDirection: CouncilDirection = longVotes >= 5
-    ? 'LONG'
-    : shortVotes >= 5
-      ? 'SHORT'
-      : null;
-  return {
-    ...report,
-    members,
-    longVotes,
-    shortVotes,
-    neutralVotes,
-    abstentions,
-    selectedDirection,
-    quorumMet: selectedDirection !== null,
-    summaryFa: selectedDirection
-      ? `شورا با ${selectedDirection === 'LONG' ? longVotes : shortVotes} رأی از ۸ عضو جهت ${selectedDirection} را انتخاب کرد؛ این نتیجه به‌تنهایی مجوز اجرای معامله نیست.`
-      : `حدنصاب ۵ رأی از ۸ عضو حاصل نشد (LONG: ${longVotes}، SHORT: ${shortVotes}، خنثی: ${neutralVotes}، ممتنع: ${abstentions})؛ جهت انتخاب نشد.`,
-  };
 }
 
 function evaluateMacro(
@@ -1505,7 +1458,20 @@ function evaluateMacro(
   macro: CouncilMacroContext | null | undefined,
   nowMs: number,
   directMacroData?: FreeMacroDataResult,
+  pair?: string,
 ): CouncilMemberVote {
+  const macroBeta = pair === undefined ? 1 : readMacroBeta(pair);
+  if (macroBeta === null) {
+    return abstain(
+      member,
+      `ضریب واکنش کلانِ کالیبره‌شده برای ${pair} تنظیم نشده است؛ رأی عمومی بازار روی این دارایی اعمال نشد.`,
+      [{
+        labelFa: 'ضریب واکنش اختصاصی دارایی',
+        passed: false,
+        detailFa: `SBK1_MACRO_BETA_BY_PAIR باید برای ${pair} مقدار کالیبره‌شده داشته باشد.`,
+      }],
+    );
+  }
   const directSignals: Array<{
     label: string;
     provider: string;
@@ -1606,13 +1572,13 @@ function evaluateMacro(
   }
 
   if (uniqueDirectSignals.length >= 2) {
-    const score = uniqueDirectSignals.reduce((sum, signal) => sum + signal.direction, 0);
+    const score = uniqueDirectSignals.reduce((sum, signal) => sum + signal.direction * macroBeta, 0);
     const vote: CouncilVote = score >= 2 ? 'LONG' : score <= -2 ? 'SHORT' : 'NEUTRAL';
     const sourceTimestampMs = Math.max(...uniqueDirectSignals.map((signal) => signal.timestampMs));
     return createVote(
       member,
       vote,
-      `رأی از ${uniqueDirectSignals.length} شاخص مستقیم و تازه گرفته شد: ${uniqueDirectSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ شاخص یا proxy با نام و نوع واقعی خودش گزارش شده است.`,
+      `رأی ${pair ?? 'بازار'} با ضریب واکنش ${macroBeta} از ${uniqueDirectSignals.length} شاخص مستقیم و تازه گرفته شد: ${uniqueDirectSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ شاخص یا proxy با نام و نوع واقعی خودش گزارش شده است.`,
       [
         {
           labelFa: 'تازگی منابع کلان مستقیم',
@@ -1688,13 +1654,13 @@ function evaluateMacro(
     });
   }
   if (contextSignals.length >= 2) {
-    const score = contextSignals.reduce((sum, signal) => sum + signal.direction, 0);
+    const score = contextSignals.reduce((sum, signal) => sum + signal.direction * macroBeta, 0);
     const vote: CouncilVote = score >= 2 ? 'LONG' : score <= -2 ? 'SHORT' : 'NEUTRAL';
     const sourceTimestampMs = Math.max(...contextSignals.map((signal) => signal.timestampMs));
     return createVote(
       member,
       vote,
-      `رأی از ${contextSignals.length} شاخص مستقیم و تازهٔ زمینهٔ کلان گرفته شد: ${contextSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ proxy دلار به‌جای DXY معرفی نشده است.`,
+      `رأی ${pair ?? 'بازار'} با ضریب واکنش ${macroBeta} از ${contextSignals.length} شاخص مستقیم و تازهٔ زمینهٔ کلان گرفته شد: ${contextSignals.map(({ label, direction }) => `${label} (${direction > 0 ? 'صعودی' : direction < 0 ? 'نزولی' : 'خنثی'})`).join('، ')}؛ proxy دلار به‌جای DXY معرفی نشده است.`,
       [
         {
           labelFa: 'تازگی منابع کلان مستقیم',
@@ -1713,6 +1679,18 @@ function evaluateMacro(
         dataQualityPct: Math.round(Math.min(contextSignals.length, 3) / 3 * 100),
         confidencePct: confidenceForStrength(Math.min(30, Math.abs(score) * 10)),
       },
+    );
+  }
+
+  if (pair !== undefined) {
+    return abstain(
+      member,
+      `برای ${pair} دو شاخص مستقیم و تازه برای ارزیابی واکنش اختصاصی موجود نیست؛ سوگیری عمومی macroContext به ارث نمی‌رسد.`,
+      [{
+        labelFa: 'پوشش شاخص‌های واکنش‌پذیری',
+        passed: false,
+        detailFa: `${contextSignals.length} شاخص pair-context معتبر؛ حداقل دو شاخص مستقل لازم است.`,
+      }],
     );
   }
 
@@ -1747,14 +1725,14 @@ function evaluateMacro(
   }
 
   const vote: CouncilVote = macro.fundamentalBias === 'BULLISH'
-    ? 'LONG'
+    ? macroBeta >= 1 ? 'LONG' : 'NEUTRAL'
     : macro.fundamentalBias === 'BEARISH'
-      ? 'SHORT'
+      ? macroBeta >= 1 ? 'SHORT' : 'NEUTRAL'
       : 'NEUTRAL';
   return createVote(
     member,
     vote,
-    `سوگیری کلان ${macro.fundamentalBias} با پوشش ${liveIndicatorCount} شاخص زنده دریافت شد.`,
+    `سوگیری کلان ${macro.fundamentalBias} برای ${pair ?? 'بازار'} با ضریب واکنش ${macroBeta} و پوشش ${liveIndicatorCount} شاخص زنده ارزیابی شد.`,
     checks,
     {
       sourceTimestampMs: freshness.timestampMs,
@@ -1767,10 +1745,14 @@ function evaluateMacro(
 function evaluateNews(
   member: CouncilMemberDefinition,
   macro: CouncilMacroContext | null | undefined,
-  nowMs: number
+  nowMs: number,
+  pair?: string,
 ): CouncilMemberVote {
   const freshness = getMacroAge(macro, nowMs, MAX_NEWS_AGE_MS);
-  const newsDeduplication = deduplicateNews(macro?.recentHeadlines ?? []);
+  const pairHeadlines = pair === undefined
+    ? macro?.recentHeadlines ?? []
+    : (macro?.recentHeadlines ?? []).filter((headline) => headline.pair === pair);
+  const newsDeduplication = deduplicateNews(pairHeadlines);
   const uniqueHeadlines = newsDeduplication.values;
   const freshHeadlines = uniqueHeadlines.filter((headline) => {
     const publishedAt = Date.parse(headline.publishedAt);
@@ -1802,6 +1784,7 @@ function evaluateNews(
     { labelFa: 'حذف خبرهای تکراری و هم‌معنی', passed: true, detailFa: `${newsDeduplication.duplicateCount} خبر تکراری/هم‌معنی از URLهای متفاوت ادغام شد.` },
     { labelFa: 'ناشر و خبر معتبر', passed: hasLiveSentiment, detailFa: hasLiveSentiment ? `${freshHeadlines.length} خبر یکتای تازه و امتیاز سنتیمنت زنده` : 'خبر معتبر یا امتیاز سنتیمنت زنده در دسترس نیست.' },
     { labelFa: 'تازگی خبر و داده', passed: freshness !== null && headlinesAreFresh, detailFa: freshness && latestFreshHeadline !== null ? `${Math.round((nowMs - latestFreshHeadline) / 60_000)} دقیقه از انتشار آخرین خبر` : 'زمان خبر/داده کهنه یا نامعتبر است.' },
+    { labelFa: 'تطبیق جفت‌ارز خبر', passed: pair === undefined || freshHeadlines.every((headline) => headline.pair === pair), detailFa: pair === undefined ? 'اجرای بدون جفت؛ سازگاری قدیمی.' : `${freshHeadlines.length} خبر برای ${pair} فیلتر شد.` },
   ];
   if (!macro || !hasLiveSentiment || !hasSufficientCoverage || !freshness || !headlinesAreFresh || !isFiniteNumber(macro.newsSentimentScore)) {
     return createVote(
@@ -1899,12 +1882,909 @@ export const UNWIRED_OR_LEGACY_ANALYSIS_MODULES = [
   'news.shockFirewall',
 ] as const;
 
+function getMemberTwoCvdSignal(
+  source: CouncilMemberSourceCheck,
+  nowMs: number,
+  maxAgeMs: number,
+): { value: number; timestampMs: number } | null {
+  const metric = (name: string): number | null => {
+    const value = source.normalizedData?.[name];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  };
+  const cvd = metric('cvdBase') ?? metric('cvdEth');
+  const buyVolume = metric('buyVolumeBase') ?? metric('buyVolumeEth');
+  const sellVolume = metric('sellVolumeBase') ?? metric('sellVolumeEth');
+  const classifiedCount = metric('classifiedTradeCount');
+  const timestampMs = metric('tradeTimestampMs');
+  const total = (buyVolume ?? 0) + (sellVolume ?? 0);
+  if (
+    cvd === null || buyVolume === null || sellVolume === null ||
+    buyVolume < 0 || sellVolume < 0 || total <= 0 ||
+    Math.abs(cvd - (buyVolume - sellVolume)) > Math.max(1e-8, total * 1e-9) ||
+    (classifiedCount ?? 0) < 5 ||
+    metric('cvdWindowMs') !== 5 * 60_000 ||
+    timestampMs === null ||
+    timestampMs > nowMs + 1_000 ||
+    nowMs - timestampMs > maxAgeMs
+  ) {
+    return null;
+  }
+  return { value: cvd / total, timestampMs };
+}
+
+export function getOptionsDirectionalScore(
+  putCallOpenInterestRatio: number | null,
+  putCallIvSkewPct: number | null,
+): number | null {
+  if (putCallOpenInterestRatio === null || putCallOpenInterestRatio <= 0) return null;
+  const oiDirection = putCallOpenInterestRatio >= 1.2
+    ? -1
+    : putCallOpenInterestRatio <= 0.8
+      ? 1
+      : 0;
+  const ivDirection = putCallIvSkewPct === null
+    ? null
+    : putCallIvSkewPct >= 2
+      ? -1
+      : putCallIvSkewPct <= -2
+        ? 1
+        : 0;
+  if (oiDirection !== 0 && ivDirection !== null &&
+      ivDirection !== 0 && oiDirection !== ivDirection) return 0;
+  if (oiDirection !== 0) return oiDirection;
+  return ivDirection !== null && ivDirection !== 0 ? ivDirection : 0;
+}
+
+function evaluatePrimaryAssetSourceVote(
+  member: CouncilMemberDefinition,
+  checks: readonly CouncilMemberSourceCheck[],
+  nowMs: number,
+  macroContext?: CouncilMacroContext | null,
+  pair?: string,
+): CouncilMemberVote {
+  const asset = getFreqtradePairBaseAsset(pair ?? '') ?? 'ETH';
+  const registeredSources = getCouncilMemberSources(member.id, asset);
+  const registeredById = new Map(registeredSources.map((source) => [source.id, source]));
+  const registeredIds = registeredSources.map(({ id }) => id);
+  const enrichSource = (source: CouncilMemberSourceCheck): CouncilMemberSourceCheck => {
+    const registered = registeredById.get(source.sourceId);
+    return {
+      ...source,
+      endpoint: source.endpoint ?? registered?.url,
+      provider: source.provider ?? registered?.provider,
+      symbol: source.symbol ?? registered?.symbol,
+      marketType: source.marketType ?? registered?.marketType,
+      independenceGroup: source.independenceGroup ?? registered?.independenceGroup,
+    };
+  };
+  const validSources = checks
+    .filter(({ sourceId, status, dataValid, normalizedData, voteValue }) =>
+      registeredIds.includes(sourceId) &&
+      status === 'HEALTHY' &&
+      dataValid === true &&
+      voteValue !== 'LOW_VALUE' &&
+      normalizedData !== undefined
+    )
+    .map(enrichSource)
+    .sort((left, right) => registeredIds.indexOf(left.sourceId) - registeredIds.indexOf(right.sourceId));
+  const observedSources = checks
+    .filter(({ sourceId, status, dataValid }) =>
+      registeredIds.includes(sourceId) && status === 'HEALTHY' && dataValid === true
+    )
+    .map(enrichSource)
+    .sort((left, right) => registeredIds.indexOf(left.sourceId) - registeredIds.indexOf(right.sourceId));
+  const metric = (source: CouncilMemberSourceCheck, name: string): number | null => {
+    const value = source.normalizedData?.[name];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  };
+  const sourceSignals: Array<{ source: CouncilMemberSourceCheck; value: number; timestampMs: number }> = [];
+  const minIndependentSignals = member.id === 5
+    ? getCouncilOptionsThresholds(asset)?.minimumIndependentSources ?? 2
+    : 2;
+  const sourceTimestampMs = validSources.reduce<number | null>((latest, source) =>
+    source.observedAtMs !== null && source.observedAtMs !== undefined
+      ? Math.max(latest ?? 0, source.observedAtMs)
+      : latest,
+  null);
+  const fallbackSourceId = (signals: readonly { source: CouncilMemberSourceCheck }[]): string | null =>
+    signals[0] && signals[0].source.sourceId !== registeredIds[0]
+      ? signals[0].source.sourceId
+      : null;
+
+  if (member.id === 1) {
+    for (const source of validSources) {
+      const returnPct = metric(source, 'returnPct');
+      if (returnPct !== null) sourceSignals.push({
+        source, value: returnPct, timestampMs: source.observedAtMs ?? nowMs,
+      });
+    }
+    if (sourceSignals.length >= minIndependentSignals) {
+      const meanReturnPct = sourceSignals.reduce((sum, signal) => sum + signal.value, 0) / sourceSignals.length;
+      const vote: CouncilVote = meanReturnPct >= 0.05 ? 'LONG' : meanReturnPct <= -0.05 ? 'SHORT' : 'NEUTRAL';
+      return createVote(
+        member,
+        vote,
+        `رأی روند ${asset} از بازده کندل ساعتی منابع ثبت‌شده محاسبه شد؛ میانگین تغییر ${meanReturnPct.toFixed(4)}٪ از ${sourceSignals.length} منبع معتبر.`,
+        [
+          { labelFa: 'دادهٔ مستقیم منابع عضو', passed: true, detailFa: `${sourceSignals.map(({ source, value }) => `${source.sourceId}=${value.toFixed(4)}٪`).join('؛ ')}` },
+          { labelFa: 'حداقل منابع مستقل', passed: true, detailFa: `${sourceSignals.length} منبع دادهٔ معتبر؛ حداقل ${minIndependentSignals}.` },
+        ],
+        {
+          sourceId: sourceSignals[0].source.sourceId,
+          fallbackSourceId: fallbackSourceId(sourceSignals),
+          sourceTimestampMs,
+          sourceAgeMs: sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+          dataQualityPct: Math.min(100, sourceSignals.length * 25),
+          confidencePct: Math.min(85, 50 + Math.round(Math.abs(meanReturnPct) * 10)),
+        },
+      );
+    }
+    return {
+      ...abstain(
+        member,
+        `کمتر از دو منبع آپشنِ دارای سنجهٔ جهت‌ساز معتبر است (${sourceSignals.length}/2)؛ سطوح IV یا mark price به‌تنهایی جهت قیمت را تعیین نمی‌کنند.`,
+        [
+          { labelFa: 'تعداد سنجه‌های جهت‌دار آپشن', passed: false, detailFa: `${sourceSignals.length}/2 منبع معتبر.` },
+          { labelFa: 'IV و mark price', passed: false, detailFa: 'دادهٔ زمینه‌ایِ بدون skew یا OI جهت‌دار در رأی شمرده نمی‌شود.' },
+        ],
+        sourceTimestampMs,
+        sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+      ),
+      sourceId: sourceSignals[0]?.source.sourceId ??
+        checks.find(({ status }) => status === 'HEALTHY')?.sourceId ?? null,
+      fallbackSourceId: null,
+    };
+  }
+
+  if (member.id === 2) {
+    const signalsByMarket = new Map<string, Map<string, {
+      source: CouncilMemberSourceCheck;
+      value: number;
+      timestampMs: number;
+    }>>();
+    for (const source of validSources) {
+      const evidence = getMemberTwoCvdSignal(
+        source,
+        nowMs,
+        registeredById.get(source.sourceId)?.maxAgeMs ?? 60_000,
+      );
+      if (!evidence) continue;
+      const marketType = source.marketType ?? 'unknown';
+      const venue = source.independenceGroup ?? source.provider ?? source.sourceId;
+      const byVenue = signalsByMarket.get(marketType) ?? new Map();
+      if (byVenue.has(venue)) continue;
+      byVenue.set(venue, { source, ...evidence });
+      signalsByMarket.set(marketType, byVenue);
+    }
+    const marketCoverage = [...signalsByMarket.entries()]
+      .map(([marketType, byVenue]) => ({
+        marketType,
+        signals: [...byVenue.values()],
+      }))
+      .sort((left, right) =>
+        right.signals.length - left.signals.length ||
+        (left.marketType === 'spot' ? -1 : right.marketType === 'spot' ? 1 : 0)
+      );
+    const qualifiedMarkets = marketCoverage.filter(({ signals }) =>
+      signals.length >= minIndependentSignals
+    );
+    const selectedMarkets = qualifiedMarkets.length > 0
+      ? qualifiedMarkets
+      : marketCoverage.slice(0, 1);
+    sourceSignals.push(...selectedMarkets.flatMap(({ signals }) => signals));
+    const marketCoverageDetail = marketCoverage.length
+      ? marketCoverage.map(({ marketType, signals }) =>
+        `${marketType}=${new Set(signals.map(({ source }) => source.independenceGroup ?? source.provider ?? source.sourceId)).size} venue`
+      ).join(', ')
+      : 'no validated spot/futures market';
+    if (sourceSignals.length >= minIndependentSignals) {
+      const marketScores = qualifiedMarkets.map(({ marketType, signals }) => ({
+        marketType,
+        signals,
+        cvdRatio: signals.reduce((sum, signal) => sum + signal.value, 0) / signals.length,
+      }));
+      const directionalVotes = new Set(marketScores.map(({ cvdRatio }) =>
+        cvdRatio >= 0.05 ? 'LONG' : cvdRatio <= -0.05 ? 'SHORT' : 'NEUTRAL'
+      ).filter((vote) => vote !== 'NEUTRAL'));
+      if (directionalVotes.size > 1) {
+        return {
+          ...abstain(
+            member,
+            'Spot و Futures هرکدام quorum مستقل دارند اما جهت CVD آن‌ها متعارض است؛ داده‌ها با هم ادغام یا به رأی تبدیل نشدند.',
+            [
+              { labelFa: 'CVD جداگانهٔ بازارها', passed: true, detailFa: marketScores.map(({ marketType, cvdRatio }) => `${marketType}=${cvdRatio.toFixed(4)}`).join('؛ ') },
+              { labelFa: 'سازگاری جهت بازارها', passed: false, detailFa: 'اختلاف Spot و Futures باعث ABSTAIN شد.' },
+            ],
+            Math.min(...sourceSignals.map(({ timestampMs }) => timestampMs)),
+            nowMs - Math.min(...sourceSignals.map(({ timestampMs }) => timestampMs)),
+          ),
+          sourceId: sourceSignals[0].source.sourceId,
+          fallbackSourceId: null,
+          usedSourceIds: [],
+        };
+      }
+      const directionalVote = [...directionalVotes][0];
+      const vote: CouncilVote = directionalVote === 'LONG'
+        ? 'LONG'
+        : directionalVote === 'SHORT'
+          ? 'SHORT'
+          : 'NEUTRAL';
+      const sourceTimestampMs = Math.min(...sourceSignals.map(({ timestampMs }) => timestampMs));
+      const meanMarketStrength = marketScores.reduce(
+        (sum, { cvdRatio }) => sum + Math.abs(cvdRatio),
+        0,
+      ) / marketScores.length;
+      return createVote(
+        member,
+        vote,
+        `CVD پنج‌دقیقه‌ای برای هر market type جداگانه از میانگین venueهای همان گروه محاسبه شد؛ ${marketScores.map(({ marketType, cvdRatio }) => `${marketType}=${cvdRatio.toFixed(4)}`).join('، ')}. فقط گروه‌های دارای quorum حداقل دو venue وارد مقایسه شدند؛ Spot و Futures با هم جمع نشدند. پوشش: ${marketCoverageDetail}.`,
+        [
+          { labelFa: 'CVD جداگانه برای هر بازار', passed: true, detailFa: marketScores.map(({ marketType, signals, cvdRatio }) => `${marketType}: میانگین ${cvdRatio.toFixed(4)} از ${signals.length} venue`).join('؛ ') },
+          { labelFa: 'quorum مستقل هر گروه', passed: true, detailFa: `${sourceSignals.length} منبع از ${qualifiedMarkets.length} گروه market type؛ هر گروه دست‌کم دو venue دارد.` },
+        ],
+        {
+          sourceId: sourceSignals[0].source.sourceId,
+          fallbackSourceId: null,
+          sourceTimestampMs,
+          sourceAgeMs: nowMs - sourceTimestampMs,
+          dataQualityPct: Math.min(100, sourceSignals.length * 25),
+          confidencePct: Math.min(65, 35 + Math.round(meanMarketStrength * 100)),
+          usedSourceIds: sourceSignals.map(({ source }) => source.sourceId),
+        },
+      );
+    }
+    return {
+      ...abstain(
+        member,
+        `برای رأی CVD حداقل دو منبع مستقل لازم است؛ فقط ${sourceSignals.length} منبع معتبر است.`,
+        [
+          { labelFa: 'تعداد منابع مستقل CVD', passed: false, detailFa: `${sourceSignals.length}/2 منبع معتبر.` },
+          { labelFa: 'پنجره پنج‌دقیقه‌ای', passed: sourceSignals.length > 0, detailFa: 'CVD فقط از معاملات تازه و دارای سمت خریدار/فروشنده محاسبه می‌شود.' },
+        ],
+        sourceTimestampMs,
+        sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+      ),
+      sourceId: sourceSignals[0]?.source.sourceId ??
+        checks.find(({ sourceId, status }) => registeredIds.includes(sourceId) && status === 'HEALTHY')?.sourceId ?? null,
+      fallbackSourceId: fallbackSourceId(sourceSignals),
+      usedSourceIds: [],
+    };
+  }
+
+  if (member.id === 3) {
+    for (const source of validSources) {
+      const imbalance = metric(source, 'orderBookImbalance');
+      if (imbalance !== null) sourceSignals.push({
+        source, value: imbalance, timestampMs: source.observedAtMs ?? nowMs,
+      });
+    }
+    if (sourceSignals.length >= minIndependentSignals) {
+      const meanImbalance = sourceSignals.reduce((sum, signal) => sum + signal.value, 0) / sourceSignals.length;
+      const vote: CouncilVote = meanImbalance >= 0.05 ? 'LONG' : meanImbalance <= -0.05 ? 'SHORT' : 'NEUTRAL';
+      return createVote(
+        member,
+        vote,
+        `رأی دفتر سفارش ${asset} از عدم‌تعادل bid/ask منابع ثبت‌شده محاسبه شد؛ میانگین OBI=${meanImbalance.toFixed(4)} از ${sourceSignals.length} دفتر.`,
+        [
+          { labelFa: 'دفترهای سفارش مستقیم', passed: true, detailFa: sourceSignals.map(({ source, value }) => `${source.sourceId} OBI=${value.toFixed(4)}`).join('؛ ') },
+          { labelFa: 'حداقل منابع مستقل', passed: true, detailFa: `${sourceSignals.length} دفتر معتبر.` },
+        ],
+        {
+          sourceId: sourceSignals[0].source.sourceId,
+          fallbackSourceId: fallbackSourceId(sourceSignals),
+          sourceTimestampMs,
+          sourceAgeMs: sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+          dataQualityPct: Math.min(100, sourceSignals.length * 25),
+          confidencePct: Math.min(85, 50 + Math.round(Math.abs(meanImbalance) * 100)),
+        },
+      );
+    }
+  }
+
+  if (member.id === 4) {
+    for (const source of validSources) {
+      const fundingRate = metric(source, 'fundingRate');
+      if (fundingRate !== null) sourceSignals.push({
+        source, value: fundingRate, timestampMs: source.observedAtMs ?? nowMs,
+      });
+    }
+    if (sourceSignals.length >= minIndependentSignals) {
+      const meanFunding = sourceSignals.reduce((sum, signal) => sum + signal.value, 0) / sourceSignals.length;
+      const vote: CouncilVote = meanFunding >= 0.0005 ? 'SHORT' : meanFunding <= -0.0005 ? 'LONG' : 'NEUTRAL';
+      return createVote(
+        member,
+        vote,
+        `رأی مشتقات ${asset} از نرخ funding منابع ثبت‌شده گرفته شد؛ میانگین ${meanFunding.toFixed(7)} از ${sourceSignals.length} بازار. Funding در محدودهٔ عادی جهت خنثی دارد.`,
+        [
+          { labelFa: 'Funding و OI از بازارهای مستقیم', passed: true, detailFa: sourceSignals.map(({ source, value }) => `${source.sourceId} funding=${value}`).join('؛ ') },
+          { labelFa: 'حداقل منابع مستقل', passed: true, detailFa: `${sourceSignals.length} منبع مشتقات معتبر.` },
+        ],
+        {
+          sourceId: sourceSignals[0].source.sourceId,
+          fallbackSourceId: fallbackSourceId(sourceSignals),
+          sourceTimestampMs,
+          sourceAgeMs: sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+          dataQualityPct: Math.min(100, sourceSignals.length * 25),
+          confidencePct: Math.min(80, 50 + Math.round(Math.abs(meanFunding) * 10_000)),
+        },
+      );
+    }
+  }
+
+  if (member.id === 5) {
+    const coreAsset = asset === 'BTC' || asset === 'ETH';
+    const optionSources = validSources.filter(({ sourceId }) =>
+      !sourceId.includes('.proxy.') &&
+      (!coreAsset || ['.deribit-options', '.okx-opt-summary', '.bybit-options']
+        .some((suffix) => sourceId.endsWith(suffix)))
+    );
+    const proxySources = validSources.filter(({ sourceId }) =>
+      sourceId.includes('.proxy.')
+    );
+    for (const source of optionSources) {
+      const putCallRatio = metric(source, 'putCallOpenInterestRatio');
+      const ivSpread = metric(source, 'putCallIvSpread');
+      const callOpenInterest = metric(source, 'callOpenInterest');
+      const putOpenInterest = metric(source, 'putOpenInterest');
+      const contractCount = metric(source, 'optionInstrumentCount');
+      const callCount = metric(source, 'optionCallContractCount');
+      const putCount = metric(source, 'optionPutContractCount');
+      const bidAskCount = metric(source, 'bidAskValidatedContracts');
+      const sizedBookCount = metric(source, 'bidAskSizeValidatedContracts');
+      const spreadPct = metric(source, 'medianBidAskSpreadPct');
+      const volume24h = metric(source, 'optionsVolume24h');
+      const impliedVolatility = metric(source, 'optionImpliedVolatilityPct');
+      const underlyingPrice = metric(source, 'optionUnderlyingPrice');
+      const strikePrice = metric(source, 'optionStrikePrice');
+      const expiryTimestampMs = metric(source, 'optionExpiryTimestampMs');
+      const timestampMs = metric(source, 'optionTimestampMs');
+      const thresholds = getCouncilOptionsThresholds(asset);
+      if (!thresholds) continue;
+      const direction = getOptionsDirectionalScore(
+        putCallRatio,
+        ivSpread === null ? null : ivSpread * 100,
+      );
+      const oiRatioMatches = putCallRatio !== null &&
+        callOpenInterest !== null && callOpenInterest > 0 &&
+        putOpenInterest !== null && putOpenInterest > 0 &&
+        Math.abs(putCallRatio - putOpenInterest / callOpenInterest) <=
+          Math.max(0.01, putCallRatio * 0.02);
+      if (
+        direction === null ||
+        !oiRatioMatches ||
+        contractCount === null || contractCount < thresholds.minimumContracts ||
+        (callCount ?? 0) < thresholds.minimumContractsPerSide ||
+        (putCount ?? 0) < thresholds.minimumContractsPerSide ||
+        bidAskCount === null || bidAskCount < contractCount ||
+        (sizedBookCount ?? 0) < thresholds.minimumSizedOrderBooks ||
+        spreadPct === null || spreadPct < 0 || spreadPct > 20 ||
+        volume24h === null || volume24h <= 0 ||
+        impliedVolatility === null || impliedVolatility <= 0 ||
+        underlyingPrice === null || underlyingPrice <= 0 ||
+        strikePrice === null || strikePrice <= 0 ||
+        expiryTimestampMs === null || expiryTimestampMs <= nowMs ||
+        timestampMs === null || timestampMs > nowMs + 1_000 ||
+        nowMs - timestampMs > Math.min(
+          registeredById.get(source.sourceId)?.maxAgeMs ?? thresholds.maxAgeMs,
+          thresholds.maxAgeMs,
+        )
+      ) continue;
+      sourceSignals.push({ source, value: direction, timestampMs });
+    }
+    const independentSignals = [...new Map(sourceSignals.map((signal) => [
+      signal.source.independenceGroup ?? signal.source.provider ?? signal.source.sourceId,
+      signal,
+    ])).values()];
+    if (independentSignals.length >= minIndependentSignals) {
+      const meanOptionDirection = independentSignals.reduce((sum, signal) => sum + signal.value, 0) /
+        independentSignals.length;
+      const vote: CouncilVote = meanOptionDirection >= 0.25
+        ? 'LONG'
+        : meanOptionDirection <= -0.25
+          ? 'SHORT'
+          : 'NEUTRAL';
+      return createVote(
+        member,
+        vote,
+        `رأی آپشن از نسبت put/call OI یا IV-skew تفکیک‌شدهٔ ${independentSignals.length} venue مستقل گرفته شد؛ امتیاز جهت=${meanOptionDirection.toFixed(3)}. confidence بین 80 تا 95 یک برآورد قاعده‌محور است، نه احتمال آماری کالیبره‌شده.`,
+        [
+          { labelFa: 'سنجش جهت‌دار آپشن', passed: true, detailFa: independentSignals.map(({ source, value }) => `${source.sourceId} (${source.independenceGroup ?? source.provider ?? source.sourceId})=${value.toFixed(3)}`).join('؛ ') },
+          { labelFa: 'دادهٔ IV/موقعیت', passed: true, detailFa: `IV parity به‌تنهایی جهت‌ساز نیست؛ منبعی بدون OI تفکیک‌شده یا IV skew معنادار کنار گذاشته شد.${sourceSignals.some(({ source }) => source.normalizedData?.timestampProvenance === 'response-received-not-provider') ? ' Binance با زمان دریافت پاسخ، نه زمان منبع، ثبت شد.' : ''}` },
+          { labelFa: 'تفسیر confidence', passed: true, detailFa: 'درجهٔ 80–95 قاعده‌محور و غیرکالیبره است؛ احتمال موفقیت آماری محسوب نمی‌شود.' },
+        ],
+        {
+          sourceId: independentSignals[0].source.sourceId,
+          fallbackSourceId: fallbackSourceId(independentSignals),
+          sourceTimestampMs: Math.min(...independentSignals.map(({ timestampMs }) => timestampMs)),
+          sourceAgeMs: nowMs - Math.min(...independentSignals.map(({ timestampMs }) => timestampMs)),
+          dataQualityPct: Math.min(100, independentSignals.length * 25),
+          confidencePct: Math.min(
+            95,
+            80 + Math.min(15, (independentSignals.length - minIndependentSignals) * 5 +
+              Math.round(Math.abs(meanOptionDirection) * 10)),
+          ),
+          evidenceTrack: 'OPTIONS',
+          sourceQuorumRequired: minIndependentSignals,
+          usedSourceIds: independentSignals.map(({ source }) => source.sourceId),
+        },
+      );
+    }
+    const proxySignals = proxySources.flatMap((source) => {
+      const directionScore = metric(source, 'proxyDirectionScore');
+      const fundingRate = metric(source, 'proxyFundingRate');
+      const fundingBaselineRate = metric(source, 'proxyFundingBaselineRate');
+      const fundingDeviation = metric(source, 'proxyFundingDeviation');
+      const longShortRatio = metric(source, 'proxyLongShortRatio');
+      const openInterestChangePct = metric(source, 'proxyOpenInterestChangePct');
+      const priceReturnPct = metric(source, 'proxyPriceReturnPct');
+      const realizedVolatilityPct = metric(source, 'proxyRealizedVolatilityPct');
+      const liquidationLongNotional = metric(source, 'proxyLiquidationLongNotional');
+      const liquidationShortNotional = metric(source, 'proxyLiquidationShortNotional');
+      const liquidationTimestampMs = metric(source, 'proxyLiquidationTimestampMs');
+      const liquidationEventCount = metric(source, 'proxyLiquidationEventCount');
+      const liquidationFeedStatus = source.normalizedData?.proxyLiquidationFeedStatus;
+      const cacheStatus = source.normalizedData?.proxyCacheStatus;
+      const cacheReceivedAtMs = metric(source, 'proxyCacheReceivedAtMs');
+      const cacheAgeMs = cacheReceivedAtMs === null
+        ? null
+        : nowMs - cacheReceivedAtMs;
+      const timestampMs = metric(source, 'proxyTimestampMs');
+      const fundingTimestampMs = metric(source, 'proxyFundingTimestampMs');
+      const positioningTimestampMs = metric(source, 'proxyPositioningTimestampMs');
+      const priceTimestampMs = metric(source, 'proxyPriceTimestampMs');
+      if (
+        directionScore === null || fundingRate === null || fundingBaselineRate === null ||
+        fundingDeviation === null ||
+        longShortRatio === null || longShortRatio <= 0 ||
+        openInterestChangePct === null || priceReturnPct === null ||
+        realizedVolatilityPct === null || realizedVolatilityPct < 0 ||
+        (cacheStatus !== 'FRESH' && cacheStatus !== 'CACHED_OK') ||
+        cacheAgeMs === null || cacheAgeMs < 0 ||
+        cacheAgeMs > MEMBER_FIVE_PROXY_CACHE_TTL_MS ||
+        timestampMs === null || fundingTimestampMs === null ||
+        positioningTimestampMs === null || priceTimestampMs === null ||
+        timestampMs > nowMs + 1_000 || nowMs - timestampMs > 6 * 60_000 ||
+        fundingTimestampMs > nowMs + 1_000 ||
+        nowMs - fundingTimestampMs > 60_000 ||
+        positioningTimestampMs > nowMs + 1_000 ||
+        nowMs - positioningTimestampMs > 6 * 60_000 ||
+        priceTimestampMs > nowMs + 1_000 ||
+        nowMs - priceTimestampMs > 60_000 ||
+        (liquidationLongNotional !== null &&
+          (liquidationLongNotional < 0 ||
+            liquidationShortNotional === null ||
+            liquidationShortNotional < 0 ||
+            liquidationTimestampMs === null ||
+            liquidationEventCount === null ||
+            liquidationEventCount < 1 ||
+            liquidationTimestampMs > nowMs + 1_000 ||
+            nowMs - liquidationTimestampMs > 60_000)) ||
+        ((liquidationLongNotional === null) !== (liquidationShortNotional === null))
+      ) return [];
+      const liquidationTotal = (liquidationLongNotional ?? 0) +
+        (liquidationShortNotional ?? 0);
+      const liquidationImbalance = liquidationTotal > 0
+        ? (liquidationShortNotional! - liquidationLongNotional!) / liquidationTotal
+        : null;
+      const recalculatedScore = calculateMemberFiveProxyScore({
+        fundingRate,
+        fundingDeviation,
+        longShortRatio,
+        openInterestChangePct,
+        priceReturnPct,
+        liquidationImbalance,
+      });
+      if (recalculatedScore === null || Math.abs(recalculatedScore - directionScore) > 0.000001) {
+        return [];
+      }
+      const validatedLiquidationFeedStatus:
+        | 'LIVE'
+        | 'NO_EVENTS'
+        | 'UNAVAILABLE' = liquidationFeedStatus === 'LIVE' ||
+          liquidationFeedStatus === 'NO_EVENTS' ||
+          liquidationFeedStatus === 'UNAVAILABLE'
+          ? liquidationFeedStatus
+          : 'UNAVAILABLE';
+      return [{
+        source,
+        value: directionScore,
+        timestampMs,
+        fundingRate,
+        fundingBaselineRate,
+        fundingDeviation,
+        longShortRatio,
+        openInterestChangePct,
+        priceReturnPct,
+        realizedVolatilityPct,
+        liquidationLongNotional,
+        liquidationShortNotional,
+        liquidationTimestampMs,
+        liquidationEventCount: liquidationEventCount ?? 0,
+        liquidationFeedStatus: validatedLiquidationFeedStatus,
+      }];
+    });
+    const independentProxySignals = [...new Map(proxySignals.map((signal) => [
+      signal.source.independenceGroup ?? signal.source.provider ?? signal.source.sourceId,
+      signal,
+    ])).values()];
+    const proxyQuorum = MEMBER_FIVE_PROXY_QUORUM;
+    const proxyAggregate = aggregateMemberFiveProxyMetrics(independentProxySignals.map((signal) => ({
+      sourceId: signal.source.sourceId,
+      fundingRate: signal.fundingRate,
+      fundingBaselineRate: signal.fundingBaselineRate,
+      longShortRatio: signal.longShortRatio,
+      openInterestChangePct: signal.openInterestChangePct,
+      priceReturnPct: signal.priceReturnPct,
+      realizedVolatilityPct: signal.realizedVolatilityPct,
+      liquidationLongNotional: signal.liquidationLongNotional,
+      liquidationShortNotional: signal.liquidationShortNotional,
+      liquidationEventCount: signal.liquidationEventCount,
+      liquidationFeedStatus: signal.liquidationFeedStatus,
+    })));
+    if (independentProxySignals.length >= proxyQuorum && proxyAggregate !== null) {
+      const aggregateScore = proxyAggregate.directionScore;
+      const vote: CouncilVote = aggregateScore >= 0.15
+        ? 'LONG'
+        : aggregateScore <= -0.15
+          ? 'SHORT'
+          : 'NEUTRAL';
+      const positiveSignals = independentProxySignals.filter(({ value }) => value > 0).length;
+      const negativeSignals = independentProxySignals.filter(({ value }) => value < 0).length;
+      const agreementPct = Math.max(positiveSignals, negativeSignals) /
+        independentProxySignals.length;
+      const sourceTimestampMs = Math.min(...independentProxySignals.map(({ timestampMs }) => timestampMs));
+      const confidencePct = Math.min(
+        75,
+        60 + Math.round((independentProxySignals.length - proxyQuorum) * 3) +
+          Math.round(agreementPct * 10) + Math.round(Math.min(Math.abs(aggregateScore), 1) * 2),
+      );
+      const voteWeightPct = Math.min(
+        75,
+        60 + Math.round(agreementPct * 10) +
+          Math.round(Math.min(Math.abs(aggregateScore), 1) * 5),
+      );
+      return createVote(
+        member,
+        vote,
+        `دادهٔ مستقیم Options به حدنصاب ${minIndependentSignals} venue نرسید؛ رأی جایگزین پس از تجمیع میانه‌ایِ funding، L/S، تغییر OI و حرکت قیمت از ${independentProxySignals.length}/${proxyQuorum} منبع سالمِ مستقل با امتیاز ${aggregateScore.toFixed(3)} صادر شد. Confidence و وزن proxy heuristic هستند.`,
+        [
+          { labelFa: 'Options مستقیم', passed: false, detailFa: `${independentSignals.length}/${minIndependentSignals} venue مستقل واجد شرایط.` },
+          { labelFa: 'quorum مستقل futures proxy', passed: true, detailFa: `${independentProxySignals.length}/${proxyQuorum} venue؛ منابع: ${independentProxySignals.map(({ source }) => source.sourceId).join('، ')}.` },
+          { labelFa: 'تجمیع مقاوم در برابر دادهٔ پرت', passed: true, detailFa: `میانه‌ها: funding=${proxyAggregate.fundingRate.toFixed(8)}، L/S=${proxyAggregate.longShortRatio.toFixed(4)}، ΔOI=${proxyAggregate.openInterestChangePct.toFixed(4)}٪، بازده=${proxyAggregate.priceReturnPct.toFixed(4)}٪، نوسان=${proxyAggregate.realizedVolatilityPct.toFixed(4)}٪، امتیاز=${proxyAggregate.directionScore.toFixed(4)}.` },
+          { labelFa: 'سنجه‌های proxy', passed: true, detailFa: independentProxySignals.map(({ source, fundingRate, fundingDeviation, longShortRatio, openInterestChangePct, priceReturnPct, realizedVolatilityPct, liquidationLongNotional, liquidationShortNotional, liquidationEventCount, liquidationFeedStatus, value }) =>
+            `${source.provider}: امتیاز=${value.toFixed(3)}، funding=${fundingRate.toFixed(6)}، انحراف funding=${fundingDeviation.toFixed(6)}، L/S=${longShortRatio.toFixed(3)}، ΔOI=${openInterestChangePct.toFixed(3)}٪، بازده=${priceReturnPct.toFixed(3)}٪، نوسان=${realizedVolatilityPct.toFixed(3)}٪، liquidation=${liquidationFeedStatus}/${liquidationEventCount} رویداد، long=${liquidationLongNotional ?? 'ناموجود'}، short=${liquidationShortNotional ?? 'ناموجود'}`
+          ).join('؛ ') },
+        ],
+        {
+          sourceId: independentProxySignals[0].source.sourceId,
+          fallbackSourceId: independentProxySignals[0].source.sourceId,
+          sourceTimestampMs,
+          sourceAgeMs: nowMs - sourceTimestampMs,
+          dataQualityPct: Math.min(85, independentProxySignals.length * 25),
+          confidencePct,
+          voteWeightPct,
+          evidenceTrack: 'FUTURES_PROXY',
+          sourceQuorumRequired: proxyQuorum,
+          usedSourceIds: independentProxySignals.map(({ source }) => source.sourceId),
+          proxyAggregate,
+        },
+      );
+    }
+
+    const proxyTimestampMs = independentProxySignals.length
+      ? Math.min(...independentProxySignals.map(({ timestampMs }) => timestampMs))
+      : null;
+    return createVote(
+      member,
+      'ABSTAIN',
+      `Options مستقیم فقط ${independentSignals.length}/${minIndependentSignals} venue مستقل واجد شرایط داشت؛ futures proxy نیز فقط ${independentProxySignals.length}/${proxyQuorum} منبع تازه و مستقل داشت. برای جلوگیری از رأی ساختگی، عضو ممتنع ماند.`,
+      [
+        { labelFa: 'حدنصاب Options مستقیم', passed: false, detailFa: `${independentSignals.length}/${minIndependentSignals} venue مستقل.` },
+        { labelFa: 'حدنصاب futures proxy', passed: false, detailFa: `${independentProxySignals.length}/${proxyQuorum} venue مستقل با تمام سنجه‌های تازه و معتبر.` },
+        { labelFa: 'قابلیت لیکوئیدیشن', passed: false, detailFa: 'دادهٔ عمومی REST قابل اتکای لیکوئیدیشن در این مسیر تأیید نشد و در امتیازدهی جعل/جایگزین نشد.' },
+      ],
+      {
+        sourceId: independentProxySignals[0]?.source.sourceId ??
+          optionSources[0]?.sourceId ?? checks[0]?.sourceId ?? null,
+        fallbackSourceId: independentProxySignals[0]?.source.sourceId ?? null,
+        sourceTimestampMs: proxyTimestampMs,
+        sourceAgeMs: proxyTimestampMs === null ? null : nowMs - proxyTimestampMs,
+        voteWeightPct: 0,
+        evidenceTrack: 'FUTURES_PROXY',
+        sourceQuorumRequired: proxyQuorum,
+        usedSourceIds: independentProxySignals.map(({ source }) => source.sourceId),
+      },
+    );
+  }
+
+  if (member.id === 6) {
+    const cexDirectionalSources = validSources.flatMap((source) => {
+      const matched = metric(source, 'cexWatchlistMatched') === 1;
+      const score = metric(source, 'cexDirectionScore');
+      const timestamp = metric(source, 'observationTimestampMs');
+      const freshness = timestamp === null
+        ? null
+        : freshTimestamp(timestamp, null, nowMs, registeredById.get(source.sourceId)?.maxAgeMs ?? 5 * 60_000);
+      return matched && score !== null && Math.abs(score) <= 1 && freshness
+        ? [{ source, score, timestampMs: freshness.timestampMs }]
+        : [];
+    });
+    const independentCexSignals = cexDirectionalSources.filter((signal, index, all) =>
+      all.findIndex((candidate) =>
+        (candidate.source.independenceGroup ?? candidate.source.sourceId) ===
+        (signal.source.independenceGroup ?? signal.source.sourceId)
+      ) === index
+    );
+    if (independentCexSignals.length >= 2) {
+      const score = independentCexSignals.reduce((total, signal) => total + signal.score, 0) /
+        independentCexSignals.length;
+      const direction: CouncilVote = score >= 0.2
+        ? 'LONG'
+        : score <= -0.2
+          ? 'SHORT'
+          : 'NEUTRAL';
+      return createVote(
+        member,
+        direction,
+        `رأی عضو ۶ فقط از ${independentCexSignals.length} منبع مستقلِ تازه با تطبیق صریح CEX Watchlist و امتیاز جهت‌دار معتبر محاسبه شد؛ میانگین امتیاز ${score.toFixed(3)} است.`,
+        [
+          {
+            labelFa: 'تطبیق صریح CEX Watchlist و تازگی',
+            passed: true,
+            detailFa: independentCexSignals.map(({ source, score: sourceScore }) =>
+              `${source.sourceId}=${sourceScore.toFixed(3)}`
+            ).join('؛ '),
+          },
+          {
+            labelFa: 'حداقل منابع مستقل',
+            passed: true,
+            detailFa: `${independentCexSignals.length} منبع مستقل؛ حداقل ۲ لازم است.`,
+          },
+        ],
+        {
+          sourceId: independentCexSignals[0].source.sourceId,
+          fallbackSourceId: fallbackSourceId(independentCexSignals),
+          sourceTimestampMs: Math.max(...independentCexSignals.map(({ timestampMs }) => timestampMs)),
+          sourceAgeMs: Math.max(...independentCexSignals.map(({ timestampMs }) => nowMs - timestampMs)),
+          dataQualityPct: Math.min(80, independentCexSignals.length * 30),
+          confidencePct: Math.min(50, 25 + Math.round(Math.abs(score) * 25)),
+          voteWeightPct: 40,
+        },
+      );
+    }
+    return {
+      ...abstain(
+        member,
+        `هیچ حدنصابِ دو منبع مستقلِ تازه با تطبیق صریح CEX Watchlist و سنجهٔ جهت‌دار معتبر برقرار نیست (${independentCexSignals.length}/2). سلامت RPC، عرضهٔ استیبل‌کوین، staking و حجم DEX به‌تنهایی برای رأی جهت‌دار کافی نیستند.`,
+        [
+          { labelFa: 'تطبیق CEX Watchlist', passed: false, detailFa: `${independentCexSignals.length}/2 منبع دارای تطبیق صریح، timestamp تازه و امتیاز جهت‌دار معتبر.` },
+          { labelFa: 'سلامت زیرساخت در برابر رأی', passed: true, detailFa: `${observedSources.length} پاسخ سلامت/زمینه‌ای ممکن است سالم باشد، اما به‌تنهایی در quorum رأی شمرده نمی‌شود.` },
+        ],
+        independentCexSignals.length > 0
+          ? Math.max(...independentCexSignals.map(({ timestampMs }) => timestampMs))
+          : sourceTimestampMs,
+        independentCexSignals.length > 0
+          ? Math.max(...independentCexSignals.map(({ timestampMs }) => nowMs - timestampMs))
+          : sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+      ),
+      sourceId: sourceSignals[0]?.source.sourceId ??
+        checks.find(({ status }) => status === 'HEALTHY')?.sourceId ?? null,
+      fallbackSourceId: null,
+    };
+  }
+
+  if (member.id === 7) {
+    for (const source of validSources) {
+      if (source.sourceId === 'council.member7.fred-market-series') continue;
+      const direction = metric(source, 'macroDirectionValue');
+      if (direction !== null) sourceSignals.push({
+        source, value: direction, timestampMs: source.observedAtMs ?? nowMs,
+      });
+    }
+    if (sourceSignals.length >= minIndependentSignals) {
+      const meanDirection = sourceSignals.reduce((sum, signal) => sum + signal.value, 0) /
+        sourceSignals.length;
+      const vote: CouncilVote = meanDirection > 0 ? 'LONG' : meanDirection < 0 ? 'SHORT' : 'NEUTRAL';
+      return createVote(
+        member,
+        vote,
+        `رأی کلان ${asset} با heuristic غیرقطعی از دلار، S&P 500 و VIX روزانه محاسبه شد؛ امتیاز میانگین ${meanDirection.toFixed(3)} از ${sourceSignals.length} منبع مشترک، نه اختصاصی دارایی. گروه دوم FRED برای تنوع داده است و ارائه‌دهنده مستقل شمرده نمی‌شود؛ سقف اطمینان 40٪.`,
+        [
+          { labelFa: 'دادهٔ کلان مشترک و تاریخ‌دار', passed: true, detailFa: sourceSignals.map(({ source, value }) => `${source.sourceId}=${value.toFixed(3)}`).join('؛ ') },
+          { labelFa: 'حداقل منابع مستقل', passed: true, detailFa: `${sourceSignals.length} منبع با سنجهٔ کلان جهت‌ساز از ${registeredIds.length}.` },
+        ],
+        {
+          sourceId: sourceSignals[0].source.sourceId,
+          fallbackSourceId: fallbackSourceId(sourceSignals),
+          sourceTimestampMs,
+          sourceAgeMs: sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+          dataQualityPct: Math.min(100, sourceSignals.length * 25),
+          confidencePct: Math.min(40, 30 + Math.round(Math.abs(meanDirection) * 5)),
+        },
+      );
+    }
+  }
+
+  if (member.id === 8) {
+    const publisherFallback = (sourceId: string): string =>
+      sourceId.endsWith('.decrypt') ? 'Decrypt'
+        : sourceId.endsWith('.the-block') ? 'The Block'
+          : sourceId.endsWith('.coindesk') ? 'CoinDesk'
+            : sourceId.endsWith('.google-news') ? 'Google News item'
+              : sourceId;
+    const assetNewsPattern: Readonly<Record<string, RegExp>> = {
+      BTC: /\bBTC\b|\bBitcoin\b/i,
+      SOL: /\bSOL\b|\bSolana\b/i,
+      XRP: /\bXRP\b|\bRipple\b/i,
+      BNB: /\bBNB\b|\bBinance Coin\b|\bBNB Chain\b/i,
+      ETH: /\bETH\b|\bEthereum\b|\bEther\b/i,
+    };
+    const isAssetNews = (value: string): boolean =>
+      (assetNewsPattern[asset] ??
+        new RegExp(`\\b${asset.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+      ).test(value);
+    const relatedSources = validSources.filter((source) =>
+      (metric(source, 'assetRelevantItemCount24h') ??
+        metric(source, 'ethRelevantItemCount24h') ??
+        metric(source, 'freshEthItemCount') ?? 0) > 0
+    );
+    const headlineRows: Array<{
+      title: string;
+      description: string;
+      categories: string[];
+      publisher: string;
+      publishedAtMs: number;
+      sourceId: string;
+    }> = [];
+    for (const source of relatedSources) {
+      const serialized = source.normalizedData?.rssAssetItemsJson ??
+        source.normalizedData?.rssEthItemsJson;
+      if (typeof serialized !== 'string') continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(serialized) as unknown;
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(parsed)) continue;
+      for (const item of parsed) {
+        if (!isRecord(item)) continue;
+        const row = item;
+        if (typeof row.title !== 'string' || typeof row.publishedAtMs !== 'number' ||
+            !Number.isFinite(row.publishedAtMs)) continue;
+        const description = typeof row.description === 'string' ? row.description : '';
+        const categories = Array.isArray(row.categories)
+          ? row.categories.filter((category): category is string => typeof category === 'string')
+          : [];
+        if (!isAssetNews(`${row.title} ${description} ${categories.join(' ')}`)) continue;
+        const ageMs = nowMs - row.publishedAtMs;
+        if (ageMs < 0 || ageMs > 24 * 60 * 60_000) continue;
+        const publisher = typeof row.publisher === 'string' && row.publisher.trim()
+          ? row.publisher.trim()
+          : publisherFallback(source.sourceId);
+        headlineRows.push({
+          title: row.title,
+          description,
+          categories,
+          publisher,
+          publishedAtMs: row.publishedAtMs,
+          sourceId: source.sourceId,
+        });
+      }
+    }
+    const deduplicatedHeadlines = new Map<string, typeof headlineRows[number]>();
+    for (const headline of headlineRows) {
+      const key = headline.title.trim().toLowerCase().replace(/\s+/g, ' ');
+      if (!deduplicatedHeadlines.has(key)) deduplicatedHeadlines.set(key, headline);
+    }
+    const freshAssetHeadlines = [...deduplicatedHeadlines.values()];
+    const publisherCount = new Set(freshAssetHeadlines.map(({ publisher }) =>
+      publisher.toLowerCase()
+    )).size;
+    const positiveWords = /\b(?:surge|surges|surged|rally|rallies|gain|gains|gained|bullish|approve|approved|approval|adoption|inflow|inflows|record|rise|rises|rose|soar|soars|uptrend|upgrade|breakthrough|strong|growth|positive)\b/gi;
+    const negativeWords = /\b(?:crash|crashes|crashed|fall|falls|fell|decline|declines|declined|outflow|outflows|bearish|hack|hacks|hacked|exploit|exploits|lawsuit|ban|bans|drop|drops|dropped|loss|losses|weak|negative|selloff|slump)\b/gi;
+    const scoredHeadlines = freshAssetHeadlines.map((headline) => {
+      const text = `${headline.title} ${headline.description} ${headline.categories.join(' ')}`;
+      const positiveHits = (text.match(positiveWords) ?? []).length;
+      const negativeHits = (text.match(negativeWords) ?? []).length;
+      const ageMs = nowMs - headline.publishedAtMs;
+      return {
+        ...headline,
+        score: Math.sign(positiveHits - negativeHits),
+        weight: ageMs <= 6 * 60 * 60_000 ? 2 : 1,
+      };
+    });
+    const totalWeight = scoredHeadlines.reduce((sum, item) => sum + item.weight, 0);
+    const weightedLexiconScore = totalWeight > 0
+      ? scoredHeadlines.reduce((sum, item) => sum + item.score * item.weight, 0) / totalWeight
+      : 0;
+    const latestNewsTimestamp = freshAssetHeadlines.reduce<number | null>((latest, item) =>
+      Math.max(latest ?? 0, item.publishedAtMs),
+    null);
+    const usedSourceIds = [...new Set(scoredHeadlines.map(({ sourceId }) => sourceId))];
+    const sourceForVote = relatedSources.find((source) => usedSourceIds.includes(source.sourceId));
+    const providerCount = relatedSources.length;
+    const publisherQuorum = publisherCount >= 2;
+    if (publisherQuorum && sourceForVote) {
+      const vote: CouncilVote = weightedLexiconScore >= 0.15
+        ? 'LONG'
+        : weightedLexiconScore <= -0.15
+          ? 'SHORT'
+          : 'NEUTRAL';
+      const fallbackActive = sourceForVote.sourceId !== registeredIds[0];
+      return createVote(
+        member,
+        vote,
+        `امتیازدهی احساسات ${asset} با fallback واژه‌نامه (lexicon) انجام شد؛ ${freshAssetHeadlines.length} خبر از ${publisherCount} ناشر، امتیاز وزنی ${weightedLexiconScore.toFixed(3)}. خبرهای ۶ ساعت اخیر وزن ۲ و خبرهای ۶ تا ۲۴ ساعت وزن ۱ دارند؛ رأی کم‌اطمینان است.`,
+        [
+          { labelFa: `ناشران مستقل با خبر ${asset} در ۲۴ ساعت`, passed: true, detailFa: `${publisherCount} ناشر واقعی از ${providerCount} فید واجد خبر؛ حداقل ۲ لازم است.` },
+          { labelFa: 'فیلتر و بازهٔ زمانی', passed: true, detailFa: `${freshAssetHeadlines.length} خبر یکتا؛ کلیدواژهٔ ${asset} در عنوان/توضیح/دسته؛ پنجره ۲۴ ساعت.` },
+          { labelFa: 'مدل احساسات', passed: true, detailFa: `lexicon fallback؛ وزن ۶ساعت اخیر=۲، ۶–۲۴ساعت=۱؛ score=${weightedLexiconScore.toFixed(3)}.` },
+        ],
+        {
+          sourceId: sourceForVote.sourceId,
+          fallbackSourceId: fallbackActive ? sourceForVote.sourceId : null,
+          sourceTimestampMs: latestNewsTimestamp,
+          sourceAgeMs: latestNewsTimestamp === null ? null : nowMs - latestNewsTimestamp,
+          dataQualityPct: Math.min(100, publisherCount * 20 + freshAssetHeadlines.length * 5),
+          confidencePct: Math.min(40, 25 + Math.round(Math.abs(weightedLexiconScore) * 15)),
+        },
+      );
+    }
+    const feedFailures = checks.filter(({ sourceId, status }) =>
+      registeredIds.includes(sourceId) && status !== 'HEALTHY'
+    ).length;
+    const reason = feedFailures === registeredIds.length
+      ? 'خرابی فیدها: هیچ‌یک از فیدهای ثبت‌شده سالم نیست.'
+      : freshAssetHeadlines.length === 0
+        ? `کمبود خبر پس از فیلتر ${asset}: در پنجرهٔ ۲۴ساعت، ${freshAssetHeadlines.length} خبر یکتا پیدا شد.`
+        : `فیلتر/پوشش: فقط ${publisherCount} ناشر دارای خبر ${asset} در ۲۴ ساعت است؛ حداقل ۲ ناشر لازم است.`;
+    return {
+      ...abstain(member, `${reason} ابزار مدل در این محیط لازم نیست؛ fallback واژه‌نامه (lexicon) فعال است.`, [
+        { labelFa: 'پوشش ناشران واقعی', passed: publisherQuorum, detailFa: `${publisherCount} ناشر برای ${freshAssetHeadlines.length} خبر یکتا؛ حداقل ۲ لازم است.` },
+        { labelFa: 'تعداد فید سالم', passed: feedFailures < registeredIds.length, detailFa: `${registeredIds.length - feedFailures}/${registeredIds.length} فید سالم.` },
+        { labelFa: 'امتیاز احساسات', passed: true, detailFa: 'lexicon fallback موجود است؛ نبود torch یا مدل باعث abstain نمی‌شود.' },
+      ], latestNewsTimestamp, latestNewsTimestamp === null ? null : nowMs - latestNewsTimestamp),
+      sourceId: sourceForVote?.sourceId ??
+        checks.find(({ sourceId }) => registeredIds.includes(sourceId))?.sourceId ?? null,
+      fallbackSourceId: null,
+    };
+  }
+
+  const abstention = abstain(
+    member,
+    member.id === 6
+      ? 'سنجه‌های آن‌چین تازه موجودند، اما طبق سیاست اتاق فقط زمینه‌اند و جهت قیمت را اثبات نمی‌کنند؛ منبع Etherscan نیز بدون API key در دسترس نیست.'
+      : member.id === 7
+        ? `کمتر از ${minIndependentSignals} منبع کلانِ سالم با سنجهٔ جهت‌ساز تازه در اتاق ETH موجود است.`
+        : member.id === 8
+          ? 'فیلتر خبر ETH در پنجرهٔ تازگی منبع، خبر کافی از دو ناشر پیدا نکرد؛ تا دریافت خبر ETH تازه، رأی abstain است.'
+          : `ورودی جهت‌ساز معتبر از حداقل ${minIndependentSignals} منبع ثبت‌شده برای عضو ${member.id} در اتاق ETH موجود نیست؛ رأی از ورودی عمومی/غیرهم‌اتاق ساخته نشد.`,
+    [
+      { labelFa: 'منابع دادهٔ معتبر', passed: validSources.length >= minIndependentSignals, detailFa: `${validSources.length} منبع داده معتبر از ${registeredIds.length}.` },
+      { labelFa: 'سیگنال جهت‌ساز اختصاصی', passed: false, detailFa: member.id >= 6 ? 'داده‌های ثبت‌شده برای این عضو جریان/جهت بازار را به‌تنهایی اثبات نمی‌کنند.' : `فقط ${sourceSignals.length} منبع دارای metric جهت‌ساز قابل‌استفاده است.` },
+    ],
+    sourceTimestampMs,
+    sourceTimestampMs === null ? null : nowMs - sourceTimestampMs,
+  );
+  const primaryObservedSource = observedSources[0] ??
+    checks.find(({ sourceId }) => registeredIds.includes(sourceId));
+  return {
+    ...abstention,
+    sourceId: primaryObservedSource?.sourceId ?? null,
+    fallbackSourceId: null,
+  };
+}
+
 export function evaluateEightMemberCouncil(input: {
   analysis?: Partial<AnalysisResult> | null;
   macroContext?: CouncilMacroContext | null;
   directMacroData?: FreeMacroDataResult;
   optionsData?: CouncilOptionsData | null;
   whaleFlowData?: CouncilWhaleFlowData | null;
+  memberSourceChecks?: Readonly<Record<number, readonly CouncilMemberSourceCheck[]>>;
+  requireMemberSourceQuorum?: boolean;
+  pair?: string;
   supportingModules?: Readonly<Record<string, CouncilModuleEvidence>>;
   evidenceFingerprints?: Readonly<Record<number, string>>;
   previousMemberEvidence?: Readonly<Record<number, CouncilMemberEvidenceCacheEntry>>;
@@ -1917,20 +2797,78 @@ export function evaluateEightMemberCouncil(input: {
     () => evaluateTradeFlow(members[1], input.analysis, nowMs),
     () => evaluateOrderBook(members[2], input.analysis, nowMs),
     () => evaluateDerivatives(members[3], input.analysis, nowMs),
-    () => evaluateOptions(members[4], input.optionsData, nowMs),
-    () => evaluateOnChain(members[5], input.macroContext, nowMs, input.whaleFlowData ?? undefined),
-    () => evaluateMacro(members[6], input.macroContext, nowMs, input.directMacroData),
-    () => evaluateNews(members[7], input.macroContext, nowMs),
+    () => evaluateOptions(members[4], input.optionsData, nowMs, input.pair),
+    () => evaluateOnChain(members[5], nowMs, input.whaleFlowData ?? undefined, input.pair),
+    () => evaluateMacro(members[6], input.macroContext, nowMs, input.directMacroData, input.pair),
+    () => evaluateNews(members[7], input.macroContext, nowMs, input.pair),
   ];
-  const votes = evaluators.map((evaluate, index) => {
+  const evaluatedVotes = evaluators.map((evaluate, index) => {
     const memberId = index + 1;
     return reuseCachedMemberVote(
       input.previousMemberEvidence?.[memberId],
       input.evidenceFingerprints?.[memberId],
       nowMs,
     ) ?? evaluate();
-  }).map((vote) => ({
+  });
+  const sourceDrivenVotes = input.requireMemberSourceQuorum && input.pair
+    ? evaluatedVotes.map((vote) => {
+      const sourceChecks = input.memberSourceChecks?.[vote.id];
+      return sourceChecks && vote.id !== 6
+        ? evaluatePrimaryAssetSourceVote(
+          EIGHT_MEMBER_COUNCIL[vote.id - 1],
+          sourceChecks,
+          nowMs,
+          input.macroContext,
+          input.pair,
+        )
+        : vote;
+    })
+    : evaluatedVotes;
+  const attributedVotes = sourceDrivenVotes.map((vote) => ({
     ...vote,
+    ...(() => {
+      const memberId = vote.id;
+      const feed = memberId === 1
+        ? input.analysis?.dataQualityReport?.feeds.candles
+        : memberId === 2
+          ? input.analysis?.dataQualityReport?.feeds.orderFlow
+          : memberId === 3
+            ? input.analysis?.dataQualityReport?.feeds.orderBook
+            : memberId === 4
+              ? input.analysis?.dataQualityReport?.feeds.derivatives
+              : undefined;
+      const directMetric = memberId === 7
+        ? [
+          input.directMacroData?.dxy,
+          input.directMacroData?.sp500,
+          input.directMacroData?.broadDollar,
+          input.directMacroData?.fedEffectiveRate,
+        ].find((metric) => metric?.status === 'LIVE')
+        : undefined;
+      const provider = memberId <= 4
+        ? feed?.source
+        : memberId === 5
+          ? input.optionsData?.provider
+          : memberId === 6
+            ? input.whaleFlowData?.provider
+            : memberId === 7
+              ? directMetric?.provider
+              : input.macroContext?.recentHeadlines?.[0]?.source;
+      const explicitSourceId = memberId === 5
+        ? input.optionsData?.sourceId
+        : memberId === 6
+          ? input.whaleFlowData?.sourceId
+          : undefined;
+      const explicitFallbackSourceId = memberId === 5
+        ? input.requireMemberSourceQuorum ? undefined : input.optionsData?.fallbackSourceId
+        : memberId === 6
+          ? input.whaleFlowData?.fallbackSourceId
+          : undefined;
+      return {
+        sourceId: vote.sourceId ?? explicitSourceId ?? sourceIdForProvider(memberId, provider),
+        fallbackSourceId: vote.fallbackSourceId ?? explicitFallbackSourceId ?? null,
+      };
+    })(),
     supportingEvidence: vote.moduleIds.map((moduleId) => input.supportingModules?.[moduleId] ?? {
       moduleId,
       nameFa: moduleId,
@@ -1939,18 +2877,177 @@ export function evaluateEightMemberCouncil(input: {
       summaryFa: 'خروجی این ماژول هنوز به شورا نرسیده است؛ در رأی عضو دخالت ندارد.',
     }),
   }));
+  const votes = attributedVotes.map((vote) => {
+    if (!input.requireMemberSourceQuorum) return vote;
+
+    const asset = getFreqtradePairBaseAsset(input.pair ?? '') ?? 'ETH';
+    const registeredSources = getCouncilMemberSources(vote.id, asset);
+    const suppliedChecks = input.memberSourceChecks?.[vote.id];
+    if (!suppliedChecks) {
+      return {
+        ...vote,
+        healthySourceCount: null,
+        sourceChecks: [],
+      };
+    }
+    const checksById = new Map(suppliedChecks.map((check) => [check.sourceId, check]));
+    const usedSourceIds = new Set(vote.usedSourceIds ?? []);
+    const sourceChecks = registeredSources.map((source): CouncilMemberSourceCheck => {
+      const observed = checksById.get(source.id);
+      const sourceTimestampMs = observed?.sourceTimestampMs ??
+        (typeof observed?.normalizedData?.tradeTimestampMs === 'number'
+          ? observed.normalizedData.tradeTimestampMs
+          : typeof observed?.normalizedData?.optionTimestampMs === 'number'
+            ? observed.normalizedData.optionTimestampMs
+            : null);
+      const base = {
+        ...(observed ?? {
+          sourceId: source.id,
+          status: 'UNTESTED' as const,
+          detail: 'No live source check was supplied for this request.',
+        }),
+        endpoint: observed?.endpoint ?? source.url,
+        provider: observed?.provider ?? source.provider,
+        symbol: observed?.symbol ?? source.symbol,
+        marketType: observed?.marketType ?? source.marketType,
+        independenceGroup: observed?.independenceGroup ?? source.independenceGroup,
+        sourceTimestampMs,
+      };
+      const memberTwoSignal = vote.id === 2
+        ? getMemberTwoCvdSignal(base, nowMs, source.maxAgeMs)
+        : null;
+      const checkedBase = vote.id === 2 &&
+        base.status === 'HEALTHY' &&
+        base.dataValid === true &&
+        memberTwoSignal === null
+        ? {
+            ...base,
+            status: 'BROKEN' as const,
+            dataValid: false,
+            voteValue: 'LOW_VALUE' as const,
+            detail: 'CVD evidence failed the vote-boundary freshness and consistency validation.',
+            dataDetail: 'Rejected: CVD requires a fresh trade timestamp, consistent base-volume arithmetic, at least five classified trades, and a five-minute window.',
+          }
+        : base;
+      const staleAtProxyVoteBoundary = vote.id === 5 &&
+        vote.evidenceTrack === 'FUTURES_PROXY' &&
+        checkedBase.status === 'HEALTHY' &&
+        !usedSourceIds.has(source.id);
+      const voteUsage: CouncilMemberSourceCheck['voteUsage'] = usedSourceIds.has(source.id)
+        ? vote.vote === 'ABSTAIN' ? 'ABSTAINED' : 'USED'
+        : staleAtProxyVoteBoundary
+          ? 'REJECTED'
+        : checkedBase.status === 'HEALTHY' && checkedBase.dataValid === true && checkedBase.voteValue !== 'LOW_VALUE'
+          ? 'NOT_SELECTED'
+          : 'REJECTED';
+      return {
+        ...checkedBase,
+        ...(staleAtProxyVoteBoundary
+          ? { detail: `${checkedBase.detail} Rejected at vote boundary: the proxy fields were stale or failed consistency checks.` }
+          : {}),
+        voteUsage,
+      };
+    });
+    const voteEligibleChecks = sourceChecks.filter((check) =>
+      check.status === 'HEALTHY' &&
+      check.dataValid === true &&
+      check.voteValue !== 'LOW_VALUE' &&
+      (vote.id !== 2 || getMemberTwoCvdSignal(
+        check,
+        nowMs,
+        registeredSources.find(({ id }) => id === check.sourceId)?.maxAgeMs ?? 60_000,
+      ) !== null)
+    );
+    const activeMemberFiveChecks = vote.id === 5
+      ? voteEligibleChecks.filter(({ sourceId }) =>
+        vote.evidenceTrack === 'FUTURES_PROXY'
+          ? sourceId.includes('.proxy.')
+          : !sourceId.includes('.proxy.') &&
+            ((asset !== 'BTC' && asset !== 'ETH') ||
+              ['.deribit-options', '.okx-opt-summary', '.bybit-options']
+                .some((suffix) => sourceId.endsWith(suffix)))
+      ).filter(({ sourceId }) =>
+        vote.evidenceTrack !== 'FUTURES_PROXY' || usedSourceIds.has(sourceId)
+      )
+      : voteEligibleChecks;
+    const independentGroups = new Set(activeMemberFiveChecks.map(({ independenceGroup, sourceId, marketType }) =>
+      vote.id === 2
+        ? `${marketType ?? 'unknown'}:${independenceGroup ?? sourceId}`
+        : independenceGroup ?? sourceId
+    ));
+    const healthySourceCount = vote.id === 2 || vote.id === 5
+      ? independentGroups.size
+      : sourceChecks.filter(({ status }) => status === 'HEALTHY').length;
+    const usedSourceIndex = registeredSources.findIndex(({ id }) => id === vote.sourceId);
+    const minimumHealthySources = vote.id === 5
+      ? vote.sourceQuorumRequired ??
+        (vote.evidenceTrack === 'FUTURES_PROXY'
+          ? MEMBER_FIVE_PROXY_QUORUM
+          : getCouncilOptionsThresholds(asset)?.minimumIndependentSources ?? 2)
+      : 2;
+    const member2MarketQuorum = new Set(voteEligibleChecks
+      .filter(({ marketType }) => marketType === 'spot' || marketType === 'futures')
+      .map(({ marketType, independenceGroup, sourceId }) =>
+        `${marketType}:${independenceGroup ?? sourceId}`
+      ));
+    const member2QuorumPassed = [...new Set(voteEligibleChecks
+      .filter(({ marketType }) => marketType === 'spot' || marketType === 'futures')
+      .map(({ marketType }) => marketType))]
+      .some((marketType) => [...member2MarketQuorum].filter((group) =>
+        group.startsWith(`${marketType}:`)
+      ).length >= minimumHealthySources);
+    const memberSixEvidenceQuorumPassed = vote.id === 6 &&
+      vote.sourceQuorumRequired === 2 &&
+      new Set(vote.usedSourceIds ?? []).size >= 2;
+    const quorumPassed = vote.id === 6
+      ? vote.vote === 'ABSTAIN' || memberSixEvidenceQuorumPassed
+      : vote.id === 2
+        ? member2QuorumPassed
+        : vote.id === 5
+          ? independentGroups.size >= minimumHealthySources
+          : healthySourceCount >= minimumHealthySources;
+    const usedFallback = usedSourceIndex > 0 &&
+      sourceChecks.slice(0, usedSourceIndex).some(({ status, dataValid, voteValue }) =>
+        status !== 'HEALTHY' || dataValid !== true || voteValue === 'LOW_VALUE'
+      );
+    const fallbackSourceId = vote.id === 2 || vote.id === 5
+      ? vote.fallbackSourceId
+      : usedFallback ? vote.sourceId : vote.fallbackSourceId;
+    const failedSourceCheck: CouncilQualityCheck = {
+      labelFa: 'سلامت منابع عضو',
+      passed: vote.id === 6 ? memberSixEvidenceQuorumPassed : quorumPassed,
+      detailFa: vote.id === 6
+        ? `${new Set(vote.usedSourceIds ?? []).size}/2 منبع مستقل برای جریان برچسب‌خورده؛ source health context=${healthySourceCount}/${registeredSources.length}.`
+        : `${healthySourceCount}/${registeredSources.length} منبع سالم؛ حداقل ${minimumHealthySources} لازم است؛ منبع دادهٔ رأی ${vote.sourceId ?? 'در شواهد خام مشخص نشده است.'}`,
+    };
+    return {
+      ...vote,
+      vote: quorumPassed ? vote.vote : 'ABSTAIN',
+      rationaleFa: quorumPassed || vote.id === 6 || vote.id === 8
+        ? vote.rationaleFa
+        : vote.id === 5
+          ? `ABSTAIN: ${vote.rationaleFa} Vote-boundary eligible sources=${healthySourceCount}/${minimumHealthySources}; statuses=${sourceChecks.map(({ sourceId, status, voteUsage }) => `${sourceId}=${status}/${voteUsage}`).join(', ')}.`
+        : `ABSTAIN: فقط ${healthySourceCount}/${registeredSources.length} منبع عضو سالم است؛ حداقل ${minimumHealthySources} منبع سالم لازم است. وضعیت منابع: ${sourceChecks.map(({ sourceId, status }) => `${sourceId}=${status}`).join(', ')}.`,
+      fallbackSourceId,
+      healthySourceCount,
+      sourceChecks,
+      confidencePct: quorumPassed ? vote.confidencePct : null,
+      qualityChecks: [...vote.qualityChecks, failedSourceCheck],
+    };
+  });
   const longVotes = votes.filter(({ vote }) => vote === 'LONG').length;
   const shortVotes = votes.filter(({ vote }) => vote === 'SHORT').length;
   const neutralVotes = votes.filter(({ vote }) => vote === 'NEUTRAL').length;
   const abstentions = votes.filter(({ vote }) => vote === 'ABSTAIN').length;
-  const selectedDirection: CouncilDirection = longVotes >= 5
+  const weightedVotes = getCouncilWeightedVoteCounts(votes);
+  const selectedDirection: CouncilDirection = weightedVotes.long >= 5
     ? 'LONG'
-    : shortVotes >= 5
+    : weightedVotes.short >= 5
       ? 'SHORT'
       : null;
   const summaryFa = selectedDirection
-    ? `شورا با ${selectedDirection === 'LONG' ? longVotes : shortVotes} رأی از ۸ عضو جهت ${selectedDirection} را انتخاب کرد؛ این نتیجه به‌تنهایی مجوز اجرای معامله نیست.`
-    : `حدنصاب ۵ رأی از ۸ عضو حاصل نشد (LONG: ${longVotes}، SHORT: ${shortVotes}، خنثی: ${neutralVotes}، ممتنع: ${abstentions})؛ جهت انتخاب نشد.`;
+    ? `شورا با وزن مؤثر ${selectedDirection === 'LONG' ? weightedVotes.long.toFixed(1) : weightedVotes.short.toFixed(1)} از حدنصاب ۵ جهت ${selectedDirection} را انتخاب کرد (رأی خام LONG: ${longVotes}، SHORT: ${shortVotes})؛ این نتیجه به‌تنهایی مجوز اجرای معامله نیست.`
+    : `حدنصاب وزن‌دار ۵ رأی از ۸ عضو حاصل نشد (LONG: ${weightedVotes.long.toFixed(1)}، SHORT: ${weightedVotes.short.toFixed(1)}؛ رأی خام LONG: ${longVotes}، SHORT: ${shortVotes}، خنثی: ${neutralVotes}، ممتنع: ${abstentions})؛ جهت انتخاب نشد.`;
 
   return {
     evaluatedAtMs: nowMs,
@@ -1958,6 +3055,8 @@ export function evaluateEightMemberCouncil(input: {
     members: votes,
     longVotes,
     shortVotes,
+    weightedLongVotes: weightedVotes.long,
+    weightedShortVotes: weightedVotes.short,
     neutralVotes,
     abstentions,
     selectedDirection,

@@ -18,6 +18,7 @@ import { OperationalTradeArchive } from '../src/services/operationalTradeArchive
 import type { OperationalTradeArchiveMetadata } from '../src/services/operationalTradeArchive';
 import { centralTradeDatasetService } from '../src/services/centralTradeDataset';
 import type { SbkFreqtradeSignalRecord } from '../src/services/freqtradeSignalAdapter';
+import type { EightMemberCouncilReport } from '../src/services/eightMemberCouncil';
 
 const fixturePath = path.resolve('scripts/fixtures/CONTRACT_TEST_ONLY.json');
 const parsedFixture: unknown = JSON.parse(await readFile(fixturePath, 'utf8'));
@@ -81,7 +82,7 @@ const snapshot: FreqtradeMarketSnapshot = {
   pair: 'BTC/USDT:USDT',
   timeframe: '15m',
   generatedAtMs: currentNowMs,
-  candles: [candle],
+  candles: [candle, { ...candle, timestampMs: currentNowMs }],
   additionalCandles: {},
   ticker: null,
   orderBook: null,
@@ -122,6 +123,7 @@ try {
     getOpenTrades: async (): Promise<FreqtradeTrade[]> => [...rpcOpenTrades],
   };
   let analysisCalls = 0;
+  let analyzedCandleCount = 0;
   let exitEvaluationCalls = 0;
   async function namedArchiveSignalMock(
     record: SbkFreqtradeSignalRecord,
@@ -149,8 +151,9 @@ try {
       exitEvaluationCalls += 1;
       return { shouldExit: true, reason: 'CONTRACT_TEST_ONLY thesis invalidation' };
     },
-    analyze: async () => {
+    analyze: async (_snapshot, analyzedCandles) => {
       analysisCalls += 1;
+      analyzedCandleCount = analyzedCandles.length;
       return {
         candidate: {
           direction: 'SHORT' as const,
@@ -202,16 +205,142 @@ try {
     minimumCandles: 1,
   };
 
+  const originalConfiguredPairs = process.env.SBK1_FREQTRADE_PAIRS;
+  process.env.SBK1_FREQTRADE_PAIRS = [
+    'BTC/USDT:USDT',
+    'ETH/USDT:USDT',
+    'SOL/USDT:USDT',
+    'XRP/USDT:USDT',
+    'BNB/USDT:USDT',
+  ].join(',');
+  const analyzedPairs: string[] = [];
+  const multiPairSnapshots = new Map(
+    process.env.SBK1_FREQTRADE_PAIRS.split(',').map((pair) => [pair, { ...snapshot, pair }]),
+  );
+  const multiPairRunner = new ServerSignalRunner({
+    ...dependencies,
+    getSnapshot: (expected) => multiPairSnapshots.get(expected.pair)!,
+    isAutoPilotEnabled: () => false,
+    analyze: async (pairSnapshot) => {
+      analyzedPairs.push(pairSnapshot.pair);
+      return { candidate: null, reason: 'CONTRACT_TEST_ONLY no candidate.' };
+    },
+  });
+  try {
+    await multiPairRunner.runOnce();
+  } finally {
+    if (originalConfiguredPairs === undefined) delete process.env.SBK1_FREQTRADE_PAIRS;
+    else process.env.SBK1_FREQTRADE_PAIRS = originalConfiguredPairs;
+  }
+  assert.deepEqual(
+    analyzedPairs,
+    ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 'BNB/USDT:USDT'],
+    'the server runner must independently analyze each configured pair',
+  );
+  assert.equal(multiPairRunner.getPairUpdates().length, 5, 'each configured pair must publish its own decision state');
+
+  const timeBeforeDelayedRpc = currentNowMs;
+  let snapshotLookupAtMs: number | null = null;
+  const delayedRpcRunner = new ServerSignalRunner({
+    ...dependencies,
+    getFreqtradeStatus: async () => {
+      currentNowMs += 20_000;
+      return { ...status, lastChecked: currentNowMs };
+    },
+    getSnapshot: (_expected, nowMs) => {
+      snapshotLookupAtMs = nowMs;
+      return { ...snapshot, generatedAtMs: currentNowMs };
+    },
+    analyze: async () => ({
+      candidate: null,
+      reason: 'CONTRACT_TEST_ONLY delayed RPC preflight.',
+    }),
+  });
+  try {
+    await delayedRpcRunner.runOnce();
+    assert.equal(
+      snapshotLookupAtMs,
+      currentNowMs,
+      'snapshot freshness must use the current time after asynchronous RPC preflight',
+    );
+    assert.equal(
+      delayedRpcRunner.getLatestUpdate().reason,
+      'CONTRACT_TEST_ONLY delayed RPC preflight.',
+      'a fresh snapshot after delayed RPC preflight must reach analysis',
+    );
+  } finally {
+    currentNowMs = timeBeforeDelayedRpc;
+  }
+
+  const higherTimeframeRunner = new ServerSignalRunner({
+    ...dependencies,
+    getSnapshot: () => ({ ...snapshot, timeframe: '1h' }),
+  });
+  await higherTimeframeRunner.runOnce();
+  assert.equal(analysisCalls, 0, 'higher-timeframe snapshots must not independently reach entry analysis');
+
   const firstRunner = new ServerSignalRunner(dependencies);
   await firstRunner.runOnce();
   await firstRunner.runOnce();
   assert.equal(analysisCalls, 1, 'the same closed candle must only be analyzed once per runner instance');
+  assert.equal(analyzedCandleCount, 1, 'only completed 15m candles may reach entry analysis');
+  assert.equal(snapshot.candles.length, 2, 'the snapshot fixture includes one still-forming candle');
 
   const restartedRunner = new ServerSignalRunner(dependencies);
   await restartedRunner.runOnce();
   const stored = await adapter.getForStrategy(snapshot.pair, snapshot.timeframe);
   assert.equal(stored.length, 1, 'a restarted runner must not queue a second signal for the same candle');
   assert.equal(stored[0]?.signal.direction, 'SHORT');
+  assert.equal(stored[0]?.signal.timeframe, '15m');
+  const autoPilotOffRunner = new ServerSignalRunner({
+    ...dependencies,
+    isAutoPilotEnabled: () => false,
+  });
+  await autoPilotOffRunner.runOnce();
+  assert.equal(
+    autoPilotOffRunner.getLatestUpdate().reason.includes('Auto-Pilot is disabled'),
+    true,
+    'the server council may evaluate while Auto-Pilot is off, but must not submit an automatic entry',
+  );
+  assert.equal((await adapter.getForStrategy(snapshot.pair, snapshot.timeframe)).length, 1);
+
+  const conflictingCouncilReport: EightMemberCouncilReport = {
+    evaluatedAtMs: currentNowMs,
+    quorumRequired: 5,
+    members: [],
+    longVotes: 5,
+    shortVotes: 3,
+    neutralVotes: 0,
+    abstentions: 0,
+    selectedDirection: 'LONG',
+    quorumMet: true,
+    summaryFa: 'CONTRACT_TEST_ONLY council report.',
+  };
+  const manualIntentRunner = new ServerSignalRunner({
+    ...dependencies,
+    isAutoPilotEnabled: () => false,
+    submitSignal: async () => {
+      throw new Error('A manual intent conflicting with the council must not submit a signal.');
+    },
+    analyze: async (...args) => ({
+      ...await dependencies.analyze!(...args),
+      councilReport: conflictingCouncilReport,
+    }),
+  });
+  assert.equal(manualIntentRunner.requestManualEntry('BTC/USDT:USDT', 'SHORT'), true);
+  await manualIntentRunner.runOnce();
+  assert.match(
+    manualIntentRunner.getLatestUpdate().reason,
+    /does not match the server council direction/,
+    'manual direction is an intent only and must match the authoritative server council',
+  );
+  const overLimitRunner = new ServerSignalRunner({
+    ...dependencies,
+    getFreqtradeStatus: async () => ({ ...status, maxOpenTrades: 4 }),
+  });
+  const analysisCallsBeforeOverLimit = analysisCalls;
+  await overLimitRunner.runOnce();
+  assert.equal(analysisCalls, analysisCallsBeforeOverLimit, 'runner must reject an execution config above the three-trade cap');
   assert.equal(stored[0]?.signal.referencePrice, candle.close);
   assert.equal(stored[0]?.signal.entryConditions.stopLoss, candle.high);
   assert.equal(stored[0]?.signal.entryConditions.takeProfit, candle.low);
@@ -395,6 +524,11 @@ try {
   await closedRunner.runOnce();
   assert.equal(exitEvaluationCalls, 1, 'a closed trade must not be evaluated or receive another exit');
   assert.equal((await adapter.getPendingExitSignals(snapshot.pair)).length, 0);
+  assert.equal(
+    closedRunner.getLatestUpdate().reason,
+    'Manual SBK1 kill switch is active; open-position exits were still evaluated.',
+    'the UI must report the active kill switch instead of retaining a stale snapshot error',
+  );
   console.log('Named Freqtrade RPC mock verified entry, one-shot exit signal, and closed-trade idempotency.');
 } finally {
   if (originalSignalStore === undefined) delete process.env.SBK1_SIGNAL_STORE_PATH;

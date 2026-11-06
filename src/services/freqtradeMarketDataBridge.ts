@@ -2,6 +2,7 @@ import { deduplicateTrades } from './councilEvidenceDeduplication';
 
 export const FREQTRADE_MARKET_SNAPSHOT_VERSION = 'sbk1.freqtrade.market-snapshot.v5';
 export const FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS = 15_000;
+export const FREQTRADE_MARKET_SNAPSHOT_MAX_CANDLES = 1_500;
 export const FREQTRADE_TICKER_MAX_AGE_MS = 5_000;
 export const FREQTRADE_TRADE_FLOW_MAX_AGE_MS = 5_000;
 export const FREQTRADE_OPEN_INTEREST_MAX_AGE_MS = 10 * 60_000;
@@ -149,7 +150,11 @@ function validateCandles(
   timeframe: string,
   generatedAtMs: number,
 ): value is FreqtradeMarketCandle[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 500) return false;
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > FREQTRADE_MARKET_SNAPSHOT_MAX_CANDLES
+  ) return false;
   const timeframeMs = timeframeToMs(timeframe);
   if (timeframeMs <= 0) return false;
   let previousTimestampMs = 0;
@@ -348,19 +353,19 @@ export function validateFreqtradeMarketSnapshot(
       continue;
     }
     if (!validateCandles(candidateCandles, timeframe, value.generatedAtMs)) {
-      throw new FreqtradeMarketSnapshotValidationError(`Snapshot candles for ${timeframe} are invalid or stale.`, 'INVALID_CANDLES');
+      additionalCandles[timeframe] = null;
+      continue;
     }
     additionalCandles[timeframe] = candidateCandles.map((candle) => ({ ...candle }));
   }
-  const ticker = value.ticker;
-  if (!validateTickerShape(ticker)) {
-    throw new FreqtradeMarketSnapshotValidationError('Ticker is invalid or stale.', 'INVALID_TICKER');
-  }
+  let ticker: FreqtradeMarketTicker | null = validateTickerShape(value.ticker)
+    ? value.ticker
+    : null;
   if (
     isRecord(ticker) &&
     (ticker.retrievedAtMs > nowMs + 1_000 || ticker.retrievedAtMs > value.generatedAtMs + 1_000)
   ) {
-    throw new FreqtradeMarketSnapshotValidationError('Ticker is future-dated.', 'INVALID_TICKER');
+    ticker = null;
   }
   const verifiedTicker = ticker !== null &&
     nowMs - ticker.retrievedAtMs <= FREQTRADE_TICKER_MAX_AGE_MS &&
@@ -368,66 +373,68 @@ export function validateFreqtradeMarketSnapshot(
       ticker.retrievedAtMs - ticker.exchangeTimestampMs <= FREQTRADE_TICKER_MAX_AGE_MS)
     ? ticker
     : null;
-  const orderBook = value.orderBook;
-  if (!validateOrderBookShape(orderBook, nowMs)) {
-    throw new FreqtradeMarketSnapshotValidationError('Order book is invalid or stale.', 'INVALID_ORDER_BOOK');
-  }
+  let orderBook: FreqtradeMarketOrderBook | null = validateOrderBookShape(value.orderBook, nowMs)
+    ? value.orderBook
+    : null;
   if (orderBook && (
     (orderBook.venue !== undefined && orderBook.venue.toLowerCase() !== expected.exchange.toLowerCase()) ||
     (orderBook.symbol !== undefined && orderBook.symbol.toLowerCase() !== expected.pair.toLowerCase())
   )) {
-    throw new FreqtradeMarketSnapshotValidationError(
-      'Order book venue or symbol does not match the requested market.',
-      'INVALID_ORDER_BOOK_IDENTITY',
-    );
+    orderBook = null;
   }
-  if (isRecord(orderBook) && orderBook.timestampMs > value.generatedAtMs + 1_000) {
-    throw new FreqtradeMarketSnapshotValidationError('Order book is future-dated.', 'INVALID_ORDER_BOOK');
+  if (orderBook && orderBook.timestampMs > value.generatedAtMs + 1_000) {
+    orderBook = null;
   }
   const verifiedOrderBook = orderBook !== null && nowMs - orderBook.timestampMs <= 10_000
     ? orderBook
     : null;
-  const fundingRate = value.fundingRate;
-  if (!validateFundingRateShape(fundingRate)) {
-    throw new FreqtradeMarketSnapshotValidationError('Funding rate is invalid or stale.', 'INVALID_FUNDING_RATE');
-  }
-  if (isRecord(fundingRate) && (fundingRate.retrievedAtMs > nowMs + 1_000 || fundingRate.retrievedAtMs > value.generatedAtMs + 1_000)) {
-    throw new FreqtradeMarketSnapshotValidationError('Funding rate is future-dated.', 'INVALID_FUNDING_RATE');
+  let fundingRate: FreqtradeMarketFundingRate | null = validateFundingRateShape(value.fundingRate)
+    ? value.fundingRate
+    : null;
+  if (
+    fundingRate &&
+    (fundingRate.retrievedAtMs > nowMs + 1_000 ||
+      fundingRate.retrievedAtMs > value.generatedAtMs + 1_000)
+  ) {
+    fundingRate = null;
   }
   const verifiedFundingRate = fundingRate !== null &&
     nowMs - fundingRate.retrievedAtMs <= FREQTRADE_MARKET_SNAPSHOT_MAX_AGE_MS
     ? fundingRate
     : null;
-  const openInterest = value.openInterest;
-  if (!validateOpenInterestShape(openInterest, value.generatedAtMs, nowMs)) {
-    throw new FreqtradeMarketSnapshotValidationError('Open interest is invalid.', 'INVALID_OPEN_INTEREST');
-  }
+  let openInterest: FreqtradeMarketOpenInterest | null = validateOpenInterestShape(
+    value.openInterest,
+    value.generatedAtMs,
+    nowMs,
+  )
+    ? value.openInterest
+    : null;
   if (
-    isRecord(openInterest) &&
+    openInterest &&
     (openInterest.retrievedAtMs > nowMs + 1_000 ||
       openInterest.retrievedAtMs > value.generatedAtMs + 1_000 ||
       openInterest.latestTimestampMs > nowMs + 1_000 ||
       openInterest.previousTimestampMs > nowMs + 1_000)
   ) {
-    throw new FreqtradeMarketSnapshotValidationError('Open interest is future-dated.', 'INVALID_OPEN_INTEREST');
+    openInterest = null;
   }
   const verifiedOpenInterest = openInterest !== null &&
     nowMs - openInterest.latestTimestampMs >= 0 &&
     nowMs - openInterest.latestTimestampMs <= FREQTRADE_OPEN_INTEREST_MAX_AGE_MS
     ? openInterest
     : null;
-  const tradeFlow = value.tradeFlow;
-  if (!validateTradeFlowShape(tradeFlow, value.generatedAtMs, nowMs)) {
-    throw new FreqtradeMarketSnapshotValidationError('Trade flow is invalid, empty, or stale.', 'INVALID_TRADE_FLOW');
-  }
+  let tradeFlow: FreqtradeMarketTradeFlow | null = validateTradeFlowShape(
+    value.tradeFlow,
+    value.generatedAtMs,
+    nowMs,
+  )
+    ? value.tradeFlow
+    : null;
   if (tradeFlow && tradeFlow.trades.some((trade) =>
     (trade.venue !== undefined && trade.venue.toLowerCase() !== expected.exchange.toLowerCase()) ||
     (trade.symbol !== undefined && trade.symbol.toLowerCase() !== expected.pair.toLowerCase())
   )) {
-    throw new FreqtradeMarketSnapshotValidationError(
-      'Trade flow venue or symbol does not match the requested market.',
-      'INVALID_TRADE_FLOW_IDENTITY',
-    );
+    tradeFlow = null;
   }
   const verifiedTradeFlow = tradeFlow !== null &&
     nowMs - tradeFlow.retrievedAtMs <= FREQTRADE_TRADE_FLOW_MAX_AGE_MS &&
@@ -441,12 +448,9 @@ export function validateFreqtradeMarketSnapshot(
       symbol: trade.symbol ?? expected.pair,
     })))
     : null;
-  if (deduplicatedTradeFlow?.conflictingIdentity) {
-    throw new FreqtradeMarketSnapshotValidationError(
-      'Trade flow contains conflicting records for the same venue, symbol, and exchange trade id.',
-      'DUPLICATE_TRADE_IDENTITY_CONFLICT',
-    );
-  }
+  const usableTradeFlow = deduplicatedTradeFlow && !deduplicatedTradeFlow.conflictingIdentity
+    ? deduplicatedTradeFlow
+    : null;
   return {
     contractVersion: FREQTRADE_MARKET_SNAPSHOT_VERSION,
     source: 'freqtrade.dataprovider',
@@ -471,16 +475,24 @@ export function validateFreqtradeMarketSnapshot(
     },
     fundingRate: verifiedFundingRate && { ...verifiedFundingRate },
     openInterest: verifiedOpenInterest && { ...verifiedOpenInterest },
-    tradeFlow: verifiedTradeFlow && deduplicatedTradeFlow && {
+    tradeFlow: verifiedTradeFlow && usableTradeFlow && {
       retrievedAtMs: verifiedTradeFlow.retrievedAtMs,
-      duplicateCount: (verifiedTradeFlow.duplicateCount ?? 0) + deduplicatedTradeFlow.duplicateCount,
-      trades: deduplicatedTradeFlow.values.map((trade) => ({ ...trade })),
+      duplicateCount: (verifiedTradeFlow.duplicateCount ?? 0) + usableTradeFlow.duplicateCount,
+      trades: usableTradeFlow.values.map((trade) => ({ ...trade })),
     },
   };
 }
 
 export class FreqtradeMarketDataBridge {
   private readonly latestByMarket = new Map<string, FreqtradeMarketSnapshot>();
+  private readonly snapshotListeners = new Set<(snapshot: FreqtradeMarketSnapshot) => void>();
+
+  subscribe(listener: (snapshot: FreqtradeMarketSnapshot) => void): () => void {
+    this.snapshotListeners.add(listener);
+    return () => {
+      this.snapshotListeners.delete(listener);
+    };
+  }
 
   accept(
     value: unknown,
@@ -494,6 +506,13 @@ export class FreqtradeMarketDataBridge {
       throw new FreqtradeMarketSnapshotValidationError('Snapshot timestamp did not advance.', 'OUT_OF_ORDER_SNAPSHOT');
     }
     this.latestByMarket.set(key, snapshot);
+    for (const listener of this.snapshotListeners) {
+      try {
+        listener(snapshot);
+      } catch (error) {
+        console.error('[FreqtradeMarketDataBridge] Snapshot subscriber failed:', error);
+      }
+    }
     return snapshot;
   }
 

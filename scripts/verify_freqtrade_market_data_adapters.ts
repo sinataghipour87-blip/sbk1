@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import {
   validateFreqtradeMarketSnapshot,
-  FreqtradeMarketSnapshotValidationError,
 } from '../src/services/freqtradeMarketDataBridge';
 
 const nowMs = Date.now();
@@ -29,8 +28,8 @@ const marketSnapshot = {
   additionalCandles: {
     '1m': makeCandles(60_000, 30),
     '5m': makeCandles(5 * 60_000, 30),
-    '1h': makeCandles(60 * 60_000, 10),
-    '4h': makeCandles(4 * 60 * 60_000, 10),
+    '1h': makeCandles(60 * 60_000, 30),
+    '4h': makeCandles(4 * 60 * 60_000, 30),
   },
   ticker: {
     exchangeTimestampMs: null,
@@ -54,7 +53,13 @@ const marketSnapshot = {
   },
   fundingRate: { retrievedAtMs: nowMs - 500, rate: -0.0001, nextFundingAtMs: null },
   openInterest: null,
-  tradeFlow: null,
+  tradeFlow: {
+    retrievedAtMs: nowMs - 100,
+    trades: [
+      { timestampMs: nowMs - 300, side: 'buy', price: 60_000, amount: 1, tradeId: 'buy-1' },
+      { timestampMs: nowMs - 200, side: 'sell', price: 60_001, amount: 0.25, tradeId: 'sell-1' },
+    ],
+  },
 };
 
 const snapshotWithRepeatedTrades = validateFreqtradeMarketSnapshot({
@@ -78,7 +83,7 @@ assert.equal(snapshotWithRepeatedTrades.tradeFlow?.trades.length, 2,
 assert.equal(snapshotWithRepeatedTrades.tradeFlow?.duplicateCount, 1);
 assert.equal(snapshotWithRepeatedTrades.tradeFlow?.trades[0].venue, 'bybit');
 assert.equal(snapshotWithRepeatedTrades.tradeFlow?.trades[0].symbol, 'BTC/USDT:USDT');
-assert.throws(() => validateFreqtradeMarketSnapshot({
+const snapshotWithConflictingTrades = validateFreqtradeMarketSnapshot({
   ...marketSnapshot,
   tradeFlow: {
     retrievedAtMs: nowMs - 100,
@@ -92,8 +97,9 @@ assert.throws(() => validateFreqtradeMarketSnapshot({
   market: 'futures',
   pair: 'BTC/USDT:USDT',
   timeframe: '15m',
-}, nowMs), FreqtradeMarketSnapshotValidationError,
-'conflicting records with the same trade identity must fail closed');
+}, nowMs);
+assert.equal(snapshotWithConflictingTrades.tradeFlow, null,
+  'conflicting optional trade flow must be unavailable without rejecting valid market candles');
 
 Object.defineProperty(globalThis, 'window', { value: {}, configurable: true });
 let requestCount = 0;
@@ -111,10 +117,38 @@ globalThis.fetch = async (input) => {
   });
 };
 
+class FakeEventSource {
+  static OPEN = 1;
+  static instances: FakeEventSource[] = [];
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+
+  constructor(url: string) {
+    assert.equal(url, '/api/market/freqtrade-snapshot/stream');
+    FakeEventSource.instances.push(this);
+  }
+
+  open(): void {
+    this.readyState = FakeEventSource.OPEN;
+    this.onopen?.();
+  }
+
+  send(data: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(data) });
+  }
+
+  close(): void {
+    this.readyState = 2;
+  }
+}
+Object.defineProperty(globalThis, 'EventSource', { value: FakeEventSource, configurable: true });
+
 try {
 const marketData = await import('../src/services/marketData');
 await marketData.getFreqtradeMarketSnapshot();
-const { setupFreqtradeMarketFeed } = await import('../src/services/websocket');
+const { setupFreqtradeMarketFeed } = await import('../src/services/freqtradeMarketFeed');
 let feedMessage: { price: number; source: string } | null = null;
 let feedState = 'DISCONNECTED';
 const feed = setupFreqtradeMarketFeed((price, message) => {
@@ -122,7 +156,10 @@ const feed = setupFreqtradeMarketFeed((price, message) => {
 }, (state) => {
   feedState = state;
 });
-await new Promise((resolve) => setTimeout(resolve, 0));
+const activeFeedSource = FakeEventSource.instances.at(-1);
+assert.ok(activeFeedSource);
+activeFeedSource.open();
+activeFeedSource.send({ serverTimeMs: nowMs, snapshot: marketSnapshot });
 assert.equal(feedState, 'LIVE');
 assert.deepEqual(feedMessage, { price: 60_001, source: 'freqtrade.dataprovider' });
 feed.close();
@@ -134,9 +171,19 @@ const candles = await marketData.fetchCandles();
   assert.equal(marketData.validateMarketDataLiveSafety(candles.candles, candles.status).isLiveSafe, true);
   assert.equal(marketData.validateMarketDataLiveSafety(candles.candles.slice(-299), candles.status).isLiveSafe, false);
 
-  const htf = await marketData.fetchHtf();
-  assert.equal(htf['Freqtrade 1h']?.length, 10);
-  assert.equal(htf['Freqtrade 4h']?.length, 10);
+for (const interval of ['1', '5', '60', '240']) {
+  const result = await marketData.fetchBybit(interval, 20);
+  assert.equal(result.candles.length, 20, `${interval}m chart timeframe should use validated Freqtrade snapshot candles`);
+}
+await assert.rejects(
+  marketData.fetchBybit('1440', 20),
+  /Unsupported Bybit candle request/,
+  'unsupported daily chart timeframe must not be advertised or silently mapped',
+);
+
+const htf = await marketData.fetchHtf();
+  assert.equal(htf['Freqtrade 1h']?.length, 30);
+  assert.equal(htf['Freqtrade 4h']?.length, 30);
   assert.equal(requestCount, 1, 'snapshot consumers should share the in-memory snapshot');
 
   const originalDateNow = Date.now;
@@ -163,8 +210,13 @@ const candles = await marketData.fetchCandles();
   assert.equal(derivatives.funding, -0.0001, 'verified funding is retained even when open interest is unavailable');
 
   const tradeFlow = await marketData.fetchRealTradeFlowCvd();
-  assert.equal(tradeFlow.status, 'UNAVAILABLE');
-  assert.equal(tradeFlow.cvdDelta, null);
+  assert.equal(tradeFlow.status, 'LIVE');
+  assert.equal(tradeFlow.isRealTradeFlow, true);
+  assert.equal(tradeFlow.takerBuyVol, 1);
+  assert.equal(tradeFlow.takerSellVol, 0.25);
+  assert.equal(tradeFlow.cvdDelta, 0.75);
+  assert.equal(tradeFlow.cvdDeltaUsd, 44_999.75);
+  assert.equal(tradeFlow.uniqueTradeCount, 2);
 
   const canonical = await marketData.getCanonicalMarketSnapshot();
   assert.equal(canonical.primaryIndexPrice, 59_999);
@@ -189,9 +241,18 @@ const candles = await marketData.fetchCandles();
     noTickerState = state;
   });
   try {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(noTickerState, 'STALE');
+    const noTickerSource = FakeEventSource.instances.at(-1);
+    assert.ok(noTickerSource);
+    noTickerSource.open();
+    noTickerSource.send({
+      serverTimeMs: nowMs + 8_000,
+      snapshot: { ...marketSnapshot, generatedAtMs: nowMs + 8_000, ticker: null },
+    });
+    assert.equal(noTickerState, 'DEGRADED');
     assert.deepEqual(noTickerMessages, [], 'a missing ticker must not produce a synthetic price');
+    const unavailableTradeFlow = await marketData.fetchRealTradeFlowCvd();
+    assert.equal(unavailableTradeFlow.status, 'UNAVAILABLE');
+    assert.equal(unavailableTradeFlow.cvdDelta, null);
   } finally {
     noTickerFeed.close();
     Date.now = originalDateNow;
@@ -225,7 +286,7 @@ const candles = await marketData.fetchCandles();
     () => marketData.fetchKucoin(),
     /venue fallback is disabled/,
   );
-  assert.equal(requestCount, 5, 'all adapter requests must use the internal Freqtrade snapshot endpoint');
+  assert.equal(requestCount, 3, 'SSE snapshots are cached; only the initial and forced adapter requests fetch the snapshot endpoint');
 } finally {
   globalThis.fetch = originalFetch;
 }

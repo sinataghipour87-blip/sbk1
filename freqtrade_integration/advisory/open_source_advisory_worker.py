@@ -22,6 +22,13 @@ for thread_variable in (
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(message)s")
 LOGGER = logging.getLogger("sbk1.open_source_advisories")
 CONTRACT_VERSION = "sbk1.open-source-advisories.v1"
+SUPPORTED_PAIRS = {
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "XRP/USDT:USDT",
+    "BNB/USDT:USDT",
+}
 NEWS_MODEL = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
 NEWS_MODEL_REVISION = "ae0eab9ad336d7d548e0efe394b07c04bcaf6e91"
 LEXICON_POSITIVE_TERMS = {
@@ -539,6 +546,9 @@ def analyze_news_isolated(headlines: list[dict[str, Any]], timestamp_ms: int) ->
 def analyze_request(request: Any) -> dict[str, Any]:
     if not isinstance(request, dict) or not isinstance(request.get("requestId"), str):
         raise ValueError("requestId is required")
+    pair = request.get("pair")
+    if not isinstance(pair, str) or pair not in SUPPORTED_PAIRS:
+        raise ValueError("pair must be a supported full Freqtrade pair")
     candles, timestamp_ms = validate_candles(request.get("candles"))
     raw_headlines = request.get("headlines")
     if not isinstance(raw_headlines, list) or len(raw_headlines) > 24:
@@ -551,8 +561,9 @@ def analyze_request(request: Any) -> dict[str, Any]:
             or not headline["headline"].strip()
             or not isinstance(headline.get("publisher"), str)
             or not isinstance(headline.get("publishedAt"), str)
+            or headline.get("pair") != pair
         ):
-            raise ValueError("headline records require headline, publisher, and publishedAt")
+            raise ValueError("headline records must be scoped to the request pair")
         headlines.append(headline)
 
     news_sentiment = module_result(
@@ -575,6 +586,7 @@ def analyze_request(request: Any) -> dict[str, Any]:
     )
     return {
         "requestId": request["requestId"],
+        "pair": pair,
         "contractVersion": CONTRACT_VERSION,
         "generatedAtMs": int(time.time() * 1000),
         "sourceTimestampMs": timestamp_ms,

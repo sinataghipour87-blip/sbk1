@@ -200,13 +200,16 @@ export function analyzePro(
   balance = 1000.0,
   riskPct = 1.5,
   rawCandles?: Candle[],
-  dataStatus: 'LIVE' | 'STALE' | 'DATA_UNAVAILABLE' | 'SIMULATED' = 'LIVE',
+  dataStatus: 'LIVE' | 'STALE' | 'DATA_UNAVAILABLE' | 'SIMULATED' | 'VERIFIED_REALTIME' = 'LIVE',
   dataQualityReport?: DataQualityReport,
   realObiData?: RealOrderBookImbalance,
   canonicalSnapshot?: CanonicalMarketSnapshot,
   futuresPrices?: FuturesPrices,
-  orderFlowFeatures?: OrderFlowFeatures
+  orderFlowFeatures?: OrderFlowFeatures,
+  options: { allowDemoData?: boolean } = {},
 ): AnalysisResult {
+  const allowDemoData = options.allowDemoData === true;
+  const minimumCandles = allowDemoData ? 30 : 300;
   const hasFreshPrimaryFeeds =
     dataQualityReport?.feeds?.candles?.status === 'LIVE' &&
     dataQualityReport.feeds.futuresPrices?.status === 'LIVE' &&
@@ -224,11 +227,13 @@ export function analyzePro(
   // Missing optional feeds disables execution, but fresh candles and ticker still support technical analysis.
   if (
     !candles ||
-    candles.length < 300 ||
-    dataStatus === 'DATA_UNAVAILABLE' ||
-    dataStatus === 'SIMULATED' ||
-    (dataStatus === 'STALE' && primaryFeedsUnavailable) ||
-    (dataQualityReport && !dataQualityReport.isTradeAllowed && primaryFeedsUnavailable)
+    candles.length < minimumCandles ||
+    (!allowDemoData && (
+      dataStatus === 'DATA_UNAVAILABLE' ||
+      dataStatus === 'SIMULATED' ||
+      (dataStatus === 'STALE' && primaryFeedsUnavailable) ||
+      (dataQualityReport && !dataQualityReport.isTradeAllowed && primaryFeedsUnavailable)
+    ))
   ) {
     const dummyPrice = futuresPrices?.lastPrice || (candles && candles.length > 0 ? candles[candles.length - 1][3] : 0);
     const reasonsMsg = dataQualityReport?.reasonsFa?.join(' | ') || 'فیدهای زنده بازار در دسترس نیستند یا کهنه شده‌اند';
@@ -242,7 +247,7 @@ export function analyzePro(
       stopLossPriceType: 'MARK_PRICE',
       liquidationPriceType: 'MARK_PRICE',
       sentiment,
-      action: `🛑 توقف کامل معامله (NO TRADE): ${candles && candles.length < 300 ? 'حداقل ۳۰۰ کندل واقعی برای اعتبارسنجی OOS مدل رژیم لازم است.' : reasonsMsg}`,
+      action: `🛑 توقف کامل معامله (NO TRADE): ${candles && candles.length < minimumCandles ? `حداقل ${minimumCandles} کندل برای تحلیل لازم است.` : reasonsMsg}`,
       actionCol: '#E74C3C',
       direction: 'LONG',
       signalOk: false,
@@ -615,7 +620,18 @@ export function analyzePro(
   // 3. Market-Aware Structural Invalidation Stop Loss (Issue 8 & 37 & 38)
   // Stop is anchored to structural invalidation with historical MAE Fingerprint cross-validation
   const provOrderFlow = orderFlowFeatures ?? calculateOrderFlowFeatures(candles);
-  const provRegime = classifyMarketRegime(candles, price, adxVal, currAtr, bbUp, bbLow, bbMid, vwapVal, provOrderFlow);
+  const provRegime = classifyMarketRegime(
+    candles,
+    price,
+    adxVal,
+    currAtr,
+    bbUp,
+    bbLow,
+    bbMid,
+    vwapVal,
+    provOrderFlow,
+    allowDemoData,
+  );
   const currentFingerprint = getMaeMfeFingerprint(setupType, provRegime.activeRegime, '15m');
   const slReport = separateStopFromProbability(confDirection, price, invalidationLevel, currentFingerprint, currAtr);
   const sl = slReport.finalStopPrice;
@@ -870,7 +886,7 @@ export function analyzePro(
   let entryTiming: 'IMMEDIATE' | 'WAIT_FOR_PULLBACK' | 'WAIT_FOR_BREAKOUT' | 'NO_TRADE' = 'IMMEDIATE';
   let tradeThesis = `${confDirection === 'LONG' ? 'خرید' : 'فروش'} (${setupType})؛ همگرایی ${confScore}/5؛ تارگت لیکوییدیتی $${tp1.toLocaleString()}؛ ابطال ساختاری $${invalidationLevel.toLocaleString()}`;
 
-  const isDataQualityBroken = Boolean(dataQualityReport && !dataQualityReport.isTradeAllowed);
+  const isDataQualityBroken = !allowDemoData && Boolean(dataQualityReport && !dataQualityReport.isTradeAllowed);
 
   // 0) Central Probability Engine, Risk-Adjusted Edge & Trade Quality Gating (Rules 5 & 6)
   if (isRiskBudgetBreachedByMinLot) {
@@ -1139,7 +1155,18 @@ export function analyzePro(
     const sweepSetup = detectLiquiditySweepReversal(candles, liqMap, price, currAtr);
     const cvdMatrix = computeCvdOiDivergenceMatrix(candles, price, orderFlow, deriv);
     const cascadePrediction = predictLiquidationCascade(candles, price, liqMap, deriv, currAtr);
-    const regimeClass = classifyMarketRegime(candles, price, adxVal, currAtr, bbUp, bbLow, bbMid, vwapVal, orderFlow);
+    const regimeClass = classifyMarketRegime(
+      candles,
+      price,
+      adxVal,
+      currAtr,
+      bbUp,
+      bbLow,
+      bbMid,
+      vwapVal,
+      orderFlow,
+      allowDemoData,
+    );
     const candidateSetup: EntryCandidateType = sweepSetup?.isReversalSetupActive ? 'LIQUIDITY_SWEEP_RECLAIM' : 'PULLBACK_ENTRY';
     const regimeEdgeMatrix = evaluateRegimeSetupEdge(
       candidateSetup,

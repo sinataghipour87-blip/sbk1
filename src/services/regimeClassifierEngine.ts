@@ -36,7 +36,8 @@ export function classifyMarketRegime(
   bbLow?: number[],
   bbMid?: number[],
   vwapVal?: number,
-  orderFlow?: OrderFlowFeatures
+  orderFlow?: OrderFlowFeatures,
+  allowPartialHistory = false,
 ): MarketRegimeClassification {
   if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
     throw new Error('Regime classifier requires a valid live market price.');
@@ -44,8 +45,9 @@ export function classifyMarketRegime(
   const safePrice = currentPrice;
   const count = candles.length;
 
-  if (count < 300) {
-    throw new Error('Regime classifier requires at least 300 real candles for OOS model validation.');
+  const minimumCandles = allowPartialHistory ? 30 : 300;
+  if (count < minimumCandles) {
+    throw new Error(`Regime classifier requires at least ${minimumCandles} candles for analysis.`);
   }
 
   const closes = candles.map(c => c[3]);
@@ -128,7 +130,7 @@ export function classifyMarketRegime(
     trendAlignmentScore = -Math.min(100, Math.round(effectiveAdx * 2.5));
   }
 
-  const model = classifyFutureRegime(candles, derivedFeatures);
+  const model = classifyFutureRegime(candles, derivedFeatures, allowPartialHistory);
   const { activeRegime, probabilities: regimeProbabilities, validation: probabilityModelValidation } = model;
   const confidencePct = Math.round(regimeProbabilities[activeRegime]);
 

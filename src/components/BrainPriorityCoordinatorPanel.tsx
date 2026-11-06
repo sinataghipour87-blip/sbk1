@@ -301,6 +301,8 @@ export const BrainPriorityCoordinatorPanel: React.FC<Props> = ({
                 <button
                   key={sim.val}
                   type="button"
+                  aria-pressed={testDrawdown === sim.val}
+                  aria-label={sim.label}
                   onClick={() => handleSimulateLossScenario(sim.val)}
                   className={`px-2 py-1 rounded-lg text-[10px] font-mono font-bold transition-all ${
                     testDrawdown === sim.val
