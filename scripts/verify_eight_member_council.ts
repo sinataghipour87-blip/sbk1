@@ -8,6 +8,7 @@ import {
   UNWIRED_OR_LEGACY_ANALYSIS_MODULES,
   UNWIRED_TRADE_MANAGEMENT_MODULES,
   evaluateEightMemberCouncil,
+  evaluateMember6VoteAndEvidenceForShadow,
   validateCouncilModuleOwnership,
   type CouncilMacroContext,
 } from '../src/services/eightMemberCouncil';
@@ -23,6 +24,30 @@ import {
 } from '../src/services/councilEvidenceDeduplication';
 
 const nowMs = Date.now();
+
+function member6FeeMetrics(asset: 'BTC' | 'ETH' | 'BNB' | 'SOL' | 'XRP') {
+  const feeByAsset = {
+    BTC: ['mempool_median_fee_rate', 'sat_vbyte', 'mempool.space,blockstream'],
+    ETH: ['priority_fee_gwei', 'gwei', 'ethereum-rpc-publicnode,ethereum-rpc-blockrazor'],
+    BNB: ['priority_fee_gwei', 'gwei', 'bsc-rpc-publicnode,bsc-rpc-blockrazor'],
+    SOL: [
+      'prioritization_fee_micro_lamports',
+      'micro_lamports_per_compute_unit',
+      'solana-rpc-solana-foundation,solana-rpc-publicnode',
+    ],
+    XRP: ['validated_base_fee_xrp', 'XRP', 'xrp-rpc-xrplcluster,xrp-rpc-honeycluster'],
+  } as const;
+  const [fee_metric, fee_unit, fee_source_ids] = feeByAsset[asset];
+  return {
+    fee_status: 'QUORUM',
+    fee_metric,
+    fee_unit,
+    fee_value: 1,
+    fee_operator_count: 2,
+    fee_source_ids,
+    fee_observed_at_ms: nowMs,
+  } as const;
+}
 
 function feed(feedName: string): MarketFeedQuality {
   return {
@@ -334,7 +359,7 @@ const quorumCandidate = {
   observations: [
     { sourceId: 'mempool.space' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
     { sourceId: 'blockstream' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
-    { sourceId: 'whale-alert' as const, evidenceType: 'ATTRIBUTION' as const, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', direction: 'EXCHANGE_OUTFLOW' as const, amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+    { sourceId: 'local-exchange-address-list' as const, evidenceType: 'ATTRIBUTION' as const, blockchain: 'bitcoin', transactionHash: 'tx-1', transferId: 'vout:0', direction: 'EXCHANGE_OUTFLOW' as const, amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const, exchangeName: 'Test Exchange', exchangeAddress: 'bc1qtestexchange' },
   ],
 };
 const quorumFlowData = {
@@ -349,6 +374,7 @@ const quorumFlowData = {
     { ...quorumConfirmedTransfer, blockchain: 'BITCOIN', transactionHash: 'TX-1', transferId: 'VOUT:0', sourceProvider: 'mirror-b' },
   ],
   consensusMatrix: { candidates: [quorumCandidate] },
+  networkMetrics: member6FeeMetrics('BTC'),
   exchangeInflowsBtc: null,
   exchangeOutflowsBtc: null,
   netExchangeFlowBtc: null,
@@ -363,13 +389,92 @@ const deduplicatedOnchainVote = evaluateEightMemberCouncil({
   nowMs,
 });
 assert.equal(deduplicatedOnchainVote.members[5].vote, 'LONG');
-assert.match(
-  deduplicatedOnchainVote.members[5].qualityChecks.find(({ labelFa }) => labelFa === 'تأیید مستقل Consensus Matrix')?.detailFa ?? '',
-  /1 انتقال واجد quorum دو منبع مستقل/,
+const feeEvidenceCheck = deduplicatedOnchainVote.members[5].qualityChecks.find(
+  ({ labelFa }) => labelFa === 'کارمزد چندمنبعی / شرط کانال ۲',
 );
+assert.equal(feeEvidenceCheck?.passed, true,
+  'fresh fee quorum is independently surfaced as a voting evidence check');
+assert.match(
+  deduplicatedOnchainVote.members[5].qualityChecks.find(({ labelFa }) => labelFa.startsWith('کانال ۱: هویت'))?.detailFa ?? '',
+  /1 انتقال واجد quorum و انتساب آدرس high-confidence/,
+);
+const feeBoostedVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    ...quorumFlowData,
+    aggregateExchangeFlow: {
+      observations: [{
+        blockchain: 'bitcoin',
+        transactionHash: 'tx-1',
+        transferId: 'vout:0',
+        timestampMs: nowMs - 1_000,
+        direction: 'EXCHANGE_OUTFLOW',
+        amount: 125,
+        estimatedUsd: 8_000_000,
+        exchangeName: 'Test Exchange',
+        exchangeAddress: 'bc1qtestexchange',
+        attributionSourceId: 'local-exchange-address-list',
+        sourceIds: ['mempool.space', 'blockstream'],
+      }],
+    },
+    networkMetrics: {
+      ...member6FeeMetrics('BTC'),
+      fee_spike_status: 'SPIKE',
+      fee_spike_ratio: 2,
+      fee_baseline_value: 0.5,
+      fee_baseline_sample_count: 10,
+      fee_baseline_span_ms: 10 * 60_000,
+      fee_baseline_source_ids: 'mempool.space,blockstream',
+      fee_baseline_operator_count: 2,
+    },
+  },
+  nowMs,
+});
+assert.equal(
+  feeBoostedVote.members[5].confidencePct,
+  deduplicatedOnchainVote.members[5].confidencePct! + 5,
+  'a validated multi-operator fee spike contributes structured conviction to the flow vote',
+);
+const noFeeQuorumVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    ...quorumFlowData,
+    largeTransfers: [],
+    consensusMatrix: { candidates: [] },
+    aggregateExchangeFlow: {
+      observations: [{
+        blockchain: 'bitcoin',
+        transactionHash: 'tx-1',
+        transferId: 'vout:0',
+        timestampMs: nowMs - 1_000,
+        direction: 'EXCHANGE_OUTFLOW',
+        amount: 125,
+        estimatedUsd: 8_000_000,
+        exchangeName: 'Test Exchange',
+        exchangeAddress: 'bc1qtestexchange',
+        attributionSourceId: 'local-exchange-address-list',
+        sourceIds: ['mempool.space', 'blockstream'],
+      }],
+    },
+    networkMetrics: {
+      fee_status: 'QUORUM',
+      fee_metric: 'mempool_median_fee_rate',
+      fee_value: 1,
+      fee_observed_at_ms: nowMs,
+      fee_operator_count: 1,
+      fee_source_ids: 'mempool.space',
+    },
+  },
+  nowMs,
+});
+assert.equal(noFeeQuorumVote.members[5].vote, 'ABSTAIN',
+  'macro-flow channel cannot vote without fresh fee quorum, while the independent address channel remains separate');
 const ethereumFlowData = {
   ...quorumFlowData,
   assetSymbol: 'ETH',
+  networkMetrics: member6FeeMetrics('ETH'),
   largeTransfers: [{
     ...quorumConfirmedTransfer,
     blockchain: 'ethereum',
@@ -392,7 +497,7 @@ const ethereumFlowData = {
       observations: [
         { sourceId: 'ethereum-rpc-publicnode', evidenceType: 'TRANSFER' as const, blockchain: 'ethereum', transactionHash: 'eth-tx-1', transferId: 'log:1', amount: 4_000, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
         { sourceId: 'ethereum-rpc-blockrazor', evidenceType: 'TRANSFER' as const, blockchain: 'ethereum', transactionHash: 'eth-tx-1', transferId: 'log:1', amount: 4_000, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
-        { sourceId: 'whale-alert', evidenceType: 'ATTRIBUTION' as const, blockchain: 'ethereum', transactionHash: 'eth-tx-1', transferId: 'log:1', direction: 'EXCHANGE_OUTFLOW' as const, amount: 4_000, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+        { sourceId: 'local-exchange-address-list', evidenceType: 'ATTRIBUTION' as const, blockchain: 'ethereum', transactionHash: 'eth-tx-1', transferId: 'log:1', direction: 'EXCHANGE_OUTFLOW' as const, amount: 4_000, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const, exchangeName: 'Test Exchange', exchangeAddress: '0x1111111111111111111111111111111111111111' },
       ],
     }],
   },
@@ -432,6 +537,7 @@ for (const fixture of additionalAssetFixtures) {
   const assetFlow = {
     ...quorumFlowData,
     assetSymbol: fixture.assetSymbol,
+    networkMetrics: member6FeeMetrics(fixture.assetSymbol),
     largeTransfers: [{
       ...quorumConfirmedTransfer,
       blockchain: fixture.blockchain,
@@ -463,7 +569,7 @@ for (const fixture of additionalAssetFixtures) {
             confirmationStatus: 'CONFIRMED' as const,
           })),
           {
-            sourceId: fixture.assetSymbol === 'BNB' ? 'etherscan-metadata' : 'whale-alert',
+            sourceId: 'local-exchange-address-list',
             evidenceType: 'ATTRIBUTION' as const,
             blockchain: fixture.blockchain,
             transactionHash: fixture.transactionHash,
@@ -472,6 +578,8 @@ for (const fixture of additionalAssetFixtures) {
             amount: fixture.amount,
             timestampMs: nowMs - 1_000,
             confirmationStatus: 'CONFIRMED' as const,
+            exchangeName: 'Test Exchange',
+            exchangeAddress: '0x1111111111111111111111111111111111111111',
           },
         ],
       }],
@@ -482,6 +590,14 @@ for (const fixture of additionalAssetFixtures) {
     'LONG',
     `Member 6 must evaluate independent quorum for ${fixture.assetSymbol}`,
   );
+  const shadowEvaluation = evaluateMember6VoteAndEvidenceForShadow({
+    macroContext,
+    whaleFlowData: assetFlow,
+    nowMs,
+  });
+  assert.equal(shadowEvaluation.verifiedCandidates.length, 1);
+  assert.equal(shadowEvaluation.verifiedCandidates[0].transactionHash, fixture.transactionHash);
+  assert.equal(shadowEvaluation.verifiedCandidates[0].estimatedUsd, 12_000_000);
 }
 const insufficientQuorumVote = evaluateEightMemberCouncil({
   analysis,
@@ -499,6 +615,23 @@ const insufficientQuorumVote = evaluateEightMemberCouncil({
 });
 assert.equal(insufficientQuorumVote.members[5].vote, 'ABSTAIN',
   'member 6 must ignore candidates confirmed by fewer than two independent sources');
+assert.equal(
+  evaluateMember6VoteAndEvidenceForShadow({
+    macroContext,
+    whaleFlowData: {
+      ...quorumFlowData,
+      consensusMatrix: {
+        candidates: [{
+          ...quorumCandidate,
+          observations: [quorumCandidate.observations[0]],
+        }],
+      },
+    },
+    nowMs,
+  }).verifiedCandidates.length,
+  0,
+  'shadow records must exclude candidates that fail Member 6 quorum validation',
+);
 const mismatchedTransferIdentityVote = evaluateEightMemberCouncil({
   analysis,
   macroContext,
@@ -581,6 +714,24 @@ const unidentifiedOnchainVote = evaluateEightMemberCouncil({
 });
 assert.equal(unidentifiedOnchainVote.members[5].vote, 'ABSTAIN',
   'member 6 must fail closed if a transfer has no logIndex/vout identity');
+
+const unavailableQuorumVote = evaluateEightMemberCouncil({
+  analysis,
+  macroContext,
+  whaleFlowData: {
+    ...quorumFlowData,
+    largeTransfers: [],
+    consensusMatrix: { candidates: [] },
+    unavailableReason: 'Scanner found transfers, but no configured exchange address matched.',
+  },
+  nowMs,
+});
+assert.match(
+  unavailableQuorumVote.members[5].qualityChecks.find(({ labelFa }) =>
+    labelFa.startsWith('کانال ۱: هویت'))?.detailFa ?? '',
+  /no configured exchange address matched/i,
+  'Member 6 diagnostics must preserve the poller reason when quorum data is unavailable',
+);
 
 const uniqueMacroObservations = deduplicateMacroObservations([
   { provider: 'fred', metric: 'DGS10', timestampMs: nowMs, value: 4.2, direction: 1 },

@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "addresses": [
+    {
+      "chain": "ETH",
+      "address": "0x001866Ae5B3de6cAa5a51543FD9fB64f524F5478",
+      "exchange": "Binance",
+      "label": "Binance (hot wallet)",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained entry merged from cex-list, GraphSense, and Etherscan labels."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x71660c4005BA85c37ccec55d0C4493E66Fe775d3",
+      "exchange": "Coinbase",
+      "label": "Coinbase",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x2910543Af39abA0Cd09dBb2D50200b3E800A63D2",
+      "exchange": "Kraken",
+      "label": "Kraken",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x6cC5F688a315f3dC28A7781717a9A798a59fDA7b",
+      "exchange": "OKX",
+      "label": "OKX",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    },
+    {
+      "chain": "ETH",
+      "address": "0x1151314c646Ce4E0eFD76d1aF4760aE66a9Fe30F",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex",
+      "sourceName": "cex-list / Etherscan labels",
+      "sourceUrl": "https://github.com/tradezon/cex-list/blob/master/data/ethereum-mainnet.json",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community-maintained Ethereum address label in the Etherscan-derived exchange list."
+    }
+  ]
+}

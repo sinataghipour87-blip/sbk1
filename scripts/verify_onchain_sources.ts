@@ -6,18 +6,31 @@ import {
 import {
   buildSolanaGetBlockParams,
   collectCompleteBtcTransactionPages,
+  DEFAULT_BOOTSTRAP_BLOCKS,
   filterSourcesByMedianHeight,
   getPublicSourceBackoffUntil,
   getPublicSourceCircuitOpenUntil,
   isAllowedPublicEndpointUrl,
   isHealthySourcePingSet,
+  isSuccessfulEvmReceipt,
+  isSuccessfulSolanaTransaction,
+  isUnambiguousBtcTransfer,
   isValidSolanaMainnetGenesisHash,
   isValidXrpMainnetNetworkId,
   listPublicWhaleSources,
+  MAX_BOOTSTRAP_BLOCKS,
+  nextMember6CandleCloseMs,
   ONCHAIN_SOURCE_CONFIG,
   requestPublicWhaleSourceJson,
+  selectFeeMetricQuorumGroup,
+  xrpDeliveredAmountDrops,
   type PublicWhaleSource,
 } from '../src/services/publicWhaleObservationPoller';
+
+assert.equal(nextMember6CandleCloseMs(0), 15 * 60_000);
+assert.equal(nextMember6CandleCloseMs(14 * 60_000 + 59_999), 15 * 60_000);
+assert.equal(nextMember6CandleCloseMs(15 * 60_000), 30 * 60_000);
+assert.throws(() => nextMember6CandleCloseMs(-1), /timestamp is invalid/);
 
 const sources = listPublicWhaleSources();
 const expectedOperators: Record<string, string | null> = {
@@ -36,11 +49,13 @@ const expectedOperators: Record<string, string | null> = {
   'ETH/ethereum-rpc-zan': 'zan',
   'ETH/ethereum-rpc-bloxroute': 'bloxroute',
   'ETH/ethereum-rpc-nownodes': 'nownodes',
+  'ETH/ethereum-rpc-drpc': 'drpc',
   'BNB/bsc-rpc-publicnode': 'publicnode',
   'BNB/bsc-rpc-blockrazor': 'blockrazor',
   'BNB/bsc-rpc-meowrpc': 'meowrpc',
   'BNB/bsc-rpc-bloxroute': 'bloxroute',
   'BNB/bsc-rpc-48club': '48club',
+  'BNB/bsc-rpc-bnbchain': 'bnb-chain',
   'BNB/bsc-rpc-defibit': null,
   'SOL/solana-rpc-solana-foundation': 'solana-foundation',
   'SOL/solana-rpc-solana-foundation-beta': 'solana-foundation',
@@ -73,11 +88,13 @@ const expectedPrimaryUrls: Record<string, string> = {
   'ETH/ethereum-rpc-zan': 'https://api.zan.top/eth-mainnet',
   'ETH/ethereum-rpc-bloxroute': 'https://eth.rpc.blxrbdn.com',
   'ETH/ethereum-rpc-nownodes': 'https://public-eth.nownodes.io',
+  'ETH/ethereum-rpc-drpc': 'https://eth.drpc.org',
   'BNB/bsc-rpc-publicnode': 'https://bsc-rpc.publicnode.com',
   'BNB/bsc-rpc-blockrazor': 'https://bsc.blockrazor.xyz',
   'BNB/bsc-rpc-meowrpc': 'https://bsc.meowrpc.com',
   'BNB/bsc-rpc-bloxroute': 'https://bsc.rpc.blxrbdn.com',
   'BNB/bsc-rpc-48club': 'https://rpc-bsc.48.club',
+  'BNB/bsc-rpc-bnbchain': 'https://bsc-dataseed.bnbchain.org',
   'BNB/bsc-rpc-defibit': 'https://bsc-dataseed1.defibit.io',
   'SOL/solana-rpc-solana-foundation': 'https://api.mainnet.solana.com',
   'SOL/solana-rpc-solana-foundation-beta': 'https://api.mainnet-beta.solana.com',
@@ -94,7 +111,7 @@ const expectedPrimaryUrls: Record<string, string> = {
   'XRP/xrp-rpc-ankr': 'https://rpc.ankr.com/xrp_mainnet',
   'XRP/xrp-rpc-unverified-backup': 'https://xrpl.link',
 };
-const expectedIndependentCounts = { BTC: 7, ETH: 8, BNB: 5, SOL: 5, XRP: 4 } as const;
+const expectedIndependentCounts = { BTC: 7, ETH: 9, BNB: 6, SOL: 5, XRP: 4 } as const;
 
 assert.deepEqual(
   Object.fromEntries(sources.map(({ asset, sourceId, operatorId }) => [`${asset}/${sourceId}`, operatorId])),
@@ -154,10 +171,36 @@ assert.equal(getWhaleSourceOperator('BNB', 'local-exchange-address-list'), null,
 assert.equal(countDistinctWhaleSourceOperators('ETH', ['ethereum-rpc-blockrazor', 'ethereum-rpc-bloxroute']), 2);
 assert.equal(countDistinctWhaleSourceOperators('BNB', ['bsc-rpc-blockrazor', 'bsc-rpc-bloxroute']), 2,
   'operator IDs are counted per chain, not across chains');
+assert.equal(getWhaleSourceOperator('ETH', 'ethereum-rpc-drpc'), 'drpc');
+assert.equal(getWhaleSourceOperator('BNB', 'bsc-rpc-bnbchain'), 'bnb-chain');
 
 assert.equal(isAllowedPublicEndpointUrl('https://api.mainnet.solana.com'), true);
 assert.equal(isAllowedPublicEndpointUrl('https://example.invalid/devnet'), false);
 assert.equal(isAllowedPublicEndpointUrl('https://example.invalid/testnet'), false);
+
+const btcFeeSources = ['mempool.space', 'blockstream', 'mempool-ninja'].map((sourceId) => {
+  const source = sources.find((item) => item.asset === 'BTC' && item.sourceId === sourceId);
+  assert.ok(source);
+  return source;
+});
+assert.deepEqual(
+  selectFeeMetricQuorumGroup('BTC', [
+    { provider: btcFeeSources[0], value: 10 },
+    { provider: btcFeeSources[1], value: 11 },
+    { provider: btcFeeSources[2], value: 50 },
+  ])?.map(({ provider }) => provider.sourceId),
+  ['mempool.space', 'blockstream'],
+  'fee quorum uses the largest agreeing independent-operator group and rejects an outlier',
+);
+assert.equal(
+  selectFeeMetricQuorumGroup('BTC', [
+    { provider: btcFeeSources[0], value: 10 },
+    { provider: btcFeeSources[1], value: 15 },
+    { provider: btcFeeSources[2], value: 20 },
+  ]),
+  null,
+  'ambiguous equally sized fee quorum groups must fail closed',
+);
 assert.equal(isAllowedPublicEndpointUrl('https://user:pass@example.invalid'), false);
 assert.equal(isValidSolanaMainnetGenesisHash('5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d'), true);
 assert.equal(isValidSolanaMainnetGenesisHash('wrong-genesis'), false);
@@ -173,6 +216,8 @@ assert.equal(ONCHAIN_SOURCE_CONFIG.healthPingTimeoutMs, 5_000);
 assert.equal(ONCHAIN_SOURCE_CONFIG.maxConcurrentRequests, 4);
 assert.equal(ONCHAIN_SOURCE_CONFIG.circuitBreakerFailureCount, 3);
 assert.equal(ONCHAIN_SOURCE_CONFIG.circuitBreakerCooldownMs, 300_000);
+assert.equal(DEFAULT_BOOTSTRAP_BLOCKS, 12);
+assert.equal(MAX_BOOTSTRAP_BLOCKS, 24);
 const web3cdn = sources.find(({ sourceId }) => sourceId === 'solana-rpc-web3cdn');
 assert.ok(web3cdn);
 assert.equal(web3cdn.timeoutMs, ONCHAIN_SOURCE_CONFIG.requestTimeoutMs);
@@ -184,6 +229,47 @@ assert.equal(
   (blockParams[1] as { maxSupportedTransactionVersion: number }).maxSupportedTransactionVersion,
   1,
 );
+const btcFixture = {
+  txid: 'btc-fixture',
+  status: { confirmed: true },
+  vin: [{ prevout: { scriptpubkey_address: 'sender' } }],
+  vout: [{ value: 1_000, scriptpubkey_address: 'recipient' }],
+};
+assert.equal(isUnambiguousBtcTransfer(btcFixture, structuredClone(btcFixture)), true);
+assert.equal(isUnambiguousBtcTransfer({
+  ...btcFixture,
+  vout: [...btcFixture.vout, { value: 100, scriptpubkey_address: 'change' }],
+}, btcFixture), false, 'multi-output Bitcoin transfers are not direction-attributed');
+assert.equal(isSuccessfulEvmReceipt({
+  transactionHash: '0xabc',
+  blockHash: '0xdef',
+  status: '0x1',
+}, '0xABC', '0xDEF'), true);
+assert.equal(isSuccessfulEvmReceipt({
+  transactionHash: '0xabc',
+  blockHash: '0xdef',
+  status: '0x0',
+}, '0xabc', '0xdef'), false, 'failed EVM receipts are rejected');
+assert.equal(isSuccessfulEvmReceipt({
+  transactionHash: '0xabc',
+  blockHash: '0xother',
+  status: '0x1',
+}, '0xabc', '0xdef'), false, 'receipt must belong to the agreed block');
+assert.equal(isSuccessfulSolanaTransaction({ err: null }), true);
+assert.equal(isSuccessfulSolanaTransaction({ err: { InstructionError: [0, 'Custom'] } }), false);
+assert.equal(isSuccessfulSolanaTransaction({}), false);
+assert.equal(xrpDeliveredAmountDrops({
+  hash: 'a'.repeat(64),
+  meta: { TransactionResult: 'tesSUCCESS', delivered_amount: '1250000' },
+}), '1250000');
+assert.equal(xrpDeliveredAmountDrops({
+  hash: 'a'.repeat(64),
+  meta: { TransactionResult: 'tecUNFUNDED_PAYMENT', delivered_amount: '1250000' },
+}), null, 'failed XRP payments are rejected');
+assert.equal(xrpDeliveredAmountDrops({
+  hash: 'a'.repeat(64),
+  meta: { TransactionResult: 'tesSUCCESS', delivered_amount: 'unavailable' },
+}), null, 'XRP payments without a delivered amount are rejected');
 
 const filteredBtc = filterSourcesByMedianHeight('BTC', [
   { sourceId: 'a', operatorId: 'a', height: 100 },
@@ -243,6 +329,19 @@ await assert.rejects(
   /invalid or incomplete/,
   'a partial BTC pagination result must be rejected in full',
 );
+await assert.rejects(
+  collectCompleteBtcTransactionPages(
+    'block',
+    2,
+    async (startIndex) => {
+      if (startIndex === 0) return [btcTransaction('tx-0')];
+      throw new Error('HTTP 429');
+    },
+    'btcscan',
+  ),
+  /incomplete block: got 1 of 2; HTTP 429/,
+  'an interrupted BTC pagination result must report its received and expected transaction counts',
+);
 
 const rateLimitedSource = sources.find(({ asset, sourceId }) =>
   asset === 'BTC' && sourceId === 'mempool-emzy');
@@ -276,6 +375,33 @@ await assert.rejects(
   /temporarily disabled/,
 );
 assert.equal(rateLimitRequests, 1, 'a 429 source must stay disabled during its backoff window');
+
+const rateLimitedPrimaryWithFallback: PublicWhaleSource = {
+  asset: 'BTC',
+  sourceId: 'verify-fallback-429',
+  operatorId: null,
+  independent: false,
+  urls: ['https://primary.example/api', 'https://fallback.example/api'],
+};
+let fallbackRequests = 0;
+assert.equal(
+  await requestPublicWhaleSourceJson(
+    rateLimitedPrimaryWithFallback,
+    undefined,
+    async () => {
+      fallbackRequests += 1;
+      return fallbackRequests === 1
+        ? new Response('', { status: 429, headers: { 'retry-after': '60' } })
+        : new Response('123', { status: 200 });
+    },
+    { retries: false },
+  ),
+  123,
+  'a rate-limited primary endpoint must fall back to another configured URL',
+);
+assert.equal(fallbackRequests, 2);
+assert.equal(getPublicSourceBackoffUntil('verify-fallback-429'), null,
+  'a successful alternate endpoint clears the shared provider backoff');
 
 const timeoutSource: PublicWhaleSource = {
   asset: 'BTC',

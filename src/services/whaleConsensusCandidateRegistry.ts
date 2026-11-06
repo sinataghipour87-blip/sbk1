@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type {
   CouncilWhaleConsensusCandidate,
+  CouncilAggregateExchangeFlowObservation,
   CouncilWhaleFlowData,
   CouncilWhaleQuorumSourceId,
   CouncilWhaleTransfer,
@@ -16,8 +17,13 @@ export { getWhaleSourceOperator, QUORUM_ASSETS } from './whaleConsensusSourceOpe
 export type { QuorumAsset } from './whaleConsensusSourceOperators';
 
 const REGISTRY_VERSION = 1;
+export const MEMBER6_INGESTION_PILLARS = [
+  'WATCHLIST_TRACKING',
+  'EXCHANGE_NETFLOW',
+  'PRIORITY_FEE_TELEMETRY',
+] as const;
 const DEFAULT_MAX_AGE_MS = 5 * 60_000;
-const DEFAULT_HISTORICAL_WINDOW_MS = 15 * 24 * 60 * 60_000;
+const DEFAULT_HISTORICAL_WINDOW_MS = 90 * 24 * 60 * 60_000;
 const MAX_HISTORICAL_CANDIDATES_PER_ASSET = 20_000;
 const DEFAULT_REGISTRY_PATH = path.resolve(process.cwd(), '.cache/sbk1/quorum-candidates.json');
 const BLOCKCHAIN_BY_ASSET: Readonly<Record<QuorumAsset, string>> = {
@@ -66,23 +72,51 @@ export interface QuorumObservedTransfer {
   toAddresses?: string[];
 }
 
+export type QuorumAggregateExchangeFlowObservation = CouncilAggregateExchangeFlowObservation;
+
 export type QuorumCandidateSnapshotInput = Readonly<Record<QuorumAsset, readonly QuorumCandidateRecord[]>>;
 export type QuorumObservedTransferInput = Readonly<Record<QuorumAsset, readonly QuorumObservedTransfer[]>>;
+export type QuorumAggregateExchangeFlowInput = Readonly<
+  Record<QuorumAsset, readonly QuorumAggregateExchangeFlowObservation[]>
+>;
 
 interface QuorumCandidateSnapshot {
   version: typeof REGISTRY_VERSION;
+  ingestionPillars: typeof MEMBER6_INGESTION_PILLARS;
   generatedAtMs: number;
   assets: Record<QuorumAsset, QuorumCandidateRecord[]>;
   historicalCandidates: Record<QuorumAsset, QuorumCandidateRecord[]>;
   observedTransfers: Record<QuorumAsset, QuorumObservedTransfer[]>;
+  aggregateExchangeFlows?: Record<QuorumAsset, QuorumAggregateExchangeFlowObservation[]>;
+  networkMetrics?: Record<QuorumAsset, Record<string, number | string | null>>;
+  diagnostics?: Record<QuorumAsset, QuorumAssetPollDiagnostics>;
 }
 
 export interface QuorumCandidateWriteResult {
   path: string;
   persistedByAsset: Record<QuorumAsset, number>;
   rejectedByAsset: Record<QuorumAsset, number>;
+  rejectedCandidatesByAsset: Record<QuorumAsset, number>;
   historicalByAsset: Record<QuorumAsset, number>;
 }
+
+export interface QuorumAssetPollDiagnostics {
+  scanError: string | null;
+  priceError: string | null;
+  observedTransferCount: number;
+  configuredAddressCount: number;
+  matchedAddressTransferCount: number;
+  exchangeAttributedTransferCount: number;
+  priceAvailable: boolean | null;
+  generatedCandidateCount: number;
+  persistedCandidateCount: number;
+  rejectedCandidateCount: number;
+}
+
+export type QuorumAssetPollDiagnosticsInput = Omit<
+  QuorumAssetPollDiagnostics,
+  'persistedCandidateCount' | 'rejectedCandidateCount'
+>;
 
 export function countDistinctWhaleSourceOperators(asset: string, sourceIds: readonly string[]): number {
   return new Set(sourceIds.flatMap((sourceId) => {
@@ -166,7 +200,10 @@ function validateCandidate(
         rawObservation.timestampMs > nowMs ||
         nowMs - rawObservation.timestampMs > maxAgeMs) continue;
     const operator = getWhaleSourceOperator(asset, rawObservation.sourceId);
-    if (!operator) continue;
+    const isConfiguredAttribution =
+      rawObservation.evidenceType === 'ATTRIBUTION' &&
+      rawObservation.sourceId === 'local-exchange-address-list';
+    if (!operator && !isConfiguredAttribution) continue;
     const observationAmount = getObservationAmount(rawObservation);
     if (
       observationAmount === null ||
@@ -175,12 +212,17 @@ function validateCandidate(
     if (rawObservation.evidenceType === 'TRANSFER') {
       if (rawObservation.direction !== undefined) return false;
       transferOperators.add(operator);
-    } else if (rawObservation.direction === value.direction) {
+    } else if (
+      rawObservation.sourceId === 'local-exchange-address-list' &&
+      typeof rawObservation.exchangeName === 'string' && rawObservation.exchangeName.trim() &&
+      typeof rawObservation.exchangeAddress === 'string' && rawObservation.exchangeAddress.trim() &&
+      rawObservation.direction === value.direction
+    ) {
       hasMatchingAttribution = true;
     } else {
       return false;
     }
-    operators.add(operator);
+    if (operator) operators.add(operator);
   }
   return operators.size >= 2 && transferOperators.size >= 2 && hasMatchingAttribution;
 }
@@ -191,6 +233,40 @@ function emptyAssets(): Record<QuorumAsset, QuorumCandidateRecord[]> {
 
 function emptyObservedTransfers(): Record<QuorumAsset, QuorumObservedTransfer[]> {
   return { BTC: [], ETH: [], BNB: [], SOL: [], XRP: [] };
+}
+
+function emptyAggregateExchangeFlows(): Record<QuorumAsset, QuorumAggregateExchangeFlowObservation[]> {
+  return { BTC: [], ETH: [], BNB: [], SOL: [], XRP: [] };
+}
+
+function isValidAggregateExchangeFlowObservation(
+  value: unknown,
+  asset: QuorumAsset,
+  nowMs: number,
+  maxAgeMs: number,
+): value is QuorumAggregateExchangeFlowObservation {
+  if (!isRecord(value) ||
+      value.blockchain !== BLOCKCHAIN_BY_ASSET[asset] ||
+      typeof value.transactionHash !== 'string' || !isValidTransactionHash(asset, value.transactionHash) ||
+      typeof value.transferId !== 'string' || !value.transferId.trim() ||
+      !isSafeTimestamp(value.timestampMs) || value.timestampMs > nowMs ||
+      nowMs - value.timestampMs > maxAgeMs ||
+      !['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(value.direction)) ||
+      !isFiniteNumber(value.amount) || value.amount <= 0 ||
+      !isFiniteNumber(value.estimatedUsd) || value.estimatedUsd <= 0 ||
+      typeof value.exchangeName !== 'string' || !value.exchangeName.trim() ||
+      typeof value.exchangeAddress !== 'string' || !value.exchangeAddress.trim() ||
+      value.attributionSourceId !== 'local-exchange-address-list' ||
+      !Array.isArray(value.sourceIds) || value.sourceIds.length < 2 ||
+      value.sourceIds.some((sourceId) => typeof sourceId !== 'string' || !sourceId.trim()) ||
+      new Set(value.sourceIds).size !== value.sourceIds.length) return false;
+  const operators = value.sourceIds.flatMap((sourceId) => {
+    const operator = getWhaleSourceOperator(asset, sourceId as string);
+    return operator ? [operator] : [];
+  });
+  return operators.length === value.sourceIds.length &&
+    new Set(operators).size >= 2 &&
+    new Set(operators).size === operators.length;
 }
 
 function isValidObservedTransfer(
@@ -234,6 +310,28 @@ function observedTransferKey(transfer: QuorumObservedTransfer): string {
   return `${transfer.assetSymbol}:${hash}:${transferId}`;
 }
 
+function aggregateExchangeFlowKey(
+  asset: QuorumAsset,
+  observation: QuorumAggregateExchangeFlowObservation,
+): string {
+  const hash = asset === 'SOL' ? observation.transactionHash : observation.transactionHash.toLowerCase();
+  const transferId = asset === 'SOL' ? observation.transferId : observation.transferId.toLowerCase();
+  return `${asset}:${hash}:${transferId}`;
+}
+
+function aggregateExchangeFlowAttributionMatches(
+  asset: QuorumAsset,
+  left: QuorumAggregateExchangeFlowObservation,
+  right: QuorumAggregateExchangeFlowObservation,
+): boolean {
+  const normalizeAddress = (address: string) =>
+    asset === 'ETH' || asset === 'BNB' ? address.toLowerCase() : address;
+  return left.direction === right.direction &&
+    Math.abs(left.amount - right.amount) <= Math.max(1e-8, left.amount * 1e-8) &&
+    normalizeAddress(left.exchangeAddress) === normalizeAddress(right.exchangeAddress) &&
+    left.exchangeName.toLowerCase() === right.exchangeName.toLowerCase();
+}
+
 function candidateKey(candidate: QuorumCandidateRecord): string {
   const hash = candidate.assetSymbol === 'SOL'
     ? candidate.transactionHash
@@ -244,7 +342,11 @@ function candidateKey(candidate: QuorumCandidateRecord): string {
   return `${candidate.assetSymbol}:${hash}:${transferId}`;
 }
 
-function unavailable(asset: QuorumAsset, reason: string): CouncilWhaleFlowData {
+function unavailable(
+  asset: QuorumAsset,
+  reason: string,
+  networkMetrics?: Record<string, number | string | null>,
+): CouncilWhaleFlowData {
   return {
     status: 'UNAVAILABLE',
     provider: 'Local quorum candidate registry',
@@ -257,6 +359,7 @@ function unavailable(asset: QuorumAsset, reason: string): CouncilWhaleFlowData {
     unavailableReason: reason,
     largeTransfers: [],
     consensusMatrix: { candidates: [] },
+    ...(networkMetrics ? { networkMetrics } : {}),
     exchangeInflowsBtc: null,
     exchangeOutflowsBtc: null,
     netExchangeFlowBtc: null,
@@ -270,7 +373,12 @@ function snapshotFrom(value: unknown): QuorumCandidateSnapshot {
   if (!isRecord(value) ||
       value.version !== REGISTRY_VERSION ||
       !isSafeTimestamp(value.generatedAtMs) ||
-      !isRecord(value.assets)) {
+      !isRecord(value.assets) ||
+      (value.ingestionPillars !== undefined &&
+        (!Array.isArray(value.ingestionPillars) ||
+          value.ingestionPillars.length !== MEMBER6_INGESTION_PILLARS.length ||
+          value.ingestionPillars.some((pillar, index) =>
+            pillar !== MEMBER6_INGESTION_PILLARS[index])))) {
     throw new Error('Quorum candidate registry has an unsupported or malformed snapshot.');
   }
   const assets = emptyAssets();
@@ -280,23 +388,91 @@ function snapshotFrom(value: unknown): QuorumCandidateSnapshot {
   const observedTransfers = isRecord(value.observedTransfers)
     ? value.observedTransfers
     : emptyObservedTransfers();
+  const aggregateExchangeFlows = value.aggregateExchangeFlows === undefined
+    ? emptyAggregateExchangeFlows()
+    : isRecord(value.aggregateExchangeFlows)
+      ? value.aggregateExchangeFlows
+      : null;
+  if (aggregateExchangeFlows === null) {
+    throw new Error('Quorum candidate registry aggregate exchange flows are malformed.');
+  }
+  const diagnostics = value.diagnostics === undefined
+    ? undefined
+    : isRecord(value.diagnostics)
+      ? value.diagnostics
+      : null;
+  if (diagnostics === null) {
+    throw new Error('Quorum candidate registry diagnostics are malformed.');
+  }
+  const networkMetrics = value.networkMetrics === undefined
+    ? undefined
+    : isRecord(value.networkMetrics)
+      ? value.networkMetrics
+      : null;
+  if (networkMetrics === null) {
+    throw new Error('Quorum candidate registry network metrics are malformed.');
+  }
+  const parsedNetworkMetrics = networkMetrics
+    ? {} as Record<QuorumAsset, Record<string, number | string | null>>
+    : undefined;
+  const parsedDiagnostics = diagnostics
+    ? {} as Record<QuorumAsset, QuorumAssetPollDiagnostics>
+    : undefined;
+  const parsedAggregateExchangeFlows = {} as Record<
+    QuorumAsset,
+    QuorumAggregateExchangeFlowObservation[]
+  >;
   for (const asset of QUORUM_ASSETS) {
     const candidates = value.assets[asset];
     const history = historicalCandidates[asset];
     const observations = observedTransfers[asset];
-    if (!Array.isArray(candidates) || !Array.isArray(history) || !Array.isArray(observations)) {
+    const macroFlows = aggregateExchangeFlows[asset];
+    if (!Array.isArray(candidates) || !Array.isArray(history) ||
+        !Array.isArray(observations) || !Array.isArray(macroFlows)) {
       throw new Error(`Quorum candidate registry is missing the ${asset} candidate list.`);
     }
     assets[asset] = candidates as QuorumCandidateRecord[];
     historicalCandidates[asset] = history as QuorumCandidateRecord[];
     observedTransfers[asset] = observations as QuorumObservedTransfer[];
+    parsedAggregateExchangeFlows[asset] = macroFlows as QuorumAggregateExchangeFlowObservation[];
+    if (networkMetrics) {
+      const metrics = networkMetrics[asset];
+      if (!isRecord(metrics) ||
+          Object.values(metrics).some((item) =>
+            item !== null && typeof item !== 'string' &&
+            (typeof item !== 'number' || !Number.isFinite(item)))) {
+        throw new Error(`Quorum candidate registry network metrics for ${asset} are invalid.`);
+      }
+      parsedNetworkMetrics![asset] = metrics as Record<string, number | string | null>;
+    }
+    if (diagnostics) {
+      const item = diagnostics[asset];
+      if (!isRecord(item) ||
+          !(item.scanError === null || typeof item.scanError === 'string') ||
+          !(item.priceError === null || typeof item.priceError === 'string') ||
+          !Number.isSafeInteger(item.observedTransferCount) || (item.observedTransferCount as number) < 0 ||
+          !Number.isSafeInteger(item.configuredAddressCount) || (item.configuredAddressCount as number) < 0 ||
+          !Number.isSafeInteger(item.matchedAddressTransferCount) || (item.matchedAddressTransferCount as number) < 0 ||
+          !Number.isSafeInteger(item.exchangeAttributedTransferCount) || (item.exchangeAttributedTransferCount as number) < 0 ||
+          !(item.priceAvailable === null || typeof item.priceAvailable === 'boolean') ||
+          !Number.isSafeInteger(item.generatedCandidateCount) || (item.generatedCandidateCount as number) < 0 ||
+          !Number.isSafeInteger(item.persistedCandidateCount) || (item.persistedCandidateCount as number) < 0 ||
+          !Number.isSafeInteger(item.rejectedCandidateCount) || (item.rejectedCandidateCount as number) < 0) {
+        throw new Error(`Quorum candidate registry diagnostics for ${asset} are invalid.`);
+      }
+      parsedDiagnostics![asset] = item as unknown as QuorumAssetPollDiagnostics;
+    }
   }
   return {
     version: REGISTRY_VERSION,
+    ingestionPillars: MEMBER6_INGESTION_PILLARS,
     generatedAtMs: value.generatedAtMs,
     assets,
     historicalCandidates: historicalCandidates as Record<QuorumAsset, QuorumCandidateRecord[]>,
     observedTransfers: observedTransfers as Record<QuorumAsset, QuorumObservedTransfer[]>,
+    aggregateExchangeFlows: parsedAggregateExchangeFlows,
+    ...(parsedNetworkMetrics ? { networkMetrics: parsedNetworkMetrics } : {}),
+    ...(parsedDiagnostics ? { diagnostics: parsedDiagnostics } : {}),
   };
 }
 
@@ -308,6 +484,12 @@ export async function writeQuorumCandidateSnapshot(
     maxAgeMs?: number;
     historicalCandidatesByAsset?: QuorumCandidateSnapshotInput;
     observedTransfersByAsset?: QuorumObservedTransferInput;
+    aggregateExchangeFlowsByAsset?: QuorumAggregateExchangeFlowInput;
+    networkMetricsByAsset?: Readonly<Record<
+      QuorumAsset,
+      Readonly<Record<string, number | string | null>>
+    >>;
+    diagnosticsByAsset?: Readonly<Record<QuorumAsset, QuorumAssetPollDiagnosticsInput>>;
     clearAssetCandidates?: readonly QuorumAsset[];
   } = {},
 ): Promise<QuorumCandidateWriteResult> {
@@ -319,8 +501,10 @@ export async function writeQuorumCandidateSnapshot(
   const assets = emptyAssets();
   const historicalCandidates = emptyAssets();
   const observedTransfers = emptyObservedTransfers();
+  const aggregateExchangeFlows = emptyAggregateExchangeFlows();
   const persistedByAsset = emptyAssetsCount();
   const rejectedByAsset = emptyAssetsCount();
+  const rejectedCandidatesByAsset = emptyAssetsCount();
   const historicalByAsset = emptyAssetsCount();
   const clearAssetCandidates = new Set(options.clearAssetCandidates ?? []);
   const filePath = options.filePath ?? process.env.SBK1_QUORUM_CANDIDATES_PATH ?? DEFAULT_REGISTRY_PATH;
@@ -347,6 +531,7 @@ export async function writeQuorumCandidateSnapshot(
         liveByKey.set(candidateKey(candidate), candidate);
       } else {
         rejectedByAsset[asset] += 1;
+        rejectedCandidatesByAsset[asset] += 1;
       }
     }
     assets[asset] = [...liveByKey.values()];
@@ -387,14 +572,73 @@ export async function writeQuorumCandidateSnapshot(
     observedTransfers[asset] = [...observedByKey.values()]
       .sort((left, right) => right.timestampMs - left.timestampMs)
       .slice(0, MAX_HISTORICAL_CANDIDATES_PER_ASSET);
+
+    const macroFlowByKey = new Map<string, QuorumAggregateExchangeFlowObservation>();
+    const macroFlowConflicts = new Map<
+      string,
+      [QuorumAggregateExchangeFlowObservation, QuorumAggregateExchangeFlowObservation]
+    >();
+    const addMacroFlow = (observation: QuorumAggregateExchangeFlowObservation) => {
+      const key = aggregateExchangeFlowKey(asset, observation);
+      if (macroFlowConflicts.has(key)) return;
+      const existing = macroFlowByKey.get(key);
+      if (existing && !aggregateExchangeFlowAttributionMatches(asset, existing, observation)) {
+        macroFlowByKey.delete(key);
+        macroFlowConflicts.set(key, [existing, observation]);
+        return;
+      }
+      macroFlowByKey.set(key, observation);
+    };
+    for (const observation of previousSnapshot?.aggregateExchangeFlows?.[asset] ?? []) {
+      if (isValidAggregateExchangeFlowObservation(observation, asset, nowMs, maxAgeMs)) {
+        addMacroFlow(observation);
+      }
+    }
+    for (const observation of options.aggregateExchangeFlowsByAsset?.[asset] ?? []) {
+      if (isValidAggregateExchangeFlowObservation(observation, asset, nowMs, maxAgeMs)) {
+        addMacroFlow(observation);
+      } else {
+        rejectedByAsset[asset] += 1;
+      }
+    }
+    aggregateExchangeFlows[asset] = [
+      ...macroFlowByKey.values(),
+      ...[...macroFlowConflicts.values()].flat(),
+    ]
+      .sort((left, right) => right.timestampMs - left.timestampMs)
+      .slice(0, MAX_HISTORICAL_CANDIDATES_PER_ASSET);
   }
 
   const snapshot: QuorumCandidateSnapshot = {
     version: REGISTRY_VERSION,
+    ingestionPillars: MEMBER6_INGESTION_PILLARS,
     generatedAtMs: nowMs,
     assets,
     historicalCandidates,
     observedTransfers,
+    aggregateExchangeFlows,
+    ...(options.networkMetricsByAsset
+      ? {
+          networkMetrics: Object.fromEntries(QUORUM_ASSETS.map((asset) => [
+            asset,
+            { ...options.networkMetricsByAsset![asset] },
+          ])) as Record<QuorumAsset, Record<string, number | string | null>>,
+        }
+      : previousSnapshot?.networkMetrics
+        ? { networkMetrics: previousSnapshot.networkMetrics }
+        : {}),
+    ...(options.diagnosticsByAsset
+      ? {
+          diagnostics: Object.fromEntries(QUORUM_ASSETS.map((asset) => [
+            asset,
+            {
+              ...options.diagnosticsByAsset![asset],
+              persistedCandidateCount: persistedByAsset[asset],
+              rejectedCandidateCount: rejectedCandidatesByAsset[asset],
+            },
+          ])) as Record<QuorumAsset, QuorumAssetPollDiagnostics>,
+        }
+      : {}),
   };
   await mkdir(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -405,7 +649,13 @@ export async function writeQuorumCandidateSnapshot(
     await rm(temporaryPath, { force: true });
     throw error;
   }
-  return { path: filePath, persistedByAsset, rejectedByAsset, historicalByAsset };
+  return {
+    path: filePath,
+    persistedByAsset,
+    rejectedByAsset,
+    rejectedCandidatesByAsset,
+    historicalByAsset,
+  };
 }
 
 function emptyAssetsCount(): Record<QuorumAsset, number> {
@@ -422,6 +672,12 @@ function asCouncilCandidate(candidate: QuorumCandidateRecord): CouncilWhaleConse
     amount: candidate.amount,
     estimatedUsd: candidate.estimatedUsd,
     direction: candidate.direction,
+    senderAddress: candidate.senderAddress,
+    receiverAddress: candidate.receiverAddress,
+    senderIsExchange: candidate.senderIsExchange,
+    receiverIsExchange: candidate.receiverIsExchange,
+    senderProfile: candidate.senderProfile,
+    receiverProfile: candidate.receiverProfile,
     observations: candidate.observations.map((observation) => ({
       sourceId: observation.sourceId as CouncilWhaleQuorumSourceId,
       evidenceType: observation.evidenceType,
@@ -450,7 +706,26 @@ function asCouncilTransfer(candidate: QuorumCandidateRecord): CouncilWhaleTransf
     estimatedUsd: candidate.estimatedUsd,
     confirmationStatus: 'CONFIRMED',
     transferId: candidate.transferId,
+    senderAddress: candidate.senderAddress,
+    receiverAddress: candidate.receiverAddress,
+    senderIsExchange: candidate.senderIsExchange,
+    receiverIsExchange: candidate.receiverIsExchange,
+    senderProfile: candidate.senderProfile,
+    receiverProfile: candidate.receiverProfile,
   };
+}
+
+export async function loadQuorumCandidateNetworkMetrics(
+  asset: QuorumAsset,
+  filePath = process.env.SBK1_QUORUM_CANDIDATES_PATH ?? DEFAULT_REGISTRY_PATH,
+): Promise<Record<string, number | string | null> | null> {
+  try {
+    const snapshot = snapshotFrom(JSON.parse(await readFile(filePath, 'utf8')) as unknown);
+    return snapshot.networkMetrics?.[asset] ?? null;
+  } catch (error) {
+    if (isRecord(error) && error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 export async function loadQuorumCandidateFlow(
@@ -485,13 +760,39 @@ export async function loadQuorumCandidateFlow(
     }
     const candidates = snapshot.assets[asset]
       .filter((candidate) => validateCandidate(candidate, asset, nowMs, maxAgeMs));
-    if (candidates.length === 0) {
+    const aggregateExchangeFlow = (snapshot.aggregateExchangeFlows?.[asset] ?? [])
+      .filter((observation) =>
+        isValidAggregateExchangeFlowObservation(observation, asset, nowMs, maxAgeMs));
+    if (candidates.length === 0 && aggregateExchangeFlow.length === 0) {
+      const diagnostics = snapshot.diagnostics?.[asset];
+      let reason = `Poller heartbeat is current (${Math.round(snapshotAgeMs / 1_000)}s old), but no fresh, confirmed candidate with two independent sources and high-confidence exchange attribution is available.`;
+      if (diagnostics?.scanError) {
+        reason = `${asset} scanner failed: ${diagnostics.scanError}`;
+      } else if (diagnostics && diagnostics.observedTransferCount === 0) {
+        reason = `Scanner completed, but found no qualifying confirmed ${asset} transfers in its scan window.`;
+      } else if (diagnostics && diagnostics.configuredAddressCount === 0) {
+        reason = `Scanner found ${diagnostics.observedTransferCount} transfers, but the exchange-address registry has no ${asset} entries.`;
+      } else if (diagnostics && diagnostics.matchedAddressTransferCount === 0) {
+        reason = `Scanner found ${diagnostics.observedTransferCount} transfers, but none touched the ${diagnostics.configuredAddressCount} configured high-confidence ${asset} addresses; address coverage is the blocker.`;
+      } else if (diagnostics && diagnostics.exchangeAttributedTransferCount === 0) {
+        reason = `${diagnostics.matchedAddressTransferCount} transfers touched known ${asset} addresses, but none could be direction-attributed (for example internal exchange transfers or ambiguous ownership).`;
+      } else if (diagnostics && diagnostics.priceAvailable === false) {
+        reason = `${diagnostics.exchangeAttributedTransferCount} transfers were attributed, but public USD price lookup failed${diagnostics.priceError ? `: ${diagnostics.priceError}` : ''}; no candidate could be valued.`;
+      } else if (diagnostics && diagnostics.generatedCandidateCount === 0) {
+        reason = `${diagnostics.exchangeAttributedTransferCount} transfers matched exchange addresses, but transfer validation/quorum/attribution checks rejected them all.`;
+      } else if (diagnostics && diagnostics.persistedCandidateCount === 0) {
+        reason = `${diagnostics.generatedCandidateCount} candidates were generated but all ${diagnostics.rejectedCandidateCount} were rejected by registry validation.`;
+      }
       return unavailable(
         asset,
-        `Poller heartbeat is current (${Math.round(snapshotAgeMs / 1_000)}s old), but no fresh, confirmed candidate with two independent sources and high-confidence exchange attribution is available.`,
+        reason,
+        snapshot.networkMetrics?.[asset],
       );
     }
-    const timestampMs = Math.max(...candidates.map(({ timestampMs: candidateTimestamp }) => candidateTimestamp));
+    const timestampMs = Math.max(
+      ...candidates.map(({ timestampMs: candidateTimestamp }) => candidateTimestamp),
+      ...aggregateExchangeFlow.map(({ timestampMs: observationTimestamp }) => observationTimestamp),
+    );
     const councilCandidates = candidates.map(asCouncilCandidate);
     return {
       status: 'LIVE',
@@ -504,10 +805,14 @@ export async function loadQuorumCandidateFlow(
       coverageStatus: 'COMPLETE',
       largeTransfers: candidates.map(asCouncilTransfer),
       consensusMatrix: { candidates: councilCandidates },
+      aggregateExchangeFlow: { observations: aggregateExchangeFlow },
+      ...(snapshot.networkMetrics?.[asset]
+        ? { networkMetrics: snapshot.networkMetrics[asset] }
+        : {}),
       exchangeInflowsBtc: null,
       exchangeOutflowsBtc: null,
       netExchangeFlowBtc: null,
-      transactionCount: candidates.length,
+      transactionCount: candidates.length + aggregateExchangeFlow.length,
       windowStartHeight: null,
       windowEndHeight: null,
     };

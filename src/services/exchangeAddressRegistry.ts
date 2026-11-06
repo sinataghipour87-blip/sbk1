@@ -4,6 +4,7 @@ import { getWhaleSourceOperator, type QuorumCandidateRecord, type QuorumObserved
 
 export type ExchangeAddressChain = 'BTC' | 'ETH' | 'BNB' | 'SOL' | 'XRP';
 export type ExchangeAddressConfidence = 'HIGH' | 'MEDIUM';
+export const EXCHANGE_ADDRESS_MAX_AGE_MS = 365 * 24 * 60 * 60_000;
 
 export interface ExchangeAddressRecord {
   chain: ExchangeAddressChain;
@@ -31,7 +32,8 @@ interface ExchangeAddressFile {
   addresses: ExchangeAddressRecord[];
 }
 
-const DEFAULT_ADDRESS_FILE = path.resolve(process.cwd(), 'data/exchange-addresses.json');
+const DEFAULT_ADDRESS_DIRECTORY = path.resolve(process.cwd(), 'data/whale-addresses');
+const ADDRESS_CHAINS: readonly ExchangeAddressChain[] = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP'];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -53,7 +55,10 @@ function validAddress(chain: ExchangeAddressChain, address: string): boolean {
   return /^(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[ac-hj-np-z02-9]{11,71})$/i.test(address);
 }
 
-function parseAddressRecord(value: unknown): ExchangeAddressRecord | null {
+function parseAddressRecord(value: unknown, nowMs: number): ExchangeAddressRecord | null {
+  const retrievedAtMs = isRecord(value) && typeof value.retrievedAt === 'string'
+    ? Date.parse(value.retrievedAt)
+    : Number.NaN;
   if (
     !isRecord(value) ||
     !['BTC', 'ETH', 'BNB', 'SOL', 'XRP'].includes(String(value.chain)) ||
@@ -64,7 +69,9 @@ function parseAddressRecord(value: unknown): ExchangeAddressRecord | null {
     !nonEmptyString(value.sourceName) ||
     !nonEmptyString(value.sourceUrl) ||
     !nonEmptyString(value.retrievedAt) ||
-    !Number.isFinite(Date.parse(value.retrievedAt)) ||
+    !Number.isFinite(retrievedAtMs) ||
+    retrievedAtMs > nowMs ||
+    nowMs - retrievedAtMs > EXCHANGE_ADDRESS_MAX_AGE_MS ||
     (value.confidence !== 'HIGH' && value.confidence !== 'MEDIUM') ||
     typeof value.note !== 'string'
   ) return null;
@@ -93,12 +100,16 @@ function parseAddressRecord(value: unknown): ExchangeAddressRecord | null {
 export function parseExchangeAddressFile(
   value: unknown,
   onIssue: (message: string) => void = (message) => console.error(`[ExchangeAddressRegistry] ${message}`),
+  nowMs = Date.now(),
 ): ExchangeAddressFile {
+  if (!Number.isSafeInteger(nowMs) || nowMs <= 0) {
+    throw new Error('Exchange address registry validation time is invalid.');
+  }
   if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.addresses)) {
     throw new Error('Exchange address file must contain version 1 and an addresses array.');
   }
 
-  const parsed = value.addresses.map(parseAddressRecord);
+  const parsed = value.addresses.map((record) => parseAddressRecord(record, nowMs));
   if (parsed.some((record) => record === null)) {
     throw new Error('Exchange address file contains an invalid address record.');
   }
@@ -126,17 +137,37 @@ export async function loadExchangeAddressRegistry(options: {
   filePath?: string;
   onIssue?: (message: string) => void;
 } = {}): Promise<ExchangeAddressRecord[]> {
-  const filePath = options.filePath ?? process.env.SBK1_EXCHANGE_ADDRESS_FILE ?? DEFAULT_ADDRESS_FILE;
   const onIssue = options.onIssue ?? ((message: string) =>
     console.error(`[ExchangeAddressRegistry] ${message}`));
-  try {
-    const content = await readFile(filePath, 'utf8');
-    return parseExchangeAddressFile(JSON.parse(content) as unknown, onIssue).addresses;
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    onIssue(`Exchange address registry unavailable; using an empty list: ${reason}`);
-    return [];
+  const configuredFilePath = options.filePath ?? process.env.SBK1_EXCHANGE_ADDRESS_FILE;
+  if (configuredFilePath) {
+    try {
+      const content = await readFile(configuredFilePath, 'utf8');
+      return parseExchangeAddressFile(JSON.parse(content) as unknown, onIssue).addresses;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      onIssue(`Exchange address registry ${configuredFilePath} unavailable: ${reason}`);
+      return [];
+    }
   }
+
+  const addresses: ExchangeAddressRecord[] = [];
+  for (const chain of ADDRESS_CHAINS) {
+    const filePath = path.join(DEFAULT_ADDRESS_DIRECTORY, `${chain}.json`);
+    try {
+      const content = await readFile(filePath, 'utf8');
+      const records = parseExchangeAddressFile(JSON.parse(content) as unknown, onIssue).addresses;
+      if (records.some((record) => record.chain !== chain)) {
+        throw new Error(`Registry contains an address outside its ${chain} file.`);
+      }
+      addresses.push(...records);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      onIssue(`${chain} address registry ${filePath} unavailable: ${reason}`);
+    }
+  }
+  const deduplicated = parseExchangeAddressFile({ version: 1, addresses }, onIssue);
+  return deduplicated.addresses;
 }
 
 export function findHighConfidenceExchangeAddress(

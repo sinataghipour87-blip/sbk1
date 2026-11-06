@@ -1117,7 +1117,12 @@ async function analyzeSnapshot(
   ]);
   const whaleFlowData = quorumWhaleFlowData?.status === 'LIVE'
     ? quorumWhaleFlowData
-    : rawWhaleFlowData;
+    : rawWhaleFlowData
+      ? {
+          ...rawWhaleFlowData,
+          unavailableReason: quorumWhaleFlowData?.unavailableReason ?? rawWhaleFlowData.unavailableReason,
+        }
+      : quorumWhaleFlowData;
   if (asset === 'BTC' && quorumWhaleFlowData?.status !== 'LIVE' &&
       rawWhaleFlowData?.status === 'LIVE' && (rawWhaleFlowData.largeTransfers?.length ?? 0) > 0) {
     // Sampled BTC outputs lack exchange attribution and cannot enter Member 6's quorum matrix.
@@ -1177,6 +1182,9 @@ async function analyzeSnapshot(
     optionsData,
     whaleFlowData,
     publicMarketFallback,
+    pair: snapshot.pair,
+    exchange: snapshot.exchange,
+    market: snapshot.market,
     decisionSnapshotTimestampMs,
     nowMs: councilEvaluationNowMs,
   });
@@ -1391,6 +1399,10 @@ export class ServerSignalRunner {
     startPublicBitcoinWhaleDataPrefetch();
     if (process.env.SBK1_DISABLE_PUBLIC_WHALE_OBSERVATION_POLLER !== 'true') {
       startPublicWhaleObservationPoller();
+    } else {
+      console.warn(
+        '[SBK1_SIGNAL_RUNNER] Public whale observation poller is disabled; Member 6 will abstain without a fresh quorum snapshot.',
+      );
     }
     void this.runOnce();
     this.timer = setInterval(() => void this.runOnce(), this.pollIntervalMs);

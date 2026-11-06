@@ -1,5 +1,5 @@
 import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { AnalysisResult } from '../types/trading';
 import type { MultiBrainConsensusReport } from './multiBrainEnsemble';
@@ -7,7 +7,7 @@ import type { FreeMacroDataResult, DirectMetricResult } from './freeMacroData';
 import {
   applyMember6ShadowMode,
   EIGHT_MEMBER_COUNCIL,
-  evaluateMember6VoteForShadow,
+  evaluateMember6VoteAndEvidenceForShadow,
   evaluateEightMemberCouncil,
   member6ShadowModeEnabled,
   type CouncilMacroContext,
@@ -17,11 +17,17 @@ import {
   type CouncilOptionsData,
   type CouncilWhaleFlowData,
   type EightMemberCouncilReport,
+  type Member6VerifiedCandidate,
 } from './eightMemberCouncil';
 import type { OpenSourceAdvisoryReport } from './openSourceAdvisoryService';
 import type { PublicMarketFallbackData } from './publicMarketDataFallback';
 import type { SbPentagonOutput } from './sbFiveModelsEngine';
 import type { SignalToExecutionResult } from './signalToExecution';
+import {
+  member6ShadowLogBasePath,
+  member6ShadowSegmentPath,
+  pruneExpiredMember6ShadowLogs,
+} from './member6ShadowLog';
 import {
   deduplicateCandles,
   deduplicateNews,
@@ -52,14 +58,18 @@ interface RuntimeInput {
   optionsData?: CouncilOptionsData;
   whaleFlowData?: CouncilWhaleFlowData;
   publicMarketFallback?: PublicMarketFallbackData;
+  pair?: string;
+  exchange?: string;
+  market?: 'spot' | 'futures';
   repositoryDir?: string;
   decisionSnapshotTimestampMs?: number;
   nowMs?: number;
 }
 
 interface Member6ShadowVoteRecord {
+  recordId: string;
   evaluatedAtMs: number;
-  asset: 'BTC' | 'ETH';
+  asset: 'BTC' | 'ETH' | 'BNB' | 'SOL' | 'XRP';
   vote: CouncilMemberVote['vote'];
   confidencePct: number | null;
   totalVolume: number;
@@ -68,59 +78,69 @@ interface Member6ShadowVoteRecord {
   transactionHashes: string[];
   exchanges: string[];
   priceAtVote: number | null;
+  marketPair: string | null;
+  marketExchange: string | null;
+  marketType: 'spot' | 'futures' | null;
 }
 
 async function appendMember6ShadowVote(record: Member6ShadowVoteRecord): Promise<void> {
-  const filePath = path.resolve(
-    process.env.SBK1_MEMBER6_SHADOW_LOG_PATH?.trim() || '.cache/sbk1/member6-shadow-votes.jsonl',
-  );
+  const basePath = member6ShadowLogBasePath();
+  const filePath = member6ShadowSegmentPath(basePath, record.evaluatedAtMs, 'votes');
+  const currentDay = new Date(record.evaluatedAtMs).toISOString().slice(0, 10);
+  if (lastMember6ShadowPruneDay !== currentDay) {
+    await pruneExpiredMember6ShadowLogs(basePath, record.evaluatedAtMs);
+    lastMember6ShadowPruneDay = currentDay;
+  }
   await mkdir(path.dirname(filePath), { recursive: true });
   await appendFile(filePath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
 }
 
+let lastMember6ShadowPruneDay: string | null = null;
+
 function makeMember6ShadowVoteRecord(
   input: RuntimeInput,
-  vote: CouncilMemberVote,
+  evaluation: { vote: CouncilMemberVote; verifiedCandidates: Member6VerifiedCandidate[] },
   nowMs: number,
 ): Member6ShadowVoteRecord | null {
   if (!input.whaleFlowData) return null;
   const asset = (input.whaleFlowData.assetSymbol ?? 'BTC').toUpperCase();
-  if (asset !== 'BTC' && asset !== 'ETH') return null;
-  const candidates = input.whaleFlowData?.consensusMatrix?.candidates ?? [];
-  const valueOf = (candidate: NonNullable<typeof candidates[number]>): number => {
-    const raw = asset === 'BTC'
-      ? candidate.amountBtc ?? candidate.amount
-      : candidate.estimatedUsd;
-    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0;
-  };
-  const inflow = candidates
+  if (!isMember6ShadowAsset(asset)) return null;
+  const valueOf = (candidate: Member6VerifiedCandidate): number =>
+    asset === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0;
+  const inflow = evaluation.verifiedCandidates
     .filter(({ direction }) => direction === 'EXCHANGE_INFLOW')
     .reduce((sum, candidate) => sum + valueOf(candidate), 0);
-  const outflow = candidates
+  const outflow = evaluation.verifiedCandidates
     .filter(({ direction }) => direction === 'EXCHANGE_OUTFLOW')
     .reduce((sum, candidate) => sum + valueOf(candidate), 0);
-  const transactionHashes = [...new Set(candidates
-    .map(({ transactionHash }) => transactionHash)
-    .filter((hash) => typeof hash === 'string' && hash.length > 0))];
-  const exchanges = [...new Set(candidates.flatMap((candidate) =>
-    candidate.observations?.flatMap((observation) =>
-      observation.evidenceType === 'ATTRIBUTION' && observation.exchangeName
-        ? [observation.exchangeName]
-        : []) ?? []
-  ))];
+  const transactionHashes = [...new Set(evaluation.verifiedCandidates
+    .map(({ transactionHash }) => transactionHash))];
+  const exchanges = [...new Set(evaluation.verifiedCandidates
+    .flatMap(({ exchangeNames }) => exchangeNames))];
   const price = input.analysis.price;
   return {
+    recordId: randomUUID(),
     evaluatedAtMs: nowMs,
     asset,
-    vote: vote.vote,
-    confidencePct: vote.confidencePct,
+    vote: evaluation.vote.vote,
+    confidencePct: evaluation.vote.confidencePct,
     totalVolume: inflow + outflow,
     netVolume: inflow - outflow,
     volumeUnit: asset === 'BTC' ? 'BTC' : 'USD',
     transactionHashes,
     exchanges,
     priceAtVote: typeof price === 'number' && Number.isFinite(price) && price > 0 ? price : null,
+    marketPair: input.pair ?? null,
+    marketExchange: input.exchange ?? null,
+    marketType: input.market ?? null,
   };
+}
+
+function isMember6ShadowAsset(
+  asset: string,
+): asset is Member6ShadowVoteRecord['asset'] {
+  return asset === 'BTC' || asset === 'ETH' || asset === 'BNB' ||
+    asset === 'SOL' || asset === 'XRP';
 }
 
 type ModuleValue = {
@@ -1155,8 +1175,8 @@ export async function runEightMemberCouncilRuntime(
       entry ? [[memberId, entry]] : []
     ));
   const shadowMode = member6ShadowModeEnabled();
-  const shadowVote = shadowMode
-    ? evaluateMember6VoteForShadow({
+  const shadowEvaluation = shadowMode
+    ? evaluateMember6VoteAndEvidenceForShadow({
       macroContext,
       whaleFlowData: input.whaleFlowData,
       nowMs,
@@ -1188,8 +1208,8 @@ export async function runEightMemberCouncilRuntime(
     })),
   };
   const report = shadowMode ? applyMember6ShadowMode(evaluatedReport) : evaluatedReport;
-  if (shadowVote) {
-    const shadowRecord = makeMember6ShadowVoteRecord(input, shadowVote, nowMs);
+  if (shadowEvaluation) {
+    const shadowRecord = makeMember6ShadowVoteRecord(input, shadowEvaluation, nowMs);
     if (shadowRecord) {
       try {
         await appendMember6ShadowVote(shadowRecord);

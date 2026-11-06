@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "addresses": [
+    {
+      "chain": "SOL",
+      "address": "rTCAfDDrTAiP2hxBdfRtqnVZ9SF9E9JaQn617oStvPF",
+      "exchange": "Binance",
+      "label": "Binance (proof-of-reserves)",
+      "sourceName": "DefiLlama exchange attribution export",
+      "sourceUrl": "https://github.com/DefiLlama/DefiLlama-Adapters/blob/master/projects/binance/index.js",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Public PoR wallet attribution; ownership is attributed, but the source does not identify it as hot."
+    },
+    {
+      "chain": "SOL",
+      "address": "FxteHmLwG9nk1eL4pjNve3Eub2goGkkz6g6TbvdmW46a",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex (proof-of-reserves)",
+      "sourceName": "DefiLlama exchange attribution export",
+      "sourceUrl": "https://github.com/DefiLlama/DefiLlama-Adapters",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Public PoR wallet attribution; ownership is attributed, but the source does not identify it as hot."
+    }
+  ]
+}
