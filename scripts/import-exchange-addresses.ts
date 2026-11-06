@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parseExchangeAddressFile } from '../src/services/exchangeAddressRegistry';
 
@@ -13,6 +13,7 @@ const CSV_FIELDS = [
   'confidence',
   'note',
 ] as const;
+const ADDRESS_CHAINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP'] as const;
 
 function parseCsv(content: string): Array<Record<string, string>> {
   const rows: string[][] = [];
@@ -61,20 +62,34 @@ function parseCsv(content: string): Array<Record<string, string>> {
 async function main(): Promise<void> {
   const [inputArgument, outputArgument] = process.argv.slice(2);
   if (!inputArgument) {
-    throw new Error('Usage: npm run import:exchange-addresses -- <input.csv|input.json> [output.json]');
+    throw new Error('Usage: npm run import:exchange-addresses -- <input.csv|input.json> [output-directory|output.json]');
   }
   const inputPath = path.resolve(inputArgument);
-  const outputPath = path.resolve(outputArgument ?? 'data/exchange-addresses.json');
+  const outputPath = path.resolve(outputArgument ?? 'data/whale-addresses');
   const content = await readFile(inputPath, 'utf8');
   const raw: unknown = inputPath.toLowerCase().endsWith('.csv')
     ? { version: 1, addresses: parseCsv(content) }
     : JSON.parse(content);
   const registry = parseExchangeAddressFile(raw);
-  await writeFile(outputPath, `${JSON.stringify(registry, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  });
-  console.info(`[ExchangeAddressImport] Wrote ${registry.addresses.length} unambiguous records to ${outputPath}.`);
+  if (outputPath.toLowerCase().endsWith('.json')) {
+    await mkdir(path.dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, `${JSON.stringify(registry, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    console.info(`[ExchangeAddressImport] Wrote ${registry.addresses.length} unambiguous records to ${outputPath}.`);
+    return;
+  }
+  await mkdir(outputPath, { recursive: true });
+  for (const chain of ADDRESS_CHAINS) {
+    const addresses = registry.addresses.filter((record) => record.chain === chain);
+    const assetPath = path.join(outputPath, `${chain}.json`);
+    await writeFile(assetPath, `${JSON.stringify({ version: 1, addresses }, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    console.info(`[ExchangeAddressImport] Wrote ${addresses.length} ${chain} records to ${assetPath}.`);
+  }
 }
 
 main().catch((error: unknown) => {

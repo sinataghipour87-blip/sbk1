@@ -28,6 +28,7 @@ import {
   writeQuorumCandidateSnapshot,
   type QuorumCandidateRecord,
 } from '../src/services/whaleConsensusCandidateRegistry';
+import { member6ShadowSegmentPath } from '../src/services/member6ShadowLog';
 
 const nowMs = Date.now();
 const sourceTimestampMs = nowMs - 1_000;
@@ -347,6 +348,8 @@ const freeMacroData: FreeMacroDataResult = {
 
 const repositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-council-runtime-'));
 const memberTwoRepositoryDir = await mkdtemp(path.join(os.tmpdir(), 'sbk1-council-member-02-'));
+const previousShadowLogPath = process.env.SBK1_MEMBER6_SHADOW_LOG_PATH;
+process.env.SBK1_MEMBER6_SHADOW_LOG_PATH = path.join(repositoryDir, 'member6-shadow-votes.jsonl');
 try {
   const report = await runEightMemberCouncilRuntime({
     analysis,
@@ -378,7 +381,7 @@ try {
       confidence: 'HIGH',
       note: 'Synthetic test-only address.',
     };
-    const candidate = createAttributedQuorumCandidate({
+    const attributedCandidate = createAttributedQuorumCandidate({
       assetSymbol: 'ETH',
       blockchain: 'ethereum',
       transactionHash: `0x${'a'.repeat(64)}`,
@@ -396,7 +399,24 @@ try {
       sourceTimestampMs: nowMs,
       retrievedAtMs: nowMs,
     }, nowMs);
-    assert.ok(candidate);
+    assert.ok(attributedCandidate);
+    const candidate: QuorumCandidateRecord = {
+      ...attributedCandidate,
+      senderAddress: '0x2222222222222222222222222222222222222222',
+      receiverAddress: exchangeAddress.address,
+      senderIsExchange: false,
+      receiverIsExchange: true,
+      senderProfile: {
+        isWhale: true,
+        behaviorTag: 'ACCUMULATOR',
+        confidenceScore: 0.9,
+      },
+      receiverProfile: {
+        isWhale: false,
+        behaviorTag: 'UNKNOWN',
+        confidenceScore: 0,
+      },
+    };
     const candidates = Object.fromEntries(QUORUM_ASSETS.map((asset) =>
       [asset, asset === 'ETH' ? [candidate] : []])) as Record<
         typeof QUORUM_ASSETS[number],
@@ -407,6 +427,53 @@ try {
       nowMs,
       filePath: quorumPath,
       observedTransfersByAsset: { BTC: [], ETH: [], BNB: [], SOL: [], XRP: [] },
+      networkMetricsByAsset: {
+        BTC: {
+          fee_status: 'QUORUM',
+          fee_metric: 'mempool_median_fee_rate',
+          fee_unit: 'sat_vbyte',
+          fee_value: 1,
+          fee_operator_count: 2,
+          fee_source_ids: 'mempool.space,blockstream',
+          fee_observed_at_ms: nowMs,
+        },
+        ETH: {
+          fee_status: 'QUORUM',
+          fee_metric: 'priority_fee_gwei',
+          fee_unit: 'gwei',
+          fee_value: 1,
+          fee_operator_count: 2,
+          fee_source_ids: 'ethereum-rpc-publicnode,ethereum-rpc-blockrazor',
+          fee_observed_at_ms: nowMs,
+        },
+        BNB: {
+          fee_status: 'QUORUM',
+          fee_metric: 'priority_fee_gwei',
+          fee_unit: 'gwei',
+          fee_value: 1,
+          fee_operator_count: 2,
+          fee_source_ids: 'bsc-rpc-publicnode,bsc-rpc-blockrazor',
+          fee_observed_at_ms: nowMs,
+        },
+        SOL: {
+          fee_status: 'QUORUM',
+          fee_metric: 'prioritization_fee_micro_lamports',
+          fee_unit: 'micro_lamports_per_compute_unit',
+          fee_value: 1,
+          fee_operator_count: 2,
+          fee_source_ids: 'solana-rpc-solana-foundation,solana-rpc-publicnode',
+          fee_observed_at_ms: nowMs,
+        },
+        XRP: {
+          fee_status: 'QUORUM',
+          fee_metric: 'validated_base_fee_xrp',
+          fee_unit: 'XRP',
+          fee_value: 1,
+          fee_operator_count: 2,
+          fee_source_ids: 'xrp-rpc-xrplcluster,xrp-rpc-honeycluster',
+          fee_observed_at_ms: nowMs,
+        },
+      },
     });
     const shadowFlow = await loadQuorumCandidateFlow('ETH', { nowMs, filePath: quorumPath });
     assert.equal(shadowFlow.status, 'LIVE');
@@ -421,6 +488,9 @@ try {
       macroContext,
       freeMacroData,
       whaleFlowData: shadowFlow,
+      pair: 'ETH/USDT',
+      exchange: 'binance',
+      market: 'spot',
       repositoryDir: shadowRepositoryDir,
       nowMs,
     });
@@ -432,13 +502,20 @@ try {
       transactionHashes: string[];
       exchanges: string[];
       priceAtVote: number | null;
-    }>(shadowLogPath);
+      marketPair: string | null;
+      marketExchange: string | null;
+      marketType: 'spot' | 'futures' | null;
+    }>(member6ShadowSegmentPath(shadowLogPath, nowMs, 'votes'));
     assert.equal(shadowRecord.asset, 'ETH');
     assert.equal(shadowRecord.vote, 'SHORT');
     assert.ok((shadowRecord.confidencePct ?? 0) > 0);
     assert.deepEqual(shadowRecord.transactionHashes, [`0x${'a'.repeat(64)}`]);
     assert.deepEqual(shadowRecord.exchanges, ['TEST_ONLY_SYNTHETIC_EXCHANGE']);
     assert.equal(shadowRecord.priceAtVote, analysis.price);
+    assert.deepEqual(
+      [shadowRecord.marketPair, shadowRecord.marketExchange, shadowRecord.marketType],
+      ['ETH/USDT', 'binance', 'spot'],
+    );
 
     process.env.SBK1_MEMBER6_SHADOW_MODE = 'false';
     const liveReport = await runEightMemberCouncilRuntime({
@@ -896,6 +973,20 @@ try {
     estimatedUsd: 8_000_000,
     confirmationStatus: 'CONFIRMED' as const,
     transferId: 'vout:0',
+    senderAddress: 'bc1qtestexchange',
+    receiverAddress: 'bc1qaccumulator',
+    senderIsExchange: true,
+    receiverIsExchange: false,
+    senderProfile: {
+      isWhale: false,
+      behaviorTag: 'UNKNOWN' as const,
+      confidenceScore: 0,
+    },
+    receiverProfile: {
+      isWhale: true,
+      behaviorTag: 'ACCUMULATOR' as const,
+      confidenceScore: 0.9,
+    },
   }];
   const connectedWhaleFlowData = {
     status: 'LIVE' as const,
@@ -905,6 +996,15 @@ try {
     qualityPct: 85,
     coverageStatus: 'SAMPLED' as const,
     largeTransfers: connectedTransfers,
+    networkMetrics: {
+      fee_status: 'QUORUM',
+      fee_metric: 'mempool_median_fee_rate',
+      fee_unit: 'sat_vbyte',
+      fee_value: 1,
+      fee_operator_count: 2,
+      fee_source_ids: 'mempool.space,blockstream',
+      fee_observed_at_ms: nowMs,
+    },
     consensusMatrix: {
       candidates: [{
         blockchain: 'bitcoin',
@@ -913,10 +1013,24 @@ try {
         timestampMs: nowMs - 1_000,
         amountBtc: 125,
         direction: 'EXCHANGE_OUTFLOW' as const,
+        senderAddress: 'bc1qtestexchange',
+        receiverAddress: 'bc1qaccumulator',
+        senderIsExchange: true,
+        receiverIsExchange: false,
+        senderProfile: {
+          isWhale: false,
+          behaviorTag: 'UNKNOWN' as const,
+          confidenceScore: 0,
+        },
+        receiverProfile: {
+          isWhale: true,
+          behaviorTag: 'ACCUMULATOR' as const,
+          confidenceScore: 0.9,
+        },
         observations: [
           { sourceId: 'mempool.space' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'test-tx', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
           { sourceId: 'blockstream' as const, evidenceType: 'TRANSFER' as const, blockchain: 'bitcoin', transactionHash: 'test-tx', transferId: 'vout:0', amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
-          { sourceId: 'whale-alert' as const, evidenceType: 'ATTRIBUTION' as const, blockchain: 'bitcoin', transactionHash: 'test-tx', transferId: 'vout:0', direction: 'EXCHANGE_OUTFLOW' as const, amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const },
+          { sourceId: 'local-exchange-address-list' as const, evidenceType: 'ATTRIBUTION' as const, blockchain: 'bitcoin', transactionHash: 'test-tx', transferId: 'vout:0', direction: 'EXCHANGE_OUTFLOW' as const, amountBtc: 125, timestampMs: nowMs - 1_000, confirmationStatus: 'CONFIRMED' as const, exchangeName: 'Test Exchange', exchangeAddress: 'bc1qtestexchange' },
         ],
       }],
     },
@@ -985,14 +1099,14 @@ try {
     'LONG',
     'LONG',
     'NEUTRAL',
-    'ABSTAIN',
+    'LONG',
     'LONG',
     'LONG',
   ];
   assert.deepEqual(
     connectedSourcesReport.members.map(({ vote }) => vote),
     expectedConnectedVotes,
-    'shadow-mode Member 6 evidence must not contribute a directional council vote',
+    'verified Member 6 evidence must contribute its directional council vote when shadow mode is disabled',
   );
   const connectedVoteRecord = await readLatestJsonLine<{
     coordinator: { moduleId: string; excludedFromMemberVotes: boolean };
@@ -1078,7 +1192,7 @@ try {
   assert.equal(whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinPublicTransfers').status, 'AVAILABLE');
   assert.equal('output' in whaleMember.moduleOutputs.find((item: { moduleId: string }) => item.moduleId === 'onchain.bitcoinPublicTransfers'), false);
   assert.equal(whaleMember.sourceData.publicOnChainData.provider, 'mempool.space public REST API (sampled confirmed BTC outputs)');
-  assert.equal(whaleMember.vote, 'ABSTAIN', 'shadow-mode Member 6 vote must persist as ABSTAIN in council records');
+  assert.equal(whaleMember.vote, 'LONG', 'live Member 6 vote must persist in council records when shadow mode is disabled');
 
   const noSupportingModulesDir = path.join(repositoryDir, 'no-supporting-modules');
   await runEightMemberCouncilRuntime({
@@ -1138,6 +1252,8 @@ try {
   );
   assert.equal(noQuorumVote.report.quorumMet, false);
 } finally {
+  if (previousShadowLogPath === undefined) delete process.env.SBK1_MEMBER6_SHADOW_LOG_PATH;
+  else process.env.SBK1_MEMBER6_SHADOW_LOG_PATH = previousShadowLogPath;
   await rm(repositoryDir, { recursive: true, force: true });
   await rm(memberTwoRepositoryDir, { recursive: true, force: true });
 }

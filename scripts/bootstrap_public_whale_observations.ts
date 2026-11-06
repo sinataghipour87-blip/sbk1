@@ -5,6 +5,7 @@ console.log(JSON.stringify({
   status: Object.keys(result.unavailableAssets).length === 0 ? 'COMPLETE' : 'PARTIAL',
   path: result.path,
   observedByAsset: result.observedByAsset,
+  diagnosticsByAsset: result.diagnosticsByAsset,
   rejectedByAsset: result.rejectedByAsset,
   unavailableAssets: result.unavailableAssets,
   note: 'Raw transfer observations are not exchange-attributed Member 6 candidates.',

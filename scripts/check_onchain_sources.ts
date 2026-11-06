@@ -132,26 +132,47 @@ async function checkSource(source: PublicWhaleSource): Promise<ProbeResult> {
     chainGate = isValidSolanaMainnetGenesisHash(genesisHash);
     if (!chainGate) details.push('Mainnet genesis hash did not validate.');
   } else if (source.asset === 'XRP') {
-    const serverInfo = await capture(() => request('', {
-      method: 'server_info',
-      params: [{}],
-    }));
+    const [serverInfo, current, validated] = await Promise.all([
+      capture(() => request('', {
+        method: 'server_info',
+        params: [{}],
+      })),
+      capture(() => request('', {
+        method: 'ledger_current',
+        params: [],
+      })),
+      capture(() => request('', {
+        method: 'ledger',
+        params: [{ ledger_index: 'validated', transactions: false }],
+      })),
+    ]);
     const info = rpcResult(serverInfo);
     const server = info && isRecord(info.info) ? info.info : info;
-    chainGate = isValidXrpMainnetNetworkId(server?.network_id);
-    if (!chainGate) details.push(`XRPL network_id is ${String(server?.network_id)}, not 0.`);
-    const validated = await capture(() => request('', {
-      method: 'ledger',
-      params: [{ ledger_index: 'validated', transactions: false }],
-    }));
+    const networkId = server?.network_id;
+    const currentResult = rpcResult(current);
     const ledger = rpcResult(validated)?.ledger;
-    const index = isRecord(ledger) ? Number(ledger.ledger_index) : Number.NaN;
-    const currentIndex = height ?? Number.NaN;
-    validatedXrpLedger = Number.isSafeInteger(index) ? index : null;
-    if (!Number.isSafeInteger(index) || !Number.isSafeInteger(currentIndex) ||
-        currentIndex < index || currentIndex - index > 3) {
-      chainGate = false;
-      details.push('Validated XRPL ledger is invalid or more than 3 ledgers behind ledger_current.');
+    const currentValue = isRecord(currentResult)
+      ? currentResult.ledger_current_index ?? currentResult.ledger_index
+      : undefined;
+    const currentIndex = Number(currentValue);
+    const validatedIndex = isRecord(ledger) ? Number(ledger.ledger_index) : Number.NaN;
+    const currentValid = Number.isSafeInteger(currentIndex);
+    const validatedValid = Number.isSafeInteger(validatedIndex);
+    const lag = currentValid && validatedValid ? currentIndex - validatedIndex : null;
+    validatedXrpLedger = validatedValid ? validatedIndex : null;
+    const reasons: string[] = [];
+    if (!isValidXrpMainnetNetworkId(networkId)) reasons.push('network_id is not 0');
+    if (!currentValid) reasons.push('current ledger index is invalid');
+    if (!validatedValid) reasons.push('validated ledger index is invalid');
+    if (lag !== null && currentIndex < validatedIndex) reasons.push('current is below validated');
+    if (lag !== null && lag > ONCHAIN_SOURCE_CONFIG.maxXrpLedgerLag) {
+      reasons.push(`lag exceeds ${ONCHAIN_SOURCE_CONFIG.maxXrpLedgerLag}`);
+    }
+    chainGate = reasons.length === 0;
+    if (!chainGate) {
+      details.push(
+        `XRPL gate rejected: network_id=${String(networkId)}, current=${currentValid ? currentIndex : String(currentValue ?? 'invalid')}, validated=${validatedValid ? validatedIndex : 'invalid'}, lag=${lag ?? 'invalid'}; reason=${reasons.join(', ')}.`,
+      );
     }
   }
 
@@ -204,6 +225,9 @@ async function checkSource(source: PublicWhaleSource): Promise<ProbeResult> {
           blockRead = complete && transactionCount === txCount
             ? `YES (${transactionCount} tx)`
             : `PARTIAL ${transactionCount}/${txCount}`;
+          if (!complete || transactionCount !== txCount) {
+            details.push(`incomplete block: got ${transactionCount} of ${txCount}`);
+          }
         } else {
           details.push('BTC block hash, height, timestamp, or transaction metadata did not validate.');
         }
@@ -304,7 +328,7 @@ const sourceList = listPublicWhaleSources();
 const scannerCycles = await Promise.all(assets.map(async (asset) => {
   const startedAtMs = Date.now();
   try {
-    const observations = await scanPublicWhaleAsset(asset);
+    const observations = await scanPublicWhaleAsset(asset, Date.now(), 1);
     return { asset, cycleMs: Date.now() - startedAtMs, observations: observations.length, error: '' };
   } catch (error) {
     return {

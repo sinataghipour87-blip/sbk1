@@ -55,7 +55,7 @@ const report = evaluateEightMemberCouncil({
   nowMs,
 });
 assert.equal(report.members[5].vote, 'ABSTAIN');
-assert.match(report.members[5].rationaleFa, /quorum مستقل/);
+assert.match(report.members[5].rationaleFa, /اپراتور مستقل/);
 
 resetWhaleAlertFlowCacheForTests();
 let fetchedWithoutKey = false;

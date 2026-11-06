@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "addresses": [
+    {
+      "chain": "BTC",
+      "address": "1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s",
+      "exchange": "Binance",
+      "label": "Binance.com",
+      "sourceName": "WalletExplorer",
+      "sourceUrl": "https://www.walletexplorer.com/wallet/Binance.com/addresses",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Listed on WalletExplorer under Binance.com; cluster is not asserted to be hot-only."
+    },
+    {
+      "chain": "BTC",
+      "address": "12nxRsisUcJqCDeUpTYH2a7F5jcad3YhFG",
+      "exchange": "Coinbase",
+      "label": "Coinbase.com",
+      "sourceName": "GraphSense TagPacks",
+      "sourceUrl": "https://github.com/graphsense/graphsense-tagpacks",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community label identifies this address as Coinbase.com; hot/cold role is unspecified."
+    },
+    {
+      "chain": "BTC",
+      "address": "3G3VG4X1WquWjqXT27JRwrRoyZgdyWf1dT",
+      "exchange": "Kraken",
+      "label": "Kraken.com",
+      "sourceName": "WalletExplorer / GraphSense TagPacks",
+      "sourceUrl": "https://www.walletexplorer.com/address/3G3VG4X1WquWjqXT27JRwrRoyZgdyWf1dT",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "WalletExplorer and GraphSense identify this address as Kraken.com; hot/cold role is unspecified."
+    },
+    {
+      "chain": "BTC",
+      "address": "1129A9dFqy4ABDsGQ8RGusbMWYBoZc4myc",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex.com",
+      "sourceName": "WalletExplorer / GraphSense TagPacks",
+      "sourceUrl": "https://www.walletexplorer.com/address/1129A9dFqy4ABDsGQ8RGusbMWYBoZc4myc",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "WalletExplorer and GraphSense identify this address as Bitfinex.com; hot/cold role is unspecified."
+    }
+  ]
+}

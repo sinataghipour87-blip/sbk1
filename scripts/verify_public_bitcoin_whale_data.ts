@@ -68,7 +68,7 @@ assert.equal(report.members.length, 8);
 assert.equal(report.quorumRequired, 5);
 assert.equal(report.members[5].vote, 'ABSTAIN');
 assert.equal(report.members.filter((member) => member.id === 6).length, 1);
-assert.match(report.members[5].rationaleFa, /quorum مستقل/);
+assert.match(report.members[5].rationaleFa, /اپراتور مستقل/);
 
 const staleForCouncil = {
   ...data,

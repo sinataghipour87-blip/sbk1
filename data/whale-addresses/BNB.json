@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "addresses": [
+    {
+      "chain": "BNB",
+      "address": "0x01c952174c24e1210d26961d456a77a39e1f0bb0",
+      "exchange": "Binance",
+      "label": "Binance Hot Wallet 10",
+      "sourceName": "eth-labels / GraphSense / Etherscan labels",
+      "sourceUrl": "https://github.com/dawsbot/eth-labels",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "BSC record in the community attribution export; not inferred from an Ethereum-only label."
+    }
+  ]
+}

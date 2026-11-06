@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import crypto from 'crypto';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
@@ -31,6 +32,7 @@ import { fetchDirectNewsHeadlines } from './src/services/directNewsFeeds';
 import { fetchFreeMacroData } from './src/services/freeMacroData';
 import { openSourceAdvisoryService } from './src/services/openSourceAdvisoryService';
 import { binancePublicMarketDataStream } from './src/services/publicMarketDataStream';
+import { readWalletProfileSnapshot } from './src/services/whaleAddressTracker';
 
 dotenv.config();
 
@@ -1120,6 +1122,33 @@ app.get('/api/whale-onchain-radar', async (_req, res) => {
   });
 });
 
+app.get('/api/wallet-profiles', async (req, res) => {
+  const parseQueryInteger = (value: unknown, fallback: number): number => {
+    if (value === undefined) return fallback;
+    if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+      throw new Error('limit and offset must be non-negative integers.');
+    }
+    return Number(value);
+  };
+  try {
+    const snapshot = await readWalletProfileSnapshot({
+      limit: parseQueryInteger(req.query.limit, 100),
+      offset: parseQueryInteger(req.query.offset, 0),
+    });
+    res.json({
+      status: snapshot.updatedAtMs === null ? 'EMPTY' : 'LIVE',
+      updatedAtMs: snapshot.updatedAtMs,
+      totalWallets: snapshot.totalWallets,
+      wallets: snapshot.wallets,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = /pagination settings|limit and offset/.test(message) ? 400 : 500;
+    if (status === 500) console.error('[WalletProfiles] Could not read wallet profile store:', message);
+    res.status(status).json({ error: message });
+  }
+});
+
 app.get('/api/macro-context', async (_req, res) => {
   const [newsHeadlines, macroData] = await Promise.all([
     fetchDirectNewsHeadlines(),
@@ -2032,6 +2061,7 @@ function listenOnAvailablePort(port: number, allowFallback: boolean): Promise<Re
 }
 
 async function startServer() {
+  await mkdir(path.resolve(process.cwd(), '.cache/sbk1'), { recursive: true });
   viteServer = await createViteServer({
     server: { middlewareMode: true, hmr: false, ws: false },
     appType: 'spa'

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "addresses": [
+    {
+      "chain": "XRP",
+      "address": "rLW9gnQo7BQhU6igk5keqYnH3TVrCxGRzm",
+      "exchange": "Bitfinex",
+      "label": "Bitfinex Ripple XRP hot wallet",
+      "sourceName": "GraphSense TagPacks",
+      "sourceUrl": "https://github.com/graphsense/graphsense-tagpacks",
+      "retrievedAt": "2026-11-04T00:00:00.000Z",
+      "confidence": "HIGH",
+      "note": "Community label explicitly identifies this as a Bitfinex XRP hot wallet."
+    }
+  ]
+}

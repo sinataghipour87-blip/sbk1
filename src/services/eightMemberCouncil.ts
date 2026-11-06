@@ -43,6 +43,7 @@ export interface CouncilWhaleFlowData {
   unavailableReason?: string;
   largeTransfers?: CouncilWhaleTransfer[];
   consensusMatrix?: CouncilWhaleConsensusMatrix;
+  aggregateExchangeFlow?: CouncilAggregateExchangeFlow;
   networkMetrics?: Record<string, number | string | null>;
   exchangeInflowsBtc: number | null;
   exchangeOutflowsBtc: number | null;
@@ -50,6 +51,24 @@ export interface CouncilWhaleFlowData {
   transactionCount: number;
   windowStartHeight: number | null;
   windowEndHeight: number | null;
+}
+
+export interface CouncilAggregateExchangeFlow {
+  observations: CouncilAggregateExchangeFlowObservation[];
+}
+
+export interface CouncilAggregateExchangeFlowObservation {
+  blockchain: string;
+  transactionHash: string;
+  transferId: string;
+  timestampMs: number;
+  direction: CouncilWhaleFlowDirection;
+  amount: number;
+  estimatedUsd: number;
+  exchangeName: string;
+  exchangeAddress: string;
+  attributionSourceId: 'local-exchange-address-list';
+  sourceIds: readonly string[];
 }
 
 export interface CouncilWhaleTransfer {
@@ -63,6 +82,18 @@ export interface CouncilWhaleTransfer {
   estimatedUsd: number | null;
   confirmationStatus: 'CONFIRMED' | 'UNCONFIRMED' | 'UNKNOWN';
   transferId?: string;
+  senderAddress?: string | null;
+  receiverAddress?: string | null;
+  senderIsExchange?: boolean;
+  receiverIsExchange?: boolean;
+  senderProfile?: CouncilWhaleBehaviorProfile;
+  receiverProfile?: CouncilWhaleBehaviorProfile;
+}
+
+export interface CouncilWhaleBehaviorProfile {
+  isWhale: boolean;
+  behaviorTag: 'ACCUMULATOR' | 'DISTRIBUTOR' | 'MM' | 'UNKNOWN';
+  confidenceScore: number;
 }
 
 export type CouncilWhaleFlowDirection = 'EXCHANGE_INFLOW' | 'EXCHANGE_OUTFLOW';
@@ -75,6 +106,7 @@ export type CouncilWhaleQuorumSourceId =
   | 'mempool-bullbitcoin'
   | 'mempool-sweetsats'
   | 'whale-alert'
+  | 'local-exchange-address-list'
   | 'etherscan'
   | 'etherscan-metadata'
   | 'blockscout'
@@ -136,6 +168,20 @@ export interface CouncilWhaleConsensusCandidate {
   estimatedUsd?: number;
   direction: CouncilWhaleFlowDirection;
   observations: CouncilWhaleQuorumObservation[];
+  senderAddress?: string | null;
+  receiverAddress?: string | null;
+  senderIsExchange?: boolean;
+  receiverIsExchange?: boolean;
+  senderProfile?: CouncilWhaleBehaviorProfile;
+  receiverProfile?: CouncilWhaleBehaviorProfile;
+}
+
+export interface Member6VerifiedCandidate {
+  direction: CouncilWhaleFlowDirection;
+  amount: number;
+  estimatedUsd: number | null;
+  transactionHash: string;
+  exchangeNames: string[];
 }
 
 export interface CouncilWhaleConsensusMatrix {
@@ -887,6 +933,7 @@ function evaluateOnChain(
   macro: CouncilMacroContext | null | undefined,
   nowMs: number,
   directWhaleFlow?: CouncilWhaleFlowData,
+  verifiedEvidenceOutput?: Member6VerifiedCandidate[],
 ): CouncilMemberVote {
   const assetSymbol = directWhaleFlow?.assetSymbol?.toUpperCase() ?? 'BTC';
   const freshness = directWhaleFlow
@@ -914,6 +961,14 @@ function evaluateOnChain(
     amount: number;
     estimatedUsd: number | null;
     timestampMs: number;
+    transactionHash: string;
+    exchangeNames: string[];
+    senderAddress?: string | null;
+    receiverAddress?: string | null;
+    senderIsExchange?: boolean;
+    receiverIsExchange?: boolean;
+    senderProfile?: CouncilWhaleBehaviorProfile;
+    receiverProfile?: CouncilWhaleBehaviorProfile;
   }>();
   let conflictingEvidence = false;
 
@@ -938,7 +993,9 @@ function evaluateOnChain(
     const freshObservations = observations.filter((observation) =>
       isRecord(observation) &&
       typeof observation.sourceId === 'string' &&
-      getWhaleSourceOperator(assetSymbol, observation.sourceId) !== null &&
+      (getWhaleSourceOperator(assetSymbol, observation.sourceId) !== null ||
+        (observation.evidenceType === 'ATTRIBUTION' &&
+          observation.sourceId === 'local-exchange-address-list')) &&
       typeof observation.blockchain === 'string' &&
       observation.blockchain.toLowerCase() === candidate.blockchain.toLowerCase() &&
       typeof observation.transactionHash === 'string' &&
@@ -948,7 +1005,10 @@ function evaluateOnChain(
       ['TRANSFER', 'ATTRIBUTION'].includes(String(observation.evidenceType)) &&
       (observation.evidenceType === 'TRANSFER'
         ? observation.direction === undefined
-        : ['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(observation.direction))) &&
+        : observation.sourceId === 'local-exchange-address-list' &&
+          ['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(observation.direction)) &&
+          typeof observation.exchangeName === 'string' && Boolean(observation.exchangeName.trim()) &&
+          typeof observation.exchangeAddress === 'string' && Boolean(observation.exchangeAddress.trim())) &&
       observation.confirmationStatus === 'CONFIRMED' &&
       isFiniteNumber(observation.timestampMs) &&
       observation.timestampMs <= nowMs &&
@@ -981,6 +1041,10 @@ function evaluateOnChain(
     const amountMatches = transfer !== undefined &&
       Math.abs(transfer.amount - candidateAmount) <= Math.max(1e-8, candidateAmount * 1e-8) &&
       Math.abs(transfer.timestampMs - candidate.timestampMs) <= MAX_MEMBER_6_TIMESTAMP_SKEW_MS &&
+      transfer.senderAddress === candidate.senderAddress &&
+      transfer.receiverAddress === candidate.receiverAddress &&
+      transfer.senderIsExchange === candidate.senderIsExchange &&
+      transfer.receiverIsExchange === candidate.receiverIsExchange &&
       estimatedUsdMatches &&
       freshObservations.every((observation) =>
         Math.abs((observation.amount ?? observation.amountBtc!) - candidateAmount) <= Math.max(1e-8, candidateAmount * 1e-8));
@@ -1005,72 +1069,350 @@ function evaluateOnChain(
       amount: candidateAmount,
       estimatedUsd: isFiniteNumber(candidate.estimatedUsd) ? candidate.estimatedUsd : transfer.estimatedUsd,
       timestampMs: candidate.timestampMs,
+      transactionHash: candidate.transactionHash,
+      senderAddress: candidate.senderAddress,
+      receiverAddress: candidate.receiverAddress,
+      senderIsExchange: candidate.senderIsExchange,
+      receiverIsExchange: candidate.receiverIsExchange,
+      senderProfile: candidate.senderProfile,
+      receiverProfile: candidate.receiverProfile,
+      exchangeNames: [...new Set(freshObservations.flatMap((observation) =>
+        observation.evidenceType === 'ATTRIBUTION' &&
+        typeof observation.exchangeName === 'string' &&
+        observation.exchangeName.trim()
+          ? [observation.exchangeName.trim()]
+          : []
+      ))],
     });
   }
 
   const candidates = [...verifiedCandidates.values()];
-  const inflow = candidates
-    .filter(({ direction }) => direction === 'EXCHANGE_INFLOW')
-    .reduce((sum, candidate) => sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
-  const outflow = candidates
-    .filter(({ direction }) => direction === 'EXCHANGE_OUTFLOW')
-    .reduce((sum, candidate) => sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
-  const totalVolume = inflow + outflow;
-  const netFlow = inflow - outflow;
+  verifiedEvidenceOutput?.push(...candidates.map((candidate) => ({
+    direction: candidate.direction,
+    amount: candidate.amount,
+    estimatedUsd: candidate.estimatedUsd,
+    transactionHash: candidate.transactionHash,
+    exchangeNames: candidate.exchangeNames,
+  })));
+  const isValidBehaviorProfile = (profile: CouncilWhaleBehaviorProfile | undefined): profile is CouncilWhaleBehaviorProfile =>
+    isRecord(profile) &&
+    typeof profile.isWhale === 'boolean' &&
+    ['ACCUMULATOR', 'DISTRIBUTOR', 'MM', 'UNKNOWN'].includes(String(profile.behaviorTag)) &&
+    isFiniteNumber(profile.confidenceScore) &&
+    profile.confidenceScore >= 0 &&
+    profile.confidenceScore <= 1;
+  type BehaviorCandidate = (typeof candidates)[number] & {
+    voteDirection: 'LONG' | 'SHORT';
+    highConfidenceAccumulator: boolean;
+  };
+  const behaviorCandidates: BehaviorCandidate[] = [];
+  for (const candidate of candidates) {
+    if (
+      typeof candidate.senderAddress !== 'string' || !candidate.senderAddress ||
+      typeof candidate.receiverAddress !== 'string' || !candidate.receiverAddress ||
+      typeof candidate.senderIsExchange !== 'boolean' ||
+      typeof candidate.receiverIsExchange !== 'boolean' ||
+      !isValidBehaviorProfile(candidate.senderProfile) ||
+      !isValidBehaviorProfile(candidate.receiverProfile)
+    ) continue;
+    if (candidate.senderIsExchange && candidate.receiverIsExchange) continue;
+    if (
+      !candidate.senderIsExchange &&
+      candidate.receiverIsExchange &&
+      candidate.direction === 'EXCHANGE_INFLOW' &&
+      candidate.senderProfile.isWhale &&
+      candidate.senderProfile.behaviorTag === 'ACCUMULATOR'
+    ) {
+      behaviorCandidates.push({
+        ...candidate,
+        voteDirection: 'SHORT',
+        highConfidenceAccumulator: candidate.senderProfile.confidenceScore > 0.8,
+      });
+      continue;
+    }
+    if (
+      candidate.senderIsExchange &&
+      !candidate.receiverIsExchange &&
+      candidate.direction === 'EXCHANGE_OUTFLOW' &&
+      candidate.receiverProfile.isWhale &&
+      candidate.receiverProfile.behaviorTag === 'ACCUMULATOR'
+    ) {
+      behaviorCandidates.push({
+        ...candidate,
+        voteDirection: 'LONG',
+        highConfidenceAccumulator: candidate.receiverProfile.confidenceScore > 0.8,
+      });
+    }
+  }
+  const longVolume = behaviorCandidates
+    .filter(({ voteDirection }) => voteDirection === 'LONG')
+    .reduce<number>((sum, candidate) =>
+      sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
+  const shortVolume = behaviorCandidates
+    .filter(({ voteDirection }) => voteDirection === 'SHORT')
+    .reduce<number>((sum, candidate) =>
+      sum + (assetSymbol === 'BTC' ? candidate.amount : candidate.estimatedUsd ?? 0), 0);
+  const totalVolume = longVolume + shortVolume;
+  const netFlow = shortVolume - longVolume;
   const bias = totalVolume > 0 ? Math.abs(netFlow) / totalVolume : 0;
-  const sourceTimestampMs = candidates.length > 0
-    ? Math.max(...candidates.map(({ timestampMs }) => timestampMs))
-    : freshness?.timestampMs ?? null;
-  const sourceAgeMs = sourceTimestampMs === null ? null : nowMs - sourceTimestampMs;
   const feedValid = directWhaleFlow?.status === 'LIVE' &&
     directWhaleFlow.qualityPct >= 80 &&
     (directWhaleFlow.coverageStatus === 'SAMPLED' || directWhaleFlow.coverageStatus === 'COMPLETE');
-  const quorumValid = candidates.length > 0 && !conflictingEvidence;
+  const quorumValid = behaviorCandidates.length > 0 && !conflictingEvidence;
   const minimumVolume = assetSymbol === 'BTC' ? MEMBER_6_MIN_WHALE_VOLUME_BTC : MEMBER_6_MIN_WHALE_VOLUME_USD;
+  const highConfidenceAccumulatorPresent = behaviorCandidates.some(({ highConfidenceAccumulator }) =>
+    highConfidenceAccumulator);
+  const effectiveMinimumVolume = highConfidenceAccumulatorPresent
+    ? minimumVolume / 4
+    : minimumVolume;
   const minimumNetFlow = assetSymbol === 'BTC' ? MEMBER_6_MIN_NET_FLOW_BTC : MEMBER_6_MIN_NET_FLOW_USD;
-  const volumeValid = totalVolume >= minimumVolume && Math.abs(netFlow) >= minimumNetFlow;
+  const effectiveMinimumNetFlow = highConfidenceAccumulatorPresent
+    ? minimumNetFlow / 4
+    : minimumNetFlow;
+  const volumeValid = totalVolume >= effectiveMinimumVolume &&
+    Math.abs(netFlow) >= effectiveMinimumNetFlow;
   const biasValid = bias >= MEMBER_6_MIN_DIRECTIONAL_BIAS;
+  const channelOneEligible = feedValid && freshness !== null &&
+    quorumValid && volumeValid && biasValid;
+  const channelOneDirection = channelOneEligible
+    ? netFlow < 0 ? 'LONG' as const : 'SHORT' as const
+    : null;
+  const feeMetrics = directWhaleFlow?.networkMetrics;
+  const feeSourceIds = typeof feeMetrics?.fee_source_ids === 'string'
+    ? feeMetrics.fee_source_ids.split(',').map((sourceId) => sourceId.trim()).filter(Boolean)
+    : [];
+  const feeOperators = new Set(feeSourceIds.flatMap((sourceId) => {
+    const operator = getWhaleSourceOperator(assetSymbol, sourceId);
+    return operator ? [operator] : [];
+  }));
+  const baselineSourceIds = typeof feeMetrics?.fee_baseline_source_ids === 'string'
+    ? feeMetrics.fee_baseline_source_ids.split(',').map((sourceId) => sourceId.trim()).filter(Boolean)
+    : [];
+  const baselineOperators = new Set(baselineSourceIds.flatMap((sourceId) => {
+    const operator = getWhaleSourceOperator(assetSymbol, sourceId);
+    return operator ? [operator] : [];
+  }));
+  const feeObservedAtMs = feeMetrics?.fee_observed_at_ms;
+  const feeAgeMs = isFiniteNumber(feeObservedAtMs) ? nowMs - feeObservedAtMs : Number.NaN;
+  const expectedFeeMetric = assetSymbol === 'BTC'
+    ? 'mempool_median_fee_rate'
+    : assetSymbol === 'ETH' || assetSymbol === 'BNB'
+      ? 'priority_fee_gwei'
+      : assetSymbol === 'SOL'
+        ? 'prioritization_fee_micro_lamports'
+        : assetSymbol === 'XRP' ? 'validated_base_fee_xrp' : null;
+  const feeQuorumValid = feeMetrics?.fee_status === 'QUORUM' &&
+    feeMetrics.fee_metric === expectedFeeMetric &&
+    isFiniteNumber(feeMetrics.fee_value) && feeMetrics.fee_value >= 0 &&
+    isFiniteNumber(feeObservedAtMs) &&
+    isFiniteNumber(feeAgeMs) && feeAgeMs >= 0 && feeAgeMs <= MAX_PUBLIC_ONCHAIN_AGE_MS &&
+    feeSourceIds.length === new Set(feeSourceIds).size &&
+    feeOperators.size >= 2 &&
+    feeOperators.size === feeSourceIds.length &&
+    feeMetrics.fee_operator_count === feeOperators.size;
+  const baselineSpanMs = feeMetrics?.fee_baseline_span_ms;
+  const baselineSampleCount = feeMetrics?.fee_baseline_sample_count;
+  const feeSpikeRatio = feeMetrics?.fee_spike_ratio;
+  const feeSpikeEligible = feeQuorumValid &&
+    feeMetrics?.fee_spike_status === 'SPIKE' &&
+    isFiniteNumber(feeMetrics?.fee_value) && feeMetrics.fee_value > 0 &&
+    isFiniteNumber(feeMetrics?.fee_baseline_value) && feeMetrics.fee_baseline_value > 0 &&
+    isFiniteNumber(feeSpikeRatio) && feeSpikeRatio >= 2 &&
+    isFiniteNumber(baselineSampleCount) && baselineSampleCount >= 10 &&
+    isFiniteNumber(baselineSpanMs) && baselineSpanMs >= 10 * 60_000 &&
+    feeOperators.size >= 2 &&
+    feeMetrics.fee_operator_count === feeOperators.size &&
+    baselineOperators.size === feeOperators.size &&
+    [...feeOperators].every((operator) => baselineOperators.has(operator));
+
+  const expectedBlockchain: Record<string, string> = {
+    BTC: 'bitcoin',
+    ETH: 'ethereum',
+    BNB: 'binance-smart-chain',
+    SOL: 'solana',
+    XRP: 'xrpledger',
+  };
+  const macroObservations = Array.isArray(directWhaleFlow?.aggregateExchangeFlow?.observations)
+    ? directWhaleFlow.aggregateExchangeFlow.observations
+    : [];
+  const verifiedMacroObservations: CouncilAggregateExchangeFlowObservation[] = [];
+  const macroIdentities = new Set<string>();
+  let conflictingMacroEvidence = false;
+  for (const observation of macroObservations) {
+    if (!isRecord(observation) ||
+        observation.blockchain !== expectedBlockchain[assetSymbol] ||
+        typeof observation.transactionHash !== 'string' ||
+        typeof observation.transferId !== 'string' ||
+        !isFiniteNumber(observation.timestampMs) ||
+        observation.timestampMs > nowMs ||
+        nowMs - observation.timestampMs > MAX_PUBLIC_ONCHAIN_AGE_MS ||
+        !['EXCHANGE_INFLOW', 'EXCHANGE_OUTFLOW'].includes(String(observation.direction)) ||
+        !isFiniteNumber(observation.amount) || observation.amount <= 0 ||
+        !isFiniteNumber(observation.estimatedUsd) || observation.estimatedUsd <= 0 ||
+        typeof observation.exchangeName !== 'string' || !observation.exchangeName.trim() ||
+        typeof observation.exchangeAddress !== 'string' || !observation.exchangeAddress.trim() ||
+        observation.attributionSourceId !== 'local-exchange-address-list' ||
+        !Array.isArray(observation.sourceIds) || observation.sourceIds.length < 2 ||
+        observation.sourceIds.some((sourceId) => typeof sourceId !== 'string' || !sourceId.trim())) continue;
+    const sourceIds = observation.sourceIds as string[];
+    const operators = sourceIds.flatMap((sourceId) => {
+      const operator = getWhaleSourceOperator(assetSymbol, sourceId);
+      return operator ? [operator] : [];
+    });
+    if (new Set(sourceIds).size !== sourceIds.length ||
+        operators.length !== sourceIds.length ||
+        new Set(operators).size !== operators.length ||
+        operators.length < 2) continue;
+    const identity = `${observation.blockchain}:${normalizeOnChainIdentifier(observation.transactionHash)}:${normalizeOnChainIdentifier(observation.transferId)}`;
+    if (macroIdentities.has(identity)) {
+      conflictingMacroEvidence = true;
+      continue;
+    }
+    macroIdentities.add(identity);
+    verifiedMacroObservations.push(observation as CouncilAggregateExchangeFlowObservation);
+  }
+  const macroInflow = verifiedMacroObservations
+    .filter(({ direction }) => direction === 'EXCHANGE_INFLOW')
+    .reduce((sum, observation) =>
+      sum + (assetSymbol === 'BTC' ? observation.amount : observation.estimatedUsd), 0);
+  const macroOutflow = verifiedMacroObservations
+    .filter(({ direction }) => direction === 'EXCHANGE_OUTFLOW')
+    .reduce((sum, observation) =>
+      sum + (assetSymbol === 'BTC' ? observation.amount : observation.estimatedUsd), 0);
+  const macroTotalVolume = macroInflow + macroOutflow;
+  const macroNetFlow = macroInflow - macroOutflow;
+  const macroBias = macroTotalVolume > 0 ? Math.abs(macroNetFlow) / macroTotalVolume : 0;
+  const macroTimestampMs = verifiedMacroObservations.length > 0
+    ? Math.max(...verifiedMacroObservations.map(({ timestampMs }) => timestampMs))
+    : null;
+  const macroFreshness = macroTimestampMs === null
+    ? null
+    : freshTimestamp(macroTimestampMs, nowMs - macroTimestampMs, nowMs, MAX_PUBLIC_ONCHAIN_AGE_MS);
+  const macroQuorumValid = verifiedMacroObservations.length > 0 &&
+    !conflictingMacroEvidence && macroFreshness !== null;
+  const macroVolumeValid = macroTotalVolume >= minimumVolume &&
+    Math.abs(macroNetFlow) >= minimumNetFlow;
+  const macroBiasValid = macroBias >= MEMBER_6_MIN_DIRECTIONAL_BIAS;
+  const channelTwoEligible = feedValid && macroQuorumValid &&
+    macroVolumeValid && macroBiasValid && feeSpikeEligible;
+  const channelTwoDirection = channelTwoEligible
+    ? macroNetFlow < 0 ? 'LONG' as const : 'SHORT' as const
+    : null;
+  verifiedEvidenceOutput?.push(...verifiedMacroObservations.map((observation) => ({
+    direction: observation.direction,
+    amount: observation.amount,
+    estimatedUsd: observation.estimatedUsd,
+    transactionHash: observation.transactionHash,
+    exchangeNames: [observation.exchangeName],
+  })));
+
+  const channelsConflict = channelOneDirection !== null &&
+    channelTwoDirection !== null &&
+    channelOneDirection !== channelTwoDirection;
+  const selectedDirection = channelsConflict
+    ? null
+    : channelOneDirection ?? channelTwoDirection;
+  const selectedBias = channelOneDirection ? bias : macroBias;
+  const selectedTimestampMs = Math.max(
+    ...(channelOneDirection && behaviorCandidates.length > 0
+      ? behaviorCandidates.map(({ timestampMs }) => timestampMs)
+      : []),
+    ...(channelTwoDirection && macroTimestampMs !== null ? [macroTimestampMs] : []),
+  );
+  const sourceTimestampMs = Number.isFinite(selectedTimestampMs)
+    ? selectedTimestampMs
+    : freshness?.timestampMs ?? macroFreshness?.timestampMs ?? null;
+  const sourceAgeMs = sourceTimestampMs === null ? null : nowMs - sourceTimestampMs;
   const checks = [
     {
       labelFa: 'تازگی دادهٔ جریان',
-      passed: feedValid && freshness !== null,
-      detailFa: freshness
-        ? `${Math.round(freshness.ageMs / 60_000)} دقیقه؛ منبع ${directWhaleFlow?.provider ?? 'نامشخص'}`
+      passed: feedValid && (freshness !== null || macroFreshness !== null),
+      detailFa: freshness || macroFreshness
+        ? `${Math.round(Math.min(freshness?.ageMs ?? Number.POSITIVE_INFINITY, macroFreshness?.ageMs ?? Number.POSITIVE_INFINITY) / 60_000)} دقیقه؛ منبع ${directWhaleFlow?.provider ?? 'نامشخص'}`
         : directWhaleFlow?.unavailableReason ?? 'فید جریان تازه و معتبر موجود نیست.',
     },
     {
-      labelFa: 'تأیید مستقل Consensus Matrix',
-      passed: quorumValid,
+      labelFa: 'کانال ۱: رفتار نهنگ و انتساب صرافی',
+      passed: channelOneEligible,
       detailFa: conflictingEvidence
         ? 'هویت تکراری یا جهت/حجم متناقض در ماتریس اجماع مشاهده شد.'
-        : `${candidates.length} انتقال واجد quorum دو منبع مستقل؛ ورودی‌های فاقد quorum حذف شدند.`,
+        : behaviorCandidates.length > 0
+          ? `${behaviorCandidates.length} انتقالِ نهنگ accumulator با پروفایل و quorum معتبر؛ حدنصاب حجم ${effectiveMinimumVolume} و حدنصاب خالص ${effectiveMinimumNetFlow}؛ رأی مستقل از telemetry کارمزد است.`
+          : directWhaleFlow?.unavailableReason ??
+            'هیچ انتقال تازه با پروفایل accumulator، انتساب صرافی و quorum مستقل در دسترس نیست.',
     },
     {
-      labelFa: 'حجم و سوگیری جهت‌دار',
+      labelFa: 'کانال ۱: حدنصاب حجم و سوگیری',
       passed: volumeValid && biasValid,
       detailFa: assetSymbol === 'BTC'
         ? `${totalVolume.toFixed(2)} BTC کل؛ خالص ${netFlow.toFixed(2)} BTC؛ سوگیری ${(bias * 100).toFixed(0)}٪.`
         : `${assetSymbol}: $${totalVolume.toFixed(0)} کل؛ خالص $${netFlow.toFixed(0)}؛ سوگیری ${(bias * 100).toFixed(0)}٪.`,
     },
+    {
+      labelFa: 'کانال ۲: netflow تجمیعی مستقل از ماتریس نامزدها',
+      passed: channelTwoEligible,
+      detailFa: conflictingMacroEvidence
+        ? 'هویت تکراری در جریان تجمیعی تشخیص داده شد؛ کانال ۲ رد شد.'
+        : `${verifiedMacroObservations.length} انتقال تجمیعی؛ حجم ${assetSymbol === 'BTC' ? `${macroTotalVolume.toFixed(2)} BTC` : `$${macroTotalVolume.toFixed(0)}`}؛ خالص ${assetSymbol === 'BTC' ? `${macroNetFlow.toFixed(2)} BTC` : `$${macroNetFlow.toFixed(0)}`}؛ سوگیری ${(macroBias * 100).toFixed(0)}٪. برای رأی، جهش کارمزد چنداپراتوری هم لازم است.`,
+    },
+    {
+      labelFa: 'کارمزد چندمنبعی / شرط کانال ۲',
+      passed: feeQuorumValid,
+      detailFa: !feeQuorumValid
+        ? 'کارمزد تازه با quorum دو اپراتور مستقل احراز نشد؛ کانال ۲ بسته است، اما کانال ۱ می‌تواند مستقل رأی دهد.'
+        : feeSpikeEligible
+          ? `مقدار ${feeMetrics.fee_value} ${String(feeMetrics.fee_unit ?? '')} و جهش ${feeSpikeRatio!.toFixed(2)} برابری از ${feeOperators.size} اپراتور مستقل تأیید شد.`
+          : `مقدار ${feeMetrics.fee_value} ${String(feeMetrics.fee_unit ?? '')} از ${feeOperators.size} اپراتور مستقل تأیید شد، اما baseline برای جهش واجد شرایط نیست؛ کانال ۲ رأی نمی‌دهد.`,
+    },
   ];
-  if (
-    !feedValid || !freshness || !quorumValid ||
-    !volumeValid || !biasValid
-  ) {
-    const reason = conflictingEvidence
-      ? 'شواهد اجماع آن‌چین متناقض است؛ عضو ششم abstain می‌کند.'
-      : 'برای رأی جهت‌دار، جریان تازه با quorum مستقل و حجم/سوگیری کافی لازم است.';
+  if (!selectedDirection || channelsConflict) {
+    const reasons = [
+      channelsConflict
+        ? `کانال ۱ (${channelOneDirection}) و کانال ۲ (${channelTwoDirection}) جهت‌های متناقض صادر کردند.`
+        : null,
+      !feedValid ? 'فید آن‌چین موجود یا باکیفیت کافی نیست.' : null,
+      !channelOneEligible && !channelTwoEligible
+        ? directWhaleFlow?.unavailableReason ?? null
+        : null,
+      !channelOneEligible
+        ? conflictingEvidence
+          ? 'کانال ۱ شواهد اجماع متناقض یا تکراری دارد.'
+          : !quorumValid
+            ? 'کانال ۱ انتقال تازه با پروفایل رفتاری معتبر، انتساب صرافی و quorum مستقل ندارد.'
+            : !volumeValid || !biasValid
+              ? 'کانال ۱ به حدنصاب حجم، خالص جریان یا سوگیری جهت‌دار نرسید.'
+              : null
+        : null,
+      !channelTwoEligible
+        ? conflictingMacroEvidence
+          ? 'کانال ۲ شواهد تجمیعی تکراری یا متناقض دارد.'
+          : !macroQuorumValid
+            ? 'کانال ۲ جریان تجمیعی با quorum دو اپراتور مستقل و تازگی کافی ندارد.'
+            : !macroVolumeValid || !macroBiasValid
+              ? 'کانال ۲ به حدنصاب حجم، خالص جریان یا سوگیری جهت‌دار نرسید.'
+              : !feeQuorumValid
+                ? 'کانال ۲ به telemetry کارمزد تازه با quorum حداقل دو اپراتور مستقل نیاز دارد.'
+                : 'کانال ۲ جهش کارمزد معتبر با baseline کافی ندارد.'
+        : null,
+    ].filter((reason): reason is string => reason !== null);
+    const reason = `${reasons.join(' ')} عضو ششم abstain می‌کند.`;
     return abstain(member, reason, checks, sourceTimestampMs, sourceAgeMs);
   }
 
-  const direction = netFlow < 0 ? 'LONG' : 'SHORT';
-  const confidencePct = Math.min(90, 45 + bias * 35);
+  const direction = selectedDirection;
+  const confidencePct = Math.min(90, 45 + selectedBias * 35 + (channelTwoDirection ? 5 : 0));
+  const selectedChannel = channelOneDirection && channelTwoDirection
+    ? 'هر دو کانال'
+    : channelOneDirection ? 'کانال ۱ (آدرس‌های پیکربندی‌شده)' : 'کانال ۲ (netflow تجمیعی + جهش کارمزد)';
+  const rationaleFlow = direction === 'LONG'
+    ? 'خروج از صرافی غالب است'
+    : 'ورود به صرافی غالب است';
   return createVote(
     member,
     direction,
     assetSymbol === 'BTC'
-      ? `جریان خالص ${netFlow.toFixed(2)} BTC با quorum مستقل تأیید شد؛ ${direction === 'LONG' ? 'خروج از صرافی' : 'ورود به صرافی'} غالب است. هیچ هویت کیف‌پولی استنباط نشده است.`
-      : `جریان خالص ${assetSymbol} به ارزش $${Math.abs(netFlow).toFixed(0)} با quorum مستقل تأیید شد؛ ${direction === 'LONG' ? 'خروج از صرافی' : 'ورود به صرافی'} غالب است.`,
+      ? `${selectedChannel} با quorum مستقل رأی ${direction} داد؛ خالص ${channelOneDirection ? netFlow : macroNetFlow} BTC است و ${rationaleFlow}. این جریان اثبات قصد معامله یا تضمین جهت قیمت نیست؛ confidence امتیاز heuristic است، نه احتمال کالیبره‌شده.`
+      : `${selectedChannel} با quorum مستقل رأی ${direction} داد؛ خالص ${assetSymbol} برابر $${Math.abs(channelOneDirection ? netFlow : macroNetFlow).toFixed(0)} است و ${rationaleFlow}. این جریان اثبات قصد معامله یا تضمین جهت قیمت نیست؛ confidence امتیاز heuristic است، نه احتمال کالیبره‌شده.`,
     checks,
     {
       sourceTimestampMs,
@@ -1083,10 +1425,10 @@ function evaluateOnChain(
 
 export function member6ShadowModeEnabled(): boolean {
   const raw = process.env.SBK1_MEMBER6_SHADOW_MODE?.trim().toLowerCase();
-  if (!raw || raw === 'true') return true;
-  if (raw === 'false') return false;
-  console.error('[EightMemberCouncil] Invalid SBK1_MEMBER6_SHADOW_MODE; defaulting to true.');
-  return true;
+  if (!raw || raw === 'false') return false;
+  if (raw === 'true') return true;
+  console.error('[EightMemberCouncil] Invalid SBK1_MEMBER6_SHADOW_MODE; defaulting to false.');
+  return false;
 }
 
 export function evaluateMember6VoteForShadow(input: {
@@ -1094,12 +1436,23 @@ export function evaluateMember6VoteForShadow(input: {
   whaleFlowData?: CouncilWhaleFlowData | null;
   nowMs?: number;
 }): CouncilMemberVote {
-  return evaluateOnChain(
+  return evaluateMember6VoteAndEvidenceForShadow(input).vote;
+}
+
+export function evaluateMember6VoteAndEvidenceForShadow(input: {
+  macroContext?: CouncilMacroContext | null;
+  whaleFlowData?: CouncilWhaleFlowData | null;
+  nowMs?: number;
+}): { vote: CouncilMemberVote; verifiedCandidates: Member6VerifiedCandidate[] } {
+  const verifiedCandidates: Member6VerifiedCandidate[] = [];
+  const vote = evaluateOnChain(
     EIGHT_MEMBER_COUNCIL[5],
     input.macroContext,
     input.nowMs ?? Date.now(),
     input.whaleFlowData ?? undefined,
+    verifiedCandidates,
   );
+  return { vote, verifiedCandidates };
 }
 
 export function applyMember6ShadowMode(report: EightMemberCouncilReport): EightMemberCouncilReport {

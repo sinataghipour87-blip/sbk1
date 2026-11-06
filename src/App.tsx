@@ -39,6 +39,7 @@ import { RootCauseAnalysisWidget } from './components/RootCauseAnalysisWidget';
 import { MacroContextBrainWidget } from './components/MacroContextBrainWidget';
 import { WhaleSignalStatisticalProofWidget } from './components/WhaleSignalStatisticalProofWidget';
 import { WhaleOnChainRadarWidget } from './components/WhaleOnChainRadarWidget';
+import { WalletProfilesWidget } from './components/WalletProfilesWidget';
 import { OpenSourceAdvisoryPanel } from './components/OpenSourceAdvisoryPanel';
 import { GarchRealtimeRiskWidget } from './components/GarchRealtimeRiskWidget';
 import { CrossExchangeCorrelationWidget } from './components/CrossExchangeCorrelationWidget';
@@ -2381,6 +2382,7 @@ export default function App() {
               {systemHubTab === 'flow_whales' && (
                 <div className="flex flex-col gap-3">
                   <WhaleOnChainRadarWidget />
+                  <WalletProfilesWidget />
                   <LiquidityHeatmapWidget
                     currentPrice={liveEffectivePrice}
                     analysis={analysis}

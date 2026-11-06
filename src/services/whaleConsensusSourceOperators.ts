@@ -25,6 +25,7 @@ const SOURCE_OPERATORS: Readonly<Record<QuorumAsset, Readonly<Record<string, str
     'ethereum-rpc-zan': 'zan',
     'ethereum-rpc-bloxroute': 'bloxroute',
     'ethereum-rpc-nownodes': 'nownodes',
+    'ethereum-rpc-drpc': 'drpc',
     'local-exchange-address-list': 'local-exchange-address-list',
   },
   BNB: {
@@ -36,6 +37,7 @@ const SOURCE_OPERATORS: Readonly<Record<QuorumAsset, Readonly<Record<string, str
     'bsc-rpc-meowrpc': 'meowrpc',
     'bsc-rpc-bloxroute': 'bloxroute',
     'bsc-rpc-48club': '48club',
+    'bsc-rpc-bnbchain': 'bnb-chain',
   },
   SOL: {
     'whale-alert': 'whale-alert',
